@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "exactOptionalPropertyTypes": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true,
+    "noEmit": true,
+    "types": ["node"],
+    "rewriteRelativeImportExtensions": true
+  },
+  "include": ["src", "test", "migrations", "vitest.config.ts", "eslint.config.mjs"]
+}

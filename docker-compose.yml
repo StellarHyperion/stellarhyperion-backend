@@ -1,0 +1,47 @@
+# One command to get the two services the backend needs:
+#
+#   docker compose up -d
+#
+# Ports are deliberately not the defaults. A developer working on more than one project has
+# something on 5432 already, and a connection string that silently talks to the wrong database
+# is a bad afternoon.
+services:
+  postgres:
+    image: postgres:16-alpine
+    # Credentials for a container that only listens on loopback. Nothing here is a secret and
+    # nothing here is reused anywhere that matters. Change them and change DATABASE_URL to match.
+    environment:
+      POSTGRES_USER: hyperion
+      POSTGRES_PASSWORD: hyperion-local-only
+      POSTGRES_DB: hyperion
+      # Both databases exist from the start so the integration suite is not creating one on a
+      # connection it is about to migrate.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - hyperion-pgdata:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hyperion -d hyperion"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    # appendonly so a restart does not lose a keeper job that was already acknowledged.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - hyperion-redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  hyperion-pgdata:
+  hyperion-redisdata:

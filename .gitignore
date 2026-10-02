@@ -1,0 +1,18 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Secrets. Only .env.example is ever committed, and it holds placeholders.
+.env
+.env.*
+!.env.example
+
+# Local deployment records copied out of the contracts repo.
+deployments/*.json
+
+# Postgres and Redis data when compose is run with a bind mount.
+.data/
+
+*.log
+.DS_Store

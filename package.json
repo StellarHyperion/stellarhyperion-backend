@@ -1,0 +1,53 @@
+{
+  "name": "@hyperion/backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Hyperion's off-chain half: the chain watchers that answer where a transfer is, and the keeper that moves it along",
+  "license": "MIT",
+  "author": "dotmantissa",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/StellarHyperion/stellarhyperion-backend.git"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "dev": "node --watch --experimental-strip-types src/main.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "migrate": "node-pg-migrate --envPath .env --migrations-dir migrations --migrations-table pgmigrations",
+    "migrate:up": "npm run migrate -- up",
+    "migrate:down": "npm run migrate -- down",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:unit": "vitest run test/unit",
+    "test:integration": "vitest run test/integration",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "fmt": "prettier --write \"**/*.{ts,mts,mjs,cjs,json,md,yml,yaml}\"",
+    "fmt:check": "prettier --check \"**/*.{ts,mts,mjs,cjs,json,md,yml,yaml}\"",
+    "check": "npm run fmt:check && npm run lint && npm run typecheck && npm run test"
+  },
+  "dependencies": {
+    "@hyperion/protocol": "file:../contracts/packages/protocol",
+    "@stellar/stellar-sdk": "^17.2.1",
+    "fastify": "^5.12.5",
+    "node-pg-migrate": "^9.0.0",
+    "pg": "^8.16.3",
+    "pino": "^10.3.1",
+    "pino-pretty": "^13.1.2",
+    "viem": "^2.57.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.0",
+    "@types/pg": "^8.15.6",
+    "eslint": "^10.11.0",
+    "prettier": "^3.9.9",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.71.0",
+    "vitest": "^5.0.3"
+  }
+}
