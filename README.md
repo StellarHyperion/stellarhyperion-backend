@@ -21,13 +21,13 @@ do if it is compromised.
 
 Built and committed:
 
-| | |
-|---|---|
-| Config | Declarative spec table, accumulating reader, 17 tests |
-| HTTP | Fastify 5, `/health` and `/ready` meaning different things |
-| Runtime | Poller, readiness registry, graceful shutdown |
-| Database | Connection pool and row mappers |
-| Compose | Postgres on 5433, Redis on 6380 |
+|          |                                                            |
+| -------- | ---------------------------------------------------------- |
+| Config   | Declarative spec table, accumulating reader, 17 tests      |
+| HTTP     | Fastify 5, `/health` and `/ready` meaning different things |
+| Runtime  | Poller, readiness registry, graceful shutdown              |
+| Database | Connection pool and row mappers                            |
+| Compose  | Postgres on 5433, Redis on 6380                            |
 
 Not built yet, and `docs/ROADMAP.md` says so in more detail: the migrations, the two chain
 watchers, the rail status pollers, the keeper and the REST API. The module boundaries are in place
