@@ -6,6 +6,7 @@
  * message on stderr is worth more to whoever is staring at a crash loop than a single line of
  * JSON with the whole explanation escaped inside one field.
  */
+import { buildIndexer } from "./chains/runner.js";
 import { loadConfig } from "./config/config.js";
 import { ConfigError } from "./config/env.js";
 import { Database } from "./db/pool.js";
@@ -35,17 +36,26 @@ async function main(): Promise<void> {
   const db = Database.open(config.databaseUrl, { applicationName: "hyperion-backend" });
   shutdown.add("postgres", () => db.close());
 
+  // Registered between the pool and the server, because shutdown runs in reverse: the server
+  // stops accepting requests, the watchers finish the page they are on, and only then does the
+  // pool close under them.
+  const indexer = buildIndexer({ config, logger, db });
+  shutdown.add("indexer", () => indexer.stop());
+
   const server = buildServer({
     config,
     logger,
     db,
-    readiness: [],
+    readiness: indexer.readiness,
     startedAt,
   });
   // Registered before listen so a failed listen still closes what is already open.
   shutdown.add("http", () => server.close());
 
   await server.listen({ host: config.http.host, port: config.http.port });
+  // After listen, so the probes are answering before the first page is read. A watcher that
+  // starts first makes its initial RPC calls while nothing can report on them.
+  indexer.start();
   logger.info(
     {
       host: config.http.host,
@@ -54,6 +64,7 @@ async function main(): Promise<void> {
       deploymentsFile: config.deploymentsFile,
       watchingStellar: config.indexer.stellar?.chain ?? null,
       watchingEvm: config.indexer.evm.map((entry) => entry.chain),
+      workers: indexer.workers.map((worker) => worker.name),
     },
     "hyperion backend listening",
   );

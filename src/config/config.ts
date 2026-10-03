@@ -196,6 +196,16 @@ const STELLAR_RPC_URL: VarSpec = {
     "Soroban RPC. Defaults to the chain registry endpoint, which is public and will rate limit you under real load.",
 };
 
+const STELLAR_START_LEDGER: VarSpec = {
+  name: "STELLAR_START_LEDGER",
+  kind: "integer",
+  required: false,
+  min: 1,
+  printable: true,
+  purpose:
+    "Overrides the start ledger for a fresh Stellar cursor. The deployment record's deployedAt.ledger is written when the deploy script finishes, which on the live testnet record is later than the router's own first event, so an operator needs a way to wind the start back without redeploying. Ignored once a cursor exists.",
+};
+
 const STELLAR_EVENT_PAGE_SIZE: VarSpec = {
   name: "STELLAR_EVENT_PAGE_SIZE",
   kind: "integer",
@@ -290,6 +300,9 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const shutdownTimeoutMs = reader.integer(SHUTDOWN_TIMEOUT_MS);
 
   const stellarRpcOverride = reader.url(STELLAR_RPC_URL);
+  const startLedgerOverride = reader.has(STELLAR_START_LEDGER.name)
+    ? reader.integer(STELLAR_START_LEDGER)
+    : null;
   const pageSize = reader.integer(STELLAR_EVENT_PAGE_SIZE);
   const stellarPollIntervalMs = reader.integer(STELLAR_POLL_INTERVAL_MS);
   const evmPollIntervalMs = reader.integer(EVM_POLL_INTERVAL_MS);
@@ -305,6 +318,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     deployments,
     enabled: indexerEnabled,
     stellarRpcOverride,
+    startLedgerOverride,
     pageSize,
     stellarPollIntervalMs,
     evmPollIntervalMs,
@@ -377,6 +391,7 @@ interface PlanInput {
   readonly deployments: DeploymentSet;
   readonly enabled: boolean;
   readonly stellarRpcOverride: string;
+  readonly startLedgerOverride: number | null;
   readonly pageSize: number;
   readonly stellarPollIntervalMs: number;
   readonly evmPollIntervalMs: number;
@@ -442,7 +457,7 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
         rpcUrl: input.stellarRpcOverride === "" ? chain.defaultRpcUrl : input.stellarRpcOverride,
         networkPassphrase: chain.networkPassphrase,
         routerContractId: deployment.router,
-        startLedger: deployment.deployedAt.ledger,
+        startLedger: input.startLedgerOverride ?? deployment.deployedAt.ledger,
         pageSize: input.pageSize,
         pollIntervalMs: input.stellarPollIntervalMs,
       };

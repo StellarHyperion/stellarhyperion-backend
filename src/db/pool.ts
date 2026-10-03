@@ -26,6 +26,18 @@ export interface Queryable {
   query(text: string, params?: readonly unknown[]): Promise<QueryResultRows>;
 }
 
+/**
+ * A `Queryable` that can also open a transaction.
+ *
+ * Declared as an interface the watchers depend on rather than letting them name `Database`
+ * directly, and that is the seam the watcher tests run through. A watcher's whole correctness
+ * claim is about what lands in one transaction, so a test has to be able to watch the
+ * transaction boundary rather than infer it, and a real pool cannot be asked what it was told.
+ */
+export interface Transactional extends Queryable {
+  transaction<T>(work: (tx: Queryable) => Promise<T>): Promise<T>;
+}
+
 export interface OpenOptions {
   /** Low by default. Two watchers and an HTTP server do not need twenty connections. */
   readonly maxConnections?: number;
@@ -34,7 +46,7 @@ export interface OpenOptions {
   readonly applicationName?: string;
 }
 
-export class Database implements Queryable {
+export class Database implements Transactional {
   private closed = false;
 
   private constructor(private readonly pool: Pool) {}
