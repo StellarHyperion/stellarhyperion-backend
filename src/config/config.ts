@@ -55,7 +55,7 @@ export interface EvmWatchConfig {
   readonly startBlock: bigint;
   /** From the chain registry. How many blocks before a log is believed. */
   readonly confirmations: number;
-  /** How far back every pass re-reads before it believes its own cursor. */
+  /** How far back to wind the cursor when a reorg is found below the confirmation depth. */
   readonly reorgDepth: number;
   readonly logRange: number;
   readonly pollIntervalMs: number;
@@ -254,7 +254,7 @@ const EVM_REORG_DEPTH: VarSpec = {
   min: 1,
   printable: true,
   purpose:
-    "How far back every pass re-reads before it believes its own cursor. Defaults per chain to that chain's own confirmations from the registry.",
+    "How far back the cursor winds when a reorg is found below the confirmation depth. Not a re-read on every pass: ordinary passes trust the cursor, because nothing past the confirmation line is indexed in the first place. Defaults per chain to that chain's own confirmations from the registry.",
 };
 
 /** `base-sepolia` becomes `BASE_SEPOLIA`, which is what an override variable is named after. */

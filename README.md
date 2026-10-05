@@ -21,17 +21,22 @@ do if it is compromised.
 
 Built and committed:
 
-|          |                                                            |
-| -------- | ---------------------------------------------------------- |
-| Config   | Declarative spec table, accumulating reader, 17 tests      |
-| HTTP     | Fastify 5, `/health` and `/ready` meaning different things |
-| Runtime  | Poller, readiness registry, graceful shutdown              |
-| Database | Connection pool and row mappers                            |
-| Compose  | Postgres on 5433, Redis on 6380                            |
+|          |                                                                |
+| -------- | -------------------------------------------------------------- |
+| Config   | Declarative spec table, accumulating reader, 17 tests          |
+| HTTP     | Fastify 5, `/health` and `/ready` meaning different things     |
+| Runtime  | Poller, readiness registry, graceful shutdown                  |
+| Database | Schema and migrations, connection pool, row mappers            |
+| Stellar  | Soroban event watcher, cursor safe across an empty scan window |
+| EVM      | Per chain log watcher, confirmation aware, reorg detecting     |
+| Compose  | Postgres on 5433, Redis on 6380                                |
 
-Not built yet, and `docs/ROADMAP.md` says so in more detail: the migrations, the two chain
-watchers, the rail status pollers, the keeper and the REST API. The module boundaries are in place
-for all of them.
+122 tests. Both watchers are verified against a real chain rather than only against fakes: the
+Stellar one against the deployed router on testnet, the EVM one against a router deployed on a
+local node answering as the chain its record names.
+
+Not built yet, and `docs/ROADMAP.md` says so in more detail: the rail status pollers, the keeper
+and the REST API. The module boundaries are in place for all of them.
 
 ## Why the config layer is the longest file here
 
@@ -117,6 +122,50 @@ carries an `InboundRecord` with no `message_id`, while the EVM `BridgeIn` event 
 an inbound delivery can only be keyed on the chain, the route, the source chain and the source
 nonce, and `rail_message_id` is nullable with its own partial unique index. That is a gap in the
 Soroban event rather than in this schema, and it is worth closing there.
+
+## Two chains, two watchers, and why they are not one file with a flag
+
+Stellar has deterministic finality. A closed ledger is closed, so a ledger number is a complete
+description of a position and there is nothing to re-read. An EVM block number is not a complete
+description, because the chain can later disagree about which block had that number. Sharing one
+watcher between them would mean a flag selecting which half of its own correctness argument
+applied, which is how the half that is off by default stops being tested.
+
+What they do share is the writers. `src/chains/writers.ts` holds every statement that writes an
+indexed row, and the per-family files map events onto it. The tables are shared and so are the
+constraints: `inbound_delivery_claim` says a row claims either a delivery or a claim id and never
+both, and two files writing that table would be two chances to violate it on one side only.
+
+### What the Stellar watcher had to be told about `getEvents`
+
+That it does not scan to the head. It scans a bounded window and returns a cursor saying where it
+stopped: ten thousand ledgers for a request starting at a ledger, 9999 for one resuming from a
+cursor. So an empty page means "nothing in this window", never "nothing left to read", and a
+watcher that treats the two as the same re-reads one window forever and never arrives. That is
+invisible on a busy chain and permanent on a quiet one. The measurements behind this, and the
+cursor arithmetic they imply, are written out in `src/chains/stellar/cursor.ts`.
+
+### What the EVM watcher does about reorgs
+
+Two mechanisms doing two different jobs. Confirmations draw the line it will not read past, per
+chain from the registry, which is the honest way to treat one block on Arc and twelve on Ethereum
+as the same kind of fact. Indexing only up to `head - confirmations` means the ordinary pass needs
+no re-reading at all.
+
+The cursor's block hash catches what confirmations were supposed to prevent. Every pass re-reads
+the hash of the block the cursor sits on, and a hash that no longer matches means the chain
+reorganised past a depth its own registry entry claims is enough. That is reported at error level
+and the cursor winds back by the reorg depth, so the corrected blocks are read again and the
+writers overwrite what the orphaned ones said.
+
+What it will not do is delete. A transfer orphaned out of existence rather than changed leaves a
+row nothing overwrites, and the only honest fix is a person deciding. Silently deleting money
+records to tidy up after a reorg deeper than the chain's stated finality would be a worse failure
+than the one being cleaned up.
+
+Both watchers report `degraded` at worst and never `down`. `/ready` takes the worst report in the
+process, and a 503 because one chain is unreachable would stop this replica answering about the
+chains that are fine. Moving an outage is not fixing one.
 
 ## Running it
 

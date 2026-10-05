@@ -33,9 +33,11 @@ function build(env: Readonly<Record<string, string | undefined>> = {}) {
 }
 
 describe("what the runner builds", () => {
-  it("watches the Stellar router the deployment record names", () => {
+  it("watches every router the deployment record names, on both families", () => {
+    // The fixture record names a Stellar router and a sepolia one, so a build that watches one of
+    // them is the gap this whole suite exists to catch.
     const { indexer } = build();
-    expect(indexer.workers.map((worker) => worker.name)).toEqual(["stellar-testnet"]);
+    expect(indexer.workers.map((worker) => worker.name)).toEqual(["stellar-testnet", "sepolia"]);
   });
 
   it("watches nothing and says it is ready when the indexer is switched off", async () => {
@@ -49,15 +51,17 @@ describe("what the runner builds", () => {
     expect(byName.indexer?.detail).toMatch(/disabled by configuration/);
   });
 
-  it("reports the EVM routers it is not watching yet, by name", async () => {
-    // The fixture record names sepolia, and no EVM watcher is built yet. Skipping it silently
-    // would leave somebody to discover it from an empty table weeks later.
-    const { indexer, lines } = build();
+  it("gives every watcher its own readiness entry, named for its chain", async () => {
+    // One entry per chain rather than one for the indexer, because the useful question during an
+    // incident is which chain is behind, and an aggregate cannot answer it.
+    const { indexer } = build();
 
     const byName = await reports(indexer.readiness);
-    expect(byName.evm?.state).toBe("degraded");
-    expect(byName.evm?.detail).toContain("sepolia");
-    expect(lines.some((line) => line.message.includes("no EVM watcher is built yet"))).toBe(true);
+    expect(Object.keys(byName).sort()).toEqual(["sepolia", "stellar-testnet"]);
+    // Degraded before the first pass, on both, because nothing is indexed yet and saying ready
+    // would be claiming to know about a chain this process has not read.
+    expect(byName.sepolia?.state).toBe("degraded");
+    expect(byName["stellar-testnet"]?.state).toBe("degraded");
   });
 
   it("calls itself degraded when the record named nothing it can watch", async () => {
@@ -73,9 +77,10 @@ describe("what the runner builds", () => {
   });
 
   it("starts nothing until it is told to", () => {
-    // The seam this whole suite runs through. Building decides, starting acts.
+    // The seam this whole suite runs through. Building decides, starting acts, and no socket is
+    // opened by any of the tests above because none of them call start.
     const { indexer } = build();
-    expect(indexer.workers).toHaveLength(1);
+    expect(indexer.workers).toHaveLength(2);
     // Never started, so there is nothing to stop and stopping is still safe.
     return expect(indexer.stop()).resolves.toBeUndefined();
   });

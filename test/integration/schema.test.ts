@@ -82,6 +82,41 @@ suite("the schema", () => {
     const { rows } = await db.query(`SELECT ${U256_MAX}::numeric(78,0) AS value`);
     expect(String(rows[0]?.value)).toBe(U256_MAX);
   });
+
+  it("lets a cursor carry a block hash, and lets it be absent", async () => {
+    // Added in the second migration for the EVM watcher. Nullable on purpose: a Stellar cursor
+    // has nothing to put here and never will, and a NOT NULL column with a placeholder in half
+    // the rows is a column that means two things.
+    await db.query(
+      "DELETE FROM public.indexer_cursor WHERE chain_key IN ('hash-test', 'no-hash-test')",
+    );
+    await db.query(
+      `INSERT INTO public.indexer_cursor
+         (chain_key, family, contract, last_processed, last_processed_hash)
+       VALUES ('hash-test', 'evm', '0xrouter', 42, $1),
+              ('no-hash-test', 'stellar', 'CROUTER', 42, NULL)`,
+      [`0x${"ab".repeat(32)}`],
+    );
+
+    const { rows } = await db.query(
+      `SELECT chain_key, last_processed_hash FROM public.indexer_cursor
+        WHERE chain_key IN ('hash-test', 'no-hash-test') ORDER BY chain_key`,
+    );
+    expect(rows.map((row) => row.last_processed_hash)).toEqual([`0x${"ab".repeat(32)}`, null]);
+
+    await db.query(
+      "DELETE FROM public.indexer_cursor WHERE chain_key IN ('hash-test', 'no-hash-test')",
+    );
+  });
+
+  it("refuses a family that is neither of the two that exist", async () => {
+    await expect(
+      db.query(
+        `INSERT INTO public.indexer_cursor (chain_key, family, contract, last_processed)
+         VALUES ('bad-family', 'solana', 'x', 1)`,
+      ),
+    ).rejects.toSatisfy((error: unknown) => codeOf(error) === CHECK_VIOLATION);
+  });
 });
 
 suite("outbound_transfer", () => {

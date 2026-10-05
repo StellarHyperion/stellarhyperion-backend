@@ -16,3 +16,6 @@ deployments/*.json
 
 *.log
 .DS_Store
+
+# Working state for whoever picks this up next. Never a deliverable.
+.task-checklist.md

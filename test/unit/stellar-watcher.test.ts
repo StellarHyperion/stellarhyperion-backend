@@ -74,10 +74,12 @@ function cursorRow(ledger: number, contract = LIVE_ROUTER): Record<string, unkno
   };
 }
 
+/** Cursor writes, read back from the parameters rather than from the watcher's own cache. */
 function cursorWrites(db: RecordingDb): { ledger: number; contract: string }[] {
+  // writeCursor takes (chain_key, family, contract, last_processed, last_processed_at, hash).
   return db.matching("INSERT INTO indexer_cursor").map((entry) => ({
-    ledger: Number(entry.params[2]),
-    contract: String(entry.params[1]),
+    ledger: Number(entry.params[3]),
+    contract: String(entry.params[2]),
   }));
 }
 

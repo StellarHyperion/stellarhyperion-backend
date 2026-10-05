@@ -153,7 +153,7 @@ export class StellarWatcher {
       );
     }
 
-    const base = stored === null ? this.options.startLedger - 1 : Number(stored.ledger);
+    const base = stored === null ? this.options.startLedger - 1 : Number(stored.position);
     const scan = await this.scan(base, stored === null, signal);
 
     if (scan.oldestLedger > base + 1 && stored !== null) {
@@ -180,7 +180,7 @@ export class StellarWatcher {
 
     let decoded = 0;
     let skipped = 0;
-    let closedAt = stored?.closedAt ?? null;
+    let closedAt = stored?.observedAt ?? null;
     for (const raw of scan.events) {
       if (raw.ledger <= scan.through) closedAt = new Date(raw.ledgerClosedAt);
     }
@@ -205,7 +205,15 @@ export class StellarWatcher {
         else skipped += 1;
       }
 
-      await writeCursor(tx, chainKey, router, BigInt(scan.through), closedAt);
+      await writeCursor(tx, {
+        chainKey,
+        family: "stellar",
+        contract: router,
+        position: BigInt(scan.through),
+        observedAt: closedAt,
+        // Nothing to record: a closed ledger cannot be replaced by a different one.
+        hash: null,
+      });
     });
 
     const behind = Math.max(scan.latestLedger - scan.through, 0);

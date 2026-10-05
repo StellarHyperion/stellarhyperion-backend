@@ -1,18 +1,29 @@
 /**
- * Writing decoded Stellar events, and the cursor that says they are written.
+ * Soroban events mapped onto the shared row writers, plus the cursor that says they are written.
  *
- * Every function here takes a `Queryable` rather than the pool, so the watcher can hand it a
+ * The SQL lives in `../writers.ts` because both chain families write the same tables under the
+ * same constraints. What lives here is the part that is genuinely Stellar: which field of which
+ * event becomes which column, and the three places where a Soroban event carries less than its
+ * EVM counterpart and the row has to say so honestly rather than make something up.
+ *
+ * Every function takes a `Queryable` rather than the pool, so the watcher can hand it a
  * transaction. That is the whole restart safety claim: a page of events and the cursor advance past
- * it land together or not at all. If the cursor could advance without the rows, a crash in between
- * loses a page forever; if the rows could land without the cursor, a restart writes them again.
- *
- * Every insert is an upsert on the natural key for the same reason. A watcher re-reading a page
- * after a restart is normal, and re-reading must be a no-op rather than a duplicate or an error.
+ * it land together or not at all.
  */
-import { ROUTE_KINDS, type RouteKind } from "@hyperion/protocol";
+import { ROUTE_KINDS } from "@hyperion/protocol";
 
 import type { Queryable } from "../../db/pool.js";
-import { bigintOf, maybeOne, text, timestampOrNull } from "../../db/rows.js";
+import { bigintOf, maybeOne, text, textOrNull, timestampOrNull } from "../../db/rows.js";
+import type { Position } from "../writers.js";
+import {
+  settleAction,
+  settleClaim,
+  writeAction,
+  writeClaim,
+  writeHealthSample,
+  writeInbound,
+  writeOutbound,
+} from "../writers.js";
 import type {
   ActionLifecycleEvent,
   ActionQueuedEvent,
@@ -25,24 +36,28 @@ import type {
   TokenRegisteredEvent,
 } from "./events.js";
 
-/** Where a Stellar watcher has read up to. */
-export interface StellarCursor {
-  readonly ledger: bigint;
+/** Where a watcher has read up to. */
+export interface ChainCursor {
+  readonly position: bigint;
   readonly contract: string;
-  readonly closedAt: Date | null;
+  readonly observedAt: Date | null;
+  /** EVM only. Null on Stellar, where a closed ledger cannot change. */
+  readonly hash: string | null;
 }
 
-export async function readCursor(db: Queryable, chainKey: string): Promise<StellarCursor | null> {
+export async function readCursor(db: Queryable, chainKey: string): Promise<ChainCursor | null> {
   const { rows } = await db.query(
-    "SELECT last_processed, contract, last_processed_at FROM indexer_cursor WHERE chain_key = $1",
+    `SELECT last_processed, contract, last_processed_at, last_processed_hash
+       FROM indexer_cursor WHERE chain_key = $1`,
     [chainKey],
   );
   const row = maybeOne(rows, `cursor for ${chainKey}`);
   if (row === null) return null;
   return {
-    ledger: bigintOf(row, "last_processed"),
+    position: bigintOf(row, "last_processed"),
     contract: text(row, "contract"),
-    closedAt: timestampOrNull(row, "last_processed_at"),
+    observedAt: timestampOrNull(row, "last_processed_at"),
+    hash: textOrNull(row, "last_processed_hash"),
   };
 }
 
@@ -55,23 +70,38 @@ export async function readCursor(db: Queryable, chainKey: string): Promise<Stell
  */
 export async function writeCursor(
   db: Queryable,
-  chainKey: string,
-  contract: string,
-  ledger: bigint,
-  closedAt: Date | null,
+  entry: {
+    readonly chainKey: string;
+    readonly family: "stellar" | "evm";
+    readonly contract: string;
+    readonly position: bigint;
+    readonly observedAt: Date | null;
+    readonly hash: string | null;
+  },
 ): Promise<void> {
   await db.query(
-    `INSERT INTO indexer_cursor (chain_key, family, contract, last_processed, last_processed_at)
-     VALUES ($1, 'stellar', $2, $3, $4)
+    `INSERT INTO indexer_cursor
+       (chain_key, family, contract, last_processed, last_processed_at, last_processed_hash)
+     VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (chain_key) DO UPDATE
        SET contract = EXCLUDED.contract,
+           family = EXCLUDED.family,
            last_processed = EXCLUDED.last_processed,
            last_processed_at = EXCLUDED.last_processed_at,
+           last_processed_hash = EXCLUDED.last_processed_hash,
            updated_at = now()`,
-    [chainKey, contract, ledger.toString(), closedAt],
+    [
+      entry.chainKey,
+      entry.family,
+      entry.contract,
+      entry.position.toString(),
+      entry.observedAt,
+      entry.hash,
+    ],
   );
 }
 
+/** Context for one Soroban event, in the shape the shared writers take. */
 export interface EventContext {
   readonly chainKey: string;
   readonly ledger: number;
@@ -79,33 +109,39 @@ export interface EventContext {
   readonly closedAt: Date;
 }
 
+function positionOf(context: EventContext): Position {
+  return {
+    chainKey: context.chainKey,
+    block: BigInt(context.ledger),
+    txHash: context.txHash,
+    // Soroban orders events by operation and event index within a transaction rather than by a
+    // log index over the block, and putting one of those in a column named for the other would
+    // read as if the two chains agreed about something they do not.
+    logIndex: null,
+    observedAt: context.closedAt,
+  };
+}
+
 export async function recordBridgeOut(
   db: Queryable,
   context: EventContext,
   event: BridgeOutEvent,
 ): Promise<void> {
-  await db.query(
-    `INSERT INTO outbound_transfer
-       (origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
-        destination_chain, destination, origin_block, origin_tx, observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-     ON CONFLICT (origin_chain, nonce) DO NOTHING`,
-    [
-      context.chainKey,
-      event.route,
-      event.nonce.toString(),
-      event.sender,
-      event.token,
-      event.grossAmount.toString(),
-      event.fee.toString(),
-      event.netAmount.toString(),
-      event.destinationChain,
-      event.destination,
-      BigInt(event.createdLedger).toString(),
-      context.txHash,
-      context.closedAt,
-    ],
-  );
+  await writeOutbound(db, positionOf(context), {
+    route: event.route,
+    nonce: event.nonce,
+    sender: event.sender,
+    token: event.token,
+    grossAmount: event.grossAmount,
+    fee: event.fee,
+    netAmount: event.netAmount,
+    destinationChain: event.destinationChain,
+    // The 32 byte word as the router emitted it. The EVM router emits a strkey string instead,
+    // and neither is converted here.
+    destination: event.destination,
+    // No rail reference on this side: the Soroban event does not carry one.
+    railRef: null,
+  });
 }
 
 export async function recordBridgeIn(
@@ -113,29 +149,20 @@ export async function recordBridgeIn(
   context: EventContext,
   event: BridgeInEvent,
 ): Promise<void> {
-  // No rail message id, because the Soroban event does not carry one even though the router's own
-  // replay guard is keyed on it. The hop is the only identity available on this side.
-  await db.query(
-    `INSERT INTO inbound_delivery
-       (destination_chain, route, source_chain, source_nonce, rail_message_id, recipient, token,
-        amount, delivered, claim_id, destination_block, destination_tx, observed_at)
-     VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, $10, $11, $12)
-     ON CONFLICT (destination_chain, route, source_chain, source_nonce) DO NOTHING`,
-    [
-      context.chainKey,
-      event.route,
-      event.sourceChain,
-      event.sourceNonce.toString(),
-      event.recipient,
-      event.token,
-      event.amount.toString(),
-      event.delivered,
-      event.delivered ? null : event.claimId.toString(),
-      BigInt(event.ledger).toString(),
-      context.txHash,
-      context.closedAt,
-    ],
-  );
+  await writeInbound(db, positionOf(context), {
+    route: event.route,
+    sourceChain: event.sourceChain,
+    sourceNonce: event.sourceNonce,
+    // No rail message id, even though the router's own replay guard is keyed on exactly that
+    // value. It guards on `origin.message_id` and does not emit it, so the hop is the only
+    // identity available on this side. The EVM event does carry one.
+    railMessageId: null,
+    recipient: event.recipient,
+    token: event.token,
+    amount: event.amount,
+    delivered: event.delivered,
+    claimId: event.delivered ? null : event.claimId,
+  });
 }
 
 export async function recordClaimParked(
@@ -143,47 +170,25 @@ export async function recordClaimParked(
   context: EventContext,
   event: ClaimParkedEvent,
 ): Promise<void> {
-  await db.query(
-    `INSERT INTO pending_claim
-       (chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
-        created_at, settled, observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9), false, $10)
-     ON CONFLICT (chain, claim_id) DO NOTHING`,
-    [
-      context.chainKey,
-      event.claimId.toString(),
-      event.recipient,
-      event.token,
-      event.amount.toString(),
-      event.route,
-      event.sourceChain,
-      event.sourceNonce.toString(),
-      Number(event.createdAt),
-      context.closedAt,
-    ],
-  );
+  await writeClaim(db, positionOf(context), {
+    claimId: event.claimId,
+    recipient: event.recipient,
+    token: event.token,
+    amount: event.amount,
+    route: event.route,
+    sourceChain: event.sourceChain,
+    sourceNonce: event.sourceNonce,
+    // The claim's own timestamp, which this event carries and the EVM one does not.
+    createdAt: new Date(Number(event.createdAt) * 1000),
+  });
 }
 
-/**
- * Mark a claim settled.
- *
- * An update rather than an upsert, and it deliberately does nothing when the claim is not already
- * there. A settlement for a claim this indexer never saw parked means the park event fell outside
- * the retention window, and inventing a row from a settlement would record a claim with no origin
- * and a created_at nobody knows.
- */
-export async function recordClaimSettled(
+export function recordClaimSettled(
   db: Queryable,
   context: EventContext,
   event: ClaimSettledEvent,
 ): Promise<boolean> {
-  const { rowCount } = await db.query(
-    `UPDATE pending_claim
-        SET settled = true, settled_at = $3, settled_by = $4, settled_tx = $5
-      WHERE chain = $1 AND claim_id = $2 AND NOT settled`,
-    [context.chainKey, event.claimId.toString(), context.closedAt, event.settledBy, context.txHash],
-  );
-  return rowCount > 0;
+  return settleClaim(db, positionOf(context), event.claimId, event.settledBy);
 }
 
 export async function recordActionQueued(
@@ -192,41 +197,25 @@ export async function recordActionQueued(
   event: ActionQueuedEvent,
   payload: unknown,
 ): Promise<void> {
-  await db.query(
-    `INSERT INTO admin_action
-       (chain, action_id, kind, state, payload, eta, expires_at, queued_at, observed_at)
-     VALUES ($1, $2, $3, 'queued', $4, to_timestamp($5), to_timestamp($6), $7, $8)
-     ON CONFLICT (chain, action_id) DO UPDATE
-       SET state = 'queued', payload = EXCLUDED.payload, eta = EXCLUDED.eta,
-           expires_at = EXCLUDED.expires_at`,
-    [
-      context.chainKey,
-      event.id.toString(),
-      // The variant name rather than an ordinal, because the Soroban union carries no discriminant
-      // the wire exposes. Stored as a hash of the name so the column stays a smallint on both
-      // chains would be worse than useless, so the name lives in the payload and this is zero.
-      0,
-      JSON.stringify({ variant: event.variant, action: payload }),
-      Number(event.eta),
-      Number(event.expiresAt),
-      context.closedAt,
-      context.closedAt,
-    ],
-  );
+  await writeAction(db, positionOf(context), {
+    actionId: event.id,
+    // Zero, because `AdminAction` is a union with payload variants and the wire carries the
+    // variant name rather than an ordinal. The name goes in the payload, where a reviewer reads
+    // what the chain said rather than what a decoder made of it.
+    kind: 0,
+    payload: { variant: event.variant, action: payload },
+    eta: new Date(Number(event.eta) * 1000),
+    expiresAt: new Date(Number(event.expiresAt) * 1000),
+  });
 }
 
-export async function recordActionSettled(
+export function recordActionSettled(
   db: Queryable,
   context: EventContext,
   event: ActionLifecycleEvent,
   state: "executed" | "cancelled",
-): Promise<void> {
-  await db.query(
-    `UPDATE admin_action
-        SET state = $3, settled_at = $4, actor = COALESCE($5, actor)
-      WHERE chain = $1 AND action_id = $2 AND state = 'queued'`,
-    [context.chainKey, event.id.toString(), state, context.closedAt, event.actor],
-  );
+): Promise<boolean> {
+  return settleAction(db, positionOf(context), event.id, state, event.actor);
 }
 
 /**
@@ -241,12 +230,15 @@ export async function recordTokenRegistered(
   context: EventContext,
   event: TokenRegisteredEvent,
 ): Promise<void> {
-  await db.query(
-    `INSERT INTO route_health
-       (sampled_at, origin_chain, destination_chain, route, token, available, blocker, flow_available)
-     VALUES ($1, $2, $2, 0, $3, $4, 0, $5)`,
-    [context.closedAt, context.chainKey, event.token, event.enabled, event.flowLimit.toString()],
-  );
+  await writeHealthSample(db, positionOf(context), {
+    originChain: context.chainKey,
+    destinationChain: context.chainKey,
+    route: 0,
+    token: event.token,
+    available: event.enabled,
+    blocker: 0,
+    flowAvailable: event.flowLimit,
+  });
 }
 
 /**
@@ -264,15 +256,18 @@ export async function recordPauseSet(
   context: EventContext,
   event: PauseSetEvent,
 ): Promise<void> {
-  // QuoteBlocker.Paused is 1, and zero when nothing is blocking.
-  const blocker = event.paused ? 1 : 0;
+  const at = positionOf(context);
   for (const route of ROUTE_KINDS) {
-    await db.query(
-      `INSERT INTO route_health
-         (sampled_at, origin_chain, destination_chain, route, token, available, blocker)
-       VALUES ($1, $2, $2, $3, $4, $5, $6)`,
-      [context.closedAt, context.chainKey, route, context.chainKey, !event.paused, blocker],
-    );
+    await writeHealthSample(db, at, {
+      originChain: context.chainKey,
+      destinationChain: context.chainKey,
+      route,
+      token: context.chainKey,
+      available: !event.paused,
+      // QuoteBlocker.Paused is 1, and zero when nothing is blocking.
+      blocker: event.paused ? 1 : 0,
+      flowAvailable: null,
+    });
   }
 }
 
@@ -282,18 +277,14 @@ export async function recordRouteConfigured(
   event: RouteConfiguredEvent,
   token: string,
 ): Promise<void> {
-  await db.query(
-    `INSERT INTO route_health
-       (sampled_at, origin_chain, destination_chain, route, token, available, blocker)
-     VALUES ($1, $2, $2, $3, $4, $5, $6)`,
-    [
-      context.closedAt,
-      context.chainKey,
-      event.route satisfies RouteKind,
-      token,
-      event.enabled,
-      // QuoteBlocker.RouteDisabled is 2. Zero when the route is on.
-      event.enabled ? 0 : 2,
-    ],
-  );
+  await writeHealthSample(db, positionOf(context), {
+    originChain: context.chainKey,
+    destinationChain: context.chainKey,
+    route: event.route,
+    token,
+    available: event.enabled,
+    // QuoteBlocker.RouteDisabled is 2. Zero when the route is on.
+    blocker: event.enabled ? 0 : 2,
+    flowAvailable: null,
+  });
 }

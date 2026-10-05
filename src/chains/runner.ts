@@ -14,11 +14,13 @@
  */
 import type { Logger } from "pino";
 
-import type { AppConfig, StellarWatchConfig } from "../config/config.js";
+import type { AppConfig, EvmWatchConfig, StellarWatchConfig } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
 import { Poller } from "../runtime/poller.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
 import { fixedReadiness } from "../runtime/readiness.js";
+import { viemClient } from "./evm/client.js";
+import { EvmWatcher } from "./evm/watcher.js";
 import { StellarRpc } from "./stellar/rpc.js";
 import { StellarWatcher } from "./stellar/watcher.js";
 
@@ -141,22 +143,10 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
     logger.warn("the deployment record has no Stellar router, so nothing is watching Stellar");
   }
 
-  if (config.indexer.evm.length > 0) {
-    // Named rather than skipped. A record listing three EVM routers and a process indexing none of
-    // them is a gap somebody should hear about from the readiness endpoint, not discover later
-    // from an empty table.
-    const chains = config.indexer.evm.map((entry) => entry.chain);
-    logger.warn(
-      { chains },
-      "the deployment record names EVM routers and no EVM watcher is built yet",
-    );
-    extra.push(
-      fixedReadiness(
-        "evm",
-        "degraded",
-        `${chains.join(", ")} are in the deployment record and are not being indexed yet`,
-      ),
-    );
+  // One per chain in the record. Each carries its own confirmations from the registry, which is
+  // the honest way to treat one block on Arc and twelve on Ethereum as the same kind of fact.
+  for (const chain of config.indexer.evm) {
+    workers.push(evmWorker(chain, db, logger));
   }
 
   if (workers.length === 0) {
@@ -188,6 +178,23 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
       await Promise.all(workers.map((worker) => worker.stop()));
     },
   };
+}
+
+function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): Worker {
+  const child = logger.child({ chain: config.chain, chainId: config.chainId });
+  const watcher = new EvmWatcher({
+    chainKey: config.chain,
+    router: config.routerAddress,
+    chainId: config.chainId,
+    startBlock: config.startBlock,
+    confirmations: config.confirmations,
+    reorgDepth: config.reorgDepth,
+    logRange: config.logRange,
+    client: viemClient(config.rpcUrl),
+    db,
+    logger: child,
+  });
+  return new PolledWorker(watcher, config.pollIntervalMs, child);
 }
 
 function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Logger): Worker {
