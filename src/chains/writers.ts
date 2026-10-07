@@ -318,3 +318,57 @@ export async function writeHealthSample(
     ],
   );
 }
+
+/**
+ * Where a transfer is while it exists only in a rail's API.
+ *
+ * `transfer_id` is the primary key and a foreign key onto `outbound_transfer` with
+ * `ON DELETE CASCADE`, so there is deliberately no upsert on a business key here: the row is
+ * identified by the transfer it belongs to and cannot exist without it. The conflict update is
+ * what every poll does, and it is written out field by field because two of them must not be
+ * clobbered by a later poll that found nothing new.
+ */
+export interface AttestationRow {
+  readonly transferId: bigint;
+  readonly route: number;
+  readonly status: string;
+  readonly railStatus: string | null;
+  readonly railReference: string | null;
+  readonly attestedAt: Date | null;
+  readonly checkedAt: Date;
+  /** Consecutive failures for this transfer, distinct from the poller's own backoff. */
+  readonly checkFailures: number;
+  readonly lastError: string | null;
+}
+
+export async function writeAttestation(db: Queryable, row: AttestationRow): Promise<void> {
+  await db.query(
+    `INSERT INTO rail_attestation
+       (transfer_id, route, status, rail_status, rail_reference, attested_at, last_checked_at,
+        check_failures, last_error)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     ON CONFLICT (transfer_id) DO UPDATE
+       SET status = EXCLUDED.status,
+           rail_status = COALESCE(EXCLUDED.rail_status, rail_attestation.rail_status),
+           -- Both coalesced on purpose. A later poll that finds the transfer still pending must
+           -- not erase the reference or the moment it was attested; a rail that stops echoing a
+           -- field back is not a rail taking it away.
+           rail_reference = COALESCE(EXCLUDED.rail_reference, rail_attestation.rail_reference),
+           attested_at = COALESCE(rail_attestation.attested_at, EXCLUDED.attested_at),
+           last_checked_at = EXCLUDED.last_checked_at,
+           check_failures = EXCLUDED.check_failures,
+           last_error = EXCLUDED.last_error,
+           updated_at = now()`,
+    [
+      row.transferId.toString(),
+      row.route,
+      row.status,
+      row.railStatus,
+      row.railReference,
+      row.attestedAt,
+      row.checkedAt,
+      row.checkFailures,
+      row.lastError,
+    ],
+  );
+}

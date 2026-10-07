@@ -37,7 +37,51 @@ describe("what the runner builds", () => {
     // The fixture record names a Stellar router and a sepolia one, so a build that watches one of
     // them is the gap this whole suite exists to catch.
     const { indexer } = build();
-    expect(indexer.workers.map((worker) => worker.name)).toEqual(["stellar-testnet", "sepolia"]);
+    const chains = indexer.workers
+      .map((worker) => worker.name)
+      .filter((name) => !name.startsWith("rail:"));
+    expect(chains).toEqual(["stellar-testnet", "sepolia"]);
+  });
+
+  it("polls one rail per rail that has a status api to ask", () => {
+    // CCTP and Axelar have status APIs. Allbridge is absent by construction rather than by
+    // omission: it is outbound only and exposes no attestation, so a poller for it would make a
+    // request a tick for an answer that does not exist.
+    const { indexer } = build();
+    const rails = indexer.workers
+      .map((worker) => worker.name)
+      .filter((name) => name.startsWith("rail:"));
+    expect(rails).toEqual(["rail:cctp", "rail:axelar"]);
+  });
+
+  it("runs the rail pollers even when no chain is being watched", () => {
+    // A transfer indexed by a previous run is still waiting on its rail whether or not this
+    // replica watches the chain it left.
+    const { indexer } = build({ HYPERION_DEPLOYMENTS_FILE: emptyRecord() });
+    const rails = indexer.workers
+      .map((worker) => worker.name)
+      .filter((name) => name.startsWith("rail:"));
+    expect(rails).toHaveLength(2);
+  });
+
+  it("says it is watching nothing even when the rail pollers are running", async () => {
+    // The bug this guards: rail pollers padding the worker count so "nothing is watching a chain"
+    // stops being reported. A process with two rail pollers and no watcher is indexing nothing.
+    const { indexer, lines } = build({ HYPERION_DEPLOYMENTS_FILE: emptyRecord() });
+
+    const byName = await reports(indexer.readiness);
+    expect(byName.indexer?.state).toBe("degraded");
+    expect(byName.indexer?.detail).toMatch(/watching nothing/);
+    expect(lines.some((line) => line.message.includes("named no routers"))).toBe(true);
+  });
+
+  it("reports the rails as switched off when they are", async () => {
+    const { indexer } = build({ RAILS_ENABLED: "false" });
+
+    expect(indexer.workers.filter((worker) => worker.name.startsWith("rail:"))).toEqual([]);
+    const byName = await reports(indexer.readiness);
+    expect(byName.rails?.state).toBe("ready");
+    expect(byName.rails?.detail).toMatch(/disabled by configuration/);
   });
 
   it("watches nothing and says it is ready when the indexer is switched off", async () => {
@@ -51,36 +95,31 @@ describe("what the runner builds", () => {
     expect(byName.indexer?.detail).toMatch(/disabled by configuration/);
   });
 
-  it("gives every watcher its own readiness entry, named for its chain", async () => {
-    // One entry per chain rather than one for the indexer, because the useful question during an
-    // incident is which chain is behind, and an aggregate cannot answer it.
+  it("gives every worker its own readiness entry, named for what it watches", async () => {
+    // One entry per chain and per rail rather than one for the indexer, because the useful
+    // question during an incident is which one is behind, and an aggregate cannot answer it.
     const { indexer } = build();
 
     const byName = await reports(indexer.readiness);
-    expect(Object.keys(byName).sort()).toEqual(["sepolia", "stellar-testnet"]);
-    // Degraded before the first pass, on both, because nothing is indexed yet and saying ready
-    // would be claiming to know about a chain this process has not read.
-    expect(byName.sepolia?.state).toBe("degraded");
-    expect(byName["stellar-testnet"]?.state).toBe("degraded");
-  });
-
-  it("calls itself degraded when the record named nothing it can watch", async () => {
-    // A process that believes it is indexing and is watching nothing is worse than one that is
-    // plainly switched off, because only the second one is honest about it.
-    const { indexer, lines } = build({ HYPERION_DEPLOYMENTS_FILE: emptyRecord() });
-
-    expect(indexer.workers).toEqual([]);
-    const byName = await reports(indexer.readiness);
-    expect(byName.indexer?.state).toBe("degraded");
-    expect(byName.indexer?.detail).toMatch(/watching nothing/);
-    expect(lines.some((line) => line.message.includes("named no routers"))).toBe(true);
+    expect(Object.keys(byName).sort()).toEqual([
+      "rail:axelar",
+      "rail:cctp",
+      "sepolia",
+      "stellar-testnet",
+    ]);
+    // Degraded before the first pass, on all of them, because nothing is indexed yet and saying
+    // ready would be claiming to know about something this process has not read.
+    for (const report of Object.values(byName)) {
+      expect(report.state, report.name).toBe("degraded");
+    }
   });
 
   it("starts nothing until it is told to", () => {
     // The seam this whole suite runs through. Building decides, starting acts, and no socket is
     // opened by any of the tests above because none of them call start.
     const { indexer } = build();
-    expect(indexer.workers).toHaveLength(2);
+    // Two chain watchers and two rail pollers.
+    expect(indexer.workers).toHaveLength(4);
     // Never started, so there is nothing to stop and stopping is still safe.
     return expect(indexer.stop()).resolves.toBeUndefined();
   });

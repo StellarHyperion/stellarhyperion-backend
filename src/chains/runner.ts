@@ -14,11 +14,22 @@
  */
 import type { Logger } from "pino";
 
-import type { AppConfig, EvmWatchConfig, StellarWatchConfig } from "../config/config.js";
+import type {
+  AppConfig,
+  EvmWatchConfig,
+  RailsConfig,
+  StellarWatchConfig,
+} from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
 import { Poller } from "../runtime/poller.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
 import { fixedReadiness } from "../runtime/readiness.js";
+import { RouteKind } from "@hyperion/protocol";
+
+import { AxelarGmpClient } from "../rails/axelar/gmp.js";
+import { IrisClient } from "../rails/cctp/iris.js";
+import { RailPass } from "../rails/pass.js";
+import type { RailClient } from "../rails/types.js";
 import { viemClient } from "./evm/client.js";
 import { EvmWatcher } from "./evm/watcher.js";
 import { StellarRpc } from "./stellar/rpc.js";
@@ -149,7 +160,30 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
     workers.push(evmWorker(chain, db, logger));
   }
 
-  if (workers.length === 0) {
+  // Counted before the rail pollers join the list, because the two questions are different. "Is
+  // anything watching a chain" must not be answered yes by a rail poller: a process with two rail
+  // pollers and no watcher is indexing nothing, and letting the rails pad the count is how that
+  // stops being reported.
+  const chainWatchers = workers.length;
+
+  // The rail pollers join the same list and inherit the same start, stop and readiness behaviour.
+  // They are not conditional on a router being watched: a transfer indexed by a previous run is
+  // still waiting on its rail whether or not this replica is watching the chain it left.
+  if (config.rails.enabled) {
+    for (const worker of railWorkers(config.rails, config.network, db, logger)) {
+      workers.push(worker);
+    }
+  } else {
+    extra.push(
+      fixedReadiness(
+        "rails",
+        "ready",
+        "disabled by configuration, so no transfer's rail status is being refreshed",
+      ),
+    );
+  }
+
+  if (chainWatchers === 0) {
     // Worth reporting as degraded rather than ready. A process that believes it is indexing and is
     // watching nothing is the failure that takes longest to notice.
     logger.error("the deployment record named no routers this build can watch");
@@ -178,6 +212,53 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
       await Promise.all(workers.map((worker) => worker.stop()));
     },
   };
+}
+
+/**
+ * One worker per rail that has a status API to ask.
+ *
+ * Allbridge is absent on purpose rather than by omission. It is outbound only by construction and
+ * exposes no attestation to poll, so a transfer on it is pending until an inbound delivery appears,
+ * which the queue already settles without a request. A poller for it would make a request a tick
+ * for an answer that does not exist.
+ */
+function railWorkers(
+  config: RailsConfig,
+  network: AppConfig["network"],
+  db: Transactional,
+  logger: Logger,
+): readonly Worker[] {
+  const clients: readonly { readonly route: RouteKind; readonly client: RailClient }[] = [
+    {
+      route: RouteKind.Cctp,
+      client: new IrisClient(network, { baseUrl: config.irisUrl }),
+    },
+    {
+      route: RouteKind.AxelarIts,
+      client: new AxelarGmpClient(config.axelarUrl, {
+        onUnknownStatus: (status) => {
+          logger.warn(
+            { rail: "axelar", status },
+            "the rail reported a status this build does not know; it is recorded verbatim and the transfer stays pending",
+          );
+        },
+      }),
+    },
+  ];
+
+  return clients.map(({ route, client }) => {
+    const child = logger.child({ rail: client.rail, route });
+    const pass = new RailPass({
+      route,
+      client,
+      db,
+      logger: child,
+      batchSize: config.batchSize,
+      recheckAfterMs: config.recheckAfterMs,
+      maxCheckFailures: config.maxCheckFailures,
+    });
+    return new PolledWorker(pass, config.pollIntervalMs, child);
+  });
 }
 
 function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): Worker {

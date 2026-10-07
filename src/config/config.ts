@@ -18,6 +18,7 @@ import type { Chain, ChainKey, DeploymentSet, Hex, NetworkMode } from "@hyperion
 import {
   CHAINS,
   DeploymentFormatError,
+  IRIS_API,
   chainsFor,
   isEvmChain,
   isEvmDeployment,
@@ -28,6 +29,17 @@ import {
 
 import type { EnumSpec, VarSpec } from "./env.js";
 import { EnvReader } from "./env.js";
+
+/**
+ * Axelar's status API, per network.
+ *
+ * Named here and nowhere else because, unlike Circle's Iris, there is no entry for it in the
+ * shared registry. If one is ever added there, this should be deleted rather than kept in step.
+ */
+const AXELARSCAN_API: Readonly<Record<NetworkMode, string>> = {
+  mainnet: "https://api.axelarscan.io",
+  testnet: "https://testnet.api.axelarscan.io",
+};
 
 export type NodeEnv = "development" | "test" | "production";
 export type LogLevel = "trace" | "debug" | "info" | "warn" | "error" | "fatal";
@@ -61,6 +73,18 @@ export interface EvmWatchConfig {
   readonly pollIntervalMs: number;
 }
 
+/** Everything the rail status pollers need. One per rail that has a status API. */
+export interface RailsConfig {
+  readonly enabled: boolean;
+  /** Circle's Iris, from the shared registry unless overridden. */
+  readonly irisUrl: string;
+  readonly axelarUrl: string;
+  readonly pollIntervalMs: number;
+  readonly batchSize: number;
+  readonly recheckAfterMs: number;
+  readonly maxCheckFailures: number;
+}
+
 export interface IndexerConfig {
   readonly enabled: boolean;
   /** Null when the deployment record has no Stellar side for this network yet. */
@@ -78,6 +102,7 @@ export interface AppConfig {
   readonly deploymentsFile: string;
   readonly deployments: DeploymentSet;
   readonly indexer: IndexerConfig;
+  readonly rails: RailsConfig;
   readonly shutdownTimeoutMs: number;
 }
 
@@ -174,6 +199,81 @@ const INDEXER_ENABLED: VarSpec = {
   fallback: "true",
   printable: true,
   purpose: "False runs the API without the watchers, which is what a second replica wants.",
+};
+
+const RAILS_ENABLED: VarSpec = {
+  name: "RAILS_ENABLED",
+  kind: "boolean",
+  required: false,
+  fallback: "true",
+  printable: true,
+  purpose:
+    "False runs the watchers without the rail status pollers. The chains still answer; the part of a transfer that lives only in a rail's API stops being refreshed.",
+};
+
+const IRIS_API_URL: VarSpec = {
+  name: "IRIS_API_URL",
+  kind: "url",
+  protocols: ["http", "https"],
+  required: false,
+  printable: true,
+  purpose:
+    "Circle's attestation API. Defaults to the chain registry's entry for this network, which is the sandbox on testnet.",
+};
+
+const AXELAR_API_URL: VarSpec = {
+  name: "AXELAR_API_URL",
+  kind: "url",
+  protocols: ["http", "https"],
+  required: false,
+  printable: true,
+  purpose:
+    "Axelar's GMP status API. Defaults to axelarscan for this network. Unlike Iris there is no entry for it in the shared registry, so this is the only place it is named.",
+};
+
+const RAIL_POLL_INTERVAL_MS: VarSpec = {
+  name: "RAIL_POLL_INTERVAL_MS",
+  kind: "integer",
+  required: false,
+  fallback: "15000",
+  min: 1_000,
+  printable: true,
+  purpose:
+    "How often each rail is asked about the transfers waiting on it. Attestations take tens of seconds at best, so polling faster mostly asks for the same answer.",
+};
+
+const RAIL_BATCH_SIZE: VarSpec = {
+  name: "RAIL_BATCH_SIZE",
+  kind: "integer",
+  required: false,
+  fallback: "20",
+  min: 1,
+  max: 200,
+  printable: true,
+  purpose:
+    "Transfers looked up per pass. Circle blocks every request for five minutes past forty a second, so this stays well under it even at the fastest interval.",
+};
+
+const RAIL_RECHECK_AFTER_MS: VarSpec = {
+  name: "RAIL_RECHECK_AFTER_MS",
+  kind: "integer",
+  required: false,
+  fallback: "10000",
+  min: 0,
+  printable: true,
+  purpose:
+    "The soonest a transfer is asked about again. Without it one stuck transfer at the front of the queue is re-checked every pass and the rest never get a turn.",
+};
+
+const RAIL_MAX_CHECK_FAILURES: VarSpec = {
+  name: "RAIL_MAX_CHECK_FAILURES",
+  kind: "integer",
+  required: false,
+  fallback: "10",
+  min: 1,
+  printable: true,
+  purpose:
+    "Consecutive failures before the queue stops offering a transfer. Per transfer, not per rail: one unanswerable transfer must not back off the whole rail.",
 };
 
 const SHUTDOWN_TIMEOUT_MS: VarSpec = {
@@ -299,6 +399,14 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const indexerEnabled = reader.boolean(INDEXER_ENABLED);
   const shutdownTimeoutMs = reader.integer(SHUTDOWN_TIMEOUT_MS);
 
+  const railsEnabled = reader.boolean(RAILS_ENABLED);
+  const irisOverride = reader.url(IRIS_API_URL);
+  const axelarOverride = reader.url(AXELAR_API_URL);
+  const railPollIntervalMs = reader.integer(RAIL_POLL_INTERVAL_MS);
+  const railBatchSize = reader.integer(RAIL_BATCH_SIZE);
+  const railRecheckAfterMs = reader.integer(RAIL_RECHECK_AFTER_MS);
+  const railMaxCheckFailures = reader.integer(RAIL_MAX_CHECK_FAILURES);
+
   const stellarRpcOverride = reader.url(STELLAR_RPC_URL);
   const startLedgerOverride = reader.has(STELLAR_START_LEDGER.name)
     ? reader.integer(STELLAR_START_LEDGER)
@@ -340,6 +448,15 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     deploymentsFile: absoluteDeployments,
     deployments,
     indexer,
+    rails: {
+      enabled: railsEnabled,
+      irisUrl: irisOverride === "" ? IRIS_API[network] : irisOverride,
+      axelarUrl: axelarOverride === "" ? AXELARSCAN_API[network] : axelarOverride,
+      pollIntervalMs: railPollIntervalMs,
+      batchSize: railBatchSize,
+      recheckAfterMs: railRecheckAfterMs,
+      maxCheckFailures: railMaxCheckFailures,
+    },
     shutdownTimeoutMs,
   };
 }
