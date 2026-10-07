@@ -15,15 +15,11 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
 
   app.get("/v1/metrics", async (_request, reply: FastifyReply) => {
     // 1. Total outbound transfers
-    const outboundResult = await db.query(
-      "SELECT count(*)::int AS count FROM outbound_transfer",
-    );
+    const outboundResult = await db.query("SELECT count(*)::int AS count FROM outbound_transfer");
     const totalOutbound = outboundResult.rows[0] ? integer(outboundResult.rows[0], "count") : 0;
 
     // 2. Total inbound deliveries
-    const inboundResult = await db.query(
-      "SELECT count(*)::int AS count FROM inbound_delivery",
-    );
+    const inboundResult = await db.query("SELECT count(*)::int AS count FROM inbound_delivery");
     const totalInbound = inboundResult.rows[0] ? integer(inboundResult.rows[0], "count") : 0;
 
     // 3. Claims breakdown

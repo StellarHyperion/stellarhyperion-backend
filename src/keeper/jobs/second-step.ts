@@ -63,8 +63,7 @@ export async function processRailSecondStep(
     railStatus: textOrNull(row, "rail_status"),
   }));
 
-  const hasSigner =
-    config.keeper.stellarSecret !== null || config.keeper.evmPrivateKey !== null;
+  const hasSigner = config.keeper.stellarSecret !== null || config.keeper.evmPrivateKey !== null;
   const dryRun = !hasSigner;
 
   logger.info(

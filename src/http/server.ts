@@ -60,7 +60,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     allowList: () => deps.config.nodeEnv === "test",
     errorResponseBuilder: () => ({
       error: "too_many_requests",
-      message: "rate limit exceeded; status endpoints must not be polled faster than twice a second",
+      message:
+        "rate limit exceeded; status endpoints must not be polled faster than twice a second",
     }),
   });
 

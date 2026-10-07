@@ -1,0 +1,18 @@
+blank_issues_enabled: false
+
+contact_links:
+  - name: Report a vulnerability privately
+    url: https://github.com/StellarHyperion/stellarhyperion-backend/security/advisories/new
+    about: >-
+      Submit security concerns confidentially. Use this for issues concerning data manipulation,
+      unauthorized keeper actions, or indexing bypasses.
+
+  - name: Read security policy
+    url: https://github.com/StellarHyperion/stellarhyperion-backend/blob/main/.github/SECURITY.md
+    about: >-
+      Read about our vulnerability disclosure process and scope definitions.
+
+  - name: Read contribution guidelines
+    url: https://github.com/StellarHyperion/stellarhyperion-backend/blob/main/.github/CONTRIBUTING.md
+    about: >-
+      Prerequisites, local docker environment setup, and verification guidelines.

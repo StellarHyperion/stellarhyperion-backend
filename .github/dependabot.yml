@@ -1,0 +1,32 @@
+# Dependabot configuration for Hyperion Backend.
+#
+# Runs weekly on Monday mornings UTC. Grouped dev dependencies minimize noise while ensuring
+# major framework updates (Fastify, BullMQ, viem, stellar-sdk) can be evaluated individually.
+
+version: 2
+
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "backend"
+      include: scope
+    groups:
+      dev-dependencies:
+        dependency-type: development
+        patterns:
+          - "@types/*"
+          - "eslint*"
+          - "prettier"
+          - "typescript*"
+          - "vitest"
+      runtime-logging:
+        patterns:
+          - "pino"
+          - "pino-pretty"

@@ -1,0 +1,127 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  backend:
+    name: lint, typecheck, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: hyperion
+          POSTGRES_PASSWORD: hyperion-local-only
+          POSTGRES_DB: hyperion_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Check out backend repository
+        uses: actions/checkout@v4
+        with:
+          path: backend
+
+      - name: Check out contracts repository for protocol dependency
+        uses: actions/checkout@v4
+        with:
+          repository: StellarHyperion/stellarhyperion-contracts
+          path: contracts
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            contracts/packages/protocol/package-lock.json
+            backend/package-lock.json
+
+      - name: Build protocol package
+        working-directory: contracts/packages/protocol
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Check formatting
+        working-directory: backend
+        run: npm run fmt:check
+
+      - name: Lint
+        working-directory: backend
+        run: npm run lint
+
+      - name: Typecheck
+        working-directory: backend
+        run: npm run typecheck
+
+      - name: Build distribution
+        working-directory: backend
+        run: npm run build
+
+      - name: Run database migrations against test database
+        working-directory: backend
+        env:
+          DATABASE_URL: postgres://hyperion:hyperion-local-only@localhost:5432/hyperion_test
+        run: npm run migrate:up
+
+      - name: Run unit and integration tests
+        working-directory: backend
+        env:
+          TEST_DATABASE_URL: postgres://hyperion:hyperion-local-only@localhost:5432/hyperion_test
+          REDIS_URL: redis://localhost:6379
+        run: npm test
+
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    needs:
+      - backend
+    if: always()
+
+    steps:
+      - name: Verify all required checks passed
+        env:
+          BACKEND_RESULT: ${{ needs.backend.result }}
+        run: |
+          if [ "$BACKEND_RESULT" != "success" ]; then
+            echo "Backend CI failed with status: $BACKEND_RESULT"
+            exit 1
+          fi
+          echo "All backend CI checks passed successfully."

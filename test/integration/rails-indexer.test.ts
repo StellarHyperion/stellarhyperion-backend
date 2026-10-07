@@ -111,10 +111,9 @@ suite("rail pollers against real Postgres", () => {
     expect(more).toBe(false);
 
     // Verify rail_attestation table
-    const { rows } = await db.query(
-      "SELECT * FROM rail_attestation WHERE transfer_id = $1",
-      [first.transferId.toString()],
-    );
+    const { rows } = await db.query("SELECT * FROM rail_attestation WHERE transfer_id = $1", [
+      first.transferId.toString(),
+    ]);
     expect(rows).toHaveLength(1);
     const row = rows[0];
     expect(row).toBeDefined();

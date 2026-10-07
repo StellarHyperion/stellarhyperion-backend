@@ -75,24 +75,26 @@ export async function startKeeperQueue(
   );
 
   worker.on("completed", (job, result) => {
-    logger.info(
-      { jobName: job.name, jobId: job.id, kind: result.kind },
-      "keeper job completed",
-    );
+    logger.info({ jobName: job.name, jobId: job.id, kind: result.kind }, "keeper job completed");
   });
 
   worker.on("failed", (job, error) => {
-    logger.error(
-      { jobName: job?.name, jobId: job?.id, err: error },
-      "keeper job failed",
-    );
+    logger.error({ jobName: job?.name, jobId: job?.id, err: error }, "keeper job failed");
   });
 
   // Schedule repeatable jobs for the four keeper tasks
   const every = config.keeper.pollIntervalMs;
   await queue.upsertJobScheduler("repeat:ttl-bump", { every }, { name: "ttl-bump" });
-  await queue.upsertJobScheduler("repeat:claim-settlement", { every }, { name: "claim-settlement" });
-  await queue.upsertJobScheduler("repeat:rail-second-step", { every }, { name: "rail-second-step" });
+  await queue.upsertJobScheduler(
+    "repeat:claim-settlement",
+    { every },
+    { name: "claim-settlement" },
+  );
+  await queue.upsertJobScheduler(
+    "repeat:rail-second-step",
+    { every },
+    { name: "rail-second-step" },
+  );
   await queue.upsertJobScheduler("repeat:gas-topup", { every }, { name: "gas-topup" });
 
   return {

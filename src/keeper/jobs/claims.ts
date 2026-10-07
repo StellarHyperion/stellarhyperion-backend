@@ -50,14 +50,10 @@ export async function processClaimSettlement(
     route: integer(row, "route"),
   }));
 
-  const hasSigner =
-    config.keeper.stellarSecret !== null || config.keeper.evmPrivateKey !== null;
+  const hasSigner = config.keeper.stellarSecret !== null || config.keeper.evmPrivateKey !== null;
   const dryRun = !hasSigner;
 
-  logger.info(
-    { unsettledCount: claims.length, dryRun },
-    "evaluating parked claims for settlement",
-  );
+  logger.info({ unsettledCount: claims.length, dryRun }, "evaluating parked claims for settlement");
 
   const settled = 0;
   let attempted = 0;

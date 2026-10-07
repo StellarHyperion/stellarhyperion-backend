@@ -1,0 +1,57 @@
+# Reviewers for backend code paths.
+#
+# GitHub reads this file top to bottom and the LAST matching pattern wins.
+# The catch-all pattern goes first and specialized subsystems follow.
+#
+# Every line currently routes to @dotmantissa. Writing out the subsystem boundaries
+# makes future reviewer assignment a single-line modification rather than a debate over scope.
+
+# Catch-all for everything in the repository.
+*                                   @dotmantissa
+
+# -----------------------------------------------------------------------------------------------
+# Database and migrations.
+# Data models, constraints, and migrations. Schema mistakes require production data surgery.
+# -----------------------------------------------------------------------------------------------
+/migrations/                        @dotmantissa
+/src/db/                            @dotmantissa
+
+# -----------------------------------------------------------------------------------------------
+# Chain watchers and event ingestion.
+# Code that reads blocks and ledgers from RPCs and writes transfer states to storage.
+# -----------------------------------------------------------------------------------------------
+/src/chains/                        @dotmantissa
+/src/chains/writers.ts              @dotmantissa
+/src/chains/stellar/                @dotmantissa
+/src/chains/evm/                    @dotmantissa
+
+# -----------------------------------------------------------------------------------------------
+# Cross-chain rail status pollers.
+# Third-party rail API polling (Circle Iris, Axelar GMP).
+# -----------------------------------------------------------------------------------------------
+/src/rails/                         @dotmantissa
+
+# -----------------------------------------------------------------------------------------------
+# Keeper service and background upkeep.
+# BullMQ workers executing on-chain upkeep transactions (TTL bumps, claims, gas top-ups).
+# -----------------------------------------------------------------------------------------------
+/src/keeper/                        @dotmantissa
+
+# -----------------------------------------------------------------------------------------------
+# HTTP REST API and server.
+# Public queries for transfer status, route health, parked claims, and prometheus metrics.
+# -----------------------------------------------------------------------------------------------
+/src/http/                          @dotmantissa
+
+# -----------------------------------------------------------------------------------------------
+# Configuration, lifecycle, and runtime supervision.
+# Environment parsing, readiness probes, and graceful shutdown handlers.
+# -----------------------------------------------------------------------------------------------
+/src/config/                        @dotmantissa
+/src/runtime/                       @dotmantissa
+/src/logging/                       @dotmantissa
+
+# -----------------------------------------------------------------------------------------------
+# CI/CD and repository governance.
+# -----------------------------------------------------------------------------------------------
+/.github/                           @dotmantissa

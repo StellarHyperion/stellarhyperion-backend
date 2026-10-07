@@ -113,7 +113,9 @@ function formatRow(row: Record<string, unknown>): FormattedTransfer {
       delivered,
       block: textOrNull(row, "destination_block"),
       txHash: textOrNull(row, "destination_tx"),
-      deliveredAt: row.delivered_at ? new Date(row.delivered_at as string | number | Date).toISOString() : null,
+      deliveredAt: row.delivered_at
+        ? new Date(row.delivered_at as string | number | Date).toISOString()
+        : null,
     },
     rail:
       railStatus === null
@@ -208,10 +210,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
   // 2. Look up by transaction hash
   app.get(
     "/v1/transfers/by-tx/:txHash",
-    async (
-      request: FastifyRequest<{ Params: { txHash: string } }>,
-      reply: FastifyReply,
-    ) => {
+    async (request: FastifyRequest<{ Params: { txHash: string } }>, reply: FastifyReply) => {
       const { txHash } = request.params;
       const { rows } = await db.query(
         `${TRANSFER_QUERY} WHERE t.origin_tx = $1 OR d.destination_tx = $1 LIMIT 1`,
