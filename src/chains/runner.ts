@@ -30,6 +30,7 @@ import { AxelarGmpClient } from "../rails/axelar/gmp.js";
 import { IrisClient } from "../rails/cctp/iris.js";
 import { RailPass } from "../rails/pass.js";
 import type { RailClient } from "../rails/types.js";
+import { KeeperWorker } from "../keeper/worker.js";
 import { viemClient } from "./evm/client.js";
 import { EvmWatcher } from "./evm/watcher.js";
 import { StellarRpc } from "./stellar/rpc.js";
@@ -179,6 +180,20 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
         "rails",
         "ready",
         "disabled by configuration, so no transfer's rail status is being refreshed",
+      ),
+    );
+  }
+
+  // The keeper handles permissionless state progression: TTL bumps, claim settlement,
+  // rail second step, and Axelar gas topups via BullMQ.
+  if (config.keeper.enabled) {
+    workers.push(new KeeperWorker(config, db, logger));
+  } else {
+    extra.push(
+      fixedReadiness(
+        "keeper",
+        "ready",
+        "disabled by configuration, so no automated upkeep tasks run on this replica",
       ),
     );
   }

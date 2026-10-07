@@ -92,6 +92,14 @@ export interface IndexerConfig {
   readonly evm: readonly EvmWatchConfig[];
 }
 
+export interface KeeperConfig {
+  readonly enabled: boolean;
+  readonly pollIntervalMs: number;
+  readonly concurrency: number;
+  readonly stellarSecret: string | null;
+  readonly evmPrivateKey: string | null;
+}
+
 export interface AppConfig {
   readonly nodeEnv: NodeEnv;
   readonly logLevel: LogLevel;
@@ -103,6 +111,7 @@ export interface AppConfig {
   readonly deployments: DeploymentSet;
   readonly indexer: IndexerConfig;
   readonly rails: RailsConfig;
+  readonly keeper: KeeperConfig;
   readonly shutdownTimeoutMs: number;
 }
 
@@ -276,6 +285,55 @@ const RAIL_MAX_CHECK_FAILURES: VarSpec = {
     "Consecutive failures before the queue stops offering a transfer. Per transfer, not per rail: one unanswerable transfer must not back off the whole rail.",
 };
 
+const KEEPER_ENABLED: VarSpec = {
+  name: "KEEPER_ENABLED",
+  kind: "boolean",
+  required: false,
+  fallback: "true",
+  printable: true,
+  purpose:
+    "Runs the BullMQ keeper jobs: TTL bumps, claim settlement, rail second step, and Axelar gas topups.",
+};
+
+const KEEPER_POLL_INTERVAL_MS: VarSpec = {
+  name: "KEEPER_POLL_INTERVAL_MS",
+  kind: "integer",
+  required: false,
+  fallback: "30000",
+  min: 5000,
+  printable: true,
+  purpose: "How often the keeper checks for state to push forward.",
+};
+
+const KEEPER_CONCURRENCY: VarSpec = {
+  name: "KEEPER_CONCURRENCY",
+  kind: "integer",
+  required: false,
+  fallback: "2",
+  min: 1,
+  max: 10,
+  printable: true,
+  purpose: "Max concurrent jobs the keeper runs.",
+};
+
+const KEEPER_STELLAR_SECRET: VarSpec = {
+  name: "KEEPER_STELLAR_SECRET",
+  kind: "string",
+  required: false,
+  printable: false,
+  purpose:
+    "Secret key for submitting Stellar keep_alive and claim transactions. Optional; runs dry-run when absent.",
+};
+
+const KEEPER_EVM_PRIVATE_KEY: VarSpec = {
+  name: "KEEPER_EVM_PRIVATE_KEY",
+  kind: "string",
+  required: false,
+  printable: false,
+  purpose:
+    "Private key for submitting EVM settleClaim transactions. Optional; runs dry-run when absent.",
+};
+
 const SHUTDOWN_TIMEOUT_MS: VarSpec = {
   name: "SHUTDOWN_TIMEOUT_MS",
   kind: "integer",
@@ -407,6 +465,16 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const railRecheckAfterMs = reader.integer(RAIL_RECHECK_AFTER_MS);
   const railMaxCheckFailures = reader.integer(RAIL_MAX_CHECK_FAILURES);
 
+  const keeperEnabled = reader.boolean(KEEPER_ENABLED);
+  const keeperPollIntervalMs = reader.integer(KEEPER_POLL_INTERVAL_MS);
+  const keeperConcurrency = reader.integer(KEEPER_CONCURRENCY);
+  const keeperStellarSecret = reader.has(KEEPER_STELLAR_SECRET.name)
+    ? reader.string(KEEPER_STELLAR_SECRET)
+    : null;
+  const keeperEvmPrivateKey = reader.has(KEEPER_EVM_PRIVATE_KEY.name)
+    ? reader.string(KEEPER_EVM_PRIVATE_KEY)
+    : null;
+
   const stellarRpcOverride = reader.url(STELLAR_RPC_URL);
   const startLedgerOverride = reader.has(STELLAR_START_LEDGER.name)
     ? reader.integer(STELLAR_START_LEDGER)
@@ -456,6 +524,13 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       batchSize: railBatchSize,
       recheckAfterMs: railRecheckAfterMs,
       maxCheckFailures: railMaxCheckFailures,
+    },
+    keeper: {
+      enabled: keeperEnabled,
+      pollIntervalMs: keeperPollIntervalMs,
+      concurrency: keeperConcurrency,
+      stellarSecret: keeperStellarSecret,
+      evmPrivateKey: keeperEvmPrivateKey,
     },
     shutdownTimeoutMs,
   };

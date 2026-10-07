@@ -34,7 +34,9 @@
   "dependencies": {
     "@hyperion/protocol": "file:../contracts/packages/protocol",
     "@stellar/stellar-sdk": "^17.2.1",
+    "bullmq": "^6.3.11",
     "fastify": "^5.12.5",
+    "ioredis": "^6.0.0",
     "node-pg-migrate": "^9.0.0",
     "pg": "^8.16.3",
     "pino": "^10.3.1",
@@ -42,6 +44,7 @@
     "viem": "^2.57.2"
   },
   "devDependencies": {
+    "@types/ioredis": "^4.28.10",
     "@types/node": "^24.19.0",
     "@types/pg": "^8.15.6",
     "eslint": "^10.11.0",

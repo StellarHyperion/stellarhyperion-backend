@@ -39,7 +39,7 @@ describe("what the runner builds", () => {
     const { indexer } = build();
     const chains = indexer.workers
       .map((worker) => worker.name)
-      .filter((name) => !name.startsWith("rail:"));
+      .filter((name) => !name.startsWith("rail:") && name !== "keeper");
     expect(chains).toEqual(["stellar-testnet", "sepolia"]);
   });
 
@@ -52,6 +52,20 @@ describe("what the runner builds", () => {
       .map((worker) => worker.name)
       .filter((name) => name.startsWith("rail:"));
     expect(rails).toEqual(["rail:cctp", "rail:axelar"]);
+  });
+
+  it("runs the keeper worker when enabled", () => {
+    const { indexer } = build();
+    const keeper = indexer.workers.find((w) => w.name === "keeper");
+    expect(keeper).toBeDefined();
+  });
+
+  it("reports the keeper as switched off when KEEPER_ENABLED is false", async () => {
+    const { indexer } = build({ KEEPER_ENABLED: "false" });
+    expect(indexer.workers.find((w) => w.name === "keeper")).toBeUndefined();
+    const byName = await reports(indexer.readiness);
+    expect(byName.keeper?.state).toBe("ready");
+    expect(byName.keeper?.detail).toMatch(/disabled by configuration/);
   });
 
   it("runs the rail pollers even when no chain is being watched", () => {
@@ -96,12 +110,13 @@ describe("what the runner builds", () => {
   });
 
   it("gives every worker its own readiness entry, named for what it watches", async () => {
-    // One entry per chain and per rail rather than one for the indexer, because the useful
-    // question during an incident is which one is behind, and an aggregate cannot answer it.
+    // One entry per chain, per rail, and the keeper rather than one for the indexer, because the
+    // useful question during an incident is which one is behind, and an aggregate cannot answer it.
     const { indexer } = build();
 
     const byName = await reports(indexer.readiness);
     expect(Object.keys(byName).sort()).toEqual([
+      "keeper",
       "rail:axelar",
       "rail:cctp",
       "sepolia",
@@ -118,8 +133,8 @@ describe("what the runner builds", () => {
     // The seam this whole suite runs through. Building decides, starting acts, and no socket is
     // opened by any of the tests above because none of them call start.
     const { indexer } = build();
-    // Two chain watchers and two rail pollers.
-    expect(indexer.workers).toHaveLength(4);
+    // Two chain watchers, two rail pollers, and one keeper.
+    expect(indexer.workers).toHaveLength(5);
     // Never started, so there is nothing to stop and stopping is still safe.
     return expect(indexer.stop()).resolves.toBeUndefined();
   });
