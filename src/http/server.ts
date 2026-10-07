@@ -10,10 +10,16 @@ import Fastify from "fastify";
 import type { FastifyBaseLogger, FastifyError, FastifyInstance } from "fastify";
 import type { Logger } from "pino";
 
+import rateLimit from "@fastify/rate-limit";
+
 import type { AppConfig } from "../config/config.js";
 import type { Database } from "../db/pool.js";
 import type { ReadinessSource } from "../runtime/readiness.js";
+import { registerClaimRoutes } from "./routes/claims.js";
 import { registerHealthRoutes } from "./routes/health.js";
+import { registerMetricsRoutes } from "./routes/metrics.js";
+import { registerRouteHealthRoutes } from "./routes/routes.js";
+import { registerTransferRoutes } from "./routes/transfers.js";
 
 export interface ServerDeps {
   readonly config: AppConfig;
@@ -48,7 +54,21 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     bodyLimit: 64 * 1024,
   });
 
+  void app.register(rateLimit, {
+    max: 120,
+    timeWindow: "1 minute",
+    allowList: () => deps.config.nodeEnv === "test",
+    errorResponseBuilder: () => ({
+      error: "too_many_requests",
+      message: "rate limit exceeded; status endpoints must not be polled faster than twice a second",
+    }),
+  });
+
   registerHealthRoutes(app, deps);
+  registerTransferRoutes(app, deps);
+  registerClaimRoutes(app, deps);
+  registerRouteHealthRoutes(app, deps);
+  registerMetricsRoutes(app, deps);
 
   app.setNotFoundHandler((request, reply) => {
     void reply.code(404).send({
