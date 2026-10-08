@@ -11,6 +11,7 @@ import { loadConfig } from "./config/config.js";
 import { ConfigError } from "./config/env.js";
 import { Database } from "./db/pool.js";
 import { buildServer } from "./http/server.js";
+import { createKeeperRedis } from "./keeper/queue.js";
 import { createLogger } from "./logging/logger.js";
 import { Shutdown, installSignalHandlers } from "./runtime/shutdown.js";
 
@@ -36,6 +37,11 @@ async function main(): Promise<void> {
   const db = Database.open(config.databaseUrl, { applicationName: "hyperion-backend" });
   shutdown.add("postgres", () => db.close());
 
+  const redis = createKeeperRedis(config.redisUrl);
+  shutdown.add("redis", async () => {
+    await redis.quit();
+  });
+
   // Registered between the pool and the server, because shutdown runs in reverse: the server
   // stops accepting requests, the watchers finish the page they are on, and only then does the
   // pool close under them.
@@ -46,6 +52,7 @@ async function main(): Promise<void> {
     config,
     logger,
     db,
+    redis,
     readiness: indexer.readiness,
     startedAt,
   });

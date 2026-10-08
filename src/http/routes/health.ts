@@ -17,13 +17,13 @@ import type { FastifyInstance } from "fastify";
 
 import type { ServerDeps } from "../server.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
-import { worstOf } from "../../runtime/readiness.js";
+import { checkRedisHealth, worstOf } from "../../runtime/readiness.js";
 
 const LIVENESS_MEANING =
   "This process is running and answering. It says nothing about Postgres or the chains. Use /ready for that.";
 
 const READINESS_MEANING =
-  "This process can do its job: Postgres answers and every watcher is current. A 503 here means take this replica out of rotation, not restart it.";
+  "This process can do its job: Postgres and Redis answer and every watcher is current. A 503 here means take this replica out of rotation, not restart it.";
 
 export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const startedAt = deps.startedAt ?? new Date();
@@ -37,11 +37,13 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
   }));
 
   app.get("/ready", async (_request, reply) => {
-    const checks: ReadinessReport[] = [await checkDatabase(deps)];
+    const checks: ReadinessReport[] = [await checkDatabase(deps), await checkRedis(deps)];
 
     for (const source of deps.readiness) {
       try {
-        checks.push(await source.readiness());
+        const report = await source.readiness();
+        if (report.name === "redis" && deps.redis !== undefined) continue;
+        checks.push(report);
       } catch (error) {
         // A readiness check that throws is itself a failure, and swallowing it would report
         // ready for a component nobody can hear from.
@@ -76,6 +78,13 @@ async function checkDatabase(deps: ServerDeps): Promise<ReadinessReport> {
     // the pool was built from a connection string pg does not echo back.
     return { name: "postgres", state: "down", detail: `not answering: ${messageOf(error)}` };
   }
+}
+
+async function checkRedis(deps: ServerDeps): Promise<ReadinessReport> {
+  if (deps.redis !== undefined) {
+    return checkRedisHealth(deps.redis, { workers: deps.bullmqWorkers });
+  }
+  return { name: "redis", state: "down", detail: "redis client not configured or unreachable" };
 }
 
 function messageOf(error: unknown): string {
