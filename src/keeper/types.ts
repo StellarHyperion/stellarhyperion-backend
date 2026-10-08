@@ -27,8 +27,46 @@ export interface ClaimSettlementPayload {
   readonly limit?: number;
 }
 
+export interface MockEvmRpcProvider {
+  readonly writeContract?:
+    | ((args: {
+        address: string;
+        abi?: unknown;
+        functionName: string;
+        args: readonly unknown[];
+      }) => Promise<`0x${string}`>)
+    | undefined;
+  readonly waitForTransactionReceipt?:
+    | ((args: { hash: `0x${string}` }) => Promise<{
+        status: "success" | "reverted";
+        blockNumber: bigint;
+        transactionHash: `0x${string}`;
+        transactionIndex?: number | undefined;
+      }>)
+    | undefined;
+}
+
+export interface MockStellarRpcProvider {
+  readonly submitTransaction?:
+    | ((args: { contractId: string; method: string; args: readonly unknown[] }) => Promise<{
+        status: "SUCCESS" | "FAILED";
+        hash: string;
+        ledger: bigint;
+      }>)
+    | undefined;
+}
+
 export interface RailSecondStepPayload {
-  readonly limit?: number;
+  readonly limit?: number | undefined;
+  readonly attestationFetcher?:
+    | ((
+        originChain: string,
+        originTx: string,
+      ) => Promise<{ message: string; attestation: string } | null>)
+    | undefined;
+  readonly evmRpcProvider?: MockEvmRpcProvider | undefined;
+  readonly stellarRpcProvider?: MockStellarRpcProvider | undefined;
+  readonly destinationContractAddress?: string | undefined;
 }
 
 export interface GasTopupPayload {
