@@ -179,8 +179,20 @@ const TRANSFER_QUERY = `
      AND c.source_nonce = t.nonce
 `;
 
+function isDeliveryFinalized(transfer: FormattedTransfer): boolean {
+  return (
+    transfer.destination.delivered || transfer.stage === "delivered" || transfer.stage === "settled"
+  );
+}
+
 export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
+
+  const queryTransferById = async (id: string): Promise<FormattedTransfer | null> => {
+    const { rows } = await db.query(`${TRANSFER_QUERY} WHERE t.id = $1 LIMIT 1`, [id]);
+    const row = rows[0];
+    return row !== undefined ? formatRow(row) : null;
+  };
 
   // 1. Look up by originChain and nonce
   app.get(
@@ -228,6 +240,135 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       return reply.send(formatRow(row));
     },
   );
+
+  // 3. SSE live stream endpoint
+  const handleStream = async (
+    request: FastifyRequest<{
+      Params: { id: string };
+      Querystring: { pollIntervalMs?: string; heartbeatIntervalMs?: string };
+    }>,
+    reply: FastifyReply,
+  ) => {
+    const { id } = request.params;
+    const initial = await queryTransferById(id);
+    if (initial === null) {
+      return reply.code(404).send({
+        error: "not_found",
+        message: `no transfer found with id ${id}`,
+      });
+    }
+
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+
+    const safeWrite = (chunk: string): boolean => {
+      if (reply.raw.writableEnded || reply.raw.destroyed) {
+        return false;
+      }
+      return reply.raw.write(chunk);
+    };
+
+    const safeEnd = (): void => {
+      if (!reply.raw.writableEnded && !reply.raw.destroyed) {
+        reply.raw.end();
+      }
+    };
+
+    safeWrite(`event: transfer_update\ndata: ${JSON.stringify(initial)}\n\n`);
+
+    if (isDeliveryFinalized(initial)) {
+      safeWrite(`event: complete\ndata: ${JSON.stringify(initial)}\n\n`);
+      safeEnd();
+      return;
+    }
+
+    let lastSerialized = JSON.stringify(initial);
+    let closed = false;
+
+    const pollInterval = Math.max(Number(request.query.pollIntervalMs) || 1000, 10);
+    const heartbeatInterval = Math.max(Number(request.query.heartbeatIntervalMs) || 15000, 10);
+
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+    let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
+      if (pollTimer !== null) {
+        clearInterval(pollTimer);
+      }
+      if (heartbeatTimer !== null) {
+        clearInterval(heartbeatTimer);
+      }
+    };
+
+    request.raw.on("close", cleanup);
+    reply.raw.on("close", cleanup);
+    reply.raw.on("error", cleanup);
+
+    pollTimer = setInterval(() => {
+      void (async () => {
+        if (closed || reply.raw.writableEnded || reply.raw.destroyed) {
+          cleanup();
+          return;
+        }
+
+        try {
+          const current = await queryTransferById(id);
+          if (current === null) return;
+
+          const currentSerialized = JSON.stringify(current);
+          if (currentSerialized !== lastSerialized) {
+            lastSerialized = currentSerialized;
+            safeWrite(`event: transfer_update\ndata: ${JSON.stringify(current)}\n\n`);
+
+            if (isDeliveryFinalized(current)) {
+              safeWrite(`event: complete\ndata: ${JSON.stringify(current)}\n\n`);
+              safeEnd();
+              cleanup();
+            }
+          }
+        } catch (error) {
+          request.log.warn({ err: error, id }, "transfer stream poll failed");
+        }
+      })();
+    }, pollInterval);
+
+    heartbeatTimer = setInterval(() => {
+      if (closed || reply.raw.writableEnded || reply.raw.destroyed) {
+        cleanup();
+        return;
+      }
+      safeWrite(": ping\n\n");
+    }, heartbeatInterval);
+  };
+
+  app.get("/v1/transfers/:id/stream", handleStream);
+  app.get("/api/v1/transfers/:id/stream", handleStream);
+
+  // 4. Look up by ID
+  const getTransferById = async (
+    request: FastifyRequest<{ Params: { id: string } }>,
+    reply: FastifyReply,
+  ) => {
+    const { id } = request.params;
+    const transfer = await queryTransferById(id);
+    if (transfer === null) {
+      return reply.code(404).send({
+        error: "not_found",
+        message: `no transfer found with id ${id}`,
+      });
+    }
+    return reply.send(transfer);
+  };
+
+  app.get("/v1/transfers/:id", getTransferById);
+  app.get("/api/v1/transfers/:id", getTransferById);
 
   // 3. List transfers with filtering
   app.get(

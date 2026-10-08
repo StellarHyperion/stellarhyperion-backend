@@ -57,7 +57,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   void app.register(rateLimit, {
     max: 120,
     timeWindow: "1 minute",
-    allowList: () => deps.config.nodeEnv === "test",
+    allowList: (req) => deps.config.nodeEnv === "test" || req.url.includes("/stream"),
     errorResponseBuilder: () => ({
       error: "too_many_requests",
       message:
