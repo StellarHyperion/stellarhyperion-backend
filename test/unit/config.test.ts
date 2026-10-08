@@ -147,6 +147,23 @@ describe("watch plan", () => {
     const sepolia = config.indexer.evm.find((entry) => entry.chain === "sepolia");
 
     expect(sepolia?.rpcUrl).toBe("https://sepolia.example.invalid/v1");
+    expect(sepolia?.rpcUrls).toEqual(["https://sepolia.example.invalid/v1"]);
+  });
+
+  it("accepts multiple fallback RPC URLs for an EVM chain", () => {
+    const config = loadConfig({
+      env: completeEnv({
+        EVM_RPC_URL_SEPOLIA:
+          "https://sepolia1.example.invalid/v1, https://sepolia2.example.invalid/v2",
+      }),
+    });
+    const sepolia = config.indexer.evm.find((entry) => entry.chain === "sepolia");
+
+    expect(sepolia?.rpcUrl).toBe("https://sepolia1.example.invalid/v1");
+    expect(sepolia?.rpcUrls).toEqual([
+      "https://sepolia1.example.invalid/v1",
+      "https://sepolia2.example.invalid/v2",
+    ]);
   });
 
   it("refuses an override that is not a URL instead of falling back to the public endpoint", () => {

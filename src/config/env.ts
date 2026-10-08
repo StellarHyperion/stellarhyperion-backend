@@ -176,6 +176,50 @@ export class EnvReader {
     return raw;
   }
 
+  urls(spec: VarSpec): string[] {
+    const raw = this.raw(spec);
+    if (raw === null) return [];
+
+    const items = raw
+      .split(",")
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0);
+
+    if (items.length === 0) {
+      this.record(spec, `expected a URL, ${this.expectation(spec)}`);
+      return [];
+    }
+
+    const validated: string[] = [];
+    for (const item of items) {
+      let parsed: URL;
+      try {
+        parsed = new URL(item);
+      } catch {
+        this.record(spec, `expected a URL, ${this.expectation(spec)}`);
+        return [];
+      }
+
+      if (parsed.host === "") {
+        this.record(spec, `has no host, ${this.expectation(spec)}`);
+        return [];
+      }
+
+      const scheme = parsed.protocol.replace(/:$/, "");
+      if (spec.protocols !== undefined && !spec.protocols.includes(scheme)) {
+        this.record(
+          spec,
+          `uses the ${scheme} scheme, and this one accepts ${spec.protocols.join(" or ")}`,
+        );
+        return [];
+      }
+
+      validated.push(item);
+    }
+
+    return validated;
+  }
+
   /** The tail of a URL complaint, so every one of them says what good looks like. */
   private expectation(spec: VarSpec): string {
     if (spec.protocols === undefined) return "with a scheme and a host";
