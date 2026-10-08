@@ -55,3 +55,145 @@ export function fixedReadiness(
 ): ReadinessSource {
   return { readiness: () => ({ name, state, detail }) };
 }
+
+export interface RedisPingable {
+  ping(): Promise<unknown>;
+}
+
+export interface BullMQWorkerState {
+  readonly name?: string;
+  isPaused?(): boolean | Promise<boolean>;
+  isRunning?(): boolean;
+}
+
+export interface RedisHealthOptions {
+  readonly timeoutMs?: number | undefined;
+  readonly workers?: readonly BullMQWorkerState[] | undefined;
+}
+
+export const DEFAULT_REDIS_TIMEOUT_MS = 2000;
+
+/**
+ * Check Redis connectivity and BullMQ worker readiness.
+ *
+ * Pings Redis with a default timeout of 2000ms. If Redis fails or times out,
+ * reports state "down". If Redis is responding but BullMQ workers are paused,
+ * reports state "degraded".
+ */
+export async function checkRedisHealth(
+  redis: RedisPingable,
+  options: RedisHealthOptions = {},
+): Promise<ReadinessReport> {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_REDIS_TIMEOUT_MS;
+
+  try {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`timeout after ${String(timeoutMs)}ms`));
+      }, timeoutMs);
+    });
+
+    try {
+      await Promise.race([redis.ping(), timeoutPromise]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      name: "redis",
+      state: "down",
+      detail: message.includes("timeout")
+        ? `redis ping timed out after ${String(timeoutMs)}ms`
+        : `redis unreachable: ${message}`,
+    };
+  }
+
+  if (options.workers !== undefined && options.workers.length > 0) {
+    for (const worker of options.workers) {
+      const isPaused = typeof worker.isPaused === "function" ? await worker.isPaused() : false;
+      const isRunning = typeof worker.isRunning === "function" ? worker.isRunning() : true;
+      if (isPaused || !isRunning) {
+        return {
+          name: "redis",
+          state: "degraded",
+          detail: `worker ${worker.name ?? "bullmq"} is ${isPaused ? "paused" : "not running"}`,
+        };
+      }
+    }
+  }
+
+  return {
+    name: "redis",
+    state: "ready",
+    detail: "answering",
+  };
+}
+
+export function redisReadiness(
+  redis: RedisPingable,
+  options: RedisHealthOptions = {},
+): ReadinessSource {
+  return {
+    readiness: () => checkRedisHealth(redis, options),
+  };
+}
+
+export function bullmqWorkersReadiness(
+  workers: readonly BullMQWorkerState[],
+  name = "bullmq",
+): ReadinessSource {
+  return {
+    readiness: async () => {
+      for (const worker of workers) {
+        const isPaused = typeof worker.isPaused === "function" ? await worker.isPaused() : false;
+        const isRunning = typeof worker.isRunning === "function" ? worker.isRunning() : true;
+        if (isPaused || !isRunning) {
+          return {
+            name,
+            state: "degraded",
+            detail: `worker ${worker.name ?? "unnamed"} is ${isPaused ? "paused" : "not running"}`,
+          };
+        }
+      }
+      return {
+        name,
+        state: "ready",
+        detail: "active and non-paused",
+      };
+    },
+  };
+}
+
+export class ReadinessRegistry {
+  private readonly sources: ReadinessSource[] = [];
+
+  register(source: ReadinessSource): void {
+    this.sources.push(source);
+  }
+
+  registerRedis(redis: RedisPingable, options?: RedisHealthOptions): void {
+    this.sources.push(redisReadiness(redis, options));
+  }
+
+  registerBullmq(workers: readonly BullMQWorkerState[], name?: string): void {
+    this.sources.push(bullmqWorkersReadiness(workers, name));
+  }
+
+  async check(): Promise<{ state: ReadinessState; checks: ReadinessReport[] }> {
+    const checks: ReadinessReport[] = [];
+    for (const source of this.sources) {
+      try {
+        checks.push(await source.readiness());
+      } catch (error) {
+        checks.push({
+          name: "unknown",
+          state: "down",
+          detail: `readiness check threw: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+    }
+    return { state: worstOf(checks), checks };
+  }
+}

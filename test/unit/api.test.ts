@@ -573,3 +573,183 @@ describe("REST API endpoints", () => {
     expect(lookupRes.json().error).toBe("not_found");
   });
 });
+
+describe("Readiness and health probes", () => {
+  const config = loadConfig({ env: completeEnv() });
+  const { logger } = capturingLogger();
+
+  it("returns 200 when all components (Postgres, Redis, Watchers) are healthy", async () => {
+    const db = new MockDb({});
+    const mockRedis = {
+      ping: () => Promise.resolve("PONG"),
+    };
+    const mockWatcher = {
+      readiness: () => ({
+        name: "stellar",
+        state: "ready" as const,
+        detail: "watching ledger 1287400",
+      }),
+    };
+
+    const app = buildServer({
+      config,
+      logger,
+      db: db as unknown as Database,
+      redis: mockRedis,
+      readiness: [mockWatcher],
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/ready",
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.status).toBe("ready");
+    expect(body.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "postgres", state: "ready" }),
+        expect.objectContaining({ name: "redis", state: "ready" }),
+        expect.objectContaining({ name: "stellar", state: "ready" }),
+      ]),
+    );
+  });
+
+  it("returns 503 if Redis is unreachable", async () => {
+    const db = new MockDb({});
+    const mockRedis = {
+      ping: () => Promise.reject(new Error("connect ECONNREFUSED 127.0.0.1:6379")),
+    };
+
+    const app = buildServer({
+      config,
+      logger,
+      db: db as unknown as Database,
+      redis: mockRedis,
+      readiness: [],
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/ready",
+    });
+
+    expect(res.statusCode).toBe(503);
+    const body = res.json();
+    expect(body.status).toBe("down");
+    const redisCheck = body.checks.find((c: { name: string }) => c.name === "redis");
+    expect(redisCheck).toBeDefined();
+    expect(redisCheck.state).toBe("down");
+    expect(redisCheck.detail).toContain("unreachable");
+  });
+
+  it("returns 503 if Redis is timing out", async () => {
+    const db = new MockDb({});
+    const hangingRedis = {
+      ping: () =>
+        new Promise<string>((resolve) => {
+          setTimeout(() => {
+            resolve("PONG");
+          }, 5000);
+        }),
+    };
+
+    const app = buildServer({
+      config,
+      logger,
+      db: db as unknown as Database,
+      redis: hangingRedis,
+      readiness: [],
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/ready",
+    });
+
+    expect(res.statusCode).toBe(503);
+    const body = res.json();
+    expect(body.status).toBe("down");
+    const redisCheck = body.checks.find((c: { name: string }) => c.name === "redis");
+    expect(redisCheck).toBeDefined();
+    expect(redisCheck.state).toBe("down");
+    expect(redisCheck.detail).toContain("timed out");
+  }, 10_000);
+
+  it("returns degraded if BullMQ worker is in paused state", async () => {
+    const db = new MockDb({});
+    const mockRedis = {
+      ping: () => Promise.resolve("PONG"),
+    };
+    const mockWorker = {
+      name: "hyperion-keeper",
+      isPaused: () => true,
+      isRunning: () => true,
+    };
+
+    const app = buildServer({
+      config,
+      logger,
+      db: db as unknown as Database,
+      redis: mockRedis,
+      bullmqWorkers: [mockWorker],
+      readiness: [],
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/ready",
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.status).toBe("degraded");
+    const redisCheck = body.checks.find((c: { name: string }) => c.name === "redis");
+    expect(redisCheck).toBeDefined();
+    expect(redisCheck.state).toBe("degraded");
+    expect(redisCheck.detail).toContain("paused");
+  });
+
+  it("returns 503 if Redis client is missing", async () => {
+    const db = new MockDb({});
+    const app = buildServer({
+      config,
+      logger,
+      db: db as unknown as Database,
+      readiness: [],
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/ready",
+    });
+
+    expect(res.statusCode).toBe(503);
+    const body = res.json();
+    expect(body.status).toBe("down");
+    const redisCheck = body.checks.find((c: { name: string }) => c.name === "redis");
+    expect(redisCheck).toBeDefined();
+    expect(redisCheck.state).toBe("down");
+  });
+
+  it("serves liveness /health without touching dependencies", async () => {
+    const db = new MockDb({});
+    const app = buildServer({
+      config,
+      logger,
+      db: db as unknown as Database,
+      readiness: [],
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/health",
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.status).toBe("ok");
+    expect(body.service).toBe("hyperion-backend");
+  });
+});
