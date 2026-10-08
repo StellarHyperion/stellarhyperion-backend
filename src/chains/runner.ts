@@ -286,7 +286,7 @@ function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): W
     confirmations: config.confirmations,
     reorgDepth: config.reorgDepth,
     logRange: config.logRange,
-    client: viemClient(config.rpcUrl),
+    client: viemClient(config.rpcUrls, { logger: child }),
     db,
     logger: child,
   });

@@ -62,6 +62,7 @@ export interface EvmWatchConfig {
   readonly chain: ChainKey;
   readonly chainId: number;
   readonly rpcUrl: string;
+  readonly rpcUrls: readonly string[];
   readonly routerAddress: Hex;
   /** The block the router was deployed in, from the deployment record. */
   readonly startBlock: bigint;
@@ -434,6 +435,17 @@ function rpcOverrideSpec(chain: ChainKey): VarSpec {
   };
 }
 
+function rpcUrlsOverrideSpec(chain: ChainKey): VarSpec {
+  return {
+    name: `EVM_RPC_URLS_${envSuffixFor(chain)}`,
+    kind: "url",
+    protocols: ["http", "https"],
+    required: false,
+    printable: true,
+    purpose: `RPC endpoints for ${CHAINS[chain].name}, comma-separated. Defaults to EVM_RPC_URL_${envSuffixFor(chain)} or the chain registry entry.`,
+  };
+}
+
 /**
  * Read the environment and the deployment record, or explain why not.
  *
@@ -665,11 +677,21 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
         continue;
       }
       const override = rpcOverrideSpec(chainKey);
-      const rpcUrl = reader.has(override.name) ? reader.url(override) : chain.defaultRpcUrl;
+      const urlsOverride = rpcUrlsOverrideSpec(chainKey);
+      let rpcUrls: readonly string[];
+      if (reader.has(urlsOverride.name)) {
+        rpcUrls = reader.urls(urlsOverride);
+      } else if (reader.has(override.name)) {
+        rpcUrls = reader.urls(override);
+      } else {
+        rpcUrls = [chain.defaultRpcUrl];
+      }
+      const rpcUrl = rpcUrls[0] ?? chain.defaultRpcUrl;
       evm.push({
         chain: chainKey,
         chainId: chain.chainId,
         rpcUrl,
+        rpcUrls,
         routerAddress: deployment.router,
         startBlock: BigInt(deployment.deployedAt.blockNumber),
         confirmations: chain.confirmations,
