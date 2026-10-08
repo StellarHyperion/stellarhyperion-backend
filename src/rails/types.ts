@@ -44,6 +44,12 @@ export interface RailReport {
   /** The identifier to quote at the rail's support. Circle's event nonce, Axelar's message id. */
   readonly reference: string | null;
   readonly attestedAt: Date | null;
+  readonly message?: string | null;
+  readonly messageBytes?: string | null;
+  readonly attestation?: string | null;
+  readonly attestationSignature?: string | null;
+  readonly attestationTimestamp?: Date | null;
+  readonly fastTransfer?: boolean;
 }
 
 export type RailLookup =

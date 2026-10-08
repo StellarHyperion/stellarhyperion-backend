@@ -11,7 +11,14 @@
 import { describe, expect, it } from "vitest";
 
 import { AxelarGmpClient } from "../../src/rails/axelar/gmp.js";
-import { IrisClient } from "../../src/rails/cctp/iris.js";
+import {
+  CCTP_DOMAINS,
+  domainFor,
+  isIrisMessage,
+  isIrisResponsePayload,
+  IrisClient,
+  reportFor,
+} from "../../src/rails/cctp/iris.js";
 import { RailError, type PendingTransfer } from "../../src/rails/types.js";
 
 const TRANSFER: PendingTransfer = {
@@ -186,6 +193,203 @@ describe("Circle's Iris", () => {
     await expect(client.look({ ...TRANSFER, originChain: "not-a-chain" })).rejects.toSatisfy(
       (error: unknown) => error instanceof RailError && error.kind === "permanent",
     );
+  });
+
+  it("correctly parses v2 Iris JSON payloads with data array and pagination", async () => {
+    const { fetch } = answering(200, {
+      data: [
+        {
+          message: "0x11223344",
+          attestation: "0xaabbccdd",
+          status: "complete",
+          eventNonce: "100",
+        },
+      ],
+      pagination: {
+        page: 1,
+        pageSize: 10,
+        total: 1,
+      },
+    });
+    const lookup = await new IrisClient("testnet", { fetch }).look(TRANSFER);
+
+    expect(lookup.kind).toBe("found");
+    if (lookup.kind !== "found") return;
+    expect(lookup.report.status).toBe("attested");
+    expect(lookup.report.reference).toBe("100");
+    expect(lookup.report.message).toBe("0x11223344");
+    expect(lookup.report.messageBytes).toBe("0x11223344");
+    expect(lookup.report.attestation).toBe("0xaabbccdd");
+    expect(lookup.report.attestationSignature).toBe("0xaabbccdd");
+  });
+
+  it("extracts message bytes, attestation signature, and attestation timestamp from v2 payload", async () => {
+    const timestampStr = "2024-05-01T12:00:00.000Z";
+    const expectedDate = new Date(timestampStr);
+    const { fetch } = answering(200, {
+      data: [
+        {
+          messageBytes: "0xdeadbeef",
+          signature: "0xcafe",
+          status: "completed",
+          attestationTimestamp: timestampStr,
+          messageId: "msg-999",
+        },
+      ],
+    });
+    const lookup = await new IrisClient("testnet", { fetch }).look(TRANSFER);
+
+    expect(lookup.kind).toBe("found");
+    if (lookup.kind !== "found") return;
+    expect(lookup.report.status).toBe("attested");
+    expect(lookup.report.messageBytes).toBe("0xdeadbeef");
+    expect(lookup.report.message).toBe("0xdeadbeef");
+    expect(lookup.report.attestationSignature).toBe("0xcafe");
+    expect(lookup.report.attestation).toBe("0xcafe");
+    expect(lookup.report.attestationTimestamp).toEqual(expectedDate);
+    expect(lookup.report.attestedAt).toEqual(expectedDate);
+    expect(lookup.report.reference).toBe("msg-999");
+  });
+
+  it("handles unix epoch timestamp in seconds or milliseconds", async () => {
+    const epochSeconds = 1_714_564_800;
+    const expectedDate = new Date(epochSeconds * 1000);
+    const { fetch } = answering(200, {
+      messages: [
+        {
+          message: "0x01",
+          attestation: "0x02",
+          status: "complete",
+          attestationTimestamp: epochSeconds,
+        },
+      ],
+    });
+    const lookup = await new IrisClient("testnet", { fetch }).look(TRANSFER);
+
+    expect(lookup.kind).toBe("found");
+    if (lookup.kind !== "found") return;
+    expect(lookup.report.attestationTimestamp).toEqual(expectedDate);
+    expect(lookup.report.attestedAt).toEqual(expectedDate);
+  });
+
+  it("parses fast attestation metadata, flags fastTransfer, and sets expiry block", async () => {
+    const { fetch } = answering(200, {
+      data: [
+        {
+          status: "fast_complete",
+          isFastTransfer: true,
+          fastAttestation: {
+            signature: "0xfastsig",
+            expirationBlock: "54321",
+            timestamp: "2024-05-01T13:00:00.000Z",
+          },
+        },
+      ],
+    });
+    const lookup = await new IrisClient("testnet", { fetch }).look(TRANSFER);
+
+    expect(lookup.kind).toBe("found");
+    if (lookup.kind !== "found") return;
+    expect(lookup.report.status).toBe("attested");
+    expect(lookup.report.fastTransfer).toBe(true);
+    expect(lookup.report.attestationSignature).toBe("0xfastsig");
+    expect(lookup.report.railStatus).toContain("expires@54321");
+    expect(lookup.report.attestationTimestamp).toEqual(new Date("2024-05-01T13:00:00.000Z"));
+  });
+
+  it("passes pagination query parameters (page, pageSize) if configured in IrisOptions", async () => {
+    const { fetch, calls } = answering(200, { data: [] });
+    await new IrisClient("testnet", { fetch, page: 2, pageSize: 50 }).look(TRANSFER);
+
+    expect(calls[0]).toContain("page=2");
+    expect(calls[0]).toContain("pageSize=50");
+  });
+
+  it("resolves updated domain mappings across multiple ecosystems", async () => {
+    expect(CCTP_DOMAINS.arbitrum).toBe(3);
+    expect(CCTP_DOMAINS.solana).toBe(5);
+    expect(domainFor("arbitrum")).toBe(3);
+    expect(domainFor("optimism")).toBe(2);
+    expect(domainFor("solana")).toBe(5);
+    expect(domainFor("polygon")).toBe(7);
+    expect(domainFor("base")).toBe(6);
+    expect(domainFor("avalanche")).toBe(1);
+    expect(domainFor("noble")).toBe(4);
+    expect(domainFor("sui")).toBe(8);
+    expect(domainFor("aptos")).toBe(9);
+    expect(domainFor("stellar")).toBe(27);
+    expect(domainFor("arc")).toBe(26);
+
+    const { fetch, calls } = answering(200, { data: [] });
+    await new IrisClient("testnet", { fetch }).look({
+      ...TRANSFER,
+      originChain: "arbitrum",
+    });
+    expect(calls[0]).toContain("/v2/messages/3?transactionHash=");
+  });
+
+  it("validates response payloads and messages with strict runtime typeguards", async () => {
+    expect(isIrisResponsePayload({ messages: [] })).toBe(true);
+    expect(isIrisResponsePayload({ data: [] })).toBe(true);
+    expect(isIrisResponsePayload({ data: [], pagination: { page: 1, pageSize: 25 } })).toBe(true);
+    expect(isIrisResponsePayload({ message: { status: "complete" } })).toBe(true);
+    expect(isIrisResponsePayload([{ status: "complete" }])).toBe(true);
+
+    expect(isIrisResponsePayload(null)).toBe(false);
+    expect(isIrisResponsePayload("not-an-object")).toBe(false);
+    expect(isIrisResponsePayload({ messages: "not-an-array" })).toBe(false);
+    expect(isIrisResponsePayload({ data: 12345 })).toBe(false);
+    expect(isIrisResponsePayload({ message: "not-an-object" })).toBe(false);
+    expect(isIrisResponsePayload({ unexpected: true })).toBe(false);
+
+    expect(isIrisMessage({ status: "complete" })).toBe(true);
+    expect(isIrisMessage({ messageBytes: "0x1234" })).toBe(true);
+    expect(isIrisMessage(null)).toBe(false);
+    expect(isIrisMessage([])).toBe(false);
+    expect(isIrisMessage({ status: 123 })).toBe(false);
+    expect(isIrisMessage({ message: 456 })).toBe(false);
+    expect(isIrisMessage({ unexpected: "only" })).toBe(false);
+
+    // Runtime rejection during look
+    const badPayload = answering(200, { unexpectedFieldOnly: true });
+    await expect(
+      new IrisClient("testnet", { fetch: badPayload.fetch }).look(TRANSFER),
+    ).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof RailError &&
+        error.kind === "transient" &&
+        error.message.includes("invalid iris response payload format"),
+    );
+
+    const badMessage = answering(200, { data: ["not-a-valid-message-shape"] });
+    await expect(
+      new IrisClient("testnet", { fetch: badMessage.fetch }).look(TRANSFER),
+    ).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof RailError &&
+        error.kind === "transient" &&
+        error.message.includes("invalid iris message in response payload"),
+    );
+  });
+
+  it("maps various status strings across v1 and v2 formats", () => {
+    for (const status of [
+      "complete",
+      "completed",
+      "attested",
+      "signed",
+      "fast_complete",
+      "fast_attested",
+    ]) {
+      expect(reportFor({ status }).status).toBe("attested");
+    }
+    for (const status of ["failed", "canceled", "cancelled"]) {
+      expect(reportFor({ status }).status).toBe("failed");
+    }
+    expect(reportFor({ status: "expired" }).status).toBe("expired");
+    for (const status of ["pending_confirmations", "pending", "unknown_state"]) {
+      expect(reportFor({ status }).status).toBe("pending");
+    }
   });
 });
 
