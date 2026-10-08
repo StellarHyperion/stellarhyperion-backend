@@ -20,5 +20,5 @@
     "types": ["node"],
     "rewriteRelativeImportExtensions": true
   },
-  "include": ["src", "test", "migrations", "vitest.config.ts", "eslint.config.mjs"]
+  "include": ["src", "test", "migrations", "api", "vitest.config.ts", "eslint.config.mjs"]
 }

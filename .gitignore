@@ -10,6 +10,7 @@ coverage/
 
 # Local deployment records copied out of the contracts repo.
 deployments/*.json
+!deployments/testnet.json
 
 # Postgres and Redis data when compose is run with a bind mount.
 .data/
@@ -19,3 +20,5 @@ deployments/*.json
 
 # Working state for whoever picks this up next. Never a deliverable.
 .task-checklist.md
+.vercel
+.env*

@@ -21,18 +21,18 @@ do if it is compromised.
 
 Built and verified:
 
-| Subsystem | Scope |
-|---|---|
-| Config | Declarative spec table, accumulating reader, strict validation |
-| HTTP | Fastify 5, `/health` and `/ready` probes, REST API endpoints |
-| Runtime | Poller loop, backoff, readiness registry, graceful shutdown |
-| Database | Schema, SQL migrations, connection pool, row mappers |
-| Stellar | Soroban event watcher, cursor safe across bounded ledger windows |
-| EVM | Per-chain viem log watcher, confirmation-aware, reorg-detecting |
-| Rail Pollers | Circle Iris attestation poller, Axelar GMP status poller |
-| Keeper | BullMQ workers for TTL bumps, claim settlement, second-step calls |
-| REST API | Transfer status, parked claims, route health, prometheus metrics |
-| CI/CD | GitHub Actions workflow, PR template, CODEOWNERS, security docs |
+| Subsystem    | Scope                                                             |
+| ------------ | ----------------------------------------------------------------- |
+| Config       | Declarative spec table, accumulating reader, strict validation    |
+| HTTP         | Fastify 5, `/health` and `/ready` probes, REST API endpoints      |
+| Runtime      | Poller loop, backoff, readiness registry, graceful shutdown       |
+| Database     | Schema, SQL migrations, connection pool, row mappers              |
+| Stellar      | Soroban event watcher, cursor safe across bounded ledger windows  |
+| EVM          | Per-chain viem log watcher, confirmation-aware, reorg-detecting   |
+| Rail Pollers | Circle Iris attestation poller, Axelar GMP status poller          |
+| Keeper       | BullMQ workers for TTL bumps, claim settlement, second-step calls |
+| REST API     | Transfer status, parked claims, route health, prometheus metrics  |
+| CI/CD        | GitHub Actions workflow, PR template, CODEOWNERS, security docs   |
 
 158 tests passing across unit and integration suites against real PostgreSQL 16 and Redis 7. Both watchers are verified against live chains and testnet router contracts.
 
@@ -218,6 +218,15 @@ Unit tests never touch the network or the filesystem or `process.env`. The deplo
 `test/fixtures` is a real record: every strkey in it carries a valid CRC16 and
 `parseDeploymentSet` accepts it for the same reasons it would accept a live one, because a fixture
 the validator would reject tests the validator and nothing else.
+
+## Deployment
+
+The backend API surface is deployed to Vercel as a Serverless Function:
+
+- Production endpoint: https://hyperion-backend.vercel.app
+- Health probe: https://hyperion-backend.vercel.app/health
+- Readiness probe: https://hyperion-backend.vercel.app/ready
+- Configuration: `vercel.json` rewrites and entrypoint `api/index.ts`
 
 ## License
 

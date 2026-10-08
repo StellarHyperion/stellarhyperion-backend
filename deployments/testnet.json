@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-09-28T11:04:17.000Z",
+  "networks": {
+    "stellar-testnet": {
+      "family": "stellar",
+      "chain": "stellar-testnet",
+      "networkPassphrase": "Test SDF Network ; September 2015",
+      "router": "CDVDU67TASWDY7ECUQWGPIIAYVLFYTGULAQVLMUEYRIBILVHKJHBCPSI",
+      "adapters": {
+        "cctp": "CDBV6A5IQ5AL5KBWDJIHUQSIJZF7GMPZTRJ2TE6GTRRHDO5RRECXSKBO"
+      },
+      "tokens": {
+        "USDC": {
+          "sacId": "CD5IB466XCQIUDYWV22PUMJTF6EE3KPXBDGLLBSKAPNE6QPXVUZLXJGA",
+          "code": "USDC",
+          "issuer": "GBLUB2OAKSNBM4EZJWXC3ODA4YRQCCCMMWJNYUZZEYFPSDCPPULU7WWY",
+          "decimals": 7,
+          "flowLimit": "10000000000000",
+          "routes": ["cctp"]
+        }
+      },
+      "treasury": "GC4FD5G3CZJ57VPYTVNWU4FRDLLV37EYDGT3OVZA35WKHBWDI6PKTYTN",
+      "admin": "GD4IEL76RCF2CULJZAKDTEZOQIIUTH3JDKY52W7SR6GBI42PZFIZGWIB",
+      "guardian": "GCK4I7AM6GVA5XORMZ6SZHJUNNSDYBBXWNYUQHHQLAMGAMZUNG3PJWI6",
+      "feeBps": 30,
+      "flowWindow": 720,
+      "timelockDelay": 3600,
+      "wasmHashes": {
+        "hyperion-router": "3b6f1d29a4c8e05f71b2d8460a9c3e7f5d2140b8c96e3a7f04d1b8529ce6a03f",
+        "hyperion-adapter-cctp": "a71c4e08d35b92f6071e8c4d5a3b20f9e68d471c0b5a9e23f8d4061c7b2e95a8"
+      },
+      "deployedAt": {
+        "ledger": 1287400,
+        "timestamp": "2026-09-28T10:58:03.000Z"
+      },
+      "commit": "b302664f1d7a5c9e0348ab27dd51e6904f8c3a2b"
+    },
+    "sepolia": {
+      "family": "evm",
+      "chain": "sepolia",
+      "chainId": 11155111,
+      "router": "0x0165878A594ca255338adfa4d48449f69242Eb8F",
+      "adapters": {
+        "cctp": "0xa513E6E4b8f2a923D98304ec87F64353C4D5C853"
+      },
+      "tokens": {
+        "USDC": {
+          "address": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+          "decimals": 6,
+          "flowLimit": "1000000000000",
+          "routes": ["cctp"]
+        }
+      },
+      "treasury": "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+      "admin": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+      "guardian": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+      "feeBps": 30,
+      "flowWindow": 3600,
+      "timelockDelay": 3600,
+      "deployedAt": {
+        "blockNumber": "9412880",
+        "timestamp": "2026-09-28T10:46:12.000Z",
+        "txHash": "0x4c1ba9bd0f28d77e6a3b1c05e8942fd0b7613a5ce84f29d0a71b3e6c5d08947f"
+      },
+      "commit": "b302664f1d7a5c9e0348ab27dd51e6904f8c3a2b"
+    }
+  }
+}

@@ -33,7 +33,7 @@
   },
   "dependencies": {
     "@fastify/rate-limit": "^11.2.0",
-    "@hyperion/protocol": "file:../contracts/packages/protocol",
+    "@hyperion/protocol": "file:hyperion-protocol-0.1.0.tgz",
     "@stellar/stellar-sdk": "^17.2.1",
     "bullmq": "^6.3.11",
     "fastify": "^5.12.5",
