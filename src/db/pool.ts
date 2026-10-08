@@ -100,11 +100,58 @@ export class Database implements Transactional {
     await this.query("SELECT 1");
   }
 
+  /**
+   * Lightweight maintenance task that cleans up completed attestation audit rows older than 30 days.
+   * Returns the count of deleted rows.
+   */
+  async pruneCompletedAttestations(olderThanDays = 30): Promise<number> {
+    const { rowCount } = await this.query(
+      `DELETE FROM rail_attestation
+        WHERE status = 'delivered'
+          AND updated_at < now() - ($1 * INTERVAL '1 day')`,
+      [olderThanDays],
+    );
+    return rowCount;
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     await this.pool.end();
   }
+}
+
+export interface MaintenanceTaskOptions {
+  readonly intervalMs?: number;
+  readonly olderThanDays?: number;
+  readonly logger?: {
+    info?: (obj: unknown, msg: string) => void;
+    error?: (obj: unknown, msg: string) => void;
+    warn?: (obj: unknown, msg: string) => void;
+  };
+}
+
+/**
+ * Periodically runs the attestation cleanup maintenance task.
+ * Returns a function to cancel the scheduled task.
+ */
+export function startMaintenanceTask(
+  db: Database,
+  options: MaintenanceTaskOptions = {},
+): () => void {
+  const intervalMs = options.intervalMs ?? 24 * 60 * 60 * 1000;
+  const olderThanDays = options.olderThanDays ?? 30;
+
+  const timer = setInterval(() => {
+    void db.pruneCompletedAttestations(olderThanDays).catch((error: unknown) => {
+      options.logger?.warn?.({ err: error }, "maintenance attestation pruning failed");
+    });
+  }, intervalMs);
+
+  timer.unref();
+  return () => {
+    clearInterval(timer);
+  };
 }
 
 function wrapClient(client: PoolClient): Queryable {
