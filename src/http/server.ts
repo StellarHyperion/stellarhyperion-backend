@@ -14,7 +14,7 @@ import rateLimit from "@fastify/rate-limit";
 
 import type { AppConfig } from "../config/config.js";
 import type { Database } from "../db/pool.js";
-import type { ReadinessSource } from "../runtime/readiness.js";
+import type { BullMQWorkerState, RedisPingable, ReadinessSource } from "../runtime/readiness.js";
 import { registerClaimRoutes } from "./routes/claims.js";
 import { registerHealthRoutes } from "./routes/health.js";
 import { registerMetricsRoutes } from "./routes/metrics.js";
@@ -25,6 +25,8 @@ export interface ServerDeps {
   readonly config: AppConfig;
   readonly logger: Logger;
   readonly db: Database;
+  readonly redis?: RedisPingable;
+  readonly bullmqWorkers?: readonly BullMQWorkerState[];
   /** Everything with an opinion about whether this process can do its job. */
   readonly readiness: readonly ReadinessSource[];
   /** Set at boot so `/health` can report how long the process has been up. */
