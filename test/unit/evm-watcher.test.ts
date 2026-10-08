@@ -10,6 +10,7 @@
 import { describe, expect, it } from "vitest";
 
 import { EvmWatcher } from "../../src/chains/evm/watcher.js";
+import { viemClient, type EvmClient } from "../../src/chains/evm/client.js";
 import {
   ANVIL_HISTORY,
   ANVIL_CHAIN_ID,
@@ -424,5 +425,125 @@ describe("an arrival, which the capture has none of", () => {
     const params = inserted(db, "inbound_delivery");
     expect(params[8]).toBe(true);
     expect(params[9]).toBeNull();
+  });
+});
+
+describe("RPC endpoint failover", () => {
+  it("routes requests to secondary RPC when primary returns 500 error", async () => {
+    const { logger, lines } = capturingLogger();
+    const failoverEvents: { failedUrl: string; fallbackUrl: string }[] = [];
+
+    const mockFetch: typeof globalThis.fetch = (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("primary.invalid")) {
+        return Promise.resolve(new Response("Internal Server Error", { status: 500 }));
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "0xaa36a7" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    };
+
+    const client = viemClient(["https://primary.invalid/rpc", "https://secondary.invalid/rpc"], {
+      fetchFn: mockFetch,
+      logger,
+      onFailover: (e) =>
+        failoverEvents.push({ failedUrl: e.failedUrl, fallbackUrl: e.fallbackUrl }),
+    });
+
+    const chainId = await client.chainId();
+    expect(chainId).toBe(11_155_111);
+    expect(failoverEvents).toEqual([
+      { failedUrl: "https://primary.invalid/rpc", fallbackUrl: "https://secondary.invalid/rpc" },
+    ]);
+    expect(
+      lines.some(
+        (l) =>
+          l.level === "40" && l.message.includes("RPC endpoint failed, failing over to secondary"),
+      ),
+    ).toBe(true);
+  });
+
+  it("routes requests to secondary RPC when primary encounters network timeout", async () => {
+    const { logger, lines } = capturingLogger();
+    const failoverEvents: { failedUrl: string; fallbackUrl: string }[] = [];
+
+    const mockFetch: typeof globalThis.fetch = (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("primary.invalid")) {
+        const timeoutError = new Error("The operation was aborted due to timeout");
+        timeoutError.name = "TimeoutError";
+        return Promise.reject(timeoutError);
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "0x64" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    };
+
+    const client = viemClient(["https://primary.invalid/rpc", "https://secondary.invalid/rpc"], {
+      fetchFn: mockFetch,
+      logger,
+      onFailover: (e) =>
+        failoverEvents.push({ failedUrl: e.failedUrl, fallbackUrl: e.fallbackUrl }),
+    });
+
+    const blockNumber = await client.blockNumber();
+    expect(blockNumber).toBe(100n);
+    expect(failoverEvents).toEqual([
+      { failedUrl: "https://primary.invalid/rpc", fallbackUrl: "https://secondary.invalid/rpc" },
+    ]);
+    expect(lines.some((l) => l.level === "40")).toBe(true);
+  });
+
+  it("recovers without losing cursor position when primary RPC fails and secondary recovers", async () => {
+    let shouldFail = true;
+    const inner = new FakeEvmClient({ head: 60n });
+    const client: EvmClient = {
+      chainId: () => inner.chainId(),
+      blockNumber: () => {
+        if (shouldFail) {
+          throw new Error("network timeout connecting to primary RPC");
+        }
+        return inner.blockNumber();
+      },
+      logs: (q) => inner.logs(q),
+      blocks: (n) => inner.blocks(n),
+    };
+
+    const db = new RecordingDb();
+    db.cursorRow = cursorRow(20n, "0x1234");
+    const { logger } = capturingLogger();
+    const watcher = new EvmWatcher({
+      chainKey: CHAIN,
+      router: ANVIL_ROUTER,
+      chainId: ANVIL_CHAIN_ID,
+      startBlock: ANVIL_START_BLOCK,
+      confirmations: 3,
+      reorgDepth: 5,
+      logRange: 2_000,
+      client,
+      db,
+      logger,
+    });
+
+    // First tick fails due to primary RPC error
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+      /network timeout connecting to primary RPC/,
+    );
+
+    // Cursor writes should be empty - cursor position was not corrupted or lost
+    expect(cursorWrites(db)).toEqual([]);
+
+    // Secondary recovers / next tick succeeds
+    shouldFail = false;
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    // Cursor now advances properly from cursorRow(20n)
+    expect(cursorWrites(db)).toEqual([{ block: 57n, family: "evm", hash: expect.any(String) }]);
   });
 });

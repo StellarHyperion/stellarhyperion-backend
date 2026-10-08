@@ -8,7 +8,8 @@
  * return, and batching those lookups in one place keeps the per-pass call count at one per block
  * that actually has logs rather than one per block in the range.
  */
-import { createPublicClient, http } from "viem";
+import type { Logger } from "pino";
+import { createPublicClient, fallback, http, shouldThrow } from "viem";
 import type { Hex } from "viem";
 
 export interface RawEvmLog {
@@ -66,16 +67,71 @@ export interface EvmClient {
 
 export interface ViemClientOptions {
   readonly timeoutMs?: number;
+  readonly logger?: Logger;
+  readonly onFailover?: (event: {
+    readonly failedUrl: string;
+    readonly fallbackUrl: string;
+    readonly error: unknown;
+  }) => void;
+  readonly fetchFn?: typeof globalThis.fetch;
 }
 
-export function viemClient(rpcUrl: string, options: ViemClientOptions = {}): EvmClient {
+export function viemClient(
+  rpcUrls: string | readonly string[],
+  options: ViemClientOptions = {},
+): EvmClient {
+  const urls = typeof rpcUrls === "string" ? [rpcUrls] : [...rpcUrls];
+  if (urls.length === 0) {
+    throw new Error("at least one RPC URL is required");
+  }
+
+  const timeout = options.timeoutMs ?? 20_000;
+
+  const transport =
+    urls.length === 1
+      ? http(urls[0], {
+          fetchFn: options.fetchFn,
+          timeout,
+          // One retry inside viem. The poller's own backoff is the policy that matters, and retrying
+          // hard down here would hide a failing endpoint from it.
+          retryCount: 1,
+        })
+      : fallback(
+          urls.map((url) =>
+            http(url, {
+              fetchFn: options.fetchFn,
+              timeout,
+              retryCount: 0,
+            }),
+          ),
+          {
+            retryCount: 0,
+            shouldThrow(err) {
+              if (shouldThrow(err)) {
+                return true;
+              }
+              const failedUrl = "url" in err && typeof err.url === "string" ? err.url : "";
+              const failedIndex = urls.findIndex(
+                (u) =>
+                  (failedUrl.length > 0 && u.startsWith(failedUrl)) ||
+                  (failedUrl.length > 0 && failedUrl.startsWith(u)),
+              );
+              const fallbackUrl =
+                (failedIndex >= 0 ? urls[failedIndex + 1] : undefined) ??
+                urls.find((u) => u !== failedUrl) ??
+                "";
+              options.logger?.warn(
+                { failedRpc: failedUrl, fallbackRpc: fallbackUrl, err },
+                "RPC endpoint failed, failing over to secondary RPC endpoint",
+              );
+              options.onFailover?.({ failedUrl, fallbackUrl, error: err });
+              return false;
+            },
+          },
+        );
+
   const client = createPublicClient({
-    transport: http(rpcUrl, {
-      timeout: options.timeoutMs ?? 20_000,
-      // One retry inside viem. The poller's own backoff is the policy that matters, and retrying
-      // hard down here would hide a failing endpoint from it.
-      retryCount: 1,
-    }),
+    transport,
   });
 
   return {
