@@ -19,24 +19,29 @@ do if it is compromised.
 
 ## State of play
 
-Built and committed:
+Built and verified:
 
-|          |                                                                |
-| -------- | -------------------------------------------------------------- |
-| Config   | Declarative spec table, accumulating reader, 17 tests          |
-| HTTP     | Fastify 5, `/health` and `/ready` meaning different things     |
-| Runtime  | Poller, readiness registry, graceful shutdown                  |
-| Database | Schema and migrations, connection pool, row mappers            |
-| Stellar  | Soroban event watcher, cursor safe across an empty scan window |
-| EVM      | Per chain log watcher, confirmation aware, reorg detecting     |
-| Compose  | Postgres on 5433, Redis on 6380                                |
+| Subsystem | Scope |
+|---|---|
+| Config | Declarative spec table, accumulating reader, strict validation |
+| HTTP | Fastify 5, `/health` and `/ready` probes, REST API endpoints |
+| Runtime | Poller loop, backoff, readiness registry, graceful shutdown |
+| Database | Schema, SQL migrations, connection pool, row mappers |
+| Stellar | Soroban event watcher, cursor safe across bounded ledger windows |
+| EVM | Per-chain viem log watcher, confirmation-aware, reorg-detecting |
+| Rail Pollers | Circle Iris attestation poller, Axelar GMP status poller |
+| Keeper | BullMQ workers for TTL bumps, claim settlement, second-step calls |
+| REST API | Transfer status, parked claims, route health, prometheus metrics |
+| CI/CD | GitHub Actions workflow, PR template, CODEOWNERS, security docs |
 
-122 tests. Both watchers are verified against a real chain rather than only against fakes: the
-Stellar one against the deployed router on testnet, the EVM one against a router deployed on a
-local node answering as the chain its record names.
+158 tests passing across unit and integration suites against real PostgreSQL 16 and Redis 7. Both watchers are verified against live chains and testnet router contracts.
 
-Not built yet, and `docs/ROADMAP.md` says so in more detail: the rail status pollers, the keeper
-and the REST API. The module boundaries are in place for all of them.
+### Organization links
+
+This service connects on-chain contracts with the web interface across the StellarHyperion organization:
+
+- Contracts: [stellarhyperion-contracts](https://github.com/StellarHyperion/stellarhyperion-contracts)
+- Frontend: [stellarhyperion-frontend](https://github.com/StellarHyperion/stellarhyperion-frontend)
 
 ## Why the config layer is the longest file here
 
