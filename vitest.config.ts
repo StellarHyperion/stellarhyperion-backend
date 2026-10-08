@@ -3,8 +3,9 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     include: ["test/**/*.test.ts"],
-    // Integration tests share one Postgres and each one owns a schema, so they can run in
-    // parallel files. Unit tests touch nothing outside the process.
+    // Integration tests share one Postgres instance and tables, so run files sequentially
+    // to prevent concurrent table writes and deletions from clobbering each other.
+    fileParallelism: false,
     pool: "forks",
     testTimeout: 30_000,
     hookTimeout: 60_000,

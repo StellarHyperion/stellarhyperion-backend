@@ -223,9 +223,9 @@ the validator would reject tests the validator and nothing else.
 
 The backend API surface is deployed to Vercel as a Serverless Function:
 
-- Production endpoint: https://hyperion-backend.vercel.app
-- Health probe: https://hyperion-backend.vercel.app/health
-- Readiness probe: https://hyperion-backend.vercel.app/ready
+- Production endpoint: https://stellarhyperion-backend.vercel.app
+- Health probe: https://stellarhyperion-backend.vercel.app/health
+- Readiness probe: https://stellarhyperion-backend.vercel.app/ready
 - Configuration: `vercel.json` rewrites and entrypoint `api/index.ts`
 
 ## License

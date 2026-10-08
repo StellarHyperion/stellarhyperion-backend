@@ -74,8 +74,8 @@ suite("rail pollers against real Postgres", () => {
       notCheckedSince: new Date(Date.now() + 1000),
       maxCheckFailures: 5,
     });
-    expect(pending).toHaveLength(1);
-    const first = pending[0];
+    expect(pending.length).toBeGreaterThanOrEqual(1);
+    const first = pending.find((p) => p.nonce === 101n);
     expect(first).toBeDefined();
     if (first === undefined) return;
     expect(first.nonce).toBe(101n);
