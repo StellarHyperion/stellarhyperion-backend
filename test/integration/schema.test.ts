@@ -117,6 +117,17 @@ suite("the schema", () => {
       ),
     ).rejects.toSatisfy((error: unknown) => codeOf(error) === CHECK_VIOLATION);
   });
+
+  it("configures autovacuum storage parameters on indexer_cursor", async () => {
+    const { rows } = await db.query(
+      "SELECT reloptions FROM pg_class WHERE relname = 'indexer_cursor'",
+    );
+    expect(rows.length).toBe(1);
+    const reloptions = rows[0]?.reloptions as string[] | null;
+    expect(reloptions).toBeDefined();
+    expect(reloptions).toContain("autovacuum_vacuum_scale_factor=0.05");
+    expect(reloptions).toContain("autovacuum_vacuum_cost_limit=500");
+  });
 });
 
 suite("outbound_transfer", () => {
@@ -260,5 +271,68 @@ suite("inbound_delivery", () => {
     await expect(insert({ sourceNonce: "4242", delivered: true })).rejects.toSatisfy(
       (error: unknown) => codeOf(error) === UNIQUE_VIOLATION,
     );
+  });
+});
+
+suite("maintenance and pruning", () => {
+  let db: Database;
+
+  beforeAll(() => {
+    db = Database.open(CONNECTION ?? "", { applicationName: "hyperion-schema-test" });
+  });
+
+  afterAll(async () => {
+    await db.query(
+      "DELETE FROM public.rail_attestation WHERE transfer_id IN (999991, 999992, 999993)",
+    );
+    await db.query("DELETE FROM public.outbound_transfer WHERE id IN (999991, 999992, 999993)");
+    await db.close();
+  });
+
+  it("cleans up completed attestation audit rows older than 30 days", async () => {
+    await db.query(
+      `INSERT INTO public.outbound_transfer
+         (id, origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
+          destination_chain, destination, origin_block, origin_tx)
+       VALUES (999991, 'prune-test-1', 0, 999991, '0xsender', '0xtoken', 100, 0, 100,
+               'stellar-testnet', 'GA5ZYIIV', 1, '0xtx-1'),
+              (999992, 'prune-test-2', 0, 999992, '0xsender', '0xtoken', 100, 0, 100,
+               'stellar-testnet', 'GA5ZYIIV', 1, '0xtx-2'),
+              (999993, 'prune-test-3', 0, 999993, '0xsender', '0xtoken', 100, 0, 100,
+               'stellar-testnet', 'GA5ZYIIV', 1, '0xtx-3')
+       ON CONFLICT (origin_chain, nonce) DO NOTHING`,
+    );
+
+    // Old completed attestation (40 days old)
+    await db.query(
+      `INSERT INTO public.rail_attestation (transfer_id, route, status, updated_at)
+       VALUES (999991, 0, 'delivered', now() - INTERVAL '40 days')
+       ON CONFLICT (transfer_id) DO UPDATE SET status = 'delivered', updated_at = now() - INTERVAL '40 days'`,
+    );
+
+    // Recent completed attestation (5 days old)
+    await db.query(
+      `INSERT INTO public.rail_attestation (transfer_id, route, status, updated_at)
+       VALUES (999992, 0, 'delivered', now() - INTERVAL '5 days')
+       ON CONFLICT (transfer_id) DO UPDATE SET status = 'delivered', updated_at = now() - INTERVAL '5 days'`,
+    );
+
+    // Old in-progress attestation (40 days old) - should NOT be pruned
+    await db.query(
+      `INSERT INTO public.rail_attestation (transfer_id, route, status, updated_at)
+       VALUES (999993, 0, 'pending', now() - INTERVAL '40 days')
+       ON CONFLICT (transfer_id) DO UPDATE SET status = 'pending', updated_at = now() - INTERVAL '40 days'`,
+    );
+
+    const deletedCount = await db.pruneCompletedAttestations(30);
+    expect(deletedCount).toBeGreaterThanOrEqual(1);
+
+    const { rows } = await db.query(
+      "SELECT transfer_id FROM public.rail_attestation WHERE transfer_id IN (999991, 999992, 999993)",
+    );
+    const ids = rows.map((r) => Number(r.transfer_id));
+    expect(ids).not.toContain(999991);
+    expect(ids).toContain(999992);
+    expect(ids).toContain(999993);
   });
 });
