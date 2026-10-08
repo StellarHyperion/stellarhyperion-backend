@@ -17,9 +17,15 @@ import { capturingLogger } from "../stellar-fakes.js";
 
 /** Mock in-memory database answering queries for unit tests. */
 class MockDb {
+  public readonly executedQueries: { text: string; params: readonly unknown[] }[] = [];
+
   constructor(private readonly responses: Record<string, readonly Record<string, unknown>[]>) {}
 
-  query(text: string): Promise<{ rows: readonly Record<string, unknown>[]; rowCount: number }> {
+  query(
+    text: string,
+    params: readonly unknown[] = [],
+  ): Promise<{ rows: readonly Record<string, unknown>[]; rowCount: number }> {
+    this.executedQueries.push({ text, params });
     for (const [key, rows] of Object.entries(this.responses)) {
       if (text.includes(key)) {
         return Promise.resolve({ rows, rowCount: rows.length });
@@ -93,6 +99,185 @@ describe("keeper upkeep jobs", () => {
     const result = await processRailSecondStep({ db, config, logger });
     expect(result.pending).toBe(1);
     expect(result.dryRun).toBe(true);
+  });
+
+  it("submits EVM second-step execution with receiveMessage and records delivery on success", async () => {
+    const db = new MockDb({
+      outbound_transfer: [
+        {
+          id: "10",
+          origin_chain: "stellar-testnet",
+          destination_chain: "sepolia",
+          route: 0,
+          nonce: "42",
+          sender: "GBB...",
+          token: "0x2222",
+          gross_amount: "1000",
+          fee: "10",
+          net_amount: "990",
+          destination: "0x1111",
+          origin_tx: "tx-stellar-42",
+          rail_reference: JSON.stringify({ message: "0xmsgbytes", attestation: "0xsigbytes" }),
+          rail_status: "complete",
+        },
+      ],
+    });
+
+    const calls: { address: string; functionName: string; args: readonly unknown[] }[] = [];
+    const evmRpcProvider = {
+      writeContract: (args: {
+        address: string;
+        functionName: string;
+        args: readonly unknown[];
+      }) => {
+        calls.push(args);
+        return Promise.resolve(
+          "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890" as const,
+        );
+      },
+      waitForTransactionReceipt: () =>
+        Promise.resolve({
+          status: "success" as const,
+          blockNumber: 9999n,
+          transactionHash:
+            "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890" as const,
+          transactionIndex: 1,
+        }),
+    };
+
+    const worker = new KeeperWorker(config, db, logger);
+    const result = await worker.processSecondStep({ evmRpcProvider });
+
+    expect(result.relayed).toBe(1);
+    expect(result.pending).toBe(1);
+    expect(result.dryRun).toBe(false);
+    expect(result.detail).toBe("relayed 1 of 1 transfers");
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.functionName).toBe("receiveMessage");
+    expect(calls[0]?.args).toEqual(["0xmsgbytes", "0xsigbytes"]);
+
+    const inboundInsert = db.executedQueries.find((q) =>
+      q.text.includes("INSERT INTO inbound_delivery"),
+    );
+    expect(inboundInsert).toBeDefined();
+    expect(inboundInsert?.params).toContain("sepolia");
+    expect(inboundInsert?.params).toContain("0x1111");
+    expect(inboundInsert?.params).toContain("990");
+    expect(inboundInsert?.params).toContain(true); // delivered
+    expect(inboundInsert?.params).toContain(
+      "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+    );
+
+    const attestationUpdate = db.executedQueries.find((q) =>
+      q.text.includes("UPDATE rail_attestation"),
+    );
+    expect(attestationUpdate).toBeDefined();
+  });
+
+  it("validates delivery before completing and aborts if EVM transaction reverts", async () => {
+    const db = new MockDb({
+      outbound_transfer: [
+        {
+          id: "11",
+          origin_chain: "stellar-testnet",
+          destination_chain: "sepolia",
+          route: 0,
+          nonce: "43",
+          sender: "GBB...",
+          token: "0x2222",
+          gross_amount: "1000",
+          fee: "10",
+          net_amount: "990",
+          destination: "0x1111",
+          origin_tx: "tx-stellar-43",
+          rail_reference: JSON.stringify({ message: "0xbadmsg", attestation: "0xbadsig" }),
+          rail_status: "complete",
+        },
+      ],
+    });
+
+    const evmRpcProvider = {
+      writeContract: () => Promise.resolve("0xreverttx" as const),
+      waitForTransactionReceipt: () =>
+        Promise.resolve({
+          status: "reverted" as const,
+          blockNumber: 10000n,
+          transactionHash: "0xreverttx" as const,
+        }),
+    };
+
+    const result = await processRailSecondStep({ db, config, logger }, { evmRpcProvider });
+    expect(result.relayed).toBe(0);
+    expect(result.pending).toBe(1);
+    expect(result.dryRun).toBe(false);
+
+    const inboundInsert = db.executedQueries.find((q) =>
+      q.text.includes("INSERT INTO inbound_delivery"),
+    );
+    expect(inboundInsert).toBeUndefined();
+  });
+
+  it("submits Stellar second-step execution with receive_message and records delivery", async () => {
+    const db = new MockDb({
+      outbound_transfer: [
+        {
+          id: "12",
+          origin_chain: "sepolia",
+          destination_chain: "stellar-testnet",
+          route: 0,
+          nonce: "44",
+          sender: "0x1111",
+          token: "CAS...",
+          gross_amount: "5000",
+          fee: "15",
+          net_amount: "4985",
+          destination: "GBB...",
+          origin_tx: "0xevmtx",
+          rail_reference: null,
+          rail_status: "complete",
+        },
+      ],
+    });
+
+    const stellarCalls: { contractId: string; method: string; args: readonly unknown[] }[] = [];
+    const stellarRpcProvider = {
+      submitTransaction: (args: {
+        contractId: string;
+        method: string;
+        args: readonly unknown[];
+      }) => {
+        stellarCalls.push(args);
+        return Promise.resolve({
+          status: "SUCCESS" as const,
+          hash: "stellar-tx-hash-777",
+          ledger: 123456n,
+        });
+      },
+    };
+
+    const attestationFetcher = () =>
+      Promise.resolve({ message: "0xstellarmessage", attestation: "0xstellarsig" });
+
+    const result = await processRailSecondStep(
+      { db, config, logger },
+      { stellarRpcProvider, attestationFetcher },
+    );
+
+    expect(result.relayed).toBe(1);
+    expect(result.pending).toBe(1);
+    expect(result.dryRun).toBe(false);
+
+    expect(stellarCalls).toHaveLength(1);
+    expect(stellarCalls[0]?.method).toBe("receive_message");
+    expect(stellarCalls[0]?.args).toEqual(["0xstellarmessage", "0xstellarsig"]);
+
+    const inboundInsert = db.executedQueries.find((q) =>
+      q.text.includes("INSERT INTO inbound_delivery"),
+    );
+    expect(inboundInsert).toBeDefined();
+    expect(inboundInsert?.params).toContain("stellar-testnet");
+    expect(inboundInsert?.params).toContain("stellar-tx-hash-777");
   });
 
   it("identifies underfunded Axelar transfers requiring gas top-up", async () => {
