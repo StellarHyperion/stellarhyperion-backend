@@ -2,6 +2,8 @@ name: ci
 
 on:
   pull_request:
+  pull_request_review:
+    types: [submitted]
   push:
     branches: [main]
   merge_group:
@@ -105,6 +107,154 @@ jobs:
           REDIS_URL: redis://localhost:6379
         run: npm test
 
+  deploy-preview:
+    name: vercel preview deployment
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs:
+      - backend
+    if: (github.event_name == 'pull_request_review' && github.event.review.state == 'approved') || (github.event_name == 'pull_request' && (github.event.pull_request.author_association == 'OWNER' || github.event.pull_request.author_association == 'MEMBER' || github.event.pull_request.user.login == 'dotmantissa'))
+    environment:
+      name: preview
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - name: Check out backend repository
+        uses: actions/checkout@v4
+        with:
+          path: backend
+
+      - name: Check out contracts repository for protocol dependency
+        uses: actions/checkout@v4
+        with:
+          repository: StellarHyperion/stellarhyperion-contracts
+          path: contracts
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            contracts/packages/protocol/package-lock.json
+            backend/package-lock.json
+
+      - name: Build protocol package
+        working-directory: contracts/packages/protocol
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Build backend
+        working-directory: backend
+        run: npm run build
+
+      - name: Pull Vercel preview environment
+        working-directory: backend
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: npx vercel pull --yes --environment=preview --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Build with Vercel
+        working-directory: backend
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: npx vercel build --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Deploy to Vercel Preview
+        id: deploy
+        working-directory: backend
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          DEPLOYMENT_URL=$(npx vercel deploy --prebuilt --token=${{ secrets.VERCEL_TOKEN }})
+          echo "url=$DEPLOYMENT_URL" >> "$GITHUB_OUTPUT"
+          echo "### 🚀 Vercel Preview Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "URL: $DEPLOYMENT_URL" >> $GITHUB_STEP_SUMMARY
+
+  deploy-production:
+    name: vercel production deployment
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs:
+      - backend
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://stellarhyperion-backend.vercel.app
+    steps:
+      - name: Check out backend repository
+        uses: actions/checkout@v4
+        with:
+          path: backend
+
+      - name: Check out contracts repository for protocol dependency
+        uses: actions/checkout@v4
+        with:
+          repository: StellarHyperion/stellarhyperion-contracts
+          path: contracts
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            contracts/packages/protocol/package-lock.json
+            backend/package-lock.json
+
+      - name: Build protocol package
+        working-directory: contracts/packages/protocol
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Build backend
+        working-directory: backend
+        run: npm run build
+
+      - name: Pull Vercel production environment
+        working-directory: backend
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: npx vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Build with Vercel (Production)
+        working-directory: backend
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: npx vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Deploy to Vercel Production
+        id: deploy
+        working-directory: backend
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          DEPLOYMENT_URL=$(npx vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }})
+          echo "url=$DEPLOYMENT_URL" >> "$GITHUB_OUTPUT"
+          echo "### 🚀 Vercel Production Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "URL: $DEPLOYMENT_URL" >> $GITHUB_STEP_SUMMARY
+
   gate:
     name: gate
     runs-on: ubuntu-latest
@@ -113,15 +263,27 @@ jobs:
       contents: read
     needs:
       - backend
+      - deploy-preview
+      - deploy-production
     if: always()
 
     steps:
       - name: Verify all required checks passed
         env:
           BACKEND_RESULT: ${{ needs.backend.result }}
+          PREVIEW_RESULT: ${{ needs.deploy-preview.result }}
+          PROD_RESULT: ${{ needs.deploy-production.result }}
         run: |
           if [ "$BACKEND_RESULT" != "success" ]; then
             echo "Backend CI failed with status: $BACKEND_RESULT"
             exit 1
           fi
-          echo "All backend CI checks passed successfully."
+          if [ "$PREVIEW_RESULT" == "failure" ] || [ "$PREVIEW_RESULT" == "cancelled" ]; then
+            echo "Vercel preview deployment failed with status: $PREVIEW_RESULT"
+            exit 1
+          fi
+          if [ "$PROD_RESULT" == "failure" ] || [ "$PROD_RESULT" == "cancelled" ]; then
+            echo "Vercel production deployment failed with status: $PROD_RESULT"
+            exit 1
+          fi
+          echo "All backend CI checks and deployments passed successfully."
