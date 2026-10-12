@@ -32,7 +32,7 @@
     "check": "npm run fmt:check && npm run lint && npm run typecheck && npm run test"
   },
   "dependencies": {
-    "@fastify/rate-limit": "^11.2.0",
+    "@fastify/rate-limit": "^11.2.1",
     "@hyperion/protocol": "file:hyperion-protocol-0.1.0.tgz",
     "@stellar/stellar-sdk": "^17.2.1",
     "bullmq": "^6.3.11",
