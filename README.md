@@ -1,6 +1,6 @@
 # Hyperion backend
 
-Indexes Hyperion contract events, serves public transfer/claim history, polls rail status and optionally submits Stellar maintenance transactions. The checked-in deployment is the Stellar Testnet router. The supported app lane is Stellar USDC to Ethereum Sepolia through Axelar ITS, pending contract activation described in the contracts repository's `docs/TESTNET_ACTIVATION.md`.
+Indexes Hyperion contract events, serves public transfer/claim history, polls rail status and optionally submits Stellar maintenance transactions. The checked-in deployment is the Stellar Testnet router. The supported app lane is Stellar USDC to Ethereum Sepolia through Axelar ITS. The wallet-owned deployment is active; signed deployment and successful transfer evidence are described in the contracts repository's `docs/TESTNET_ACTIVATION.md`.
 
 ## Run
 

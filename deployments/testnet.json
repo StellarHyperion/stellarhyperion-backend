@@ -1,13 +1,13 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-10-01T12:11:16.725Z",
+  "generatedAt": "2026-10-28T17:09:26.361Z",
   "networks": {
     "stellar-testnet": {
       "family": "stellar",
       "networkPassphrase": "Test SDF Network ; September 2015",
-      "router": "CDMOLDF4SJDEDRWTDF7XAYMSRE6L3YEHHIRF57CFWNQYNC6ZOZ5LWCWF",
+      "router": "CCXPCT3YFLVANSF3AQMYCCZVGCMLTURAYQ6O6DYGQJMTKVYQL6NTOC2V",
       "adapters": {
-        "axelar-its": "CBK3TPRQR5A3H2AWESOUX4MVYOP63VNQ5EYHCX26EEJUC5B5FLB4DV5O"
+        "axelar-its": "CDFYEPIXO676W6E6Z4GOOR33JMRUC6DGUBGO4OWYKTO7HOGRJ6ARNOSJ"
       },
       "tokens": {
         "USDC": {
@@ -19,30 +19,38 @@
           "routes": ["axelar-its"]
         }
       },
-      "treasury": "GCHPVETUL5E4YKDLMRIBFUGFK4PMYOVKPFALVSYMP2QDYAVBA3ITQDAI",
-      "admin": "GCHPVETUL5E4YKDLMRIBFUGFK4PMYOVKPFALVSYMP2QDYAVBA3ITQDAI",
-      "guardian": "GCHPVETUL5E4YKDLMRIBFUGFK4PMYOVKPFALVSYMP2QDYAVBA3ITQDAI",
+      "treasury": "GDXRQQETEZHGRJTE3U7DYGIWGGYGMM6EAS5NWGPGN2WXFXZYZ6QZIANA",
+      "admin": "GDXRQQETEZHGRJTE3U7DYGIWGGYGMM6EAS5NWGPGN2WXFXZYZ6QZIANA",
+      "guardian": "GDXRQQETEZHGRJTE3U7DYGIWGGYGMM6EAS5NWGPGN2WXFXZYZ6QZIANA",
       "feeBps": 30,
       "flowWindow": 720,
       "timelockDelay": 3600,
       "wasmHashes": {
-        "router": "e2698a44680a74731c7fa5a9946ce8fd04499e159aa00bd20e98b63de958d10f",
-        "adapter-axelar": "b81d8090e63ac0e339217f5cce29f045e85acdb206cdb0dd0db4b44f476d4395"
+        "router": "072629035ad4e4113d6f7fa0ae3c9c2c0d4d9c44e32eb73e1661526469a2f971",
+        "adapter-axelar": "5f32139554d29edc3501a39ae3d05761101234523dd48b4d9e2d81ebf001f2c3"
       },
       "deployedAt": {
-        "ledger": 4965951,
-        "timestamp": "2026-10-01T12:11:16.702Z"
+        "ledger": 5433808,
+        "timestamp": "2026-10-28T13:04:40.000Z"
       },
-      "commit": "ee4f419384f77bf9da0e594f4d6a48d0690385cf",
-      "deployer": "GCHPVETUL5E4YKDLMRIBFUGFK4PMYOVKPFALVSYMP2QDYAVBA3ITQDAI",
-      "peerChain": "arc-testnet",
-      "queuedActionIds": [1, 2, 3, 7],
+      "commit": "60b3310",
+      "deployer": "GDXRQQETEZHGRJTE3U7DYGIWGGYGMM6EAS5NWGPGN2WXFXZYZ6QZIANA",
+      "peerChain": "sepolia",
+      "queuedActionIds": [1, 2, 3, 4],
       "queuedActions": [
         "register USDC",
         "set axelar adapter",
         "set axelar receiver",
         "enable axelar its"
-      ]
+      ],
+      "activation": {
+        "status": "active",
+        "activatedAt": "2026-10-28T17:08:25.000Z",
+        "evidence": "evidence/2026-10-28-paid-its.json",
+        "acceptance": "delivered",
+        "sourceHash": "b95ca748421ea4774dea6a08edebc3ad3a301244034cd10f1209f3cea234862d",
+        "destinationHash": "0x1fdb81fcdec18071adbdf47e359f0b9e4adc6be685c1e3bfcfb39689485037b6"
+      }
     }
   }
 }
