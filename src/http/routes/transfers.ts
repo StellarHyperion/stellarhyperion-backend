@@ -1,4 +1,4 @@
-import { isChainKey } from "@hyperion/protocol";
+import { CHAINS, isChainKey, isEvmChain, toEvmAddress } from "@hyperion/protocol";
 import type { AppConfig } from "../../config/config.js";
 /**
  * Transfer status and lookup REST API endpoints.
@@ -90,6 +90,14 @@ function deriveStage(
 function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTransfer {
   const chain = text(row, "origin_chain");
   const token = text(row, "token");
+  const destinationChain = text(row, "destination_chain");
+  const destinationWord = text(row, "destination");
+  const recipient =
+    isChainKey(destinationChain) &&
+    isEvmChain(CHAINS[destinationChain]) &&
+    /^0x[0-9a-fA-F]{64}$/.test(destinationWord)
+      ? toEvmAddress(destinationWord as `0x${string}`)
+      : destinationWord;
   const deployment = isChainKey(chain) ? config.deployments.networks[chain] : undefined;
   const entry = deployment
     ? Object.entries(
@@ -125,8 +133,8 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
       observedAt: new Date(row.observed_at as string | number | Date).toISOString(),
     },
     destination: {
-      chain: text(row, "destination_chain"),
-      recipient: text(row, "destination"),
+      chain: destinationChain,
+      recipient,
       delivered,
       block: textOrNull(row, "destination_block"),
       txHash: textOrNull(row, "destination_tx"),

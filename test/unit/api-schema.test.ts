@@ -51,7 +51,7 @@ beforeAll(async () => {
   }
   await pg.exec(`
     INSERT INTO outbound_transfer (origin_chain,route,nonce,sender,token,gross_amount,fee,net_amount,destination_chain,destination,origin_block,origin_tx)
-    VALUES ('stellar-testnet',1,42,'Gsender','USDC',10000000,30000,9970000,'sepolia','0xrecipient',123,'source-hash');
+    VALUES ('stellar-testnet',1,42,'Gsender','USDC',10000000,30000,9970000,'sepolia','0x0000000000000000000000006ef8032ffe4943f27388172549f6700f18bb8b38',123,'source-hash');
     INSERT INTO pending_claim (chain,claim_id,recipient,token,amount,route,source_chain,source_nonce,created_at)
     VALUES ('stellar-testnet',7,'Grecipient','USDC',9970000,1,'sepolia',20,now());
     INSERT INTO route_health (origin_chain,destination_chain,route,token,available,flow_available)
@@ -86,6 +86,14 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     expect(response.statusCode).toBe(200);
     expect(response.json().cursors[0].block).toBe("123");
     expect(response.json().cursors[0].hash).toBeNull();
+  });
+
+  it("renders EVM recipient words as actual addresses for wallet and explorer links", async () => {
+    const response = await app.inject("/v1/transfers/by-tx/source-hash");
+    expect(response.statusCode).toBe(200);
+    expect(response.json().destination.recipient).toBe(
+      "0x6ef8032ffe4943f27388172549f6700f18bb8b38",
+    );
   });
   it("searches real transfer rows with parameterized SQL", async () => {
     const found = await app.inject("/v1/transfers?search=source-hash");
