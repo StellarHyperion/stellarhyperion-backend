@@ -1,72 +1,58 @@
-/**
- * Soroban TTL bump keeper job.
- *
- * Soroban storage expires if not bumped, unlike EVM storage which persists indefinitely.
- * The router contract provides a permissionless `keep_alive` function that extends the
- * contract instance TTL and touches storage entries for registered tokens, flow counters,
- * active claims, and recent transfers.
- */
-import { RouteKind } from "@hyperion/protocol";
-
+import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 import { bigintOf } from "../../db/rows.js";
+import { submitStellar } from "../stellar.js";
 import type { KeeperContext, TtlBumpPayload, TtlBumpResult } from "../types.js";
-
-const DEFAULT_MAX_CLAIMS = 50;
-const DEFAULT_MAX_TRANSFERS = 50;
-
 export async function processTtlBump(
   ctx: KeeperContext,
   payload: TtlBumpPayload = {},
 ): Promise<TtlBumpResult> {
-  const { db, config, logger } = ctx;
-  const maxClaims = payload.maxClaims ?? DEFAULT_MAX_CLAIMS;
-  const maxTransfers = payload.maxTransfers ?? DEFAULT_MAX_TRANSFERS;
-
-  // 1. Gather active tokens from route health and config
-  const tokenRows = await db.query(
-    "SELECT DISTINCT token FROM route_health WHERE origin_chain LIKE 'stellar%'",
+  const chain = ctx.config.indexer.stellar;
+  if (!chain)
+    return {
+      bumpedTokens: 0,
+      bumpedClaims: 0,
+      bumpedTransfers: 0,
+      dryRun: true,
+      detail: "No Stellar deployment configured.",
+    };
+  const deployment = ctx.config.deployments.networks[chain.chain];
+  const tokens = deployment
+    ? Object.values(deployment.tokens)
+        .filter((token) => "sacId" in token)
+        .map((token) => (token as { sacId: string }).sacId)
+    : [];
+  const claimRows = await ctx.db.query(
+    "SELECT claim_id FROM pending_claim WHERE chain = $1 AND NOT settled ORDER BY claim_id DESC LIMIT $2",
+    [chain.chain, payload.maxClaims ?? 50],
   );
-  const tokens = tokenRows.rows.map((row) => String(row.token));
-
-  // 2. Gather active unsettled claims that must not expire
-  const claimRows = await db.query(
-    "SELECT claim_id FROM pending_claim WHERE settled = false ORDER BY id DESC LIMIT $1",
-    [maxClaims],
+  const transferRows = await ctx.db.query(
+    "SELECT nonce FROM outbound_transfer WHERE origin_chain = $1 ORDER BY id DESC LIMIT $2",
+    [chain.chain, payload.maxTransfers ?? 50],
   );
   const claims = claimRows.rows.map((row) => bigintOf(row, "claim_id"));
-
-  // 3. Gather recent outbound transfers
-  const transferRows = await db.query(
-    "SELECT nonce FROM outbound_transfer WHERE origin_chain LIKE 'stellar%' ORDER BY id DESC LIMIT $1",
-    [maxTransfers],
-  );
   const transfers = transferRows.rows.map((row) => bigintOf(row, "nonce"));
-
-  const routes = [RouteKind.Cctp, RouteKind.AxelarIts, RouteKind.Allbridge];
-  const hasKey = config.keeper.stellarSecret !== null;
-
-  logger.info(
-    {
-      tokensCount: tokens.length,
-      claimsCount: claims.length,
-      transfersCount: transfers.length,
-      routesCount: routes.length,
-      hasKey,
-    },
-    "evaluating Soroban keep_alive TTL bump targets",
-  );
-
-  // If a secret key is provided, on-chain execution can be submitted; otherwise runs as dry-run verification
-  const dryRun = !hasKey;
-  const detail = dryRun
-    ? `dry-run: identified ${String(tokens.length)} tokens, ${String(claims.length)} claims, and ${String(transfers.length)} transfers to bump`
-    : `executed keep_alive for ${String(tokens.length)} tokens, ${String(claims.length)} claims, ${String(transfers.length)} transfers`;
-
+  const dryRun = ctx.config.keeper.stellarSecret === null;
+  if (dryRun)
+    return {
+      bumpedTokens: 0,
+      bumpedClaims: 0,
+      bumpedTransfers: 0,
+      dryRun: true,
+      detail: `No signer: ${tokens.length} tokens, ${claims.length} claims, ${transfers.length} transfers need maintenance.`,
+    };
+  const vector = (values: xdr.ScVal[]) => xdr.ScVal.scvVec(values);
+  const hash = await submitStellar(ctx.config, chain.routerContractId, "keep_alive", () => [
+    vector(tokens.map((token) => new Address(token).toScVal())),
+    vector([0, 1, 2, 3].map((route) => nativeToScVal(route, { type: "u32" }))),
+    vector(claims.map((id) => nativeToScVal(id, { type: "u64" }))),
+    vector(transfers.map((id) => nativeToScVal(id, { type: "u64" }))),
+  ]);
+  ctx.logger.info({ hash }, "router keep_alive confirmed");
   return {
     bumpedTokens: tokens.length,
     bumpedClaims: claims.length,
     bumpedTransfers: transfers.length,
-    dryRun,
-    detail,
+    dryRun: false,
+    detail: `Confirmed router maintenance: ${hash}`,
   };
 }

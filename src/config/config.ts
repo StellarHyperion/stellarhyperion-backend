@@ -37,8 +37,8 @@ import { EnvReader } from "./env.js";
  * shared registry. If one is ever added there, this should be deleted rather than kept in step.
  */
 const AXELARSCAN_API: Readonly<Record<NetworkMode, string>> = {
-  mainnet: "https://api.axelarscan.io",
-  testnet: "https://testnet.api.axelarscan.io",
+  mainnet: "https://api.gmp.axelarscan.io",
+  testnet: "https://testnet.api.gmp.axelarscan.io",
 };
 
 export type NodeEnv = "development" | "test" | "production";
@@ -98,7 +98,6 @@ export interface KeeperConfig {
   readonly pollIntervalMs: number;
   readonly concurrency: number;
   readonly stellarSecret: string | null;
-  readonly evmPrivateKey: string | null;
 }
 
 export interface AppConfig {
@@ -179,8 +178,7 @@ const REDIS_URL: VarSpec = {
   protocols: ["redis", "rediss"],
   required: true,
   printable: false,
-  purpose:
-    "Redis for the keeper queues. Nothing connects to it yet, and it is required now so an operator finds out at deploy time rather than from a queue that silently does nothing.",
+  purpose: "Redis connection for enabled keeper queues.",
 };
 
 const HYPERION_NETWORK: EnumSpec<NetworkMode> = {
@@ -292,8 +290,7 @@ const KEEPER_ENABLED: VarSpec = {
   required: false,
   fallback: "true",
   printable: true,
-  purpose:
-    "Runs the BullMQ keeper jobs: TTL bumps, claim settlement, rail second step, and Axelar gas topups.",
+  purpose: "Runs the BullMQ keeper jobs: TTL bumps and claim settlement.",
 };
 
 const KEEPER_POLL_INTERVAL_MS: VarSpec = {
@@ -324,15 +321,6 @@ const KEEPER_STELLAR_SECRET: VarSpec = {
   printable: false,
   purpose:
     "Secret key for submitting Stellar keep_alive and claim transactions. Optional; runs dry-run when absent.",
-};
-
-const KEEPER_EVM_PRIVATE_KEY: VarSpec = {
-  name: "KEEPER_EVM_PRIVATE_KEY",
-  kind: "string",
-  required: false,
-  printable: false,
-  purpose:
-    "Private key for submitting EVM settleClaim transactions. Optional; runs dry-run when absent.",
 };
 
 const SHUTDOWN_TIMEOUT_MS: VarSpec = {
@@ -463,7 +451,8 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const host = reader.string(HTTP_HOST);
   const port = reader.integer(HTTP_PORT);
   const databaseUrl = reader.url(DATABASE_URL);
-  const redisUrl = reader.url(REDIS_URL);
+  const keeperEnabled = reader.boolean(KEEPER_ENABLED);
+  const redisUrl = reader.url({ ...REDIS_URL, required: keeperEnabled });
   const network = reader.choice(HYPERION_NETWORK);
   const deploymentsPath = reader.string(DEPLOYMENTS_FILE);
   const indexerEnabled = reader.boolean(INDEXER_ENABLED);
@@ -477,16 +466,11 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const railRecheckAfterMs = reader.integer(RAIL_RECHECK_AFTER_MS);
   const railMaxCheckFailures = reader.integer(RAIL_MAX_CHECK_FAILURES);
 
-  const keeperEnabled = reader.boolean(KEEPER_ENABLED);
   const keeperPollIntervalMs = reader.integer(KEEPER_POLL_INTERVAL_MS);
   const keeperConcurrency = reader.integer(KEEPER_CONCURRENCY);
   const keeperStellarSecret = reader.has(KEEPER_STELLAR_SECRET.name)
     ? reader.string(KEEPER_STELLAR_SECRET)
     : null;
-  const keeperEvmPrivateKey = reader.has(KEEPER_EVM_PRIVATE_KEY.name)
-    ? reader.string(KEEPER_EVM_PRIVATE_KEY)
-    : null;
-
   const stellarRpcOverride = reader.url(STELLAR_RPC_URL);
   const startLedgerOverride = reader.has(STELLAR_START_LEDGER.name)
     ? reader.integer(STELLAR_START_LEDGER)
@@ -542,7 +526,6 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       pollIntervalMs: keeperPollIntervalMs,
       concurrency: keeperConcurrency,
       stellarSecret: keeperStellarSecret,
-      evmPrivateKey: keeperEvmPrivateKey,
     },
     shutdownTimeoutMs,
   };

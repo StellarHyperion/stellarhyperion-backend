@@ -394,7 +394,7 @@ describe("Circle's Iris", () => {
 });
 
 describe("Axelar's GMP status", () => {
-  const BASE = "https://testnet.api.axelarscan.io";
+  const BASE = "https://testnet.api.gmp.axelarscan.io";
 
   it("reads an empty data array as not indexed yet", async () => {
     // The opposite convention to Circle's 404, which is why the two clients cannot share a
@@ -411,6 +411,7 @@ describe("Axelar's GMP status", () => {
     const { fetch } = answering(200, {
       data: [
         {
+          call: { transactionHash: TRANSFER.originTx },
           status: "executed",
           simplified_status: "received",
           message_id: "0xmessage",
@@ -431,7 +432,14 @@ describe("Axelar's GMP status", () => {
   it("keeps a recoverable transfer pending and names the reason", async () => {
     // Insufficient gas is exactly what the keeper exists to fix, so it must stay in the queue.
     const { fetch } = answering(200, {
-      data: [{ status: "called", simplified_status: "confirming", is_insufficient_fee: true }],
+      data: [
+        {
+          call: { transactionHash: TRANSFER.originTx },
+          status: "called",
+          simplified_status: "confirming",
+          is_insufficient_fee: true,
+        },
+      ],
     });
     const lookup = await new AxelarGmpClient(BASE, { fetch }).look(TRANSFER);
 
@@ -445,7 +453,13 @@ describe("Axelar's GMP status", () => {
     // Axelar will report `called` on a message whose destination address is invalid, and that is
     // never going to arrive.
     const { fetch } = answering(200, {
-      data: [{ status: "called", is_invalid_destination_chain: true }],
+      data: [
+        {
+          call: { transactionHash: TRANSFER.originTx },
+          status: "called",
+          is_invalid_destination_chain: true,
+        },
+      ],
     });
     const lookup = await new AxelarGmpClient(BASE, { fetch }).look(TRANSFER);
 
@@ -460,7 +474,9 @@ describe("Axelar's GMP status", () => {
     // guessed, and the transfer keeps being polled instead of being written off on the strength
     // of a string nobody has read.
     const seen: string[] = [];
-    const { fetch } = answering(200, { data: [{ status: "teleporting" }] });
+    const { fetch } = answering(200, {
+      data: [{ call: { transactionHash: TRANSFER.originTx }, status: "teleporting" }],
+    });
     const client = new AxelarGmpClient(BASE, {
       fetch,
       onUnknownStatus: (status) => seen.push(status),
@@ -480,6 +496,47 @@ describe("Axelar's GMP status", () => {
   it("posts the transaction hash to searchGMP", async () => {
     const { fetch, calls } = answering(200, { data: [] });
     await new AxelarGmpClient(BASE, { fetch }).look(TRANSFER);
-    expect(calls[0]).toBe(`${BASE}/gmp/searchGMP`);
+    expect(calls[0]).toBe(BASE);
+  });
+
+  it("rejects help responses instead of treating them as an empty history", async () => {
+    const { fetch } = answering(200, { methods: ["searchGMP"] });
+    await expect(new AxelarGmpClient(BASE, { fetch }).look(TRANSFER)).rejects.toThrow(
+      "invalid data field",
+    );
+  });
+  it("ignores execution records without the requested source hash", async () => {
+    for (const call of [undefined, { transactionHash: "0xwrong" }]) {
+      const { fetch } = answering(200, { data: [{ call, status: "executed" }] });
+      expect(await new AxelarGmpClient(BASE, { fetch }).look(TRANSFER)).toEqual({
+        kind: "missing",
+      });
+    }
+  });
+  it("matches hub forwarding rows through the original parent message", async () => {
+    const { fetch } = answering(200, {
+      data: [{ call: { parentMessageID: `${TRANSFER.originTx}-4` }, status: "executed" }],
+    });
+    const result = await new AxelarGmpClient(BASE, { fetch }).look(TRANSFER);
+    expect(result.kind).toBe("found");
+  });
+
+  it("prefers a matching destination execution over its earlier hub row", async () => {
+    const txHash = `0x${"ef".repeat(32)}`;
+    const commandId = `0x${"cd".repeat(32)}`;
+    const { fetch } = answering(200, {
+      data: [
+        { call: { transactionHash: TRANSFER.originTx }, status: "executed" },
+        {
+          call: { parentMessageID: `${TRANSFER.originTx}-4` },
+          status: "executed",
+          command_id: commandId,
+          executed: { transactionHash: txHash },
+        },
+      ],
+    });
+    const result = await new AxelarGmpClient(BASE, { fetch }).look(TRANSFER);
+    expect(result.kind).toBe("found");
+    if (result.kind === "found") expect(result.report.execution).toEqual({ txHash, commandId });
   });
 });

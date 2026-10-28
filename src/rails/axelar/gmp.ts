@@ -1,19 +1,4 @@
-/**
- * Axelar's GMP status, which is where an Axelar transfer lives between the two chains.
- *
- * `POST /gmp/searchGMP` with the source transaction hash. The convention for "not indexed yet" is
- * the exact opposite of Circle's: Axelar answers 200 with `{"data":[],"total":0}` where Circle
- * answers 404. Both mean the same thing and neither is a failure, which is why the two clients
- * cannot share a "missing" check and why `RailLookup` has a `missing` case at all.
- *
- * The status mapping is deliberately incomplete, and that is the honest position rather than a gap.
- * Every GMP row on testnet right now reports `status: executed` with `simplified_status: received`,
- * and the API refuses a page size above twenty five, so the rest of the enum could not be observed.
- * The values below are the ones Axelar documents; anything else is recorded verbatim and logged
- * once without moving our own status, which is the same treatment the chain watchers give an event
- * tag they have never seen. Inventing the remainder of somebody else's enum would file transfers
- * under states that may not exist.
- */
+/** Axelar status lookup uses the API root and a searchGMP JSON method. */
 import type {
   AttestationStatus,
   PendingTransfer,
@@ -51,8 +36,8 @@ const MAPPING: Readonly<Record<string, AttestationStatus>> = {
  * Flags that explain a stuck transfer, in the order worth reporting.
  *
  * All of these are booleans on the row rather than part of the status, so a transfer can be
- * `called` forever with the reason sitting in a field nobody reads. The first three are the
- * recoverable ones and are precisely what the keeper exists to fix, so they stay `pending`; the
+ * `called` forever with the reason sitting in a field nobody reads. The first three are
+ * recoverable, so they stay `pending`; the
  * rest describe a call that will never work.
  */
 const RECOVERABLE_FLAGS = [
@@ -76,7 +61,10 @@ interface GmpRow {
   readonly simplified_status?: unknown;
   readonly message_id?: unknown;
   readonly command_id?: unknown;
-  readonly executed?: { readonly block_timestamp?: unknown } | null;
+  readonly executed?: {
+    readonly block_timestamp?: unknown;
+    readonly transactionHash?: unknown;
+  } | null;
   readonly approved?: { readonly block_timestamp?: unknown } | null;
   readonly [flag: string]: unknown;
 }
@@ -121,8 +109,18 @@ export class AxelarGmpClient implements RailClient {
       throw new RailError(this.rail, "transient", `response was not json: ${describe(cause)}`);
     }
 
-    const rows = Array.isArray(body.data) ? (body.data as GmpRow[]) : [];
-    const row = rows[0];
+    if (!Array.isArray(body.data))
+      throw new RailError(this.rail, "transient", "status API returned an invalid data field");
+    const rows = body.data as GmpRow[];
+    // Match the requested source transaction where the API supplies source/parent identifiers.
+    const hash = transfer.originTx.toLowerCase().replace(/^0x/, "");
+    const matched = rows.filter((item) => {
+      const call = item.call as { transactionHash?: string; parentMessageID?: string } | undefined;
+      const candidates = [call?.transactionHash, call?.parentMessageID?.split("-")[0]];
+      return candidates.some((value) => value?.toLowerCase().replace(/^0x/, "") === hash);
+    });
+    // Prefer the forwarded destination execution over an earlier hub/source status row.
+    const row = matched.find((item) => this.reportFor(item).execution !== undefined) ?? matched[0];
     // An empty array is Axelar's way of saying it has not indexed the transaction yet, and that
     // is what every transfer looks like for its first few blocks.
     if (row === undefined) return { kind: "missing" };
@@ -157,6 +155,17 @@ export class AxelarGmpClient implements RailClient {
       // The message id, because that is what Axelar's support asks for.
       reference: typeof row.message_id === "string" ? row.message_id : null,
       attestedAt: stampOf(row.approved) ?? stampOf(row.executed),
+      ...(typeof row.executed?.transactionHash === "string" &&
+      /^0x[0-9a-fA-F]{64}$/.test(row.executed.transactionHash) &&
+      typeof row.command_id === "string" &&
+      /^0x[0-9a-fA-F]{64}$/.test(row.command_id)
+        ? {
+            execution: {
+              txHash: row.executed.transactionHash as `0x${string}`,
+              commandId: row.command_id as `0x${string}`,
+            },
+          }
+        : {}),
     };
   }
 
@@ -164,10 +173,10 @@ export class AxelarGmpClient implements RailClient {
     const timeout = AbortSignal.timeout(this.options.timeoutMs ?? 15_000);
     const combined = signal === undefined ? timeout : AbortSignal.any([signal, timeout]);
     try {
-      return await this.request(`${this.baseUrl}/gmp/searchGMP`, {
+      return await this.request(this.baseUrl, {
         method: "POST",
         headers: { "content-type": "application/json", accept: "application/json" },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ ...(payload as Record<string, unknown>), method: "searchGMP" }),
         signal: combined,
       });
     } catch (cause) {

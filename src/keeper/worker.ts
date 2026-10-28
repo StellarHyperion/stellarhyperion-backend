@@ -9,9 +9,7 @@ import type { Logger } from "pino";
 import type { AppConfig } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
-import { processRailSecondStep } from "./jobs/second-step.js";
 import { startKeeperQueue, type KeeperHandle } from "./queue.js";
-import type { RailSecondStepPayload, RailSecondStepResult } from "./types.js";
 
 export class KeeperWorker implements ReadinessSource {
   readonly name = "keeper";
@@ -24,13 +22,6 @@ export class KeeperWorker implements ReadinessSource {
     private readonly db: Transactional,
     private readonly logger: Logger,
   ) {}
-
-  async processSecondStep(payload: RailSecondStepPayload = {}): Promise<RailSecondStepResult> {
-    return processRailSecondStep(
-      { db: this.db, config: this.config, logger: this.logger },
-      payload,
-    );
-  }
 
   readiness(): ReadinessReport {
     if (!this.config.keeper.enabled) {
@@ -57,7 +48,7 @@ export class KeeperWorker implements ReadinessSource {
     return {
       name: this.name,
       state: "ready",
-      detail: "active on BullMQ with 4 scheduled upkeep jobs",
+      detail: "active on BullMQ with 2 scheduled Stellar upkeep jobs",
     };
   }
 

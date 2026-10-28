@@ -17,6 +17,14 @@ function faultNames(run: () => unknown): string[] {
 }
 
 describe("loadConfig", () => {
+  it("does not require Redis for a disabled keeper", () => {
+    const env = completeEnv({ KEEPER_ENABLED: "false" });
+    delete env.REDIS_URL;
+    const config = loadConfig({ env });
+    expect(config.keeper.enabled).toBe(false);
+    expect(config.redisUrl).toBe("");
+  });
+
   it("reads a complete environment and a real deployment record", () => {
     const config = loadConfig({ env: completeEnv() });
 

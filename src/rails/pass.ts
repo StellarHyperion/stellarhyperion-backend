@@ -17,11 +17,13 @@
  * the pass records a cooldown and returns without asking anything until it passes. Doubling from a
  * second would spend those five minutes refreshing the block.
  */
+import type { AppConfig } from "../config/config.js";
+import { verifyItsDelivery } from "./axelar/delivery.js";
 import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
-import { writeAttestation } from "../chains/writers.js";
+import { writeInbound, writeAttestation } from "../chains/writers.js";
 import { outstandingForRail, pendingForRail } from "./queue.js";
 import { RailError, isTerminal, type PendingTransfer, type RailClient } from "./types.js";
 
@@ -44,6 +46,7 @@ export interface RailPassOptions {
   readonly recheckAfterMs: number;
   readonly maxCheckFailures: number;
   readonly now?: () => Date;
+  readonly config?: AppConfig;
 }
 
 export interface RailProgress {
@@ -194,6 +197,29 @@ export class RailPass {
     }
 
     const { report } = lookup;
+    if (this.options.config && report.execution) {
+      const verified = await verifyItsDelivery(
+        this.options.config,
+        this.options.db,
+        transfer,
+        report,
+      );
+      if (verified) {
+        await this.options.db.transaction(async (tx) => {
+          await writeInbound(tx, verified.at, verified.row);
+        });
+        await this.write(transfer, {
+          status: "delivered",
+          railStatus: report.railStatus,
+          reference: report.reference,
+          attestedAt: report.attestedAt,
+          checkedAt: at,
+          failures: 0,
+          error: null,
+        });
+        return true;
+      }
+    }
     await this.write(transfer, {
       status: report.status,
       railStatus: report.railStatus,

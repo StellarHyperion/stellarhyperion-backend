@@ -171,7 +171,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // They are not conditional on a router being watched: a transfer indexed by a previous run is
   // still waiting on its rail whether or not this replica is watching the chain it left.
   if (config.rails.enabled) {
-    for (const worker of railWorkers(config.rails, config.network, db, logger)) {
+    for (const worker of railWorkers(config.rails, config.network, db, logger, config)) {
       workers.push(worker);
     }
   } else {
@@ -184,8 +184,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
     );
   }
 
-  // The keeper handles permissionless state progression: TTL bumps, claim settlement,
-  // rail second step, and Axelar gas topups via BullMQ.
+  // The keeper submits Stellar TTL maintenance and claim settlement through BullMQ.
   if (config.keeper.enabled) {
     workers.push(new KeeperWorker(config, db, logger));
   } else {
@@ -242,6 +241,7 @@ function railWorkers(
   network: AppConfig["network"],
   db: Transactional,
   logger: Logger,
+  appConfig: AppConfig,
 ): readonly Worker[] {
   const clients: readonly { readonly route: RouteKind; readonly client: RailClient }[] = [
     {
@@ -265,6 +265,7 @@ function railWorkers(
     const child = logger.child({ rail: client.rail, route });
     const pass = new RailPass({
       route,
+      config: appConfig,
       client,
       db,
       logger: child,

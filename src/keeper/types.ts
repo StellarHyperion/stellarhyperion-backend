@@ -1,78 +1,14 @@
-/**
- * Types and interfaces for Hyperion's background keeper.
- *
- * The keeper is the scheduled job engine that moves transfers forward through the parts of their
- * journey that do not happen on their own:
- * 1. Pushing Soroban storage archival TTLs back before contract entries expire.
- * 2. Settling parked claims whose recipients are ready to receive them.
- * 3. Submitting the second leg on rails that require permissionless relay.
- * 4. Topping up gas on Axelar GMP transfers that ran short.
- *
- * None of these operations require a key that can move user funds. Everything the keeper executes
- * is a public call that anyone can submit.
- */
 import type { Logger } from "pino";
-
 import type { AppConfig } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
-
-export type KeeperJobName = "ttl-bump" | "claim-settlement" | "rail-second-step" | "gas-topup";
-
+export type KeeperJobName = "ttl-bump" | "claim-settlement";
 export interface TtlBumpPayload {
   readonly maxClaims?: number;
   readonly maxTransfers?: number;
 }
-
 export interface ClaimSettlementPayload {
   readonly limit?: number;
 }
-
-export interface MockEvmRpcProvider {
-  readonly writeContract?:
-    | ((args: {
-        address: string;
-        abi?: unknown;
-        functionName: string;
-        args: readonly unknown[];
-      }) => Promise<`0x${string}`>)
-    | undefined;
-  readonly waitForTransactionReceipt?:
-    | ((args: { hash: `0x${string}` }) => Promise<{
-        status: "success" | "reverted";
-        blockNumber: bigint;
-        transactionHash: `0x${string}`;
-        transactionIndex?: number | undefined;
-      }>)
-    | undefined;
-}
-
-export interface MockStellarRpcProvider {
-  readonly submitTransaction?:
-    | ((args: { contractId: string; method: string; args: readonly unknown[] }) => Promise<{
-        status: "SUCCESS" | "FAILED";
-        hash: string;
-        ledger: bigint;
-      }>)
-    | undefined;
-}
-
-export interface RailSecondStepPayload {
-  readonly limit?: number | undefined;
-  readonly attestationFetcher?:
-    | ((
-        originChain: string,
-        originTx: string,
-      ) => Promise<{ message: string; attestation: string } | null>)
-    | undefined;
-  readonly evmRpcProvider?: MockEvmRpcProvider | undefined;
-  readonly stellarRpcProvider?: MockStellarRpcProvider | undefined;
-  readonly destinationContractAddress?: string | undefined;
-}
-
-export interface GasTopupPayload {
-  readonly limit?: number;
-}
-
 export interface TtlBumpResult {
   readonly bumpedTokens: number;
   readonly bumpedClaims: number;
@@ -80,7 +16,6 @@ export interface TtlBumpResult {
   readonly dryRun: boolean;
   readonly detail: string;
 }
-
 export interface ClaimSettlementResult {
   readonly settled: number;
   readonly attempted: number;
@@ -88,27 +23,9 @@ export interface ClaimSettlementResult {
   readonly dryRun: boolean;
   readonly detail: string;
 }
-
-export interface RailSecondStepResult {
-  readonly relayed: number;
-  readonly pending: number;
-  readonly dryRun: boolean;
-  readonly detail: string;
-}
-
-export interface GasTopupResult {
-  readonly toppedUp: number;
-  readonly pending: number;
-  readonly dryRun: boolean;
-  readonly detail: string;
-}
-
 export type KeeperJobResult =
   | { readonly kind: "ttl-bump"; readonly result: TtlBumpResult }
-  | { readonly kind: "claim-settlement"; readonly result: ClaimSettlementResult }
-  | { readonly kind: "rail-second-step"; readonly result: RailSecondStepResult }
-  | { readonly kind: "gas-topup"; readonly result: GasTopupResult };
-
+  | { readonly kind: "claim-settlement"; readonly result: ClaimSettlementResult };
 export interface KeeperContext {
   readonly db: Transactional;
   readonly config: AppConfig;

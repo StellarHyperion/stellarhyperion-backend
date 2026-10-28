@@ -1,82 +1,56 @@
-/**
- * Claim settlement keeper job.
- *
- * Parked claims occur when a cross-chain transfer reaches its destination chain but the recipient
- * cannot directly accept the token at delivery time (for instance, an uninitialized contract or
- * a recipient without a trustline). The money is safely parked in the router contract and indexed
- * in the `pending_claim` table.
- *
- * Settle claim is permissionless: anyone can trigger delivery to the intended recipient once they
- * become ready. The keeper periodically scans for unsettled claims and attempts settlement.
- */
-import { bigintOf, integer, text } from "../../db/rows.js";
+import { Address, nativeToScVal } from "@stellar/stellar-sdk";
+import { bigintOf } from "../../db/rows.js";
+import { submitStellar } from "../stellar.js";
 import type { ClaimSettlementPayload, ClaimSettlementResult, KeeperContext } from "../types.js";
-
-const DEFAULT_LIMIT = 20;
-
-export interface UnsettledClaim {
-  readonly id: bigint;
-  readonly chain: string;
-  readonly claimId: bigint;
-  readonly recipient: string;
-  readonly token: string;
-  readonly amount: bigint;
-  readonly route: number;
-}
-
 export async function processClaimSettlement(
   ctx: KeeperContext,
   payload: ClaimSettlementPayload = {},
 ): Promise<ClaimSettlementResult> {
-  const { db, config, logger } = ctx;
-  const limit = payload.limit ?? DEFAULT_LIMIT;
-
-  const { rows } = await db.query(
-    `SELECT id, chain, claim_id, recipient, token, amount, route
-       FROM pending_claim
-      WHERE settled = false
-      ORDER BY id ASC
-      LIMIT $1`,
-    [limit],
+  const chain = ctx.config.indexer.stellar;
+  if (!chain)
+    return {
+      settled: 0,
+      attempted: 0,
+      pending: 0,
+      dryRun: true,
+      detail: "No Stellar deployment configured.",
+    };
+  const { rows } = await ctx.db.query(
+    "SELECT claim_id FROM pending_claim WHERE chain = $1 AND NOT settled ORDER BY claim_id ASC LIMIT $2",
+    [chain.chain, payload.limit ?? 20],
   );
-
-  const claims: UnsettledClaim[] = rows.map((row) => ({
-    id: bigintOf(row, "id"),
-    chain: text(row, "chain"),
-    claimId: bigintOf(row, "claim_id"),
-    recipient: text(row, "recipient"),
-    token: text(row, "token"),
-    amount: bigintOf(row, "amount"),
-    route: integer(row, "route"),
-  }));
-
-  const hasSigner = config.keeper.stellarSecret !== null || config.keeper.evmPrivateKey !== null;
-  const dryRun = !hasSigner;
-
-  logger.info({ unsettledCount: claims.length, dryRun }, "evaluating parked claims for settlement");
-
-  const settled = 0;
-  let attempted = 0;
-
-  for (const claim of claims) {
-    attempted += 1;
-    logger.debug(
-      { claimId: claim.claimId.toString(), chain: claim.chain, recipient: claim.recipient },
-      "checking parked claim",
-    );
-    // If signer configured, actual settlement transaction is dispatched;
-    // in dry-run mode, we report attempted evaluation.
+  if (!ctx.config.keeper.stellarSecret)
+    return {
+      settled: 0,
+      attempted: 0,
+      pending: rows.length,
+      dryRun: true,
+      detail: "No signer configured; no settlement was attempted.",
+    };
+  let settled = 0;
+  for (const row of rows) {
+    const id = bigintOf(row, "claim_id");
+    try {
+      const hash = await submitStellar(
+        ctx.config,
+        chain.routerContractId,
+        "settle_claim",
+        (sender) => [new Address(sender).toScVal(), nativeToScVal(id, { type: "u64" })],
+      );
+      ctx.logger.info(
+        { claimId: String(id), hash },
+        "claim settlement confirmed; watcher will update the claim record",
+      );
+      settled += 1;
+    } catch (error) {
+      ctx.logger.warn({ err: error, claimId: String(id) }, "claim is not ready for settlement");
+    }
   }
-
-  const detail = dryRun
-    ? `dry-run: found ${String(claims.length)} unsettled claims awaiting recipient readiness`
-    : `settled ${String(settled)} of ${String(attempted)} claims (${String(claims.length)} pending)`;
-
   return {
     settled,
-    attempted,
-    pending: claims.length,
-    dryRun,
-    detail,
+    attempted: rows.length,
+    pending: rows.length - settled,
+    dryRun: false,
+    detail: `${settled} confirmed settlements of ${rows.length} attempts.`,
   };
 }
