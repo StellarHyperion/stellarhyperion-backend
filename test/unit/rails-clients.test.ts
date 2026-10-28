@@ -539,4 +539,82 @@ describe("Axelar's GMP status", () => {
     expect(result.kind).toBe("found");
     if (result.kind === "found") expect(result.report.execution).toEqual({ txHash, commandId });
   });
+
+  it("follows a hub child when the source lookup contains no destination row", async () => {
+    const parentId = `${TRANSFER.originTx}-5`;
+    const childTx = `0x${"ef".repeat(32)}`;
+    const childId = `${childTx}-123`;
+    const destinationHash = `0x${"cd".repeat(32)}`;
+    const commandId = `0x${"12".repeat(32)}`;
+    const responses = [
+      {
+        data: [
+          {
+            id: parentId,
+            call: { transactionHash: TRANSFER.originTx },
+            status: "executed",
+            executed: { childMessageIDs: [childId] },
+          },
+        ],
+      },
+      {
+        data: [
+          {
+            id: childId,
+            call: { parentMessageID: parentId },
+            status: "executed",
+            command_id: commandId,
+            executed: { transactionHash: destinationHash },
+          },
+        ],
+      },
+    ];
+    const calls: unknown[] = [];
+    const fetch = ((_input: unknown, init?: RequestInit) => {
+      if (typeof init?.body !== "string") throw new Error("Expected JSON request body");
+      calls.push(JSON.parse(init.body) as unknown);
+      return Promise.resolve(new Response(JSON.stringify(responses.shift())));
+    }) as typeof globalThis.fetch;
+    const result = await new AxelarGmpClient(BASE, { fetch }).look(TRANSFER);
+    expect(calls).toEqual([
+      { method: "searchGMP", txHash: TRANSFER.originTx },
+      { method: "searchGMP", txHash: childTx },
+    ]);
+    expect(result.kind).toBe("found");
+    if (result.kind === "found")
+      expect(result.report.execution).toEqual({ txHash: destinationHash, commandId });
+  });
+
+  it("refuses an unrelated child even when the API returns a successful destination receipt", async () => {
+    const parentId = `${TRANSFER.originTx}-5`;
+    const childId = `0x${"ef".repeat(32)}-123`;
+    const responses = [
+      {
+        data: [
+          {
+            id: parentId,
+            call: { transactionHash: TRANSFER.originTx },
+            status: "executed",
+            executed: { childMessageIDs: [childId] },
+          },
+        ],
+      },
+      {
+        data: [
+          {
+            id: childId,
+            call: { parentMessageID: "wrong-parent" },
+            status: "executed",
+            command_id: `0x${"12".repeat(32)}`,
+            executed: { transactionHash: `0x${"cd".repeat(32)}` },
+          },
+        ],
+      },
+    ];
+    const fetch = (() =>
+      Promise.resolve(new Response(JSON.stringify(responses.shift())))) as typeof globalThis.fetch;
+    const result = await new AxelarGmpClient(BASE, { fetch }).look(TRANSFER);
+    expect(result.kind).toBe("found");
+    if (result.kind === "found") expect(result.report.execution).toBeUndefined();
+  });
 });

@@ -60,10 +60,13 @@ interface GmpRow {
   readonly status?: unknown;
   readonly simplified_status?: unknown;
   readonly message_id?: unknown;
+  readonly id?: unknown;
+  readonly call?: { readonly transactionHash?: unknown; readonly parentMessageID?: unknown } | null;
   readonly command_id?: unknown;
   readonly executed?: {
     readonly block_timestamp?: unknown;
     readonly transactionHash?: unknown;
+    readonly childMessageIDs?: unknown;
   } | null;
   readonly approved?: { readonly block_timestamp?: unknown } | null;
   readonly [flag: string]: unknown;
@@ -92,40 +95,64 @@ export class AxelarGmpClient implements RailClient {
   }
 
   async look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup> {
-    const response = await this.send({ txHash: transfer.originTx }, signal);
+    const rows = await this.rowsFor(transfer.originTx, signal);
+    const hash = normalized(transfer.originTx);
+    const matched = rows.filter((item) =>
+      [
+        item.call?.transactionHash,
+        typeof item.call?.parentMessageID === "string"
+          ? item.call.parentMessageID.split("-")[0]
+          : undefined,
+      ].some((value) => normalized(value) === hash),
+    );
+    const executed = matched.find((item) => this.reportFor(item).execution !== undefined);
+    if (executed) return { kind: "found", report: this.reportFor(executed) };
+    let selected = matched[0];
+    // A Stellar ITS call executes first on the hub. The source lookup may return only that row.
+    // Follow the explicitly linked child, and require its parent and message id to match.
+    let remaining = 4;
+    for (const parent of matched) {
+      const parentId = typeof parent.message_id === "string" ? parent.message_id : parent.id;
+      const children = parent.executed?.childMessageIDs;
+      if (typeof parentId !== "string" || !Array.isArray(children)) continue;
+      for (const childId of children) {
+        if (remaining <= 0) break;
+        if (typeof childId !== "string" || !/^0x[0-9a-fA-F]{64}-\d+$/.test(childId)) continue;
+        remaining -= 1;
+        const forwarded = await this.rowsFor(childId.split("-")[0] ?? "", signal);
+        const child = forwarded.find(
+          (item) =>
+            normalized(item.call?.parentMessageID) === normalized(parentId) &&
+            normalized(item.message_id ?? item.id) === normalized(childId),
+        );
+        if (!child) continue;
+        if (this.reportFor(child).execution)
+          return { kind: "found", report: this.reportFor(child) };
+        selected = child;
+      }
+    }
+    return selected ? { kind: "found", report: this.reportFor(selected) } : { kind: "missing" };
+  }
 
-    if (response.status === 429) {
+  private async rowsFor(txHash: string, signal?: AbortSignal): Promise<GmpRow[]> {
+    const response = await this.send({ txHash }, signal);
+    if (response.status === 429)
       throw new RailError(this.rail, "rateLimited", "rate limited", 60_000);
-    }
-    if (!response.ok) {
-      const kind = response.status >= 500 ? "transient" : "permanent";
-      throw new RailError(this.rail, kind, `http ${String(response.status)}`);
-    }
-
+    if (!response.ok)
+      throw new RailError(
+        this.rail,
+        response.status >= 500 ? "transient" : "permanent",
+        `http ${String(response.status)}`,
+      );
     let body: { readonly data?: unknown };
     try {
       body = (await response.json()) as { readonly data?: unknown };
     } catch (cause) {
       throw new RailError(this.rail, "transient", `response was not json: ${describe(cause)}`);
     }
-
     if (!Array.isArray(body.data))
       throw new RailError(this.rail, "transient", "status API returned an invalid data field");
-    const rows = body.data as GmpRow[];
-    // Match the requested source transaction where the API supplies source/parent identifiers.
-    const hash = transfer.originTx.toLowerCase().replace(/^0x/, "");
-    const matched = rows.filter((item) => {
-      const call = item.call as { transactionHash?: string; parentMessageID?: string } | undefined;
-      const candidates = [call?.transactionHash, call?.parentMessageID?.split("-")[0]];
-      return candidates.some((value) => value?.toLowerCase().replace(/^0x/, "") === hash);
-    });
-    // Prefer the forwarded destination execution over an earlier hub/source status row.
-    const row = matched.find((item) => this.reportFor(item).execution !== undefined) ?? matched[0];
-    // An empty array is Axelar's way of saying it has not indexed the transaction yet, and that
-    // is what every transfer looks like for its first few blocks.
-    if (row === undefined) return { kind: "missing" };
-
-    return { kind: "found", report: this.reportFor(row) };
+    return body.data as GmpRow[];
   }
 
   private reportFor(row: GmpRow): RailReport {
@@ -202,3 +229,7 @@ function describe(cause: unknown): string {
 }
 
 export { MAPPING as AXELAR_STATUS_MAPPING, FATAL_FLAGS, RECOVERABLE_FLAGS };
+
+function normalized(value: unknown): string {
+  return typeof value === "string" ? value.toLowerCase().replace(/^0x/, "") : "";
+}
