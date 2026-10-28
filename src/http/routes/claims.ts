@@ -55,7 +55,7 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
     ) => {
       const { chain, claimId } = request.params;
       const { rows } = await db.query(
-        `SELECT id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
+        `SELECT chain || ':' || claim_id::text AS id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
                 created_at, settled, observed_at
            FROM pending_claim
           WHERE chain = $1 AND claim_id = $2
@@ -118,11 +118,11 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       const offsetClause = `OFFSET $${String(params.length)}`;
 
       const { rows } = await db.query(
-        `SELECT id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
+        `SELECT chain || ':' || claim_id::text AS id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
                 created_at, settled, observed_at
            FROM pending_claim
           ${whereClause}
-          ORDER BY id DESC
+          ORDER BY chain ASC, claim_id DESC
           ${limitClause}
           ${offsetClause}`,
         params,

@@ -40,7 +40,7 @@ export function registerRouteHealthRoutes(app: FastifyInstance, deps: ServerDeps
               available,
               blocker,
               flow_available,
-              observed_at
+              sampled_at AS observed_at
          FROM route_health
         ORDER BY origin_chain, destination_chain, route, token, id DESC`,
     );

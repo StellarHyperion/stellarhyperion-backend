@@ -459,7 +459,7 @@ describe("REST API endpoints", () => {
           },
         ],
       };
-    }, 40);
+    }, 1400);
 
     setTimeout(() => {
       db.queryMap = {
@@ -472,7 +472,7 @@ describe("REST API endpoints", () => {
           },
         ],
       };
-    }, 80);
+    }, 6200);
 
     const res = await injectPromise;
     expect(res.statusCode).toBe(200);
@@ -482,7 +482,7 @@ describe("REST API endpoints", () => {
     expect(res.payload).toContain("event: complete");
     expect(res.payload).toContain('"stage":"delivering"');
     expect(res.payload).toContain('"stage":"delivered"');
-  });
+  }, 10_000);
 
   it("closes connection gracefully on client abort", async () => {
     const db = new MockDb({

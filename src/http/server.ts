@@ -1,12 +1,4 @@
-/**
- * The HTTP surface, which for now is two probes and nothing else.
- *
- * B7 adds the transfer status API on top of this. The shape it slots into is already here: the
- * server takes its dependencies as an argument rather than importing them, so a route added later
- * gets the same database handle the watchers are using and a test can build the whole server
- * without a process environment.
- */
-import Fastify from "fastify";
+import Fastify, { LogController } from "fastify";
 import type { FastifyBaseLogger, FastifyError, FastifyInstance } from "fastify";
 import type { Logger } from "pino";
 
@@ -52,9 +44,17 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // A request id that survives into every log line for that request. Fastify generates one;
     // naming the header means a caller can supply theirs and have it show up in our logs.
     requestIdHeader: "x-request-id",
-    disableRequestLogging: deps.config.nodeEnv === "test",
+    logController: new LogController({ disableRequestLogging: deps.config.nodeEnv === "test" }),
     bodyLimit: 64 * 1024,
   });
+
+  // This API exposes public chain data and never accepts a signed transaction or a key.
+  app.addHook("onRequest", async (_request, reply) => {
+    reply.header("Access-Control-Allow-Origin", "*");
+    reply.header("Access-Control-Allow-Methods", "GET, OPTIONS");
+    reply.header("Access-Control-Allow-Headers", "Accept, Content-Type");
+  });
+  app.options("/*", async (_request, reply) => reply.code(204).send());
 
   void app.register(rateLimit, {
     max: 120,

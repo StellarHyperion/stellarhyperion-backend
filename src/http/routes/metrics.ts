@@ -47,7 +47,7 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
 
     // 5. Watcher cursor positions
     const cursorResult = await db.query(
-      "SELECT chain_key, cursor_block, cursor_hash, updated_at FROM indexer_cursor",
+      "SELECT chain_key, last_processed AS cursor_block, last_processed_hash AS cursor_hash, updated_at FROM indexer_cursor",
     );
     const cursors = cursorResult.rows.map((row) => ({
       chain: text(row, "chain_key"),

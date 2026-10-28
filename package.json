@@ -45,6 +45,7 @@
     "viem": "^2.57.2"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.12",
     "@types/ioredis": "^4.28.10",
     "@types/node": "^24.19.0",
     "@types/pg": "^8.15.6",

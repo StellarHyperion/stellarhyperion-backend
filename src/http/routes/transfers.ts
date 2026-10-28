@@ -1,3 +1,5 @@
+import { isChainKey } from "@hyperion/protocol";
+import type { AppConfig } from "../../config/config.js";
 /**
  * Transfer status and lookup REST API endpoints.
  *
@@ -31,6 +33,8 @@ export interface FormattedTransfer {
     readonly nonce: string;
     readonly sender: string;
     readonly token: string;
+    readonly symbol: string | null;
+    readonly decimals: number | null;
     readonly grossAmount: string;
     readonly fee: string;
     readonly netAmount: string;
@@ -71,7 +75,7 @@ function deriveStage(
   if (delivered) {
     return "delivered";
   }
-  if (railStatus === "failed") {
+  if (railStatus === "failed" || railStatus === "expired") {
     return "failed";
   }
   if (railStatus === "attested") {
@@ -83,7 +87,18 @@ function deriveStage(
   return "initiated";
 }
 
-function formatRow(row: Record<string, unknown>): FormattedTransfer {
+function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTransfer {
+  const chain = text(row, "origin_chain");
+  const token = text(row, "token");
+  const deployment = isChainKey(chain) ? config.deployments.networks[chain] : undefined;
+  const entry = deployment
+    ? Object.entries(
+        deployment.tokens as Record<string, { sacId?: string; address?: string; decimals: number }>,
+      ).find(([, asset]) => {
+        const value = asset.sacId ?? asset.address;
+        return value?.toLowerCase() === token.toLowerCase();
+      })
+    : undefined;
   const delivered = row.inbound_delivered === true;
   const hasClaim = row.claim_id !== null && row.claim_id !== undefined;
   const claimSettled = row.claim_settled === true;
@@ -99,7 +114,9 @@ function formatRow(row: Record<string, unknown>): FormattedTransfer {
       chain: text(row, "origin_chain"),
       nonce: text(row, "nonce"),
       sender: text(row, "sender"),
-      token: text(row, "token"),
+      token,
+      symbol: entry?.[0] ?? null,
+      decimals: entry?.[1].decimals ?? null,
       grossAmount: text(row, "gross_amount"),
       fee: text(row, "fee"),
       netAmount: text(row, "net_amount"),
@@ -191,7 +208,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
   const queryTransferById = async (id: string): Promise<FormattedTransfer | null> => {
     const { rows } = await db.query(`${TRANSFER_QUERY} WHERE t.id = $1 LIMIT 1`, [id]);
     const row = rows[0];
-    return row !== undefined ? formatRow(row) : null;
+    return row !== undefined ? formatRow(row, deps.config) : null;
   };
 
   // 1. Look up by originChain and nonce
@@ -215,7 +232,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         });
       }
 
-      return reply.send(formatRow(row));
+      return reply.send(formatRow(row, deps.config));
     },
   );
 
@@ -237,7 +254,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         });
       }
 
-      return reply.send(formatRow(row));
+      return reply.send(formatRow(row, deps.config));
     },
   );
 
@@ -290,8 +307,8 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     let lastSerialized = JSON.stringify(initial);
     let closed = false;
 
-    const pollInterval = Math.max(Number(request.query.pollIntervalMs) || 1000, 10);
-    const heartbeatInterval = Math.max(Number(request.query.heartbeatIntervalMs) || 15000, 10);
+    const pollInterval = Math.max(Number(request.query.pollIntervalMs) || 1000, 1000);
+    const heartbeatInterval = Math.max(Number(request.query.heartbeatIntervalMs) || 15000, 5000);
 
     let pollTimer: ReturnType<typeof setInterval> | null = null;
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -381,13 +398,14 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
           route?: string;
           sender?: string;
           recipient?: string;
+          search?: string;
           limit?: string;
           offset?: string;
         };
       }>,
       reply: FastifyReply,
     ) => {
-      const { originChain, destinationChain, route, sender, recipient, limit, offset } =
+      const { originChain, destinationChain, route, sender, recipient, search, limit, offset } =
         request.query;
 
       const conditions: string[] = [];
@@ -414,6 +432,14 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         conditions.push(`t.destination = $${String(params.length)}`);
       }
 
+      if (search?.trim()) {
+        params.push(`%${search.trim()}%`);
+        const parameter = `$${String(params.length)}`;
+        conditions.push(
+          `(t.origin_tx ILIKE ${parameter} OR d.destination_tx ILIKE ${parameter} OR t.sender ILIKE ${parameter} OR t.destination ILIKE ${parameter} OR t.nonce::text ILIKE ${parameter})`,
+        );
+      }
+
       const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
       const parsedLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
       const parsedOffset = Math.max(Number(offset) || 0, 0);
@@ -429,7 +455,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       );
 
       return reply.send({
-        transfers: rows.map(formatRow),
+        transfers: rows.map((row) => formatRow(row, deps.config)),
         limit: parsedLimit,
         offset: parsedOffset,
         count: rows.length,

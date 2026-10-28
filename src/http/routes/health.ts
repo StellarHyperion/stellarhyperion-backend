@@ -84,7 +84,9 @@ async function checkRedis(deps: ServerDeps): Promise<ReadinessReport> {
   if (deps.redis !== undefined) {
     return checkRedisHealth(deps.redis, { workers: deps.bullmqWorkers });
   }
-  return { name: "redis", state: "down", detail: "redis client not configured or unreachable" };
+  return deps.config.keeper.enabled
+    ? { name: "redis", state: "down", detail: "redis client not configured or unreachable" }
+    : { name: "redis", state: "ready", detail: "not required: keeper is disabled" };
 }
 
 function messageOf(error: unknown): string {

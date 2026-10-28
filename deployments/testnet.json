@@ -16,9 +16,7 @@
           "issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
           "decimals": 7,
           "flowLimit": "10000000000000",
-          "routes": [
-            "axelar-its"
-          ]
+          "routes": ["axelar-its"]
         }
       },
       "treasury": "GCHPVETUL5E4YKDLMRIBFUGFK4PMYOVKPFALVSYMP2QDYAVBA3ITQDAI",
@@ -38,12 +36,7 @@
       "commit": "ee4f419384f77bf9da0e594f4d6a48d0690385cf",
       "deployer": "GCHPVETUL5E4YKDLMRIBFUGFK4PMYOVKPFALVSYMP2QDYAVBA3ITQDAI",
       "peerChain": "arc-testnet",
-      "queuedActionIds": [
-        1,
-        2,
-        3,
-        7
-      ],
+      "queuedActionIds": [1, 2, 3, 7],
       "queuedActions": [
         "register USDC",
         "set axelar adapter",
