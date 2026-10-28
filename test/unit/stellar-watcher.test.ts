@@ -174,6 +174,29 @@ describe("the page and the cursor as one commit", () => {
     expect(watcher.progress).toBeNull();
   });
 
+  it("indexes current RPC events without the removed success flag", async () => {
+    const queued = ROUTER_HISTORY.find((event) => event.topicJson[1]?.symbol === "queued");
+    if (!queued) throw new Error("Missing captured queued event");
+    const unflagged = { ...queued };
+    delete unflagged.inSuccessfulContractCall;
+    const { watcher, db } = harness({ events: [unflagged], startLedger: FIRST_EVENT_LEDGER });
+    await watcher.tick(AbortSignal.timeout(5_000));
+    expect(watcher.progress?.decoded).toBe(1);
+    expect(db.matching("INSERT INTO admin_action")).toHaveLength(1);
+  });
+
+  it("never indexes diagnostic events even when a legacy flag is true", async () => {
+    const queued = ROUTER_HISTORY.find((event) => event.topicJson[1]?.symbol === "queued");
+    if (!queued) throw new Error("Missing captured queued event");
+    const { watcher, db } = harness({
+      events: [{ ...queued, type: "diagnostic" }],
+      startLedger: FIRST_EVENT_LEDGER,
+    });
+    await watcher.tick(AbortSignal.timeout(5_000));
+    expect(watcher.progress?.decoded).toBe(0);
+    expect(db.matching("INSERT INTO admin_action")).toHaveLength(0);
+  });
+
   it("skips an event from a reverted call rather than recording a transfer that never happened", async () => {
     const reverted = {
       ...syntheticEvent({ ledger: FIRST_EVENT_LEDGER + 1 }),

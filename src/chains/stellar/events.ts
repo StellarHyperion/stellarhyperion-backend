@@ -38,13 +38,8 @@ export interface RawStellarEvent {
   readonly txHash: string;
   readonly operationIndex: number;
   readonly transactionIndex: number;
-  /**
-   * Whether the call that emitted this actually succeeded.
-   *
-   * Load bearing. Soroban reports events from reverted calls too, and indexing one would record a
-   * transfer that never happened. Nothing downstream can tell the difference afterwards.
-   */
-  readonly inSuccessfulContractCall: boolean;
+  /** Legacy RPC success flag. Current getEvents omits it and excludes diagnostic events. */
+  readonly inSuccessfulContractCall?: boolean;
   readonly topicJson: readonly ScValJson[];
   readonly valueJson: ScValJson;
 }

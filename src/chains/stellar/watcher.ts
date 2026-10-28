@@ -189,9 +189,10 @@ export class StellarWatcher {
     // would turn every crash into either a lost page or a duplicated one.
     await db.transaction(async (tx: Queryable) => {
       for (const raw of scan.events) {
-        if (!raw.inSuccessfulContractCall) {
-          // Soroban reports events from reverted calls too. Indexing one would record a transfer
-          // that never happened, and nothing downstream could tell afterwards.
+        if (raw.type !== "contract" || raw.inSuccessfulContractCall === false) {
+          // getEvents no longer returns the deprecated success flag (RPC30).
+          // Diagnostic events are excluded by current RPC; retain legacy explicit-failure checks.
+          // https://github.com/stellar/stellar-rpc/releases/tag/v30.0.0
           skipped += 1;
           continue;
         }
