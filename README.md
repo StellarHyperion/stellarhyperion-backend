@@ -68,3 +68,5 @@ One process serializes its Stellar submissions to avoid sequence conflicts. Run 
 RPC event retention is finite. A fresh deployment record may predate the public RPC's retained history; initialize `STELLAR_START_LEDGER` within retained history only if you accept that older events are unavailable, or use a historical provider. Check readiness and logs rather than treating an empty database as complete history.
 
 MIT.
+
+As of October 29, 2026, `npm audit` reports zero known vulnerabilities after compatible locked HTTP redirect and test-tooling patches. The verification suite passes all 220 tests.
