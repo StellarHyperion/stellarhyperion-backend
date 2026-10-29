@@ -106,4 +106,22 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     expect(quoted.statusCode).toBe(200);
     expect(quoted.json().transfers).toHaveLength(0);
   });
+  it("reports the actual native-USDC payout after Circle fees in destination precision", async () => {
+    const source = config.deployments.networks["stellar-testnet"];
+    if (source?.family !== "stellar" || !source.tokens.USDC)
+      throw new Error("Missing test deployment.");
+    await pg.query(
+      `INSERT INTO outbound_transfer (origin_chain,route,nonce,sender,token,gross_amount,fee,net_amount,destination_chain,destination,origin_block,origin_tx)
+      VALUES ('stellar-testnet',0,43,'Gsender',$1,10000000,30000,9970000,'sepolia','0x0000000000000000000000006ef8032ffe4943f27388172549f6700f18bb8b38',124,'cctp-source')`,
+      [source.tokens.USDC.sacId],
+    );
+    await pg.query(`INSERT INTO inbound_delivery(destination_chain,route,source_chain,source_nonce,recipient,token,amount,delivered,destination_block,destination_tx)
+      VALUES ('sepolia',0,'stellar-testnet',43,'0x6ef8032ffe4943f27388172549f6700f18bb8b38','0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238',897000,true,400,'cctp-mint')`);
+    const response = await app.inject("/v1/transfers/by-tx/cctp-source");
+    expect(response.statusCode).toBe(200);
+    expect(response.json().destination.amount).toBe("897000");
+    expect(response.json().destination.decimals).toBe(6);
+    expect(response.json().destination.symbol).toBe("USDC");
+    expect(response.json().origin.netAmount).toBe("9970000");
+  });
 });

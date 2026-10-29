@@ -1,4 +1,4 @@
-import { CHAINS, isChainKey, isEvmChain, toEvmAddress } from "@hyperion/protocol";
+import { CHAINS, assetOn, isChainKey, isEvmChain, toEvmAddress } from "@hyperion/protocol";
 import type { AppConfig } from "../../config/config.js";
 /**
  * Transfer status and lookup REST API endpoints.
@@ -43,6 +43,10 @@ export interface FormattedTransfer {
     readonly observedAt: string;
   };
   readonly destination: {
+    readonly token: string | null;
+    readonly amount: string | null;
+    readonly symbol: string | null;
+    readonly decimals: number | null;
     readonly chain: string;
     readonly recipient: string;
     readonly delivered: boolean;
@@ -108,6 +112,19 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
       })
     : undefined;
   const delivered = row.inbound_delivered === true;
+  const receivedToken = textOrNull(row, "received_token");
+  const destinationAsset =
+    isChainKey(destinationChain) && entry ? assetOn(destinationChain, entry[0]) : null;
+  const nativeMetadata =
+    destinationAsset?.family === "evm" &&
+    destinationAsset.address.toLowerCase() === receivedToken?.toLowerCase()
+      ? { symbol: destinationAsset.symbol, decimals: destinationAsset.decimals }
+      : null;
+  const receivedMetadata =
+    nativeMetadata ??
+    (receivedToken && integer(row, "route") === 1 && entry && chain === "stellar-testnet"
+      ? { symbol: `${entry[0]} (ITS)`, decimals: entry[1].decimals }
+      : null);
   const hasClaim = row.claim_id !== null && row.claim_id !== undefined;
   const claimSettled = row.claim_settled === true;
   const railStatus = textOrNull(row, "attestation_status");
@@ -133,6 +150,10 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
       observedAt: new Date(row.observed_at as string | number | Date).toISOString(),
     },
     destination: {
+      token: receivedToken,
+      amount: textOrNull(row, "received_amount"),
+      symbol: receivedMetadata?.symbol ?? null,
+      decimals: receivedMetadata?.decimals ?? null,
       chain: destinationChain,
       recipient,
       delivered,
@@ -187,6 +208,8 @@ const TRANSFER_QUERY = `
          d.delivered AS inbound_delivered,
          d.destination_block,
          d.destination_tx,
+         d.token AS received_token,
+         d.amount AS received_amount,
          d.observed_at AS delivered_at,
          c.claim_id,
          c.settled AS claim_settled
