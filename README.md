@@ -25,11 +25,11 @@ A continuously running process must run the watchers and rail pollers. Deploying
 
 The `hyperion-backend` Vercel project serves [stellarhyperion-backend.vercel.app](https://stellarhyperion-backend.vercel.app). Configure its production `DATABASE_URL` through Vercel environment variables with a managed PostgreSQL connection and TLS. Keep the value server-side. Redis and signing keys are unnecessary while `KEEPER_ENABLED=false`.
 
-`vercel.json` includes the deployment metadata in the API function and declares one production `indexer` daemon. Its Docker image builds the current backend, runs the repository's pending SQL migrations, then continuously indexes source events and verifies bridge deliveries. The API and worker share the configured database. The worker handles shutdown signals and resumes from the persisted cursor. Daemon storage is ephemeral; PostgreSQL is the durable state. Vercel plan quotas apply to the running worker.
+`vercel.json` includes the deployment metadata in the API function. Production indexing runs in [the testnet indexer workflow](.github/workflows/indexer.yml), independently of requests to the API. Store the same database connection as the repository Actions secret `HYPERION_DATABASE_URL`. Each run applies pending SQL migrations and runs the real indexer and bridge pollers for 150 seconds, with graceful shutdown and a persisted PostgreSQL cursor. The concurrency group prevents overlapping hosted jobs. No signer is configured.
 
-Deploy from this repository with `vercel deploy --prod`. Check `/ready`, `/v1/metrics` and worker logs after deployment. The cursor must continue advancing without browser requests, and actual transfer records must survive process restarts. A health response alone does not establish working database access or indexing. Preview environments require their own database; never point an unreviewed preview worker at production.
+The workflow is scheduled every five minutes and can be started manually. GitHub may delay scheduled runs; public Activity is eventually updated rather than an instant destination feed. Inspect its latest run and `/v1/metrics` cursor timestamps to check freshness. API `/ready` verifies its database access; the serverless API does not run chain watchers itself. The optional Dockerfile packages the same service for an always-running container host.
 
-[Daemon configuration](https://vercel.com/docs/daemons) and [managed Postgres connections](https://vercel.com/docs/postgres) are documented by Vercel.
+Deploy the API with `vercel deploy --prod`. Preview environments require their own database. Database credentials stay in Vercel and GitHub secrets, never in browser configuration, Git or logs. The managed PostgreSQL database is the durable state; restarting a worker must not repeat source transfers.
 
 ## What establishes status
 

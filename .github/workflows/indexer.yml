@@ -1,0 +1,51 @@
+name: testnet-indexer
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/indexer.yml"
+      - "src/**"
+      - "migrations/**"
+      - "deployments/testnet.json"
+      - "package*.json"
+      - "hyperion-protocol-0.1.0.tgz"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hyperion-testnet-indexer
+  cancel-in-progress: false
+
+jobs:
+  catch-up:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      DATABASE_URL: ${{ secrets.HYPERION_DATABASE_URL }}
+      HYPERION_NETWORK: testnet
+      HYPERION_DEPLOYMENTS_FILE: ./deployments/testnet.json
+      INDEXER_ENABLED: "true"
+      RAILS_ENABLED: "true"
+      KEEPER_ENABLED: "false"
+      NODE_ENV: production
+      HTTP_HOST: 127.0.0.1
+      HTTP_PORT: "8080"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.22.1
+          cache: npm
+      - name: Require the server-side database connection
+        run: test -n "$DATABASE_URL"
+      - name: Install and build
+        run: npm ci && npm run build
+      - name: Apply pending migrations
+        run: npm run migrate:up
+      - name: Index source events and verify destination payments
+        run: timeout --signal=TERM --kill-after=20s 150s node dist/main.js || test "$?" -eq 124

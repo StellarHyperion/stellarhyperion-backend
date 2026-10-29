@@ -5,15 +5,6 @@
   "functions": {
     "api/index.ts": { "includeFiles": "deployments/**" }
   },
-  "daemons": {
-    "indexer": {
-      "root": ".",
-      "entrypoint": "Dockerfile",
-      "instances": { "iad1": 1 },
-      "resources": { "requests": { "memory": "1Gi" } },
-      "terminationGracePeriodSeconds": 30
-    }
-  },
   "rewrites": [
     {
       "source": "/(.*)",
