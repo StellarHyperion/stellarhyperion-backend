@@ -4,6 +4,12 @@
 
 Indexes Hyperion contract events, serves public transfer/claim history, polls rail status and optionally submits Stellar maintenance transactions. The checked-in deployment is the Stellar Testnet router. Active routes deliver Stellar USDC through Axelar ITS to Ethereum Sepolia, or through Circle CCTP to native USDC on Ethereum Sepolia, Base Sepolia and Arc Testnet. The frontend can first convert other liquid classic Stellar assets into USDC. The wallet-owned deployment is active; signed deployment and successful transfer evidence are described in the contracts repository's `docs/TESTNET_ACTIVATION.md`.
 
+## Changes since October 12, 2026
+
+- Corrected transfer, claim, health and metrics queries against the migrated schema, plus Stellar RPC retention/error handling. Regression tests run the actual migrations in embedded PostgreSQL.
+- Added independent destination-receipt verification for paid ITS and CCTP, including recipient, token identity, amount, finality and confirmations. API history exposes the actual destination payout and its precision.
+- Published the API with persistent managed PostgreSQL and a scheduled catch-up indexer, and added signer-backed Stellar maintenance for optional keeper deployments. Compatible dependency patches resolved the reported HTTP redirect and test-tooling advisories.
+
 ## Run
 
 Use Node 22.13 or newer. PostgreSQL is required. Redis is used only when the keeper is enabled.
@@ -67,6 +73,12 @@ One process serializes its Stellar submissions to avoid sequence conflicts. Run 
 
 RPC event retention is finite. A fresh deployment record may predate the public RPC's retained history; initialize `STELLAR_START_LEDGER` within retained history only if you accept that older events are unavailable, or use a historical provider. Check readiness and logs rather than treating an empty database as complete history.
 
-MIT.
+## Verified testnet status
 
-As of October 29, 2026, `npm audit` reports zero known vulnerabilities after compatible locked HTTP redirect and test-tooling patches. The verification suite passes all 220 tests.
+As of October 29, 2026, the public API and scheduled indexer use persistent Neon PostgreSQL. The verified database retained 10 delivered testnet transfers. The [successful indexer run](https://github.com/StellarHyperion/stellarhyperion-backend/actions/runs/40882312116) advanced its stored Stellar cursor and preserved transfer history after shutdown. These are recorded verification results; current freshness is available through `/v1/metrics`.
+
+Signed source transactions and independently checked destination payments are published in the contracts repository's [paid ITS evidence](https://github.com/StellarHyperion/stellarhyperion-contracts/blob/main/deployments/evidence/2026-10-28-paid-its.json), [XLM conversion evidence](https://github.com/StellarHyperion/stellarhyperion-contracts/blob/main/deployments/evidence/2026-10-29-conversion.json) and [CCTP evidence for all three destinations](https://github.com/StellarHyperion/stellarhyperion-contracts/blob/main/deployments/evidence/2026-10-29-cctp.json).
+
+The [October 29 CI run](https://github.com/StellarHyperion/stellarhyperion-backend/actions/runs/40881373948) passed formatting, lint, types, the production build and all 220 tests. `npm audit` reported zero known vulnerabilities after compatible locked HTTP redirect and test-tooling patches. These results cover dependency and regression checks; they are not a formal security audit.
+
+MIT.
