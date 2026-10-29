@@ -1,0 +1,11 @@
+.git
+.vercel
+node_modules
+dist
+coverage
+.env
+.env.*
+*.log
+TASKS.md
+**/[Aa][Gg][Ee][Nn][Tt]*.[Mm][Dd]
+test

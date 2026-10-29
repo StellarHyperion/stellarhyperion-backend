@@ -1,0 +1,8 @@
+.git
+node_modules
+coverage
+.env
+.env.*
+TASKS.md
+**/[Aa][Gg][Ee][Nn][Tt]*.[Mm][Dd]
+*.log

@@ -1,5 +1,7 @@
 # Hyperion backend
 
+[App](https://stellarhyperion.vercel.app/) | [Public API health](https://stellarhyperion-backend.vercel.app/health) | [Contracts and deployment evidence](https://github.com/StellarHyperion/stellarhyperion-contracts)
+
 Indexes Hyperion contract events, serves public transfer/claim history, polls rail status and optionally submits Stellar maintenance transactions. The checked-in deployment is the Stellar Testnet router. Active routes deliver Stellar USDC through Axelar ITS to Ethereum Sepolia, or through Circle CCTP to native USDC on Ethereum Sepolia, Base Sepolia and Arc Testnet. The frontend can first convert other liquid classic Stellar assets into USDC. The wallet-owned deployment is active; signed deployment and successful transfer evidence are described in the contracts repository's `docs/TESTNET_ACTIVATION.md`.
 
 ## Run
@@ -19,6 +21,16 @@ The SDK is installed from the committed protocol tarball. `npm run dev` does not
 
 A continuously running process must run the watchers and rail pollers. Deploying only `api/index.ts` provides reads from an existing database; it does not run indexing in the background. Set the frontend's `NEXT_PUBLIC_HYPERION_API_URL` to this service's origin. Public API reads support cross-origin GET requests.
 
+## Deploy on Vercel
+
+The `hyperion-backend` Vercel project serves [stellarhyperion-backend.vercel.app](https://stellarhyperion-backend.vercel.app). Configure its production `DATABASE_URL` through Vercel environment variables with a managed PostgreSQL connection and TLS. Keep the value server-side. Redis and signing keys are unnecessary while `KEEPER_ENABLED=false`.
+
+`vercel.json` includes the deployment metadata in the API function and declares one production `indexer` daemon. Its Docker image builds the current backend, runs the repository's pending SQL migrations, then continuously indexes source events and verifies bridge deliveries. The API and worker share the configured database. The worker handles shutdown signals and resumes from the persisted cursor. Daemon storage is ephemeral; PostgreSQL is the durable state. Vercel plan quotas apply to the running worker.
+
+Deploy from this repository with `vercel deploy --prod`. Check `/ready`, `/v1/metrics` and worker logs after deployment. The cursor must continue advancing without browser requests, and actual transfer records must survive process restarts. A health response alone does not establish working database access or indexing. Preview environments require their own database; never point an unreviewed preview worker at production.
+
+[Daemon configuration](https://vercel.com/docs/daemons) and [managed Postgres connections](https://vercel.com/docs/postgres) are documented by Vercel.
+
 ## What establishes status
 
 Stellar router events establish source transfers and claim changes. The EVM watcher indexes configured Hyperion routers with confirmation and reorg checks. The default record does not deploy an EVM Hyperion router.
@@ -28,6 +40,12 @@ For direct Stellar ITS transfers, Axelar's status API supplies a candidate desti
 For CCTP, Circle's forwarding hash is a candidate only. The backend binds the attested message to the source transfer, then verifies finalized Circle message execution and the exact native-USDC mint to the recipient in a successful confirmed canonical destination receipt. Activity exposes the actual received amount, token and six-decimal precision, separately from the source amount before forwarding fees. Real acceptance on all three destinations is recorded in `deployments/evidence/2026-10-29-cctp.json` in the contracts repository.
 
 Unknown or unreachable APIs produce errors; there are no fabricated deliveries or fallback attestations. Claims, route health and metrics query the actual migrated schema. Transfer amounts remain base-unit integer strings, with decimals/symbol supplied from deployment metadata when known.
+
+## Protocol fees and claims
+
+The active Stellar router charges 0.3% on outbound USDC and transfers that fee directly to its configured treasury during the source transaction. The backend indexes the recorded source fee; bridge and network fees are separate. Received amounts reflect actual destination payment after forwarding fees.
+
+A claim number identifies funds parked by a destination router after an unsuccessful recipient payout. Successful transfers do not create claims. The claims API exposes actual indexed claims and settlement status. Stellar settlement always pays the recipient recorded on chain.
 
 ## Keeper
 
