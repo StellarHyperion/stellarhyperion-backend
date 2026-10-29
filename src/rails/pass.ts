@@ -19,6 +19,7 @@
  */
 import type { AppConfig } from "../config/config.js";
 import { verifyItsDelivery } from "./axelar/delivery.js";
+import { verifyCctpDelivery } from "./cctp/delivery.js";
 import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
@@ -197,13 +198,10 @@ export class RailPass {
     }
 
     const { report } = lookup;
-    if (this.options.config && report.execution) {
-      const verified = await verifyItsDelivery(
-        this.options.config,
-        this.options.db,
-        transfer,
-        report,
-      );
+    if (this.options.config && (report.execution || report.forwardTxHash)) {
+      const verified =
+        (await verifyItsDelivery(this.options.config, this.options.db, transfer, report)) ??
+        (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report));
       if (verified) {
         await this.options.db.transaction(async (tx) => {
           await writeInbound(tx, verified.at, verified.row);

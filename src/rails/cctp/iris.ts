@@ -63,6 +63,7 @@ export interface FastAttestationMetadata {
 }
 
 export interface IrisMessage {
+  readonly forwardTxHash?: unknown;
   readonly message?: unknown;
   readonly messageBytes?: unknown;
   readonly rawMessage?: unknown;
@@ -94,6 +95,7 @@ export function isIrisMessage(value: unknown): value is IrisMessage {
   const msg = value as Record<string, unknown>;
 
   const recognizedKeys = [
+    "forwardTxHash",
     "status",
     "message",
     "messageBytes",
@@ -418,6 +420,10 @@ export function reportFor(message: IrisMessage): RailReport {
   railStatus = appendExpiry(railStatus, message);
 
   return {
+    ...(typeof message.forwardTxHash === "string" &&
+    /^0x[0-9a-fA-F]{64}$/.test(message.forwardTxHash)
+      ? { forwardTxHash: message.forwardTxHash as `0x${string}` }
+      : {}),
     status: mapped,
     railStatus,
     reference: nonce,
