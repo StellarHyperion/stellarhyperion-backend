@@ -66,6 +66,13 @@ jobs:
           else
             range="--max-count=1 $HEAD_SHA"
           fi
+          # Gitleaks also discovers repository ignore files even with an explicit ignore path.
+          # Reject them before scanning so contributed fingerprints cannot suppress findings.
+          suppression_files=$(git ls-files -- ':(glob)**/.gitleaksignore')
+          if [ -n "$suppression_files" ]; then
+            echo "::error::Repository .gitleaksignore files cannot suppress the contribution scan."
+            exit 1
+          fi
           printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/gitleaks.toml"
           gitleaks git --redact --no-banner --ignore-gitleaks-allow \
             --config "$RUNNER_TEMP/gitleaks.toml" \
