@@ -55,3 +55,15 @@
 # CI/CD and repository governance.
 # -----------------------------------------------------------------------------------------------
 /.github/                           @dotmantissa
+
+# Contribution supply chain and deployment trust boundaries.
+/package.json                       @dotmantissa
+/package-lock.json                  @dotmantissa
+/.npmrc                             @dotmantissa
+/hyperion-protocol-*.tgz             @dotmantissa
+/deployments/                       @dotmantissa
+/.github/CODEOWNERS                 @dotmantissa
+
+/vercel.json                        @dotmantissa
+/next.config.*                      @dotmantissa
+/Dockerfile                         @dotmantissa

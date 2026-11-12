@@ -2,8 +2,6 @@ name: ci
 
 on:
   pull_request:
-  pull_request_review:
-    types: [submitted]
   push:
     branches: [main]
   merge_group:
@@ -16,7 +14,15 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  NPM_CONFIG_IGNORE_SCRIPTS: "true"
+  HYPERION_LIVE_ROUTES: "0"
+  HYPERION_LIVE_TESTNET: "0"
+
 jobs:
+  supply-chain:
+    uses: ./.github/workflows/supply-chain.yml
+
   backend:
     name: lint, typecheck, test, build
     runs-on: ubuntu-latest
@@ -48,60 +54,52 @@ jobs:
           --health-retries 5
 
     steps:
-      - name: Check out backend repository
-        uses: actions/checkout@v4
+      - name: Restrict build network access
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # verified upstream v2 snapshot
         with:
-          path: backend
+          egress-policy: block
+          disable-sudo-and-containers: true
+          disable-telemetry: true
+          allowed-endpoints: |
+            github.com:443
+            api.github.com:443
+            raw.githubusercontent.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            registry.npmjs.org:443
+            nodejs.org:443
 
-      - name: Check out contracts repository for protocol dependency
-        uses: actions/checkout@v4
+      - name: Check out backend repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: StellarHyperion/stellarhyperion-contracts
-          path: contracts
+          persist-credentials: false
 
       - name: Set up Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22.22.1
-          cache: npm
-          cache-dependency-path: |
-            contracts/packages/protocol/package-lock.json
-            backend/package-lock.json
-
-      - name: Build protocol package
-        working-directory: contracts/packages/protocol
-        run: |
-          npm ci
-          npm run build
 
       - name: Install backend dependencies
-        working-directory: backend
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Check formatting
-        working-directory: backend
         run: npm run fmt:check
 
       - name: Lint
-        working-directory: backend
         run: npm run lint
 
       - name: Typecheck
-        working-directory: backend
         run: npm run typecheck
 
       - name: Build distribution
-        working-directory: backend
         run: npm run build
 
       - name: Run database migrations against test database
-        working-directory: backend
         env:
           DATABASE_URL: postgres://hyperion:hyperion-local-only@localhost:5432/hyperion_test
         run: npm run migrate:up
 
       - name: Run unit and integration tests
-        working-directory: backend
         env:
           TEST_DATABASE_URL: postgres://hyperion:hyperion-local-only@localhost:5432/hyperion_test
           REDIS_URL: redis://localhost:6379
@@ -112,10 +110,12 @@ jobs:
   gate:
     name: gate
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     if: always()
-    needs: [backend]
+    needs: [backend, supply-chain]
     steps:
       - name: Require successful checks
         env:
           CHECK_RESULT: ${{ needs.backend.result }}
-        run: test "$CHECK_RESULT" = success
+          SECURITY_RESULT: ${{ needs.supply-chain.result }}
+        run: test "$CHECK_RESULT" = success && test "$SECURITY_RESULT" = success

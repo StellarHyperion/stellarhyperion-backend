@@ -1,0 +1,81 @@
+name: contribution security
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NPM_CONFIG_IGNORE_SCRIPTS: "true"
+
+jobs:
+  scan:
+    name: workflow, secrets, dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Restrict build network access
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # verified upstream v2 snapshot
+        with:
+          egress-policy: block
+          disable-sudo-and-containers: true
+          disable-telemetry: true
+          allowed-endpoints: |
+            github.com:443
+            api.github.com:443
+            raw.githubusercontent.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            registry.npmjs.org:443
+            nodejs.org:443
+
+      - name: Check out the tested commit and history
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install checksum-verified security tools
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location --retry 3 \
+            -o zizmor.tgz https://github.com/zizmorcore/zizmor/releases/download/v1.32.0/zizmor-x86_64-unknown-linux-gnu.tar.gz
+          echo "bb110cc765eca9cd7efb2e284a956be5974c60027b0970f16397d86208a9957b  zizmor.tgz" | sha256sum --check --strict
+          curl --fail --silent --show-error --location --retry 3 \
+            -o gitleaks.tgz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tgz" | sha256sum --check --strict
+          mkdir -p security-tools
+          tar -xzf zizmor.tgz -C security-tools
+          tar -xzf gitleaks.tgz -C security-tools gitleaks
+          echo "$RUNNER_TEMP/security-tools" >> "$GITHUB_PATH"
+
+      - name: Analyze every workflow for unsafe trust boundaries
+        run: zizmor --offline --no-config --no-ignores --strict-collection --min-severity medium .github/workflows
+
+      - name: Scan contributed Git history for secrets
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$BASE_SHA" != "0000000000000000000000000000000000000000" ]]; then
+            range="$BASE_SHA..$HEAD_SHA"
+          else
+            range="--max-count=1 $HEAD_SHA"
+          fi
+          printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/gitleaks.toml"
+          gitleaks git --redact --no-banner --ignore-gitleaks-allow \
+            --config "$RUNNER_TEMP/gitleaks.toml" \
+            --gitleaks-ignore-path "$RUNNER_TEMP/security-tools" --log-opts="$range" .
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.22.1
+
+      - name: Audit locked dependencies in .
+        working-directory: .
+        run: npm audit --audit-level=high --ignore-scripts

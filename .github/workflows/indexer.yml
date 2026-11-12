@@ -12,6 +12,7 @@ on:
       - "migrations/**"
       - "deployments/testnet.json"
       - "package*.json"
+      - ".npmrc"
       - "hyperion-protocol-0.1.0.tgz"
 
 permissions:
@@ -22,11 +23,100 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  authorize:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      checks: read
+      actions: read
+    outputs:
+      ready: ${{ steps.gate.outputs.ready }}
+    steps:
+      # No checkout or contribution-controlled code runs in this job.
+      - name: Require successful main CI for this exact commit
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PYCODE'
+          import json, os, urllib.request
+          def get(path):
+              req = urllib.request.Request(
+                  "https://api.github.com/repos/" + os.environ["REPOSITORY"] + path,
+                  headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                           "Accept": "application/vnd.github+json"},
+              )
+              with urllib.request.urlopen(req, timeout=20) as response:
+                  return json.load(response)
+          ready = False
+          for check in get("/commits/" + os.environ["COMMIT_SHA"] + "/check-runs?per_page=100")["check_runs"]:
+              if check["name"] != "gate" or check["app"]["slug"] != "github-actions" or check["conclusion"] != "success" or check["head_sha"] != os.environ["COMMIT_SHA"]:
+                  continue
+              run_id = check["check_suite"]["id"]
+              # A check suite is not a workflow run: find its associated run and verify its identity.
+              runs = get("/actions/runs?head_sha=" + os.environ["COMMIT_SHA"] + "&per_page=100")["workflow_runs"]
+              for run in runs:
+                  if (run["check_suite_id"] == run_id and run["head_sha"] == os.environ["COMMIT_SHA"]
+                      and run["path"] == ".github/workflows/ci.yml"
+                      and run["head_branch"] == "main" and run["event"] == "push"
+                      and run["head_repository"]["full_name"] == os.environ["REPOSITORY"]):
+                      ready = True
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("ready=" + str(ready).lower() + "\n")
+          if not ready:
+              print("::notice::This main commit has no successful CI gate yet; the next scheduled run will retry.")
+          PYCODE
+
+  build:
+    needs: [authorize]
+    if: needs.authorize.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      NPM_CONFIG_IGNORE_SCRIPTS: "true"
+    steps:
+      - name: Restrict build network access
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # verified upstream v2 snapshot
+        with:
+          egress-policy: block
+          disable-sudo-and-containers: true
+          disable-telemetry: true
+          allowed-endpoints: |
+            github.com:443
+            api.github.com:443
+            registry.npmjs.org:443
+            nodejs.org:443
+            results-receiver.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.22.1
+      - name: Install and build without runtime credentials
+        run: npm ci --ignore-scripts && npm run build
+      - name: Preserve only compiled runtime code
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: indexer-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
   catch-up:
+    needs: [build]
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 6
+    # Restrict this environment to main and configure environment review/secret policies in GitHub.
+    environment: testnet-indexer
     env:
-      DATABASE_URL: ${{ secrets.HYPERION_DATABASE_URL }}
+      NPM_CONFIG_IGNORE_SCRIPTS: "true"
       HYPERION_NETWORK: testnet
       HYPERION_DEPLOYMENTS_FILE: ./deployments/testnet.json
       INDEXER_ENABLED: "true"
@@ -36,16 +126,32 @@ jobs:
       HTTP_HOST: 127.0.0.1
       HTTP_PORT: "8080"
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - name: Monitor runtime egress
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # verified upstream v2 snapshot
+        with:
+          egress-policy: audit
+          disable-sudo-and-containers: true
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22.22.1
-          cache: npm
-      - name: Require the server-side database connection
-        run: test -n "$DATABASE_URL"
-      - name: Install and build
-        run: npm ci && npm run build
+      - name: Install locked production dependencies without hooks or secrets
+        run: npm ci --omit=dev --ignore-scripts
+      - name: Download this run's compiled code
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: indexer-${{ github.sha }}
+          path: dist/
       - name: Apply pending migrations
-        run: npm run migrate:up
+        env:
+          DATABASE_URL: ${{ secrets.HYPERION_DATABASE_URL }}
+        run: |
+          test -n "$DATABASE_URL"
+          npm run migrate:up
       - name: Index source events and verify destination payments
+        env:
+          DATABASE_URL: ${{ secrets.HYPERION_DATABASE_URL }}
         run: timeout --signal=TERM --kill-after=20s 150s node dist/main.js || test "$?" -eq 124
