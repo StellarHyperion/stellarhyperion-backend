@@ -12,8 +12,9 @@ access. No executable/compiler caches are shared between jobs. The indexer runti
 network requirements and uses egress monitoring rather than the build endpoint list.
 
 Backend integration tests use the PostgreSQL installed on the Ubuntu 24.04 runner. Trusted inline
-setup creates a disposable test database before checkout; sudo and Docker access are then disabled
-before contributed code runs. Redis interactions in the current suite use mocks.
+setup creates a disposable, runner-owned cluster bound to loopback before checkout. It requires no
+sudo or Docker access, which Harden-Runner disables before job steps run. Redis interactions in
+the current suite use mocks.
 
 These checks reduce exposure; they cannot establish that arbitrary contributed code is trustworthy.
 Review changes to wallet/transaction construction, external requests, scripts, dependencies, SDK

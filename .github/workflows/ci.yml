@@ -29,16 +29,18 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      # Prepare the runner's PostgreSQL before checkout, then revoke sudo and Docker access.
+      # A private, runner-owned cluster needs neither sudo nor Docker after isolation starts.
       # Redis interactions are mocked by the current tests; no Redis service is required.
       - name: Prepare isolated PostgreSQL test database
         run: |
           set -euo pipefail
-          sudo systemctl start postgresql.service
-          sudo -u postgres psql --set=ON_ERROR_STOP=1 \
-            -c "CREATE USER hyperion WITH PASSWORD 'hyperion-local-only';"
-          sudo -u postgres psql --set=ON_ERROR_STOP=1 \
-            -c "CREATE DATABASE hyperion_test OWNER hyperion;"
+          pg_bin=/usr/lib/postgresql/16/bin
+          pg_data="$RUNNER_TEMP/hyperion-postgres"
+          mkdir -m 700 "$RUNNER_TEMP/hyperion-postgres-socket"
+          "$pg_bin/initdb" --pgdata="$pg_data" --username=hyperion --auth=trust --no-locale
+          "$pg_bin/pg_ctl" --pgdata="$pg_data" --log="$RUNNER_TEMP/hyperion-postgres.log" \
+            --options="-h 127.0.0.1 -p 5432 -k $RUNNER_TEMP/hyperion-postgres-socket" --wait start
+          "$pg_bin/createdb" --host=127.0.0.1 --username=hyperion hyperion_test
 
       - name: Restrict build network access
         uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # verified upstream v2 snapshot
@@ -90,6 +92,13 @@ jobs:
           TEST_DATABASE_URL: postgres://hyperion:hyperion-local-only@localhost:5432/hyperion_test
           REDIS_URL: redis://localhost:6379
         run: npm test
+
+      - name: Stop isolated PostgreSQL
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/hyperion-postgres/postmaster.pid" ]; then
+            /usr/lib/postgresql/16/bin/pg_ctl --pgdata="$RUNNER_TEMP/hyperion-postgres" --mode=fast --wait stop
+          fi
 
   # Vercel's installed Git integration deploys main and reports its own deployment status.
   # Keep deployment credentials out of Actions and avoid duplicate production deployments.
