@@ -11,6 +11,10 @@ Build jobs block outbound traffic outside their documented endpoint lists and di
 access. No executable/compiler caches are shared between jobs. The indexer runtime has its own
 network requirements and uses egress monitoring rather than the build endpoint list.
 
+Backend integration tests use the PostgreSQL installed on the Ubuntu 24.04 runner. Trusted inline
+setup creates a disposable test database before checkout; sudo and Docker access are then disabled
+before contributed code runs. Redis interactions in the current suite use mocks.
+
 These checks reduce exposure; they cannot establish that arbitrary contributed code is trustworthy.
 Review changes to wallet/transaction construction, external requests, scripts, dependencies, SDK
 archives, workflow files, and deployment configuration before merge. Inspect new dependency behavior,

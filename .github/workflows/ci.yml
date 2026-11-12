@@ -25,42 +25,28 @@ jobs:
 
   backend:
     name: lint, typecheck, test, build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
 
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: hyperion
-          POSTGRES_PASSWORD: hyperion-local-only
-          POSTGRES_DB: hyperion_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     steps:
+      # Prepare the runner's PostgreSQL before checkout, then revoke sudo and Docker access.
+      # Redis interactions are mocked by the current tests; no Redis service is required.
+      - name: Prepare isolated PostgreSQL test database
+        run: |
+          set -euo pipefail
+          sudo systemctl start postgresql.service
+          sudo -u postgres psql --set=ON_ERROR_STOP=1 \
+            -c "CREATE USER hyperion WITH PASSWORD 'hyperion-local-only';"
+          sudo -u postgres psql --set=ON_ERROR_STOP=1 \
+            -c "CREATE DATABASE hyperion_test OWNER hyperion;"
+
       - name: Restrict build network access
         uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # verified upstream v2 snapshot
         with:
           egress-policy: block
           disable-sudo-and-containers: true
           disable-telemetry: true
-          allowed-endpoints: |
+          allowed-endpoints: >-
             github.com:443
             api.github.com:443
             raw.githubusercontent.com:443

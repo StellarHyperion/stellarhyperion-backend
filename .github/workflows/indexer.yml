@@ -84,7 +84,7 @@ jobs:
           egress-policy: block
           disable-sudo-and-containers: true
           disable-telemetry: true
-          allowed-endpoints: |
+          allowed-endpoints: >-
             github.com:443
             api.github.com:443
             registry.npmjs.org:443
