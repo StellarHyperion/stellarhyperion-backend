@@ -18,8 +18,10 @@ import type {
   AppConfig,
   EvmWatchConfig,
   RailsConfig,
+  ReverseCctpLane,
   StellarWatchConfig,
 } from "../config/config.js";
+import { discoverReverseCctpLanes } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
 import { Poller } from "../runtime/poller.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
@@ -27,6 +29,7 @@ import { fixedReadiness } from "../runtime/readiness.js";
 import { RouteKind } from "@hyperion/protocol";
 
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
+import type { CctpVerificationClients } from "../rails/cctp/delivery.js";
 import { IrisClient } from "../rails/cctp/iris.js";
 import { RailPass } from "../rails/pass.js";
 import type { RailClient } from "../rails/types.js";
@@ -118,6 +121,12 @@ export interface BuildIndexerDeps {
   readonly config: AppConfig;
   readonly logger: Logger;
   readonly db: Transactional;
+  readonly cctpClients?: CctpVerificationClients;
+}
+
+/** Return reverse-direction (EVM -> Stellar) CCTP lanes that satisfy inbound contract capability. */
+export function configuredReverseCctpLanes(config: AppConfig): readonly ReverseCctpLane[] {
+  return discoverReverseCctpLanes(config);
 }
 
 /**
@@ -171,7 +180,14 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // They are not conditional on a router being watched: a transfer indexed by a previous run is
   // still waiting on its rail whether or not this replica is watching the chain it left.
   if (config.rails.enabled) {
-    for (const worker of railWorkers(config.rails, config.network, db, logger, config)) {
+    for (const worker of railWorkers(
+      config.rails,
+      config.network,
+      db,
+      logger,
+      config,
+      deps.cctpClients,
+    )) {
       workers.push(worker);
     }
   } else {
@@ -242,6 +258,7 @@ function railWorkers(
   db: Transactional,
   logger: Logger,
   appConfig: AppConfig,
+  cctpClients?: CctpVerificationClients,
 ): readonly Worker[] {
   const clients: readonly { readonly route: RouteKind; readonly client: RailClient }[] = [
     {
@@ -272,6 +289,7 @@ function railWorkers(
       batchSize: config.batchSize,
       recheckAfterMs: config.recheckAfterMs,
       maxCheckFailures: config.maxCheckFailures,
+      ...(cctpClients !== undefined ? { cctpClients } : {}),
     });
     return new PolledWorker(pass, config.pollIntervalMs, child);
   });

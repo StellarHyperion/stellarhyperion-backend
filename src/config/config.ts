@@ -16,15 +16,22 @@ import { resolve as resolvePath } from "node:path";
 
 import type { Chain, ChainKey, DeploymentSet, Hex, NetworkMode } from "@hyperion/protocol";
 import {
+  AddressKind,
   CHAINS,
   DeploymentFormatError,
   IRIS_API,
+  RAIL_CONTRACTS,
+  RouteKind,
+  STELLAR_DOMAIN,
+  assetOn,
   chainsFor,
+  isChainKey,
   isEvmChain,
   isEvmDeployment,
   isStellarChain,
   isStellarDeployment,
   parseDeploymentSet,
+  parseStellarAddress,
 } from "@hyperion/protocol";
 
 import type { EnumSpec, VarSpec } from "./env.js";
@@ -74,6 +81,13 @@ export interface EvmWatchConfig {
   readonly pollIntervalMs: number;
 }
 
+/** Stellar CCTP V2 inbound contract capabilities required to admit reverse-direction lanes. */
+export interface StellarCctpInboundContracts {
+  readonly tokenMessenger: string;
+  readonly messageTransmitter: string;
+  readonly inboundEnabled: boolean;
+}
+
 /** Everything the rail status pollers need. One per rail that has a status API. */
 export interface RailsConfig {
   readonly enabled: boolean;
@@ -84,6 +98,8 @@ export interface RailsConfig {
   readonly batchSize: number;
   readonly recheckAfterMs: number;
   readonly maxCheckFailures: number;
+  /** Validated Stellar inbound CCTP contracts per Stellar chain, when configured. */
+  readonly stellarCctpInbound?: Readonly<Partial<Record<ChainKey, StellarCctpInboundContracts>>>;
 }
 
 export interface IndexerConfig {
@@ -484,7 +500,8 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     : null;
 
   const absoluteDeployments = deploymentsPath === "" ? "" : resolvePath(cwd, deploymentsPath);
-  const deployments = readDeployments(reader, read, absoluteDeployments);
+  const loadedDeployments = readDeployments(reader, read, absoluteDeployments, env);
+  const deployments = loadedDeployments.set;
   const indexer = planIndexer(reader, {
     network,
     deployments,
@@ -520,6 +537,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       batchSize: railBatchSize,
       recheckAfterMs: railRecheckAfterMs,
       maxCheckFailures: railMaxCheckFailures,
+      stellarCctpInbound: loadedDeployments.stellarCctpInbound,
     },
     keeper: {
       enabled: keeperEnabled,
@@ -533,12 +551,35 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
 
 const EMPTY_SET: DeploymentSet = { schemaVersion: 1, generatedAt: "", networks: {} };
 
+const STELLAR_CCTP_TOKEN_MESSENGER: VarSpec = {
+  name: "STELLAR_CCTP_TOKEN_MESSENGER",
+  kind: "string",
+  required: false,
+  printable: true,
+  purpose: "Stellar CCTP V2 token messenger contract strkey for reverse-direction verification.",
+};
+
+const STELLAR_CCTP_MESSAGE_TRANSMITTER: VarSpec = {
+  name: "STELLAR_CCTP_MESSAGE_TRANSMITTER",
+  kind: "string",
+  required: false,
+  printable: true,
+  purpose:
+    "Stellar CCTP V2 message transmitter contract strkey for reverse-direction verification.",
+};
+
+interface LoadedDeployments {
+  readonly set: DeploymentSet;
+  readonly stellarCctpInbound: Readonly<Partial<Record<ChainKey, StellarCctpInboundContracts>>>;
+}
+
 function readDeployments(
   reader: EnvReader,
   read: (path: string) => string,
   path: string,
-): DeploymentSet {
-  if (path === "") return EMPTY_SET;
+  env: Readonly<Record<string, string | undefined>>,
+): LoadedDeployments {
+  if (path === "") return { set: EMPTY_SET, stellarCctpInbound: {} };
 
   let text: string;
   try {
@@ -548,7 +589,7 @@ function readDeployments(
     // directory is the single most common way this fails, and the resolved absolute path is the
     // thing that makes it obvious.
     reader.reject(DEPLOYMENTS_FILE, `cannot be read at ${path}`);
-    return EMPTY_SET;
+    return { set: EMPTY_SET, stellarCctpInbound: {} };
   }
 
   let parsed: unknown;
@@ -556,20 +597,119 @@ function readDeployments(
     parsed = JSON.parse(text);
   } catch (error) {
     reader.reject(DEPLOYMENTS_FILE, `is not valid JSON: ${messageOf(error)}`);
-    return EMPTY_SET;
+    return { set: EMPTY_SET, stellarCctpInbound: {} };
   }
 
+  let set: DeploymentSet;
   try {
     // Validated rather than cast. An address with a transposed character parses fine as a string
     // and turns into a watcher reading an empty contract for a week without complaining.
-    return parseDeploymentSet(parsed);
+    set = parseDeploymentSet(parsed);
   } catch (error) {
     const detail =
       error instanceof DeploymentFormatError
         ? error.message
         : `is not a deployment set: ${messageOf(error)}`;
     reader.reject(DEPLOYMENTS_FILE, detail);
-    return EMPTY_SET;
+    return { set: EMPTY_SET, stellarCctpInbound: {} };
+  }
+
+  const stellarCctpInbound = extractStellarCctpInbound(reader, parsed, set, env);
+  return { set, stellarCctpInbound };
+}
+
+function extractStellarCctpInbound(
+  reader: EnvReader,
+  rawJson: unknown,
+  set: DeploymentSet,
+  env: Readonly<Record<string, string | undefined>>,
+): Readonly<Partial<Record<ChainKey, StellarCctpInboundContracts>>> {
+  const result: Partial<Record<ChainKey, StellarCctpInboundContracts>> = {};
+  const rawNetworks =
+    typeof rawJson === "object" && rawJson !== null && !Array.isArray(rawJson)
+      ? ((rawJson as Record<string, unknown>).networks as Record<string, unknown> | undefined)
+      : undefined;
+
+  const envMessenger = env[STELLAR_CCTP_TOKEN_MESSENGER.name]?.trim() ?? "";
+  const envTransmitter = env[STELLAR_CCTP_MESSAGE_TRANSMITTER.name]?.trim() ?? "";
+  if (envMessenger !== "" && !isContractStrkey(envMessenger)) {
+    reader.reject(STELLAR_CCTP_TOKEN_MESSENGER, "must be a valid Stellar C... contract strkey");
+  }
+  if (envTransmitter !== "" && !isContractStrkey(envTransmitter)) {
+    reader.reject(STELLAR_CCTP_MESSAGE_TRANSMITTER, "must be a valid Stellar C... contract strkey");
+  }
+  if ((envMessenger !== "") !== (envTransmitter !== "")) {
+    reader.reject(
+      envMessenger === "" ? STELLAR_CCTP_TOKEN_MESSENGER : STELLAR_CCTP_MESSAGE_TRANSMITTER,
+      "must be set alongside its companion Stellar CCTP contract variable",
+    );
+  }
+
+  for (const key of Object.keys(set.networks)) {
+    if (!isChainKey(key)) continue;
+    const deployment = set.networks[key];
+    if (deployment === undefined || !isStellarDeployment(deployment)) continue;
+
+    if (
+      envMessenger !== "" &&
+      envTransmitter !== "" &&
+      isContractStrkey(envMessenger) &&
+      isContractStrkey(envTransmitter)
+    ) {
+      result[key] = {
+        tokenMessenger: envMessenger,
+        messageTransmitter: envTransmitter,
+        inboundEnabled: true,
+      };
+      continue;
+    }
+
+    const rawEntry = rawNetworks?.[key];
+    if (typeof rawEntry !== "object" || rawEntry === null || Array.isArray(rawEntry)) continue;
+    const rawCctp = (rawEntry as Record<string, unknown>).cctp;
+    if (rawCctp === undefined || rawCctp === null) continue;
+    if (typeof rawCctp !== "object" || Array.isArray(rawCctp)) {
+      reader.reject(DEPLOYMENTS_FILE, `networks.${key}.cctp must be an object when present`);
+      continue;
+    }
+    const cctpFields = rawCctp as Record<string, unknown>;
+    const tokenMessenger = cctpFields.tokenMessenger;
+    const messageTransmitter = cctpFields.messageTransmitter;
+    const inboundEnabled =
+      cctpFields.inboundEnabled === undefined ? true : cctpFields.inboundEnabled;
+    if (typeof tokenMessenger !== "string" || !isContractStrkey(tokenMessenger)) {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        `networks.${key}.cctp.tokenMessenger must be a valid Stellar C... contract strkey`,
+      );
+      continue;
+    }
+    if (typeof messageTransmitter !== "string" || !isContractStrkey(messageTransmitter)) {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        `networks.${key}.cctp.messageTransmitter must be a valid Stellar C... contract strkey`,
+      );
+      continue;
+    }
+    if (typeof inboundEnabled !== "boolean") {
+      reader.reject(DEPLOYMENTS_FILE, `networks.${key}.cctp.inboundEnabled must be a boolean`);
+      continue;
+    }
+    result[key] = {
+      tokenMessenger,
+      messageTransmitter,
+      inboundEnabled,
+    };
+  }
+
+  return result;
+}
+
+function isContractStrkey(value: string): boolean {
+  try {
+    return parseStellarAddress(value).kind === AddressKind.Contract;
+  } catch {
+    return false;
   }
 }
 
@@ -700,4 +840,208 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+export type ReverseCctpBlockerCode =
+  | "invalid_chain_pair"
+  | "missing_origin_cctp_registry"
+  | "missing_origin_deployment"
+  | "missing_origin_cctp_adapter"
+  | "missing_origin_usdc_route"
+  | "missing_destination_deployment"
+  | "missing_destination_cctp_adapter"
+  | "missing_destination_usdc_route"
+  | "missing_stellar_cctp_inbound_contracts"
+  | "inbound_capability_disabled";
+
+export interface ReverseCctpLane {
+  readonly originChain: ChainKey;
+  readonly destinationChain: ChainKey;
+  readonly sourceDomain: number;
+  readonly destinationDomain: number;
+  readonly originChainId: number;
+  readonly originRpcUrl: string;
+  readonly originRouter: Hex;
+  readonly originAdapter: Hex;
+  readonly originToken: Hex;
+  readonly originMessenger: Hex;
+  readonly destinationRouter: string;
+  readonly destinationAdapter: string;
+  readonly destinationTokenSacId: string;
+  readonly destinationMessenger: string;
+  readonly destinationTransmitter: string;
+  readonly destinationAdmin: string;
+  readonly destinationNetworkPassphrase: string;
+  readonly destinationRpcUrl: string;
+}
+
+export type ReverseCctpAdmission =
+  | {
+      readonly admitted: true;
+      readonly lane: ReverseCctpLane;
+      readonly blockers: readonly [];
+    }
+  | {
+      readonly admitted: false;
+      readonly lane: null;
+      readonly blockers: readonly ReverseCctpBlockerCode[];
+    };
+
+/**
+ * Check whether an EVM -> Stellar CCTP V2 development lane has complete source and inbound
+ * destination contract capability. Missing inbound Stellar router, adapter, USDC route, or CCTP
+ * messenger/transmitter capability blocks admission explicitly.
+ */
+export function admitReverseCctpLane(
+  config: Pick<AppConfig, "network" | "deployments" | "indexer" | "rails">,
+  originChainKey: string,
+  destinationChainKey: string,
+): ReverseCctpAdmission {
+  if (!isChainKey(originChainKey) || !isChainKey(destinationChainKey)) {
+    return { admitted: false, lane: null, blockers: ["invalid_chain_pair"] };
+  }
+  if (originChainKey === "local" || destinationChainKey === "local") {
+    return { admitted: false, lane: null, blockers: ["invalid_chain_pair"] };
+  }
+
+  const allowed = new Set(chainsFor(config.network).map((entry) => entry.key));
+  if (!allowed.has(originChainKey) || !allowed.has(destinationChainKey)) {
+    return { admitted: false, lane: null, blockers: ["invalid_chain_pair"] };
+  }
+
+  const origin = CHAINS[originChainKey];
+  const destination = CHAINS[destinationChainKey];
+  if (
+    !isEvmChain(origin) ||
+    !isStellarChain(destination) ||
+    origin.cctpDomain === null ||
+    destination.cctpDomain !== STELLAR_DOMAIN
+  ) {
+    return { admitted: false, lane: null, blockers: ["invalid_chain_pair"] };
+  }
+
+  const blockers: ReverseCctpBlockerCode[] = [];
+  const originCctp = RAIL_CONTRACTS[originChainKey]?.cctp ?? null;
+  const registryUsdc = assetOn(originChainKey, "USDC");
+  if (originCctp === null || registryUsdc?.family !== "evm") {
+    blockers.push("missing_origin_cctp_registry");
+  }
+
+  const originDeployment = config.deployments.networks[originChainKey];
+  let originAdapter: Hex | undefined;
+  let originUsdcAddress: Hex | null = null;
+  if (originDeployment === undefined || !isEvmDeployment(originDeployment)) {
+    blockers.push("missing_origin_deployment");
+  } else {
+    originAdapter = originDeployment.adapters[RouteKind.Cctp];
+    if (originAdapter === undefined) {
+      blockers.push("missing_origin_cctp_adapter");
+    }
+    const deployedUsdc = originDeployment.tokens.USDC;
+    if (
+      deployedUsdc?.decimals !== 6 ||
+      !deployedUsdc.routes.includes(RouteKind.Cctp) ||
+      (registryUsdc?.family === "evm" &&
+        deployedUsdc.address.toLowerCase() !== registryUsdc.address.toLowerCase())
+    ) {
+      blockers.push("missing_origin_usdc_route");
+    } else {
+      originUsdcAddress = deployedUsdc.address;
+    }
+  }
+
+  const destinationDeployment = config.deployments.networks[destinationChainKey];
+  let destinationAdapter: string | undefined;
+  let destinationSacId: string | null = null;
+  if (destinationDeployment === undefined || !isStellarDeployment(destinationDeployment)) {
+    blockers.push("missing_destination_deployment");
+  } else {
+    destinationAdapter = destinationDeployment.adapters[RouteKind.Cctp];
+    if (destinationAdapter === undefined) {
+      blockers.push("missing_destination_cctp_adapter");
+    }
+    const deployedStellarUsdc = destinationDeployment.tokens.USDC;
+    if (
+      deployedStellarUsdc?.decimals !== 7 ||
+      !deployedStellarUsdc.routes.includes(RouteKind.Cctp)
+    ) {
+      blockers.push("missing_destination_usdc_route");
+    } else {
+      destinationSacId = deployedStellarUsdc.sacId;
+    }
+  }
+
+  const inboundContracts = config.rails.stellarCctpInbound?.[destinationChainKey];
+  if (inboundContracts === undefined) {
+    blockers.push("missing_stellar_cctp_inbound_contracts");
+  } else if (!inboundContracts.inboundEnabled) {
+    blockers.push("inbound_capability_disabled");
+  }
+
+  if (
+    blockers.length > 0 ||
+    originCctp === null ||
+    originDeployment === undefined ||
+    !isEvmDeployment(originDeployment) ||
+    originAdapter === undefined ||
+    originUsdcAddress === null ||
+    destinationDeployment === undefined ||
+    !isStellarDeployment(destinationDeployment) ||
+    destinationAdapter === undefined ||
+    destinationSacId === null ||
+    !inboundContracts?.inboundEnabled
+  ) {
+    return { admitted: false, lane: null, blockers };
+  }
+
+  const evmWatch = config.indexer.evm.find((entry) => entry.chain === originChainKey);
+  const stellarWatch =
+    config.indexer.stellar?.chain === destinationChainKey ? config.indexer.stellar : null;
+
+  return {
+    admitted: true,
+    blockers: [],
+    lane: {
+      originChain: originChainKey,
+      destinationChain: destinationChainKey,
+      sourceDomain: origin.cctpDomain,
+      destinationDomain: STELLAR_DOMAIN,
+      originChainId: origin.chainId,
+      originRpcUrl: evmWatch?.rpcUrl ?? origin.defaultRpcUrl,
+      originRouter: originDeployment.router,
+      originAdapter,
+      originToken: originUsdcAddress,
+      originMessenger: originCctp.tokenMessengerV2,
+      destinationRouter: destinationDeployment.router,
+      destinationAdapter,
+      destinationTokenSacId: destinationSacId,
+      destinationMessenger: inboundContracts.tokenMessenger,
+      destinationTransmitter: inboundContracts.messageTransmitter,
+      destinationAdmin: destinationDeployment.admin,
+      destinationNetworkPassphrase: destinationDeployment.networkPassphrase,
+      destinationRpcUrl: stellarWatch?.rpcUrl ?? destination.defaultRpcUrl,
+    },
+  };
+}
+
+/** Enumerate every reverse-direction CCTP lane that passes inbound contract capability admission. */
+export function discoverReverseCctpLanes(
+  config: Pick<AppConfig, "network" | "deployments" | "indexer" | "rails">,
+): readonly ReverseCctpLane[] {
+  const peers = chainsFor(config.network).filter((entry) => entry.key !== "local");
+  const admitted: ReverseCctpLane[] = [];
+  for (const origin of peers) {
+    if (!isEvmChain(origin)) continue;
+    for (const destination of peers) {
+      if (!isStellarChain(destination)) continue;
+      const res = admitReverseCctpLane(config, origin.key, destination.key);
+      if (res.admitted) admitted.push(res.lane);
+    }
+  }
+  admitted.sort((a, b) =>
+    `${a.originChain}:${a.destinationChain}`.localeCompare(
+      `${b.originChain}:${b.destinationChain}`,
+    ),
+  );
+  return admitted;
 }

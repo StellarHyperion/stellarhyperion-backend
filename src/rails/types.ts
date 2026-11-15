@@ -107,3 +107,6 @@ export interface RailClient {
   /** Throws `RailError`; returns `missing` rather than throwing for a transfer not yet indexed. */
   look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup>;
 }
+
+/** Settlement classification for a verified inbound destination transfer. */
+export type InboundSettlementKind = "delivered" | "parked";

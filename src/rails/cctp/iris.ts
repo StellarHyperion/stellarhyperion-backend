@@ -419,11 +419,10 @@ export function reportFor(message: IrisMessage): RailReport {
   let railStatus = delay === null ? rawStatus : `${rawStatus}/${delay}`;
   railStatus = appendExpiry(railStatus, message);
 
+  const forwardTxHash = normalizeForwardHash(message.forwardTxHash);
+
   return {
-    ...(typeof message.forwardTxHash === "string" &&
-    /^0x[0-9a-fA-F]{64}$/.test(message.forwardTxHash)
-      ? { forwardTxHash: message.forwardTxHash as `0x${string}` }
-      : {}),
+    ...(forwardTxHash !== null ? { forwardTxHash } : {}),
     status: mapped,
     railStatus,
     reference: nonce,
@@ -536,6 +535,13 @@ async function describeError(response: Response): Promise<string> {
 
 function describe(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+function normalizeForwardHash(value: unknown): `0x${string}` | null {
+  if (typeof value !== "string") return null;
+  if (/^0x[0-9a-fA-F]{64}$/.test(value)) return value as `0x${string}`;
+  if (/^[0-9a-fA-F]{64}$/.test(value)) return `0x${value.toLowerCase()}`;
+  return null;
 }
 
 export { PENDING as IRIS_PENDING, COMPLETE as IRIS_COMPLETE, RATE_LIMIT_COOLDOWN_MS };

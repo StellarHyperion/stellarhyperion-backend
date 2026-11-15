@@ -19,12 +19,12 @@
  */
 import type { AppConfig } from "../config/config.js";
 import { verifyItsDelivery } from "./axelar/delivery.js";
-import { verifyCctpDelivery } from "./cctp/delivery.js";
+import { verifyCctpDelivery, type CctpVerificationClients } from "./cctp/delivery.js";
 import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
-import { writeInbound, writeAttestation } from "../chains/writers.js";
+import { writeAttestation, writeClaim, writeInbound } from "../chains/writers.js";
 import { outstandingForRail, pendingForRail } from "./queue.js";
 import { RailError, isTerminal, type PendingTransfer, type RailClient } from "./types.js";
 
@@ -48,6 +48,7 @@ export interface RailPassOptions {
   readonly maxCheckFailures: number;
   readonly now?: () => Date;
   readonly config?: AppConfig;
+  readonly cctpClients?: CctpVerificationClients;
 }
 
 export interface RailProgress {
@@ -201,13 +202,23 @@ export class RailPass {
     if (this.options.config && (report.execution || report.forwardTxHash)) {
       const verified =
         (await verifyItsDelivery(this.options.config, this.options.db, transfer, report)) ??
-        (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report));
+        (await verifyCctpDelivery(
+          this.options.config,
+          this.options.db,
+          transfer,
+          report,
+          this.options.cctpClients,
+        ));
       if (verified) {
         await this.options.db.transaction(async (tx) => {
+          if (verified.claim !== undefined) {
+            await writeClaim(tx, verified.at, verified.claim);
+          }
           await writeInbound(tx, verified.at, verified.row);
         });
+        const finalStatus = verified.row.delivered ? "delivered" : report.status;
         await this.write(transfer, {
-          status: "delivered",
+          status: finalStatus,
           railStatus: report.railStatus,
           reference: report.reference,
           attestedAt: report.attestedAt,
@@ -215,7 +226,7 @@ export class RailPass {
           failures: 0,
           error: null,
         });
-        return true;
+        return isTerminal(finalStatus);
       }
     }
     await this.write(transfer, {

@@ -21,13 +21,14 @@ import { createPublicClient, http, stringToHex } from "viem";
 import type { AppConfig } from "../../config/config.js";
 import type { Transactional } from "../../db/pool.js";
 import { bigintOf, text } from "../../db/rows.js";
-import type { InboundRow, Position } from "../../chains/writers.js";
+import type { ClaimRow, InboundRow, Position } from "../../chains/writers.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 
 import { ITS_ABI, matchingPayment } from "./events.js";
 export interface VerifiedDelivery {
   readonly at: Position;
   readonly row: InboundRow;
+  readonly claim?: ClaimRow;
 }
 
 // The rail API supplies a candidate receipt. Only matching confirmed chain events establish delivery.
