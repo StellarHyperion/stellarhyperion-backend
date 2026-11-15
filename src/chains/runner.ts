@@ -18,14 +18,17 @@ import type {
   AppConfig,
   EvmWatchConfig,
   RailsConfig,
+  ReverseItsLane,
   StellarWatchConfig,
 } from "../config/config.js";
+import { discoverReverseItsLanes } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
 import { Poller } from "../runtime/poller.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
 import { fixedReadiness } from "../runtime/readiness.js";
 import { RouteKind } from "@hyperion/protocol";
 
+import type { ItsVerificationClients } from "../rails/axelar/delivery.js";
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
 import { IrisClient } from "../rails/cctp/iris.js";
 import { RailPass } from "../rails/pass.js";
@@ -118,6 +121,12 @@ export interface BuildIndexerDeps {
   readonly config: AppConfig;
   readonly logger: Logger;
   readonly db: Transactional;
+  readonly itsClients?: ItsVerificationClients;
+}
+
+/** Return the reverse-direction (EVM -> Stellar) ITS lanes backed by validated deployment sets. */
+export function configuredReverseItsLanes(config: AppConfig): readonly ReverseItsLane[] {
+  return discoverReverseItsLanes(config);
 }
 
 /**
@@ -171,7 +180,14 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // They are not conditional on a router being watched: a transfer indexed by a previous run is
   // still waiting on its rail whether or not this replica is watching the chain it left.
   if (config.rails.enabled) {
-    for (const worker of railWorkers(config.rails, config.network, db, logger, config)) {
+    for (const worker of railWorkers(
+      config.rails,
+      config.network,
+      db,
+      logger,
+      config,
+      deps.itsClients,
+    )) {
       workers.push(worker);
     }
   } else {
@@ -242,6 +258,7 @@ function railWorkers(
   db: Transactional,
   logger: Logger,
   appConfig: AppConfig,
+  itsClients?: ItsVerificationClients,
 ): readonly Worker[] {
   const clients: readonly { readonly route: RouteKind; readonly client: RailClient }[] = [
     {
@@ -272,6 +289,7 @@ function railWorkers(
       batchSize: config.batchSize,
       recheckAfterMs: config.recheckAfterMs,
       maxCheckFailures: config.maxCheckFailures,
+      ...(itsClients !== undefined ? { itsClients } : {}),
     });
     return new PolledWorker(pass, config.pollIntervalMs, child);
   });

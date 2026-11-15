@@ -117,7 +117,7 @@ export class AxelarGmpClient implements RailClient {
       if (typeof parentId !== "string" || !Array.isArray(children)) continue;
       for (const childId of children) {
         if (remaining <= 0) break;
-        if (typeof childId !== "string" || !/^0x[0-9a-fA-F]{64}-\d+$/.test(childId)) continue;
+        if (typeof childId !== "string" || !/^(?:0x)?[0-9a-fA-F]{64}-\d+$/.test(childId)) continue;
         remaining -= 1;
         const forwarded = await this.rowsFor(childId.split("-")[0] ?? "", signal);
         const child = forwarded.find(
@@ -176,20 +176,19 @@ export class AxelarGmpClient implements RailClient {
     if (FATAL_FLAGS.some((flag) => row[flag] === true)) mapped = "failed";
 
     const words = [status, simplified, ...flags].filter((part): part is string => part !== null);
+    const executionTxHash = toHexWord32(row.executed?.transactionHash);
+    const executionCommandId = toHexWord32(row.command_id);
     return {
       status: mapped,
       railStatus: words.join("/"),
       // The message id, because that is what Axelar's support asks for.
       reference: typeof row.message_id === "string" ? row.message_id : null,
       attestedAt: stampOf(row.approved) ?? stampOf(row.executed),
-      ...(typeof row.executed?.transactionHash === "string" &&
-      /^0x[0-9a-fA-F]{64}$/.test(row.executed.transactionHash) &&
-      typeof row.command_id === "string" &&
-      /^0x[0-9a-fA-F]{64}$/.test(row.command_id)
+      ...(executionTxHash !== null && executionCommandId !== null
         ? {
             execution: {
-              txHash: row.executed.transactionHash as `0x${string}`,
-              commandId: row.command_id as `0x${string}`,
+              txHash: executionTxHash,
+              commandId: executionCommandId,
             },
           }
         : {}),
@@ -232,4 +231,11 @@ export { MAPPING as AXELAR_STATUS_MAPPING, FATAL_FLAGS, RECOVERABLE_FLAGS };
 
 function normalized(value: unknown): string {
   return typeof value === "string" ? value.toLowerCase().replace(/^0x/, "") : "";
+}
+
+function toHexWord32(value: unknown): `0x${string}` | null {
+  if (typeof value !== "string") return null;
+  if (/^0x[0-9a-fA-F]{64}$/.test(value)) return value as `0x${string}`;
+  if (/^[0-9a-fA-F]{64}$/.test(value)) return `0x${value.toLowerCase()}`;
+  return null;
 }

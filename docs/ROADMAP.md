@@ -1,6 +1,6 @@
 # Implementation status
 
-Implemented: schema migrations, Stellar/EVM event watchers, rail pollers, public REST reads, source-scoped Axelar lookup, confirmed direct ITS payment verification, and optional signed Stellar TTL/claim jobs. The checked-in record names the real Stellar router and no EVM Hyperion deployment.
+Implemented: schema migrations, Stellar/EVM event watchers, rail pollers, public REST reads, source-scoped Axelar lookup, confirmed direct ITS payment verification in both Stellar-to-EVM and EVM-to-Stellar directions, and optional signed Stellar TTL/claim jobs. Reverse-direction ITS verification binds EVM token-manager state, Soroban ITS callbacks, Hyperion router settlement, and final SAC recipient transfers while preserving full account and muxed strkey identities, treating adapter custody or parked claims as non-delivered, and leaving unsupported token-manager mappings unverified. The checked-in record names the real Stellar router and no EVM Hyperion deployment.
 
 Removed: mocked gas top-ups, synthetic second-step attestations and receipt-only fabricated inbound deliveries. They must not reappear as advertised capabilities without a verified contract integration.
 

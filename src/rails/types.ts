@@ -107,3 +107,14 @@ export interface RailClient {
   /** Throws `RailError`; returns `missing` rather than throwing for a transfer not yet indexed. */
   look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup>;
 }
+
+/**
+ * Axelar ITS token-manager implementation discriminants accepted for exact-amount delivery
+ * verification. Fee-on-transfer (`3` / `lock_unlock_fee`) and unknown manager variants are
+ * excluded because they break deterministic conservation between source net amount and payout.
+ */
+export type SupportedItsTokenManagerType =
+  | 0 // NATIVE_INTERCHAIN_TOKEN
+  | 1 // MINT_BURN_FROM
+  | 2 // LOCK_UNLOCK
+  | 4; // MINT_BURN

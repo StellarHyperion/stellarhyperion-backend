@@ -19,7 +19,10 @@ import {
   CHAINS,
   DeploymentFormatError,
   IRIS_API,
+  RAIL_CONTRACTS,
+  RouteKind,
   chainsFor,
+  isChainKey,
   isEvmChain,
   isEvmDeployment,
   isStellarChain,
@@ -700,4 +703,146 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Validated deployment and registry wiring for an EVM-to-Stellar Axelar ITS lane. */
+export interface ReverseItsLane {
+  readonly originChain: ChainKey;
+  readonly destinationChain: ChainKey;
+  readonly symbol: string;
+  readonly originChainId: number;
+  readonly originConfirmations: number;
+  readonly originRpcUrl: string;
+  readonly originAxelarName: string;
+  readonly originIts: Hex;
+  readonly originRouter: Hex;
+  readonly originAdapter: Hex;
+  readonly originToken: Hex;
+  readonly originDecimals: number;
+  readonly destinationAxelarName: string;
+  readonly destinationIts: string;
+  readonly destinationRouter: string;
+  readonly destinationAdapter: string;
+  readonly destinationAdmin: string;
+  readonly destinationNetworkPassphrase: string;
+  readonly destinationRpcUrl: string;
+  readonly destinationConfirmations: number;
+  readonly destinationTokenSacId: string;
+  readonly destinationDecimals: number;
+}
+
+/**
+ * Resolve a reverse-direction (EVM -> Stellar) Axelar ITS lane from validated deployments and
+ * registry contracts, returning null whenever any contract, route or token capability is absent.
+ */
+export function resolveReverseItsLane(
+  config: Pick<AppConfig, "network" | "deployments" | "indexer">,
+  originChainKey: string,
+  destinationChainKey: string,
+  sourceTokenAddress: string,
+): ReverseItsLane | null {
+  if (!isChainKey(originChainKey) || !isChainKey(destinationChainKey)) return null;
+  if (originChainKey === "local" || destinationChainKey === "local") return null;
+
+  const allowed = new Set(chainsFor(config.network).map((entry) => entry.key));
+  if (!allowed.has(originChainKey) || !allowed.has(destinationChainKey)) return null;
+
+  const origin = CHAINS[originChainKey];
+  const destination = CHAINS[destinationChainKey];
+  if (!isEvmChain(origin) || !isStellarChain(destination)) return null;
+  if (origin.axelarName === null || destination.axelarName === null) return null;
+
+  const originIts = RAIL_CONTRACTS[originChainKey]?.axelar?.interchainTokenService ?? null;
+  const destinationIts =
+    RAIL_CONTRACTS[destinationChainKey]?.axelar?.interchainTokenService ?? null;
+  if (!originIts?.startsWith("0x")) return null;
+  if (destinationIts === null || destinationIts.length === 0) return null;
+
+  const originDeployment = config.deployments.networks[originChainKey];
+  const destinationDeployment = config.deployments.networks[destinationChainKey];
+  if (originDeployment === undefined || !isEvmDeployment(originDeployment)) return null;
+  if (destinationDeployment === undefined || !isStellarDeployment(destinationDeployment)) {
+    return null;
+  }
+
+  const originAdapter = originDeployment.adapters[RouteKind.AxelarIts];
+  const destinationAdapter = destinationDeployment.adapters[RouteKind.AxelarIts];
+  if (originAdapter === undefined || destinationAdapter === undefined) return null;
+
+  const normalizedSourceToken = sourceTokenAddress.toLowerCase();
+  let matchedSymbol: string | null = null;
+  for (const symbol of Object.keys(originDeployment.tokens)) {
+    const candidate = originDeployment.tokens[symbol];
+    if (candidate === undefined) continue;
+    if (
+      candidate.address.toLowerCase() === normalizedSourceToken &&
+      candidate.routes.includes(RouteKind.AxelarIts)
+    ) {
+      matchedSymbol = symbol;
+      break;
+    }
+  }
+  if (matchedSymbol === null) return null;
+
+  const originToken = originDeployment.tokens[matchedSymbol];
+  const destinationToken = destinationDeployment.tokens[matchedSymbol];
+  if (originToken === undefined || destinationToken === undefined) return null;
+  if (!destinationToken.routes.includes(RouteKind.AxelarIts)) return null;
+
+  const evmWatch = config.indexer.evm.find((entry) => entry.chain === originChainKey);
+  const stellarWatch =
+    config.indexer.stellar?.chain === destinationChainKey ? config.indexer.stellar : null;
+
+  return {
+    originChain: originChainKey,
+    destinationChain: destinationChainKey,
+    symbol: matchedSymbol,
+    originChainId: origin.chainId,
+    originConfirmations: origin.confirmations,
+    originRpcUrl: evmWatch?.rpcUrl ?? origin.defaultRpcUrl,
+    originAxelarName: origin.axelarName,
+    originIts: originIts as Hex,
+    originRouter: originDeployment.router,
+    originAdapter,
+    originToken: originToken.address,
+    originDecimals: originToken.decimals,
+    destinationAxelarName: destination.axelarName,
+    destinationIts,
+    destinationRouter: destinationDeployment.router,
+    destinationAdapter,
+    destinationAdmin: destinationDeployment.admin,
+    destinationNetworkPassphrase: destinationDeployment.networkPassphrase,
+    destinationRpcUrl: stellarWatch?.rpcUrl ?? destination.defaultRpcUrl,
+    destinationConfirmations: 1,
+    destinationTokenSacId: destinationToken.sacId,
+    destinationDecimals: destinationToken.decimals,
+  };
+}
+
+/** Enumerate every reverse-direction ITS lane that has complete deployment and registry support. */
+export function discoverReverseItsLanes(
+  config: Pick<AppConfig, "network" | "deployments" | "indexer">,
+): readonly ReverseItsLane[] {
+  const peers = chainsFor(config.network).filter((entry) => entry.key !== "local");
+  const lanes: ReverseItsLane[] = [];
+  for (const origin of peers) {
+    if (!isEvmChain(origin)) continue;
+    const deployment = config.deployments.networks[origin.key];
+    if (deployment === undefined || !isEvmDeployment(deployment)) continue;
+    for (const symbol of Object.keys(deployment.tokens)) {
+      const token = deployment.tokens[symbol];
+      if (token === undefined) continue;
+      for (const destination of peers) {
+        if (!isStellarChain(destination)) continue;
+        const lane = resolveReverseItsLane(config, origin.key, destination.key, token.address);
+        if (lane !== null) lanes.push(lane);
+      }
+    }
+  }
+  lanes.sort((a, b) =>
+    `${a.originChain}:${a.destinationChain}:${a.symbol}`.localeCompare(
+      `${b.originChain}:${b.destinationChain}:${b.symbol}`,
+    ),
+  );
+  return lanes;
 }
