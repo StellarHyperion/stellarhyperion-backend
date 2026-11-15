@@ -20,6 +20,7 @@ import {
   DeploymentFormatError,
   IRIS_API,
   chainsFor,
+  isChainKey,
   isEvmChain,
   isEvmDeployment,
   isStellarChain,
@@ -57,6 +58,27 @@ export interface StellarWatchConfig {
   readonly pollIntervalMs: number;
 }
 
+export type EvmActivationState = "active" | "staged" | "candidate" | "disabled";
+
+export interface EvmRouterActivation {
+  readonly status: EvmActivationState;
+  readonly activatedAt: string | null;
+  readonly evidence: string | null;
+  readonly acceptance: string | null;
+  readonly sourceHash: string | null;
+  readonly destinationHash: string | null;
+}
+
+export interface UnactivatedEvmRouter {
+  readonly chain: ChainKey;
+  readonly chainId: number;
+  readonly routerAddress: Hex;
+  readonly startBlock: bigint;
+  readonly deploymentTxHash: Hex;
+  readonly commit: string;
+  readonly status: Exclude<EvmActivationState, "active">;
+}
+
 /** Everything the EVM watcher needs, per chain. */
 export interface EvmWatchConfig {
   readonly chain: ChainKey;
@@ -66,6 +88,12 @@ export interface EvmWatchConfig {
   readonly routerAddress: Hex;
   /** The block the router was deployed in, from the deployment record. */
   readonly startBlock: bigint;
+  /** Deployment/initialization transaction hash from the deployment record, when present. */
+  readonly deploymentTxHash?: Hex;
+  /** Contracts repository revision recorded for this router deployment. */
+  readonly commit?: string;
+  /** Explicit activation metadata when the deployment record includes an `activation` block. */
+  readonly activation?: EvmRouterActivation;
   /** From the chain registry. How many blocks before a log is believed. */
   readonly confirmations: number;
   /** How far back to wind the cursor when a reorg is found below the confirmation depth. */
@@ -91,6 +119,8 @@ export interface IndexerConfig {
   /** Null when the deployment record has no Stellar side for this network yet. */
   readonly stellar: StellarWatchConfig | null;
   readonly evm: readonly EvmWatchConfig[];
+  /** Staged, candidate, or disabled EVM router revisions withheld from active indexing. */
+  readonly unactivatedEvm?: readonly UnactivatedEvmRouter[];
 }
 
 export interface KeeperConfig {
@@ -484,10 +514,12 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     : null;
 
   const absoluteDeployments = deploymentsPath === "" ? "" : resolvePath(cwd, deploymentsPath);
-  const deployments = readDeployments(reader, read, absoluteDeployments);
+  const loaded = readDeployments(reader, read, absoluteDeployments);
+  const deployments = loaded.set;
   const indexer = planIndexer(reader, {
     network,
     deployments,
+    evmActivations: loaded.evmActivations,
     enabled: indexerEnabled,
     stellarRpcOverride,
     startLedgerOverride,
@@ -532,13 +564,24 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
 }
 
 const EMPTY_SET: DeploymentSet = { schemaVersion: 1, generatedAt: "", networks: {} };
+const VALID_ACTIVATION_STATES: readonly EvmActivationState[] = [
+  "active",
+  "staged",
+  "candidate",
+  "disabled",
+];
+
+interface LoadedDeployments {
+  readonly set: DeploymentSet;
+  readonly evmActivations: Readonly<Partial<Record<ChainKey, EvmRouterActivation>>>;
+}
 
 function readDeployments(
   reader: EnvReader,
   read: (path: string) => string,
   path: string,
-): DeploymentSet {
-  if (path === "") return EMPTY_SET;
+): LoadedDeployments {
+  if (path === "") return { set: EMPTY_SET, evmActivations: {} };
 
   let text: string;
   try {
@@ -548,7 +591,7 @@ function readDeployments(
     // directory is the single most common way this fails, and the resolved absolute path is the
     // thing that makes it obvious.
     reader.reject(DEPLOYMENTS_FILE, `cannot be read at ${path}`);
-    return EMPTY_SET;
+    return { set: EMPTY_SET, evmActivations: {} };
   }
 
   let parsed: unknown;
@@ -556,26 +599,130 @@ function readDeployments(
     parsed = JSON.parse(text);
   } catch (error) {
     reader.reject(DEPLOYMENTS_FILE, `is not valid JSON: ${messageOf(error)}`);
-    return EMPTY_SET;
+    return { set: EMPTY_SET, evmActivations: {} };
   }
 
+  let set: DeploymentSet;
   try {
     // Validated rather than cast. An address with a transposed character parses fine as a string
     // and turns into a watcher reading an empty contract for a week without complaining.
-    return parseDeploymentSet(parsed);
+    set = parseDeploymentSet(parsed);
   } catch (error) {
     const detail =
       error instanceof DeploymentFormatError
         ? error.message
         : `is not a deployment set: ${messageOf(error)}`;
     reader.reject(DEPLOYMENTS_FILE, detail);
-    return EMPTY_SET;
+    return { set: EMPTY_SET, evmActivations: {} };
   }
+
+  const evmActivations = extractEvmActivations(reader, parsed, set);
+  return { set, evmActivations };
+}
+
+function extractEvmActivations(
+  reader: EnvReader,
+  rawJson: unknown,
+  set: DeploymentSet,
+): Readonly<Partial<Record<ChainKey, EvmRouterActivation>>> {
+  const out: Partial<Record<ChainKey, EvmRouterActivation>> = {};
+  if (typeof rawJson !== "object" || rawJson === null || Array.isArray(rawJson)) return out;
+  const rawNetworks = (rawJson as Record<string, unknown>).networks;
+  if (typeof rawNetworks !== "object" || rawNetworks === null || Array.isArray(rawNetworks)) {
+    return out;
+  }
+
+  for (const key of Object.keys(set.networks)) {
+    if (!isChainKey(key)) continue;
+    const deployment = set.networks[key];
+    if (deployment === undefined || !isEvmDeployment(deployment)) continue;
+
+    const rawEntry = (rawNetworks as Record<string, unknown>)[key];
+    if (typeof rawEntry !== "object" || rawEntry === null || Array.isArray(rawEntry)) continue;
+    const rawActivation = (rawEntry as Record<string, unknown>).activation;
+    if (rawActivation === undefined || rawActivation === null) continue;
+    if (typeof rawActivation !== "object" || Array.isArray(rawActivation)) {
+      reader.reject(DEPLOYMENTS_FILE, `networks.${key}.activation must be an object when present`);
+      continue;
+    }
+
+    const fields = rawActivation as Record<string, unknown>;
+    const rawStatus = fields.status;
+    if (
+      typeof rawStatus !== "string" ||
+      !VALID_ACTIVATION_STATES.includes(rawStatus as EvmActivationState)
+    ) {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        `networks.${key}.activation.status must be one of ${VALID_ACTIVATION_STATES.join(", ")}`,
+      );
+      continue;
+    }
+
+    const status = rawStatus as EvmActivationState;
+    const activatedAt = optionalStringField(
+      reader,
+      fields,
+      "activatedAt",
+      `networks.${key}.activation.activatedAt`,
+    );
+    const evidence = optionalStringField(
+      reader,
+      fields,
+      "evidence",
+      `networks.${key}.activation.evidence`,
+    );
+    const acceptance = optionalStringField(
+      reader,
+      fields,
+      "acceptance",
+      `networks.${key}.activation.acceptance`,
+    );
+    const sourceHash = optionalStringField(
+      reader,
+      fields,
+      "sourceHash",
+      `networks.${key}.activation.sourceHash`,
+    );
+    const destinationHash = optionalStringField(
+      reader,
+      fields,
+      "destinationHash",
+      `networks.${key}.activation.destinationHash`,
+    );
+
+    out[key] = {
+      status,
+      activatedAt,
+      evidence,
+      acceptance,
+      sourceHash,
+      destinationHash,
+    };
+  }
+
+  return out;
+}
+
+function optionalStringField(
+  reader: EnvReader,
+  fields: Record<string, unknown>,
+  name: string,
+  path: string,
+): string | null {
+  const value = fields[name];
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || value.trim() === "") {
+    reader.reject(DEPLOYMENTS_FILE, `${path} must be a non-empty string when present`);
+    return null;
+  }
+  return value;
 }
 
 interface PlanInput {
   readonly network: NetworkMode;
   readonly deployments: DeploymentSet;
+  readonly evmActivations: Readonly<Partial<Record<ChainKey, EvmRouterActivation>>>;
   readonly enabled: boolean;
   readonly stellarRpcOverride: string;
   readonly startLedgerOverride: number | null;
@@ -594,12 +741,13 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
   // HYPERION_DEPLOYMENTS_FILE for a file that was fine. A cascading fault is worse than a silent
   // one: it sends somebody to edit the wrong thing, confidently.
   if (reader.failed(HYPERION_NETWORK) || reader.failed(DEPLOYMENTS_FILE)) {
-    return { enabled: input.enabled, stellar: null, evm: [] };
+    return { enabled: input.enabled, stellar: null, evm: [], unactivatedEvm: [] };
   }
 
   const allowed = new Set(chainsFor(input.network).map((entry: Chain) => entry.key));
   let stellar: StellarWatchConfig | null = null;
   const evm: EvmWatchConfig[] = [];
+  const unactivatedEvm: UnactivatedEvmRouter[] = [];
 
   // Gathered first and reported once. Refused rather than ignored, because a testnet record
   // quietly watched by a mainnet process is how an operator ends up confident about numbers that
@@ -659,6 +807,33 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
         );
         continue;
       }
+      if (/^0x0{40}$/i.test(deployment.router)) {
+        reader.reject(
+          DEPLOYMENTS_FILE,
+          `names the zero address as the ${chainKey} router, which cannot be indexed`,
+        );
+        continue;
+      }
+      const startBlock = BigInt(deployment.deployedAt.blockNumber);
+      if (startBlock < 0n) {
+        reader.reject(DEPLOYMENTS_FILE, `names a negative deployedAt.blockNumber for ${chainKey}`);
+        continue;
+      }
+
+      const activation = input.evmActivations[chainKey];
+      if (activation !== undefined && activation.status !== "active") {
+        unactivatedEvm.push({
+          chain: chainKey,
+          chainId: chain.chainId,
+          routerAddress: deployment.router,
+          startBlock,
+          deploymentTxHash: deployment.deployedAt.txHash,
+          commit: deployment.commit,
+          status: activation.status,
+        });
+        continue;
+      }
+
       const override = rpcOverrideSpec(chainKey);
       const urlsOverride = rpcUrlsOverrideSpec(chainKey);
       let rpcUrls: readonly string[];
@@ -676,7 +851,10 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
         rpcUrl,
         rpcUrls,
         routerAddress: deployment.router,
-        startBlock: BigInt(deployment.deployedAt.blockNumber),
+        startBlock,
+        deploymentTxHash: deployment.deployedAt.txHash,
+        commit: deployment.commit,
+        ...(activation !== undefined ? { activation } : {}),
         confirmations: chain.confirmations,
         // The chain's own confirmations is the right default per chain: one on Arc, where
         // Malachite finality is genuinely final, and twelve on Ethereum, where it is not.
@@ -695,9 +873,50 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
 
   // Stable order so logs and the ready check read the same way on every boot.
   evm.sort((a, b) => a.chain.localeCompare(b.chain));
-  return { enabled: input.enabled, stellar, evm };
+  unactivatedEvm.sort((a, b) => a.chain.localeCompare(b.chain));
+  return { enabled: input.enabled, stellar, evm, unactivatedEvm };
 }
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+export type EvmOriginAdmission =
+  | { readonly activated: true; readonly watch: EvmWatchConfig }
+  | {
+      readonly activated: false;
+      readonly reason:
+        "not_evm_chain" | "wrong_network" | "not_in_deployments" | "unactivated_revision";
+      readonly status?: Exclude<EvmActivationState, "active">;
+    };
+
+/**
+ * Inspect whether an EVM peer chain in `@hyperion/protocol` is actually backed by an activated
+ * router revision in the loaded deployment configuration. Registry presence alone never activates
+ * source indexing.
+ */
+export function admitEvmOriginRouter(
+  config: Pick<AppConfig, "network" | "indexer">,
+  chainKey: string,
+): EvmOriginAdmission {
+  if (!isChainKey(chainKey) || chainKey === "local") {
+    return { activated: false, reason: "not_evm_chain" };
+  }
+  const chain = CHAINS[chainKey];
+  if (!isEvmChain(chain)) {
+    return { activated: false, reason: "not_evm_chain" };
+  }
+  const allowed = new Set(chainsFor(config.network).map((entry) => entry.key));
+  if (!allowed.has(chainKey)) {
+    return { activated: false, reason: "wrong_network" };
+  }
+  const active = config.indexer.evm.find((entry) => entry.chain === chainKey);
+  if (active !== undefined) {
+    return { activated: true, watch: active };
+  }
+  const staged = config.indexer.unactivatedEvm?.find((entry) => entry.chain === chainKey);
+  if (staged !== undefined) {
+    return { activated: false, reason: "unactivated_revision", status: staged.status };
+  }
+  return { activated: false, reason: "not_in_deployments" };
 }

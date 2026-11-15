@@ -31,7 +31,7 @@ import { IrisClient } from "../rails/cctp/iris.js";
 import { RailPass } from "../rails/pass.js";
 import type { RailClient } from "../rails/types.js";
 import { KeeperWorker } from "../keeper/worker.js";
-import { viemClient } from "./evm/client.js";
+import { viemClient, type EvmClient } from "./evm/client.js";
 import { EvmWatcher } from "./evm/watcher.js";
 import { StellarRpc } from "./stellar/rpc.js";
 import { StellarWatcher } from "./stellar/watcher.js";
@@ -118,6 +118,7 @@ export interface BuildIndexerDeps {
   readonly config: AppConfig;
   readonly logger: Logger;
   readonly db: Transactional;
+  readonly evmClientFactory?: (watch: EvmWatchConfig, logger: Logger) => EvmClient;
 }
 
 /**
@@ -158,7 +159,19 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // One per chain in the record. Each carries its own confirmations from the registry, which is
   // the honest way to treat one block on Arc and twelve on Ethereum as the same kind of fact.
   for (const chain of config.indexer.evm) {
-    workers.push(evmWorker(chain, db, logger));
+    workers.push(evmWorker(chain, db, logger, deps.evmClientFactory));
+  }
+
+  for (const withheld of config.indexer.unactivatedEvm ?? []) {
+    logger.info(
+      {
+        chain: withheld.chain,
+        router: withheld.routerAddress,
+        status: withheld.status,
+        commit: withheld.commit,
+      },
+      "EVM router revision in deployment record is not active; withholding source watcher",
+    );
   }
 
   // Counted before the rail pollers join the list, because the two questions are different. "Is
@@ -277,17 +290,27 @@ function railWorkers(
   });
 }
 
-function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): Worker {
+function evmWorker(
+  config: EvmWatchConfig,
+  db: Transactional,
+  logger: Logger,
+  clientFactory?: (watch: EvmWatchConfig, logger: Logger) => EvmClient,
+): Worker {
   const child = logger.child({ chain: config.chain, chainId: config.chainId });
   const watcher = new EvmWatcher({
     chainKey: config.chain,
     router: config.routerAddress,
     chainId: config.chainId,
     startBlock: config.startBlock,
+    ...(config.deploymentTxHash !== undefined ? { deploymentTxHash: config.deploymentTxHash } : {}),
+    ...(config.commit !== undefined ? { commit: config.commit } : {}),
     confirmations: config.confirmations,
     reorgDepth: config.reorgDepth,
     logRange: config.logRange,
-    client: viemClient(config.rpcUrls, { logger: child }),
+    client:
+      clientFactory === undefined
+        ? viemClient(config.rpcUrls, { logger: child })
+        : clientFactory(config, child),
     db,
     logger: child,
   });

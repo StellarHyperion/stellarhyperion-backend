@@ -30,6 +30,16 @@ export function isTerminal(status: AttestationStatus): boolean {
   return TERMINAL.includes(status);
 }
 
+/**
+ * Clamp a provider-reported status so no rail status API can establish `delivered` without
+ * independently verified destination chain events.
+ */
+export function clampProviderAttestationStatus(
+  status: AttestationStatus,
+): Exclude<AttestationStatus, "delivered"> {
+  return status === "delivered" ? "attested" : status;
+}
+
 export interface RailReport {
   readonly forwardTxHash?: `0x${string}`;
   readonly execution?: { readonly txHash: `0x${string}`; readonly commandId: `0x${string}` };

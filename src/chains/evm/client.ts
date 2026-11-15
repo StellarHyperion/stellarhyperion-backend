@@ -35,6 +35,15 @@ export interface BlockStamp {
   readonly timestamp: bigint;
 }
 
+export interface EvmDeploymentReceipt {
+  readonly status: "success" | "reverted";
+  readonly blockNumber: bigint;
+  readonly blockHash: Hex;
+  readonly contractAddress: Hex | null;
+  readonly to: Hex | null;
+  readonly logAddresses: readonly Hex[];
+}
+
 export interface LogQuery {
   readonly address: Hex;
   readonly fromBlock: bigint;
@@ -63,6 +72,10 @@ export interface EvmClient {
   logs(query: LogQuery, signal?: AbortSignal): Promise<readonly RawEvmLog[]>;
   /** Hash and timestamp for each block asked for. A block missing from the map is gone. */
   blocks(numbers: readonly bigint[], signal?: AbortSignal): Promise<Map<bigint, BlockStamp>>;
+  /** Deployed runtime bytecode at `address` (`"0x"` when no contract is deployed there). */
+  code?(address: Hex, signal?: AbortSignal): Promise<Hex>;
+  /** Confirmed transaction receipt for router initialization verification, or null when absent. */
+  transactionReceipt?(hash: Hex, signal?: AbortSignal): Promise<EvmDeploymentReceipt | null>;
 }
 
 export interface ViemClientOptions {
@@ -182,6 +195,27 @@ export function viemClient(
         found.set(blockNumber, { hash: block.hash, timestamp: block.timestamp });
       }
       return found;
+    },
+
+    code: async (address) => {
+      const bytecode = await client.getCode({ address });
+      return bytecode ?? "0x";
+    },
+
+    transactionReceipt: async (hash) => {
+      try {
+        const receipt = await client.getTransactionReceipt({ hash });
+        return {
+          status: receipt.status === "success" ? "success" : "reverted",
+          blockNumber: receipt.blockNumber,
+          blockHash: receipt.blockHash,
+          contractAddress: receipt.contractAddress ?? null,
+          to: receipt.to ?? null,
+          logAddresses: receipt.logs.map((entry) => entry.address),
+        };
+      } catch {
+        return null;
+      }
     },
   };
 }

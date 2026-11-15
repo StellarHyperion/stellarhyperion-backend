@@ -7,7 +7,18 @@
  * Reading a `BridgeIn` on its own would record every parked delivery as delivered, which is both
  * wrong and a check constraint violation waiting for the first frozen recipient.
  */
-import { ROUTE_KINDS } from "@hyperion/protocol";
+import {
+  CHAINS,
+  ROUTE_KINDS,
+  encodeStellarAddress,
+  isChainKey,
+  isEvmChain,
+  isRouteKind,
+  isStellarChain,
+  parseStellarAddress,
+  toEvmAddress,
+} from "@hyperion/protocol";
+import type { Hex } from "viem";
 
 import type { Queryable } from "../../db/pool.js";
 import type { Position } from "../writers.js";
@@ -22,6 +33,7 @@ import {
 } from "../writers.js";
 import {
   type DecodedLog,
+  LogShapeError,
   requireAddress,
   requireBigint,
   requireBool,
@@ -71,22 +83,49 @@ export async function applyRouterLog(
   const args = log.args;
 
   switch (log.name) {
-    case "BridgeOut":
+    case "BridgeOut": {
+      const route = requireNumber(args, "route");
+      if (!isRouteKind(route)) {
+        throw new LogShapeError("route", `is not a supported RouteKind (${String(route)})`);
+      }
+      const nonce = requireBigint(args, "nonce");
+      if (nonce < 0n) {
+        throw new LogShapeError("nonce", "cannot be negative");
+      }
+      const sender = requireCanonicalEvmAddress(args, "sender");
+      const token = requireCanonicalEvmAddress(args, "token");
+      const grossAmount = requireBigint(args, "grossAmount");
+      const fee = requireBigint(args, "fee");
+      const netAmount = requireBigint(args, "netAmount");
+      if (grossAmount <= 0n || fee < 0n || netAmount <= 0n || grossAmount !== fee + netAmount) {
+        throw new LogShapeError(
+          "grossAmount",
+          `must be positive and equal fee + netAmount (gross=${grossAmount.toString()}, fee=${fee.toString()}, net=${netAmount.toString()})`,
+        );
+      }
+      const destinationChain = requireString(args, "destinationChain");
+      if (destinationChain.trim() === "") {
+        throw new LogShapeError("destinationChain", "cannot be empty");
+      }
+      const rawDestination = requireString(args, "destinationAddress");
+      const destination = preserveDestinationIdentity(destinationChain, rawDestination);
+
       await writeOutbound(db, at, {
-        route: requireNumber(args, "route"),
-        nonce: requireBigint(args, "nonce"),
-        sender: requireAddress(args, "sender"),
-        token: requireAddress(args, "token"),
-        grossAmount: requireBigint(args, "grossAmount"),
-        fee: requireBigint(args, "fee"),
-        netAmount: requireBigint(args, "netAmount"),
-        destinationChain: requireString(args, "destinationChain"),
+        route,
+        nonce,
+        sender,
+        token,
+        grossAmount,
+        fee,
+        netAmount,
+        destinationChain,
         // The strkey as a string, which is what this router emits. The Soroban router emits a
         // 32 byte word for the same field and neither is converted into the other here.
-        destination: requireString(args, "destinationAddress"),
+        destination,
         railRef: wordOrNull(args.railRef),
       });
       return { kind: "written" };
+    }
 
     case "ClaimParked": {
       const route = requireNumber(args, "route");
@@ -249,4 +288,74 @@ export async function applyRouterLog(
     default:
       return { kind: "ignored" };
   }
+}
+
+function requireCanonicalEvmAddress(args: Record<string, unknown>, name: string): string {
+  const addr = requireAddress(args, name);
+  if (!/^0x[0-9a-f]{40}$/.test(addr) || /^0x0{40}$/.test(addr)) {
+    throw new LogShapeError(name, `is not a valid non-zero EVM address (${addr})`);
+  }
+  return addr;
+}
+
+/**
+ * Validate and preserve chain-specific recipient identity without collapsing muxed Stellar strkeys
+ * or rewriting cross-family encodings.
+ */
+function preserveDestinationIdentity(destinationChain: string, rawDestination: string): string {
+  if (rawDestination === "") {
+    throw new LogShapeError("destinationAddress", "cannot be empty");
+  }
+  if (!isChainKey(destinationChain)) {
+    return rawDestination;
+  }
+  const chain = CHAINS[destinationChain];
+  if (isStellarChain(chain)) {
+    try {
+      const parsed = parseStellarAddress(rawDestination);
+      const canonical = encodeStellarAddress(parsed.kind, parsed.key, parsed.muxedId);
+      if (canonical !== rawDestination) {
+        throw new LogShapeError(
+          "destinationAddress",
+          `is not canonical SEP-23 strkey encoding (${rawDestination})`,
+        );
+      }
+      return canonical;
+    } catch (error) {
+      if (error instanceof LogShapeError) throw error;
+      throw new LogShapeError(
+        "destinationAddress",
+        `is not a valid Stellar strkey for ${destinationChain}: ${rawDestination}`,
+      );
+    }
+  }
+  if (isEvmChain(chain)) {
+    if (/^0x[0-9a-fA-F]{40}$/.test(rawDestination)) {
+      const lower = rawDestination.toLowerCase();
+      if (/^0x0{40}$/.test(lower)) {
+        throw new LogShapeError("destinationAddress", "cannot be the zero EVM address");
+      }
+      return lower;
+    }
+    if (/^0x[0-9a-fA-F]{64}$/.test(rawDestination)) {
+      try {
+        const addr = toEvmAddress(rawDestination as Hex);
+        if (/^0x0{40}$/.test(addr.toLowerCase())) {
+          throw new LogShapeError("destinationAddress", "cannot be the zero EVM address");
+        }
+        return rawDestination.toLowerCase();
+      } catch (error) {
+        if (error instanceof LogShapeError) throw error;
+        throw new LogShapeError(
+          "destinationAddress",
+          `is not a valid padded EVM address word for ${destinationChain}: ${rawDestination}`,
+        );
+      }
+    }
+    throw new LogShapeError(
+      "destinationAddress",
+      `is not a valid EVM destination for ${destinationChain}: ${rawDestination}`,
+    );
+  }
+  return rawDestination;
 }

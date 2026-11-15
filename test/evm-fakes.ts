@@ -19,7 +19,13 @@ import { join } from "node:path";
 import { encodeEventTopics, encodeAbiParameters, type AbiEvent, type Hex } from "viem";
 import { hyperionRouterAbi } from "@hyperion/protocol/abi";
 
-import type { BlockStamp, EvmClient, LogQuery, RawEvmLog } from "../src/chains/evm/client.js";
+import type {
+  BlockStamp,
+  EvmClient,
+  EvmDeploymentReceipt,
+  LogQuery,
+  RawEvmLog,
+} from "../src/chains/evm/client.js";
 import { FIXTURES_DIR } from "./helpers.js";
 
 interface CapturedFixture {
@@ -77,6 +83,10 @@ export interface FakeEvmClientOptions {
   readonly chainId?: number;
   /** Blocks the node no longer has, which is how a vanished block is expressed. */
   readonly missing?: readonly bigint[];
+  /** Optional deployed runtime bytecode overrides keyed by lowercase address. */
+  readonly bytecodeByAddress?: Readonly<Record<string, Hex>>;
+  /** Optional transaction receipts keyed by lowercase txHash for router deployment verification. */
+  readonly receiptsByHash?: Readonly<Record<string, EvmDeploymentReceipt | null>>;
 }
 
 export class FakeEvmClient implements EvmClient {
@@ -84,6 +94,7 @@ export class FakeEvmClient implements EvmClient {
   readonly blockQueries: bigint[][] = [];
   /** Counted, because the watcher is supposed to ask this once per process and not once per pass. */
   chainIdCalls = 0;
+  codeCalls = 0;
 
   private log: RawEvmLog[];
   private head: bigint;
@@ -92,6 +103,8 @@ export class FakeEvmClient implements EvmClient {
   private reorgFrom: bigint | null = null;
   private epoch = 0;
   private readonly chain: number;
+  private readonly bytecodeByAddress = new Map<string, Hex>();
+  private readonly receiptsByHash = new Map<string, EvmDeploymentReceipt | null>();
 
   constructor(options: FakeEvmClientOptions = {}) {
     this.chain = options.chainId ?? captured.chainId;
@@ -100,6 +113,12 @@ export class FakeEvmClient implements EvmClient {
       options.head ??
       this.log.reduce((max, entry) => (entry.blockNumber > max ? entry.blockNumber : max), 0n) + 1n;
     for (const block of options.missing ?? []) this.missing.add(block);
+    for (const [addr, code] of Object.entries(options.bytecodeByAddress ?? {})) {
+      this.bytecodeByAddress.set(addr.toLowerCase(), code);
+    }
+    for (const [hash, receipt] of Object.entries(options.receiptsByHash ?? {})) {
+      this.receiptsByHash.set(hash.toLowerCase(), receipt);
+    }
   }
 
   get latest(): bigint {
@@ -167,6 +186,20 @@ export class FakeEvmClient implements EvmClient {
       found.set(number, this.stampFor(number));
     }
     return Promise.resolve(found);
+  }
+
+  code(address: Hex): Promise<Hex> {
+    this.codeCalls += 1;
+    const override = this.bytecodeByAddress.get(address.toLowerCase());
+    return Promise.resolve(override ?? "0x6080604052");
+  }
+
+  transactionReceipt(hash: Hex): Promise<EvmDeploymentReceipt | null> {
+    const key = hash.toLowerCase();
+    if (this.receiptsByHash.has(key)) {
+      return Promise.resolve(this.receiptsByHash.get(key) ?? null);
+    }
+    return Promise.resolve(null);
   }
 
   /** What the node would say about a block right now, after any reorg already applied. */

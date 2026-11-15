@@ -52,6 +52,10 @@ export interface EvmWatcherOptions {
   readonly chainId: number;
   /** The block the router was deployed in. Where a fresh cursor starts. */
   readonly startBlock: bigint;
+  /** Optional deployment/initialization transaction hash from the deployment record. */
+  readonly deploymentTxHash?: Hex;
+  /** Optional contracts commit revision for structured diagnostics. */
+  readonly commit?: string;
   /** How many blocks behind the head this chain's own finality needs. */
   readonly confirmations: number;
   /** How far back to wind the cursor when a reorg is found below that depth. */
@@ -80,6 +84,8 @@ export class EvmWatcher {
   private reorgs = 0;
   /** Set once the node has confirmed which chain it is. */
   private chainConfirmed = false;
+  /** Set once router bytecode and initialization block have been verified on chain. */
+  private routerVerified = false;
   /** Signatures seen once and logged once. A router ahead of this build is not a log flood. */
   private readonly reportedUnknown = new Set<string>();
 
@@ -135,6 +141,17 @@ export class EvmWatcher {
   async tick(signal: AbortSignal): Promise<boolean> {
     const { chainKey, router, db, logger, client, confirmations } = this.options;
 
+    if (!/^0x[0-9a-fA-F]{40}$/.test(router) || /^0x0{40}$/.test(router)) {
+      throw new Error(
+        `the router address ${router} for ${chainKey} is not a deployed non-zero contract address`,
+      );
+    }
+    if (this.options.startBlock < 0n) {
+      throw new Error(
+        `the initialization startBlock ${this.options.startBlock.toString()} for ${chainKey} cannot be negative`,
+      );
+    }
+
     const stored = await readCursor(db, chainKey);
     if (stored !== null && stored.contract.toLowerCase() !== router.toLowerCase()) {
       // A different router at a different address shares no history with this cursor. Carrying it
@@ -171,6 +188,8 @@ export class EvmWatcher {
       };
       return false;
     }
+
+    await this.verifyRouterInitialization(signal);
 
     const to = min(from + BigInt(this.options.logRange) - 1n, confirmed);
     const logs = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
@@ -271,6 +290,68 @@ export class EvmWatcher {
       );
     }
     this.chainConfirmed = true;
+  }
+
+  /**
+   * Verify that the configured router address holds deployed bytecode and that its initialization
+   * block (and optional deployment transaction) matches the chain before any logs are indexed.
+   */
+  private async verifyRouterInitialization(signal: AbortSignal): Promise<void> {
+    if (this.routerVerified) return;
+    const { chainKey, router, startBlock, deploymentTxHash, client } = this.options;
+    const routerLower = router.toLowerCase();
+
+    if (client.code !== undefined) {
+      const bytecode = await client.code(router, signal);
+      if (bytecode.toLowerCase() === "0x" || bytecode.length <= 2) {
+        throw new Error(
+          `router ${router} on ${chainKey} has no deployed contract bytecode; refusing to index an empty address`,
+        );
+      }
+    }
+
+    const startStamps = await client.blocks([startBlock], signal);
+    const startStamp = startStamps.get(startBlock);
+    if (startStamp === undefined) {
+      throw new Error(
+        `initialization block ${startBlock.toString()} for router ${router} on ${chainKey} could not be verified on the RPC node`,
+      );
+    }
+
+    if (deploymentTxHash !== undefined && client.transactionReceipt !== undefined) {
+      const receipt = await client.transactionReceipt(deploymentTxHash, signal);
+      if (receipt === null) {
+        throw new Error(
+          `deployment transaction ${deploymentTxHash} for router ${router} on ${chainKey} was not found on the RPC node`,
+        );
+      }
+      if (receipt.status !== "success") {
+        throw new Error(
+          `deployment transaction ${deploymentTxHash} for router ${router} on ${chainKey} reverted`,
+        );
+      }
+      if (receipt.blockNumber !== startBlock) {
+        throw new Error(
+          `deployment transaction ${deploymentTxHash} on ${chainKey} landed in block ${receipt.blockNumber.toString()}, expected startBlock ${startBlock.toString()}`,
+        );
+      }
+      if (receipt.blockHash.toLowerCase() !== startStamp.hash.toLowerCase()) {
+        throw new Error(
+          `deployment transaction ${deploymentTxHash} on ${chainKey} references non-canonical block hash ${receipt.blockHash}`,
+        );
+      }
+      const touchesRouter =
+        receipt.contractAddress?.toLowerCase() === routerLower ||
+        receipt.to?.toLowerCase() === routerLower ||
+        receipt.logAddresses.some((addr) => addr.toLowerCase() === routerLower);
+      if (!touchesRouter) {
+        throw new Error(
+          `deployment transaction ${deploymentTxHash} on ${chainKey} did not deploy or initialize router ${router}`,
+        );
+      }
+    }
+
+    this.routerVerified = true;
   }
 
   /**

@@ -6,4 +6,4 @@ Removed: mocked gas top-ups, synthetic second-step attestations and receipt-only
 
 Network acceptance passed: the current testnet lane was deployed and activated, a real wallet transfer confirmed on Stellar, and matching ITS/token payment events established its Sepolia delivery in the indexer. The API server alone cannot establish background worker availability.
 
-Additional rails/networks and distributed keeper signing need their own implementation and validation. The complete PostgreSQL-backed suite passes, and the live acceptance proof is preserved in the contracts deployment evidence.
+Additional rails/networks and distributed keeper signing need their own implementation and validation. An EVM source router watcher activates only from a validated active deployment entry (never from shared chain or asset registry presence alone), verifies deployed router bytecode and initialization block receipts before indexing, and preserves exact uint256 integer amounts and full Stellar account, contract, or muxed destination strkeys. The complete PostgreSQL-backed suite passes, and the live acceptance proof is preserved in the contracts deployment evidence.
