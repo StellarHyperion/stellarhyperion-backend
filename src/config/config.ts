@@ -19,6 +19,7 @@ import {
   CHAINS,
   DeploymentFormatError,
   IRIS_API,
+  assetOn,
   chainsFor,
   isEvmChain,
   isEvmDeployment,
@@ -27,6 +28,7 @@ import {
   parseDeploymentSet,
 } from "@hyperion/protocol";
 
+import type { CandidateLane } from "../rails/types.js";
 import type { EnumSpec, VarSpec } from "./env.js";
 import { EnvReader } from "./env.js";
 
@@ -700,4 +702,49 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Enumerate candidate cross-chain lanes implied by a validated deployment set and the registry.
+ *
+ * Listing a candidate here never enables a watcher or advertises the lane; each entry must pass
+ * `evaluateLaneAcceptance` with live source, provider and destination payment evidence and still
+ * awaits manual contract/deployment activation.
+ */
+export function discoverCandidateLanes(
+  config: Pick<AppConfig, "network" | "deployments">,
+): readonly CandidateLane[] {
+  const peers = chainsFor(config.network).filter((entry) => entry.key !== "local");
+  const candidates: CandidateLane[] = [];
+
+  for (const origin of peers) {
+    const deployment = config.deployments.networks[origin.key];
+    if (deployment === undefined) continue;
+
+    for (const symbol of Object.keys(deployment.tokens)) {
+      const token = deployment.tokens[symbol];
+      if (token === undefined) continue;
+      for (const route of token.routes) {
+        if (deployment.adapters[route] === undefined) continue;
+        for (const destination of peers) {
+          if (destination.key === origin.key || destination.family === origin.family) continue;
+          if (assetOn(destination.key, symbol) === null) continue;
+          candidates.push({
+            network: config.network,
+            originChain: origin.key,
+            destinationChain: destination.key,
+            route,
+            symbol,
+          });
+        }
+      }
+    }
+  }
+
+  candidates.sort((a, b) =>
+    `${a.originChain}:${a.destinationChain}:${String(a.route)}:${a.symbol}`.localeCompare(
+      `${b.originChain}:${b.destinationChain}:${String(b.route)}:${b.symbol}`,
+    ),
+  );
+  return candidates;
 }

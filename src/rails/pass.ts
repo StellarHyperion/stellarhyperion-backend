@@ -25,8 +25,17 @@ import type { Logger } from "pino";
 import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
 import { writeInbound, writeAttestation } from "../chains/writers.js";
+import { evaluateLaneAcceptance } from "./acceptance.js";
 import { outstandingForRail, pendingForRail } from "./queue.js";
-import { RailError, isTerminal, type PendingTransfer, type RailClient } from "./types.js";
+import {
+  RailError,
+  isTerminal,
+  type CandidateLane,
+  type LaneAcceptanceEvidence,
+  type LaneAcceptanceReport,
+  type PendingTransfer,
+  type RailClient,
+} from "./types.js";
 
 /**
  * How many outstanding transfers still counts as keeping up.
@@ -70,6 +79,26 @@ export class RailPass {
 
   get progress(): RailProgress | null {
     return this.lastProgress;
+  }
+
+  /**
+   * Run the read-only acceptance gate for a candidate lane on this pass's rail without mutating
+   * runtime state or enabling the lane automatically.
+   */
+  evaluateCandidateLane(
+    lane: CandidateLane,
+    evidence: LaneAcceptanceEvidence | null,
+  ): LaneAcceptanceReport {
+    const deployments = this.options.config?.deployments ?? {
+      schemaVersion: 1,
+      generatedAt: "",
+      networks: {},
+    };
+    return evaluateLaneAcceptance({
+      lane: { ...lane, route: this.options.route },
+      deployments,
+      evidence,
+    });
   }
 
   readiness(): ReadinessReport {

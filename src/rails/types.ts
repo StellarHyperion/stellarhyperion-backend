@@ -107,3 +107,85 @@ export interface RailClient {
   /** Throws `RailError`; returns `missing` rather than throwing for a transfer not yet indexed. */
   look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup>;
 }
+
+/** Provenance of candidate-lane acceptance evidence. Only live evidence can pass the gate. */
+export type EvidenceEnvironment = "live" | "mock" | "synthetic" | "rehearsal";
+
+/** Identity of a candidate cross-chain lane evaluated before advertisement. */
+export interface CandidateLane {
+  readonly network: "mainnet" | "testnet";
+  readonly originChain: string;
+  readonly destinationChain: string;
+  readonly route: number;
+  readonly symbol: string;
+}
+
+/** Indexed departure facts from the source router. */
+export interface LaneSourceEvidence {
+  readonly originChain: string;
+  readonly destinationChain: string;
+  readonly route: number;
+  readonly nonce: string;
+  readonly sender: string;
+  readonly token: string;
+  readonly grossAmount: string;
+  readonly fee: string;
+  readonly netAmount: string;
+  readonly destination: string;
+  readonly originBlock: string;
+  readonly originTx: string;
+}
+
+/** Provider lookup observation. Necessary for discovery, never sufficient for delivery. */
+export interface LaneProviderEvidence {
+  readonly rail: string;
+  readonly status: AttestationStatus;
+  readonly railStatus: string;
+  readonly reference: string | null;
+  readonly candidateTxHash?: string | null;
+}
+
+/** Independently confirmed destination receipt and token payment facts. */
+export interface LaneDestinationEvidence {
+  readonly destinationChain: string;
+  readonly sourceChain: string;
+  readonly route: number;
+  readonly sourceNonce: string;
+  readonly railMessageId: string | null;
+  readonly recipient: string;
+  readonly token: string;
+  readonly amount: string;
+  readonly protocolFeeAmount?: string;
+  readonly delivered: boolean;
+  readonly claimId: string | null;
+  readonly destinationBlock: string;
+  readonly destinationTx: string;
+  readonly confirmations: number;
+  readonly canonicalBlockVerified: boolean;
+  readonly paymentEventVerified: boolean;
+}
+
+export interface LaneAcceptanceEvidence {
+  readonly environment: EvidenceEnvironment;
+  readonly source: LaneSourceEvidence | null;
+  readonly provider: LaneProviderEvidence | null;
+  readonly destination: LaneDestinationEvidence | null;
+}
+
+export interface LanePrerequisite {
+  readonly id: string;
+  readonly requiredForActivation: true;
+  readonly satisfied: boolean;
+  readonly summary: string;
+  readonly detail: string;
+}
+
+export interface LaneAcceptanceReport {
+  readonly laneKey: string;
+  readonly lane: CandidateLane;
+  readonly accepted: boolean;
+  readonly autoActivated: false;
+  readonly activationState: "blocked" | "pending_manual_activation";
+  readonly prerequisites: readonly LanePrerequisite[];
+  readonly reasons: readonly string[];
+}

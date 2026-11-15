@@ -14,11 +14,12 @@
  */
 import type { Logger } from "pino";
 
-import type {
-  AppConfig,
-  EvmWatchConfig,
-  RailsConfig,
-  StellarWatchConfig,
+import {
+  discoverCandidateLanes,
+  type AppConfig,
+  type EvmWatchConfig,
+  type RailsConfig,
+  type StellarWatchConfig,
 } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
 import { Poller } from "../runtime/poller.js";
@@ -26,10 +27,11 @@ import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
 import { fixedReadiness } from "../runtime/readiness.js";
 import { RouteKind } from "@hyperion/protocol";
 
+import { candidateLaneKey, evaluateLaneAcceptance } from "../rails/acceptance.js";
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
 import { IrisClient } from "../rails/cctp/iris.js";
 import { RailPass } from "../rails/pass.js";
-import type { RailClient } from "../rails/types.js";
+import type { LaneAcceptanceEvidence, LaneAcceptanceReport, RailClient } from "../rails/types.js";
 import { KeeperWorker } from "../keeper/worker.js";
 import { viemClient } from "./evm/client.js";
 import { EvmWatcher } from "./evm/watcher.js";
@@ -306,4 +308,24 @@ function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Lo
     logger: child,
   });
   return new PolledWorker(watcher, config.pollIntervalMs, child);
+}
+
+/**
+ * Evaluate candidate lanes from configuration against optional live acceptance evidence.
+ *
+ * Reports retain explicit prerequisites and `autoActivated: false`; `buildIndexer` never consumes
+ * these reports to start watchers or advertise a candidate lane automatically.
+ */
+export function evaluateConfiguredCandidateLanes(
+  config: AppConfig,
+  evidenceByKey: ReadonlyMap<string, LaneAcceptanceEvidence> = new Map(),
+): readonly LaneAcceptanceReport[] {
+  return discoverCandidateLanes(config).map((lane) => {
+    const key = candidateLaneKey(lane);
+    return evaluateLaneAcceptance({
+      lane,
+      deployments: config.deployments,
+      evidence: evidenceByKey.get(key) ?? null,
+    });
+  });
 }
