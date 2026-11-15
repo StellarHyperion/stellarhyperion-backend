@@ -26,6 +26,7 @@ import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
 import { fixedReadiness } from "../runtime/readiness.js";
 import { RouteKind } from "@hyperion/protocol";
 
+import { AllbridgeClient } from "../rails/allbridge/client.js";
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
 import { IrisClient } from "../rails/cctp/iris.js";
 import { RailPass } from "../rails/pass.js";
@@ -243,7 +244,7 @@ function railWorkers(
   logger: Logger,
   appConfig: AppConfig,
 ): readonly Worker[] {
-  const clients: readonly { readonly route: RouteKind; readonly client: RailClient }[] = [
+  const clients: { readonly route: RouteKind; readonly client: RailClient }[] = [
     {
       route: RouteKind.Cctp,
       client: new IrisClient(network, { baseUrl: config.irisUrl }),
@@ -260,6 +261,15 @@ function railWorkers(
       }),
     },
   ];
+
+  // Allbridge remains disabled unless validated Allbridge adapter, pool, and validator-quorum
+  // deployment metadata plus an explicit signed-intent API endpoint are configured.
+  if ((config.allbridgeLanes?.length ?? 0) > 0 && config.allbridgeUrl) {
+    clients.push({
+      route: RouteKind.Allbridge,
+      client: new AllbridgeClient(config.allbridgeUrl, appConfig),
+    });
+  }
 
   return clients.map(({ route, client }) => {
     const child = logger.child({ rail: client.rail, route });

@@ -6,4 +6,4 @@ Removed: mocked gas top-ups, synthetic second-step attestations and receipt-only
 
 Network acceptance passed: the current testnet lane was deployed and activated, a real wallet transfer confirmed on Stellar, and matching ITS/token payment events established its Sepolia delivery in the indexer. The API server alone cannot establish background worker availability.
 
-Additional rails/networks and distributed keeper signing need their own implementation and validation. The complete PostgreSQL-backed suite passes, and the live acceptance proof is preserved in the contracts deployment evidence.
+Additional rails/networks and distributed keeper signing need their own implementation and validation. Allbridge signed-intent verification explicitly discloses configured validator quorum trust, treats validator quorum signatures alone as `attested` rather than `delivered`, verifies source message identity and actual token payout within pool bounds on chain, and keeps unsupported lanes disabled without validated deployment metadata. The complete PostgreSQL-backed suite passes, and the live acceptance proof is preserved in the contracts deployment evidence.

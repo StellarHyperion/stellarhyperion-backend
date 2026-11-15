@@ -16,15 +16,20 @@ import { resolve as resolvePath } from "node:path";
 
 import type { Chain, ChainKey, DeploymentSet, Hex, NetworkMode } from "@hyperion/protocol";
 import {
+  AddressKind,
   CHAINS,
   DeploymentFormatError,
   IRIS_API,
+  RouteKind,
   chainsFor,
+  encodeStellarAddress,
+  isChainKey,
   isEvmChain,
   isEvmDeployment,
   isStellarChain,
   isStellarDeployment,
   parseDeploymentSet,
+  parseStellarAddress,
 } from "@hyperion/protocol";
 
 import type { EnumSpec, VarSpec } from "./env.js";
@@ -74,12 +79,48 @@ export interface EvmWatchConfig {
   readonly pollIntervalMs: number;
 }
 
+export interface AllbridgeValidatorTrustConfig {
+  readonly model: "configured-validator-quorum";
+  readonly validators: readonly Hex[];
+  readonly requiredSignatures: number;
+}
+
+export interface AllbridgeChainConfig {
+  readonly chain: ChainKey;
+  readonly chainSymbol: string;
+  readonly bridge: string;
+  readonly messenger: string;
+  readonly pools: Readonly<Record<string, string>>;
+  readonly maxSlippageBps: number;
+  readonly validatorTrust: AllbridgeValidatorTrustConfig;
+}
+
+export interface AllbridgeAdmittedLane {
+  readonly originChain: ChainKey;
+  readonly destinationChain: ChainKey;
+  readonly symbol: string;
+  readonly originAdapter: string;
+  readonly destinationAdapter: string;
+  readonly originToken: string;
+  readonly destinationToken: string;
+  readonly originDecimals: number;
+  readonly destinationDecimals: number;
+  readonly origin: AllbridgeChainConfig;
+  readonly destination: AllbridgeChainConfig;
+}
+
 /** Everything the rail status pollers need. One per rail that has a status API. */
 export interface RailsConfig {
   readonly enabled: boolean;
   /** Circle's Iris, from the shared registry unless overridden. */
   readonly irisUrl: string;
   readonly axelarUrl: string;
+  /** Optional Allbridge signed-intent endpoint for validated Allbridge adapter lanes. */
+  readonly allbridgeUrl?: string | null;
+  /** Validated Allbridge chain metadata keyed by chain. Empty when no Allbridge deployment is configured. */
+  readonly allbridge?: Readonly<Partial<Record<ChainKey, AllbridgeChainConfig>>>;
+  /** Admitted Allbridge lanes backed by validated source and destination deployment metadata. */
+  readonly allbridgeLanes?: readonly AllbridgeAdmittedLane[];
   readonly pollIntervalMs: number;
   readonly batchSize: number;
   readonly recheckAfterMs: number;
@@ -237,6 +278,16 @@ const AXELAR_API_URL: VarSpec = {
   printable: true,
   purpose:
     "Axelar's GMP status API. Defaults to axelarscan for this network. Unlike Iris there is no entry for it in the shared registry, so this is the only place it is named.",
+};
+
+const ALLBRIDGE_API_URL: VarSpec = {
+  name: "ALLBRIDGE_API_URL",
+  kind: "url",
+  protocols: ["http", "https"],
+  required: false,
+  printable: true,
+  purpose:
+    "Allbridge signed-intent and transfer status API. Polled only when validated Allbridge adapter metadata is present in the deployment record.",
 };
 
 const RAIL_POLL_INTERVAL_MS: VarSpec = {
@@ -461,6 +512,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const railsEnabled = reader.boolean(RAILS_ENABLED);
   const irisOverride = reader.url(IRIS_API_URL);
   const axelarOverride = reader.url(AXELAR_API_URL);
+  const allbridgeOverride = reader.url(ALLBRIDGE_API_URL);
   const railPollIntervalMs = reader.integer(RAIL_POLL_INTERVAL_MS);
   const railBatchSize = reader.integer(RAIL_BATCH_SIZE);
   const railRecheckAfterMs = reader.integer(RAIL_RECHECK_AFTER_MS);
@@ -484,7 +536,9 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     : null;
 
   const absoluteDeployments = deploymentsPath === "" ? "" : resolvePath(cwd, deploymentsPath);
-  const deployments = readDeployments(reader, read, absoluteDeployments);
+  const loaded = readDeployments(reader, read, absoluteDeployments);
+  const deployments = loaded.set;
+  const allbridgeLanes = planAllbridgeLanes(network, deployments, loaded.allbridge);
   const indexer = planIndexer(reader, {
     network,
     deployments,
@@ -516,6 +570,9 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       enabled: railsEnabled,
       irisUrl: irisOverride === "" ? IRIS_API[network] : irisOverride,
       axelarUrl: axelarOverride === "" ? AXELARSCAN_API[network] : axelarOverride,
+      allbridgeUrl: allbridgeOverride === "" ? null : allbridgeOverride,
+      allbridge: loaded.allbridge,
+      allbridgeLanes,
       pollIntervalMs: railPollIntervalMs,
       batchSize: railBatchSize,
       recheckAfterMs: railRecheckAfterMs,
@@ -533,12 +590,17 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
 
 const EMPTY_SET: DeploymentSet = { schemaVersion: 1, generatedAt: "", networks: {} };
 
+interface LoadedDeployments {
+  readonly set: DeploymentSet;
+  readonly allbridge: Readonly<Partial<Record<ChainKey, AllbridgeChainConfig>>>;
+}
+
 function readDeployments(
   reader: EnvReader,
   read: (path: string) => string,
   path: string,
-): DeploymentSet {
-  if (path === "") return EMPTY_SET;
+): LoadedDeployments {
+  if (path === "") return { set: EMPTY_SET, allbridge: {} };
 
   let text: string;
   try {
@@ -548,7 +610,7 @@ function readDeployments(
     // directory is the single most common way this fails, and the resolved absolute path is the
     // thing that makes it obvious.
     reader.reject(DEPLOYMENTS_FILE, `cannot be read at ${path}`);
-    return EMPTY_SET;
+    return { set: EMPTY_SET, allbridge: {} };
   }
 
   let parsed: unknown;
@@ -556,21 +618,25 @@ function readDeployments(
     parsed = JSON.parse(text);
   } catch (error) {
     reader.reject(DEPLOYMENTS_FILE, `is not valid JSON: ${messageOf(error)}`);
-    return EMPTY_SET;
+    return { set: EMPTY_SET, allbridge: {} };
   }
 
+  let set: DeploymentSet;
   try {
     // Validated rather than cast. An address with a transposed character parses fine as a string
     // and turns into a watcher reading an empty contract for a week without complaining.
-    return parseDeploymentSet(parsed);
+    set = parseDeploymentSet(parsed);
   } catch (error) {
     const detail =
       error instanceof DeploymentFormatError
         ? error.message
         : `is not a deployment set: ${messageOf(error)}`;
     reader.reject(DEPLOYMENTS_FILE, detail);
-    return EMPTY_SET;
+    return { set: EMPTY_SET, allbridge: {} };
   }
+
+  const allbridge = extractAllbridgeMetadata(reader, parsed, set);
+  return { set, allbridge };
 }
 
 interface PlanInput {
@@ -700,4 +766,354 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isValidChainContractAddress(chain: Chain, value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  if (isEvmChain(chain)) {
+    return /^0x[0-9a-fA-F]{40}$/.test(value) && !/^0x0{40}$/.test(value);
+  }
+  if (isStellarChain(chain)) {
+    try {
+      const parsed = parseStellarAddress(value);
+      return (
+        parsed.kind === AddressKind.Contract &&
+        encodeStellarAddress(parsed.kind, parsed.key, parsed.muxedId) === value
+      );
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+function extractAllbridgeMetadata(
+  reader: EnvReader,
+  rawJson: unknown,
+  set: DeploymentSet,
+): Readonly<Partial<Record<ChainKey, AllbridgeChainConfig>>> {
+  const out: Partial<Record<ChainKey, AllbridgeChainConfig>> = {};
+  if (typeof rawJson !== "object" || rawJson === null || Array.isArray(rawJson)) return out;
+  const rawNetworks = (rawJson as Record<string, unknown>).networks;
+  if (typeof rawNetworks !== "object" || rawNetworks === null || Array.isArray(rawNetworks)) {
+    return out;
+  }
+
+  for (const key of Object.keys(set.networks)) {
+    if (!isChainKey(key)) continue;
+    const deployment = set.networks[key];
+    if (deployment === undefined) continue;
+    const chain = CHAINS[key];
+    const rawEntry = (rawNetworks as Record<string, unknown>)[key];
+    if (typeof rawEntry !== "object" || rawEntry === null || Array.isArray(rawEntry)) continue;
+    const rawAllbridge = (rawEntry as Record<string, unknown>).allbridge;
+    if (rawAllbridge === undefined || rawAllbridge === null) continue;
+    if (typeof rawAllbridge !== "object" || Array.isArray(rawAllbridge)) {
+      reader.reject(DEPLOYMENTS_FILE, `networks.${key}.allbridge must be an object when present`);
+      continue;
+    }
+
+    const fields = rawAllbridge as Record<string, unknown>;
+    const chainSymbol = fields.chainSymbol;
+    if (typeof chainSymbol !== "string" || !/^[A-Z0-9_-]{2,12}$/.test(chainSymbol)) {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        `networks.${key}.allbridge.chainSymbol must be an uppercase Allbridge chain identifier`,
+      );
+      continue;
+    }
+
+    const bridge = fields.bridge;
+    if (!isValidChainContractAddress(chain, bridge)) {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        `networks.${key}.allbridge.bridge must be a valid non-zero ${chain.family} contract address`,
+      );
+      continue;
+    }
+
+    const messenger = fields.messenger;
+    if (!isValidChainContractAddress(chain, messenger)) {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        `networks.${key}.allbridge.messenger must be a valid non-zero ${chain.family} contract address`,
+      );
+      continue;
+    }
+
+    const maxSlippageBps = fields.maxSlippageBps;
+    if (
+      typeof maxSlippageBps !== "number" ||
+      !Number.isInteger(maxSlippageBps) ||
+      maxSlippageBps < 0 ||
+      maxSlippageBps > 5_000
+    ) {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        `networks.${key}.allbridge.maxSlippageBps must be an integer between 0 and 5000`,
+      );
+      continue;
+    }
+
+    const rawPools = fields.pools;
+    if (typeof rawPools !== "object" || rawPools === null || Array.isArray(rawPools)) {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        `networks.${key}.allbridge.pools must map token symbols to pool contract addresses`,
+      );
+      continue;
+    }
+    const pools: Record<string, string> = {};
+    let poolsValid = true;
+    for (const [symbol, poolAddr] of Object.entries(rawPools as Record<string, unknown>)) {
+      if (!isValidChainContractAddress(chain, poolAddr)) {
+        reader.reject(
+          DEPLOYMENTS_FILE,
+          `networks.${key}.allbridge.pools.${symbol} must be a valid non-zero ${chain.family} contract address`,
+        );
+        poolsValid = false;
+        break;
+      }
+      pools[symbol] = poolAddr;
+    }
+    if (!poolsValid || Object.keys(pools).length === 0) {
+      if (poolsValid) {
+        reader.reject(DEPLOYMENTS_FILE, `networks.${key}.allbridge.pools cannot be empty`);
+      }
+      continue;
+    }
+
+    const rawTrust = fields.validatorTrust;
+    if (typeof rawTrust !== "object" || rawTrust === null || Array.isArray(rawTrust)) {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        `networks.${key}.allbridge.validatorTrust must explicitly disclose validator quorum trust`,
+      );
+      continue;
+    }
+    const trustFields = rawTrust as Record<string, unknown>;
+    if (trustFields.model !== "configured-validator-quorum") {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        `networks.${key}.allbridge.validatorTrust.model must be "configured-validator-quorum"`,
+      );
+      continue;
+    }
+    const rawValidators = trustFields.validators;
+    if (!Array.isArray(rawValidators) || rawValidators.length === 0) {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        `networks.${key}.allbridge.validatorTrust.validators must be a non-empty array of validator signer addresses`,
+      );
+      continue;
+    }
+
+    const validators: Hex[] = [];
+    const seenValidators = new Set<string>();
+    let validatorsValid = true;
+    for (const candidate of rawValidators) {
+      if (
+        typeof candidate !== "string" ||
+        !/^0x[0-9a-fA-F]{40}$/.test(candidate) ||
+        /^0x0{40}$/.test(candidate)
+      ) {
+        reader.reject(
+          DEPLOYMENTS_FILE,
+          `networks.${key}.allbridge.validatorTrust.validators must hold non-zero 20-byte EVM signer addresses`,
+        );
+        validatorsValid = false;
+        break;
+      }
+      const lower = candidate.toLowerCase() as Hex;
+      if (seenValidators.has(lower)) {
+        reader.reject(
+          DEPLOYMENTS_FILE,
+          `networks.${key}.allbridge.validatorTrust.validators contains duplicate signer ${candidate}`,
+        );
+        validatorsValid = false;
+        break;
+      }
+      seenValidators.add(lower);
+      validators.push(lower);
+    }
+    if (!validatorsValid) continue;
+
+    const requiredSignatures = trustFields.requiredSignatures;
+    if (
+      typeof requiredSignatures !== "number" ||
+      !Number.isInteger(requiredSignatures) ||
+      requiredSignatures < 1 ||
+      requiredSignatures > validators.length
+    ) {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        `networks.${key}.allbridge.validatorTrust.requiredSignatures must be between 1 and ${String(validators.length)}`,
+      );
+      continue;
+    }
+
+    out[key] = {
+      chain: key,
+      chainSymbol,
+      bridge,
+      messenger,
+      pools,
+      maxSlippageBps,
+      validatorTrust: {
+        model: "configured-validator-quorum",
+        validators,
+        requiredSignatures,
+      },
+    };
+  }
+
+  return out;
+}
+
+function tokenContractId(
+  deployment: DeploymentSet["networks"][ChainKey],
+  symbol: string,
+): {
+  readonly address: string;
+  readonly decimals: number;
+  readonly routes: readonly number[];
+} | null {
+  if (deployment === undefined) return null;
+  if (isStellarDeployment(deployment)) {
+    const token = deployment.tokens[symbol];
+    if (token === undefined) return null;
+    return { address: token.sacId, decimals: token.decimals, routes: token.routes };
+  }
+  if (isEvmDeployment(deployment)) {
+    const token = deployment.tokens[symbol];
+    if (token === undefined) return null;
+    return { address: token.address, decimals: token.decimals, routes: token.routes };
+  }
+  return null;
+}
+
+function planAllbridgeLanes(
+  network: NetworkMode,
+  deployments: DeploymentSet,
+  allbridgeByChain: Readonly<Partial<Record<ChainKey, AllbridgeChainConfig>>>,
+): readonly AllbridgeAdmittedLane[] {
+  const allowed = new Set(chainsFor(network).map((entry) => entry.key));
+  const configuredChains = Object.keys(deployments.networks).filter(
+    (key): key is ChainKey => isChainKey(key) && allowed.has(key),
+  );
+  const lanes: AllbridgeAdmittedLane[] = [];
+
+  for (const originChain of configuredChains) {
+    for (const destinationChain of configuredChains) {
+      if (originChain === destinationChain) continue;
+      const originDeployment = deployments.networks[originChain];
+      const destinationDeployment = deployments.networks[destinationChain];
+      const originAllbridge = allbridgeByChain[originChain];
+      const destinationAllbridge = allbridgeByChain[destinationChain];
+      const originAdapter = originDeployment?.adapters[RouteKind.Allbridge];
+      const destinationAdapter = destinationDeployment?.adapters[RouteKind.Allbridge];
+      if (
+        originDeployment === undefined ||
+        destinationDeployment === undefined ||
+        originAllbridge === undefined ||
+        destinationAllbridge === undefined ||
+        originAdapter === undefined ||
+        destinationAdapter === undefined
+      ) {
+        continue;
+      }
+
+      for (const symbol of Object.keys(originAllbridge.pools)) {
+        if (destinationAllbridge.pools[symbol] === undefined) continue;
+        const originTok = tokenContractId(originDeployment, symbol);
+        const destTok = tokenContractId(destinationDeployment, symbol);
+        if (
+          originTok === null ||
+          destTok === null ||
+          !originTok.routes.includes(RouteKind.Allbridge) ||
+          !destTok.routes.includes(RouteKind.Allbridge)
+        ) {
+          continue;
+        }
+        lanes.push({
+          originChain,
+          destinationChain,
+          symbol,
+          originAdapter,
+          destinationAdapter,
+          originToken: originTok.address,
+          destinationToken: destTok.address,
+          originDecimals: originTok.decimals,
+          destinationDecimals: destTok.decimals,
+          origin: originAllbridge,
+          destination: destinationAllbridge,
+        });
+      }
+    }
+  }
+
+  return lanes;
+}
+
+export type AllbridgeLaneAdmission =
+  | { readonly enabled: true; readonly lane: AllbridgeAdmittedLane }
+  | { readonly enabled: false; readonly reason: string };
+
+/**
+ * Admit an Allbridge lane only when both endpoints carry validated Allbridge adapter, pool, token
+ * route, and validator-quorum trust metadata in the loaded deployment set.
+ */
+export function admitAllbridgeLane(
+  config: Pick<AppConfig, "network" | "deployments" | "rails">,
+  originChain: string,
+  destinationChain: string,
+  symbol = "USDC",
+): AllbridgeLaneAdmission {
+  if (
+    !isChainKey(originChain) ||
+    !isChainKey(destinationChain) ||
+    originChain === "local" ||
+    destinationChain === "local"
+  ) {
+    return { enabled: false, reason: "unsupported_chain_key" };
+  }
+  if (originChain === destinationChain) {
+    return { enabled: false, reason: "same_chain_lane" };
+  }
+  const allowed = new Set(chainsFor(config.network).map((entry) => entry.key));
+  if (!allowed.has(originChain) || !allowed.has(destinationChain)) {
+    return { enabled: false, reason: "wrong_network_mode" };
+  }
+  const originDeployment = config.deployments.networks[originChain];
+  const destinationDeployment = config.deployments.networks[destinationChain];
+  if (originDeployment === undefined || destinationDeployment === undefined) {
+    return { enabled: false, reason: "missing_deployment_record" };
+  }
+  if (
+    originDeployment.adapters[RouteKind.Allbridge] === undefined ||
+    destinationDeployment.adapters[RouteKind.Allbridge] === undefined
+  ) {
+    return { enabled: false, reason: "missing_allbridge_adapter" };
+  }
+  const originAllbridge = config.rails.allbridge?.[originChain];
+  const destinationAllbridge = config.rails.allbridge?.[destinationChain];
+  if (originAllbridge === undefined || destinationAllbridge === undefined) {
+    return { enabled: false, reason: "missing_allbridge_metadata" };
+  }
+  if (
+    originAllbridge.pools[symbol] === undefined ||
+    destinationAllbridge.pools[symbol] === undefined
+  ) {
+    return { enabled: false, reason: "missing_allbridge_pool" };
+  }
+  const matched = (config.rails.allbridgeLanes ?? []).find(
+    (entry) =>
+      entry.originChain === originChain &&
+      entry.destinationChain === destinationChain &&
+      entry.symbol === symbol,
+  );
+  if (matched === undefined) {
+    return { enabled: false, reason: "token_route_not_enabled" };
+  }
+  return { enabled: true, lane: matched };
 }

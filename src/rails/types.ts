@@ -30,9 +30,40 @@ export function isTerminal(status: AttestationStatus): boolean {
   return TERMINAL.includes(status);
 }
 
+/**
+ * Clamp a provider-reported status so no rail status API or validator signature alone can
+ * establish `delivered` without independently verified destination chain events.
+ */
+export function clampProviderAttestationStatus(
+  status: AttestationStatus,
+): Exclude<AttestationStatus, "delivered"> {
+  return status === "delivered" ? "attested" : status;
+}
+
+export interface AllbridgeValidatorTrustDisclosure {
+  readonly model: "configured-validator-quorum";
+  readonly configuredValidators: readonly `0x${string}`[];
+  readonly requiredSignatures: number;
+  readonly verifiedSigners: readonly `0x${string}`[];
+  readonly quorumSatisfied: boolean;
+}
+
+export interface AllbridgeSignedIntentReport {
+  readonly messageHash: `0x${string}`;
+  readonly sourceChainSymbol: string;
+  readonly destinationChainSymbol: string;
+  readonly sourceNonce: bigint;
+  readonly recipient: string;
+  readonly sourceAmount: bigint;
+  readonly signatures: readonly `0x${string}`[];
+  readonly destinationTxHash?: `0x${string}`;
+  readonly trustDisclosure: AllbridgeValidatorTrustDisclosure;
+}
+
 export interface RailReport {
   readonly forwardTxHash?: `0x${string}`;
   readonly execution?: { readonly txHash: `0x${string}`; readonly commandId: `0x${string}` };
+  readonly allbridge?: AllbridgeSignedIntentReport;
   readonly status: AttestationStatus;
   /**
    * The rail's own word for it, verbatim.
