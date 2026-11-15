@@ -12,6 +12,7 @@ import { Database } from "../../src/db/pool.js";
 import { outstandingForRail, pendingForRail } from "../../src/rails/queue.js";
 import { RailPass } from "../../src/rails/pass.js";
 import type { PendingTransfer, RailClient, RailLookup } from "../../src/rails/types.js";
+import { runCrashRestartScenario } from "../crash-harness.js";
 import { capturingLogger } from "../stellar-fakes.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
@@ -214,5 +215,74 @@ suite("rail pollers against real Postgres", () => {
     // Outstanding should now be 0 for this transfer since delivered is terminal
     const outstanding = await outstandingForRail(db, 1);
     expect(outstanding).toBe(0);
+  });
+
+  it("restarts RailPass cleanly after an injected attestation write crash without marking provider status delivered", async () => {
+    await clean();
+    await db.transaction(async (tx) => {
+      await writeOutbound(
+        tx,
+        {
+          chainKey: ORIGIN_CHAIN,
+          block: 1010n,
+          txHash: "0xaaa303",
+          logIndex: 0,
+          observedAt: new Date(),
+        },
+        {
+          route: 0,
+          nonce: 303n,
+          sender: "0x1111111111111111111111111111111111111111",
+          token: "0x3333333333333333333333333333333333333333",
+          grossAmount: 2002000n,
+          fee: 2000n,
+          netAmount: 2000000n,
+          destinationChain: DESTINATION_CHAIN,
+          destination: "0x2222222222222222222222222222222222222222",
+          railRef: "0x0000",
+        },
+      );
+    });
+
+    const mockClient: RailClient = {
+      rail: "cctp",
+      look: (_transfer: PendingTransfer): Promise<RailLookup> =>
+        Promise.resolve({
+          kind: "found",
+          report: {
+            status: "attested",
+            railStatus: "complete",
+            reference: "iris-ref-303",
+            attestedAt: new Date("2026-10-08T00:00:00.000Z"),
+          },
+        }),
+    };
+
+    const result = await runCrashRestartScenario({
+      db,
+      rule: { seed: 303, boundary: "after_attestation_write", occurrence: 1 },
+      createWorker: (faultDb) => {
+        const { logger } = capturingLogger();
+        return new RailPass({
+          route: 0,
+          client: mockClient,
+          db: faultDb,
+          logger,
+          batchSize: 10,
+          recheckAfterMs: 60_000,
+          maxCheckFailures: 5,
+          now: () => new Date("2026-10-08T01:00:00.000Z"),
+        });
+      },
+      filter: { chains: [ORIGIN_CHAIN, DESTINATION_CHAIN] },
+      verifyMidCrash: (mid) => {
+        expect(mid.railAttestations).toEqual([]);
+      },
+    });
+
+    expect(result.crashed).toBe(true);
+    expect(result.finalSnapshot.railAttestations).toHaveLength(1);
+    expect(result.finalSnapshot.railAttestations[0]?.status).toBe("attested");
+    expect(result.finalSnapshot.inboundDeliveries).toEqual([]);
   });
 });

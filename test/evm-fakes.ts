@@ -77,6 +77,9 @@ export interface FakeEvmClientOptions {
   readonly chainId?: number;
   /** Blocks the node no longer has, which is how a vanished block is expressed. */
   readonly missing?: readonly bigint[];
+  /** Optional hooks invoked before serving log or block requests. */
+  readonly onLogsRequest?: (query: LogQuery, requestIndex: number) => void;
+  readonly onBlocksRequest?: (numbers: readonly bigint[], requestIndex: number) => void;
 }
 
 export class FakeEvmClient implements EvmClient {
@@ -92,6 +95,9 @@ export class FakeEvmClient implements EvmClient {
   private reorgFrom: bigint | null = null;
   private epoch = 0;
   private readonly chain: number;
+  private readonly onLogsRequest: ((query: LogQuery, requestIndex: number) => void) | null;
+  private readonly onBlocksRequest:
+    ((numbers: readonly bigint[], requestIndex: number) => void) | null;
 
   constructor(options: FakeEvmClientOptions = {}) {
     this.chain = options.chainId ?? captured.chainId;
@@ -100,6 +106,8 @@ export class FakeEvmClient implements EvmClient {
       options.head ??
       this.log.reduce((max, entry) => (entry.blockNumber > max ? entry.blockNumber : max), 0n) + 1n;
     for (const block of options.missing ?? []) this.missing.add(block);
+    this.onLogsRequest = options.onLogsRequest ?? null;
+    this.onBlocksRequest = options.onBlocksRequest ?? null;
   }
 
   get latest(): bigint {
@@ -140,7 +148,9 @@ export class FakeEvmClient implements EvmClient {
   }
 
   logs(query: LogQuery): Promise<readonly RawEvmLog[]> {
+    const requestIndex = this.logQueries.length;
     this.logQueries.push(query);
+    this.onLogsRequest?.(query, requestIndex);
     return Promise.resolve(
       this.log
         .filter(
@@ -160,7 +170,9 @@ export class FakeEvmClient implements EvmClient {
   }
 
   blocks(numbers: readonly bigint[]): Promise<Map<bigint, BlockStamp>> {
+    const requestIndex = this.blockQueries.length;
     this.blockQueries.push([...numbers]);
+    this.onBlocksRequest?.(numbers, requestIndex);
     const found = new Map<bigint, BlockStamp>();
     for (const number of numbers) {
       if (this.missing.has(number) || number > this.head) continue;

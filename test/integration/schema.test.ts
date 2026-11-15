@@ -12,6 +12,11 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { Database } from "../../src/db/pool.js";
+import {
+  CrashInjectingDatabase,
+  CrashInjectionError,
+  captureDatabaseSnapshot,
+} from "../crash-harness.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
 const suite = CONNECTION === undefined ? describe.skip : describe;
@@ -334,5 +339,38 @@ suite("maintenance and pruning", () => {
     expect(ids).not.toContain(999991);
     expect(ids).toContain(999992);
     expect(ids).toContain(999993);
+  });
+
+  it("rolls back uncommitted rows atomically when the crash harness injects before commit", async () => {
+    const chain = "crash-schema-test";
+    await db.query("DELETE FROM public.outbound_transfer WHERE origin_chain = $1", [chain]);
+    await db.query("DELETE FROM public.indexer_cursor WHERE chain_key = $1", [chain]);
+
+    const faultDb = new CrashInjectingDatabase(db, {
+      seed: 137,
+      boundary: "before_commit",
+      occurrence: 1,
+    });
+
+    await expect(
+      faultDb.transaction(async (tx) => {
+        await tx.query(
+          `INSERT INTO public.outbound_transfer
+             (origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
+              destination_chain, destination, origin_block, origin_tx)
+           VALUES ($1, 0, 1, '0xsender', '0xtoken', 1000, 10, 990, 'stellar-testnet', 'GDEST', 1, '0xtx-1')`,
+          [chain],
+        );
+        await tx.query(
+          `INSERT INTO public.indexer_cursor (chain_key, family, contract, last_processed)
+           VALUES ($1, 'evm', '0xrouter', 1)`,
+          [chain],
+        );
+      }),
+    ).rejects.toBeInstanceOf(CrashInjectionError);
+
+    const snap = await captureDatabaseSnapshot(db, { chains: [chain] });
+    expect(snap.outboundTransfers).toEqual([]);
+    expect(snap.cursors).toEqual([]);
   });
 });

@@ -15,9 +15,11 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { AddressKind, RouteKind, encodeStellarAddress } from "@hyperion/protocol";
 import pino, { type Logger } from "pino";
 
 import type { RawStellarEvent } from "../src/chains/stellar/events.js";
+import type { ScValJson } from "../src/chains/stellar/scval.js";
 import type { EventsPage, EventsQuery, LatestLedger } from "../src/chains/stellar/rpc.js";
 import { StellarRpcError } from "../src/chains/stellar/rpc.js";
 import type { Queryable, QueryResultRows, Transactional } from "../src/db/pool.js";
@@ -78,6 +80,184 @@ export interface FakeRpcOptions {
    * the refusal firing first.
    */
   readonly oldestLedger?: number;
+  /** Optional hook invoked before serving each `getEvents` request. */
+  readonly onEventsRequest?: (query: EventsQuery, requestIndex: number) => void;
+}
+
+const DEFAULT_STELLAR_SENDER = encodeStellarAddress(
+  AddressKind.Account,
+  new Uint8Array(32).fill(0x11),
+);
+const DEFAULT_STELLAR_TOKEN = encodeStellarAddress(
+  AddressKind.Contract,
+  new Uint8Array(32).fill(0x22),
+);
+const DEFAULT_STELLAR_SETTLER = encodeStellarAddress(
+  AddressKind.Account,
+  new Uint8Array(32).fill(0x33),
+);
+
+function scMapFromEntries(entries: readonly (readonly [string, ScValJson])[]): ScValJson {
+  return {
+    map: [...entries]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, val]) => ({ key: { symbol: key }, val })),
+  };
+}
+
+/** Deterministic Soroban `BridgeOut` event preserving full-width identifiers and string amounts. */
+export function syntheticBridgeOutEvent(options: {
+  readonly ledger: number;
+  readonly eventIndex?: number;
+  readonly txHash?: string;
+  readonly route?: RouteKind;
+  readonly nonce: bigint;
+  readonly sender?: string;
+  readonly token?: string;
+  readonly grossAmount: bigint;
+  readonly fee: bigint;
+  readonly netAmount: bigint;
+  readonly destinationChain?: string;
+  readonly destinationHex?: string;
+}): RawStellarEvent {
+  const eventIndex = options.eventIndex ?? 0;
+  const route = options.route ?? RouteKind.Cctp;
+  const destinationBytes = (options.destinationHex ?? `0x${"ab".repeat(32)}`).replace(/^0x/i, "");
+  return syntheticEvent({
+    ledger: options.ledger,
+    id: idOf(toid(options.ledger, 0, eventIndex), eventIndex),
+    txHash: options.txHash ?? `0x${options.ledger.toString(16).padStart(64, "0")}`,
+    operationIndex: eventIndex,
+    topicJson: [{ symbol: "hyperion" }, { symbol: "out" }],
+    valueJson: scMapFromEntries([
+      [
+        "transfer",
+        scMapFromEntries([
+          ["created_at", { u64: String(1_790_000_000 + options.ledger) }],
+          ["created_ledger", { u32: options.ledger }],
+          ["destination", { bytes: destinationBytes }],
+          ["destination_chain", { string: options.destinationChain ?? "sepolia" }],
+          ["fee", { i128: options.fee.toString() }],
+          ["gross_amount", { i128: options.grossAmount.toString() }],
+          ["net_amount", { i128: options.netAmount.toString() }],
+          ["nonce", { u64: options.nonce.toString() }],
+          ["route", { u32: route }],
+          ["sender", { address: options.sender ?? DEFAULT_STELLAR_SENDER }],
+          ["token", { address: options.token ?? DEFAULT_STELLAR_TOKEN }],
+        ]),
+      ],
+    ]),
+  });
+}
+
+/** Deterministic Soroban `BridgeIn` event for crash and replay harnesses. */
+export function syntheticBridgeInEvent(options: {
+  readonly ledger: number;
+  readonly eventIndex?: number;
+  readonly txHash?: string;
+  readonly route?: RouteKind;
+  readonly recipient?: string;
+  readonly token?: string;
+  readonly amount: bigint;
+  readonly sourceChain?: string;
+  readonly sourceNonce: bigint;
+  readonly delivered: boolean;
+  readonly claimId?: bigint;
+}): RawStellarEvent {
+  const eventIndex = options.eventIndex ?? 0;
+  const route = options.route ?? RouteKind.Cctp;
+  const claimId = options.delivered ? 0n : (options.claimId ?? 1n);
+  return syntheticEvent({
+    ledger: options.ledger,
+    id: idOf(toid(options.ledger, 0, eventIndex), eventIndex),
+    txHash: options.txHash ?? `0x${options.ledger.toString(16).padStart(64, "0")}`,
+    operationIndex: eventIndex,
+    topicJson: [{ symbol: "hyperion" }, { symbol: "in" }],
+    valueJson: scMapFromEntries([
+      [
+        "inbound",
+        scMapFromEntries([
+          ["amount", { i128: options.amount.toString() }],
+          ["claim_id", { u64: claimId.toString() }],
+          ["delivered", { bool: options.delivered }],
+          ["ledger", { u32: options.ledger }],
+          ["recipient", { address: options.recipient ?? DEFAULT_STELLAR_SENDER }],
+          ["route", { u32: route }],
+          ["source_chain", { string: options.sourceChain ?? "sepolia" }],
+          ["source_nonce", { u64: options.sourceNonce.toString() }],
+          ["token", { address: options.token ?? DEFAULT_STELLAR_TOKEN }],
+        ]),
+      ],
+    ]),
+  });
+}
+
+/** Deterministic Soroban `ClaimParked` event for crash and replay harnesses. */
+export function syntheticClaimParkedEvent(options: {
+  readonly ledger: number;
+  readonly eventIndex?: number;
+  readonly txHash?: string;
+  readonly claimId: bigint;
+  readonly recipient?: string;
+  readonly token?: string;
+  readonly amount: bigint;
+  readonly route?: RouteKind;
+  readonly sourceChain?: string;
+  readonly sourceNonce: bigint;
+}): RawStellarEvent {
+  const eventIndex = options.eventIndex ?? 0;
+  const route = options.route ?? RouteKind.Cctp;
+  return syntheticEvent({
+    ledger: options.ledger,
+    id: idOf(toid(options.ledger, 0, eventIndex), eventIndex),
+    txHash: options.txHash ?? `0x${options.ledger.toString(16).padStart(64, "0")}`,
+    operationIndex: eventIndex,
+    topicJson: [{ symbol: "hyperion" }, { symbol: "park" }],
+    valueJson: scMapFromEntries([
+      [
+        "claim",
+        scMapFromEntries([
+          ["amount", { i128: options.amount.toString() }],
+          ["created_at", { u64: String(1_790_000_000 + options.ledger) }],
+          ["id", { u64: options.claimId.toString() }],
+          ["recipient", { address: options.recipient ?? DEFAULT_STELLAR_SENDER }],
+          ["route", { u32: route }],
+          ["settled", { bool: false }],
+          ["source_chain", { string: options.sourceChain ?? "sepolia" }],
+          ["source_nonce", { u64: options.sourceNonce.toString() }],
+          ["token", { address: options.token ?? DEFAULT_STELLAR_TOKEN }],
+        ]),
+      ],
+    ]),
+  });
+}
+
+/** Deterministic Soroban `ClaimSettled` event for crash and replay harnesses. */
+export function syntheticClaimSettledEvent(options: {
+  readonly ledger: number;
+  readonly eventIndex?: number;
+  readonly txHash?: string;
+  readonly claimId: bigint;
+  readonly recipient?: string;
+  readonly token?: string;
+  readonly amount: bigint;
+  readonly settledBy?: string;
+}): RawStellarEvent {
+  const eventIndex = options.eventIndex ?? 0;
+  return syntheticEvent({
+    ledger: options.ledger,
+    id: idOf(toid(options.ledger, 0, eventIndex), eventIndex),
+    txHash: options.txHash ?? `0x${options.ledger.toString(16).padStart(64, "0")}`,
+    operationIndex: eventIndex,
+    topicJson: [{ symbol: "hyperion" }, { symbol: "settled" }],
+    valueJson: scMapFromEntries([
+      ["amount", { i128: options.amount.toString() }],
+      ["claim_id", { u64: options.claimId.toString() }],
+      ["recipient", { address: options.recipient ?? DEFAULT_STELLAR_SENDER }],
+      ["settled_by", { address: options.settledBy ?? DEFAULT_STELLAR_SETTLER }],
+      ["token", { address: options.token ?? DEFAULT_STELLAR_TOKEN }],
+    ]),
+  });
 }
 
 export class FakeRpc {
@@ -86,12 +266,14 @@ export class FakeRpc {
   private head: number;
 
   private readonly oldestOverride: number | null;
+  private readonly onEventsRequest: ((query: EventsQuery, requestIndex: number) => void) | null;
 
   constructor(options: FakeRpcOptions = {}) {
     this.log = [...(options.events ?? [])].sort((a, b) => a.id.localeCompare(b.id));
     const highest = this.log.reduce((max, event) => Math.max(max, event.ledger), 0);
     this.head = options.latestLedger ?? highest + 1;
     this.oldestOverride = options.oldestLedger ?? null;
+    this.onEventsRequest = options.onEventsRequest ?? null;
   }
 
   get latest(): number {
@@ -108,7 +290,9 @@ export class FakeRpc {
 
   // eslint-disable-next-line @typescript-eslint/require-await
   async events(query: EventsQuery): Promise<EventsPage> {
+    const requestIndex = this.requests.length;
     this.requests.push(query);
+    this.onEventsRequest?.(query, requestIndex);
     const oldest = Math.max(this.head - RETENTION_LEDGERS, 1);
 
     let from: number;
