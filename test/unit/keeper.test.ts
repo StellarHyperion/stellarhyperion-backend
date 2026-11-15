@@ -3,11 +3,18 @@ import { Keypair } from "@stellar/stellar-sdk";
 import { loadConfig } from "../../src/config/config.js";
 import { processTtlBump } from "../../src/keeper/jobs/ttl.js";
 import { processClaimSettlement } from "../../src/keeper/jobs/claims.js";
+import type * as KeeperStellarModule from "../../src/keeper/stellar.js";
 import { submitStellar } from "../../src/keeper/stellar.js";
 import { KeeperWorker } from "../../src/keeper/worker.js";
 import { completeEnv } from "../helpers.js";
 import { capturingLogger } from "../stellar-fakes.js";
-vi.mock("../../src/keeper/stellar.js", () => ({ submitStellar: vi.fn() }));
+vi.mock("../../src/keeper/stellar.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof KeeperStellarModule>();
+  return {
+    ...actual,
+    submitStellar: vi.fn(),
+  };
+});
 class Db {
   calls: { sql: string; params: readonly unknown[] }[] = [];
   query(sql: string, params: readonly unknown[] = []) {

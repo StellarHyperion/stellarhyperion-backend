@@ -10,18 +10,39 @@ import type { AppConfig } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
 import { startKeeperQueue, type KeeperHandle } from "./queue.js";
+import { KeeperRecoveryLedger, type KeeperRecoveryDecision } from "./recovery.js";
+import { sanitizeKeeperText, type KeeperTxLookupClient } from "./stellar.js";
 
 export class KeeperWorker implements ReadinessSource {
   readonly name = "keeper";
   private handle: KeeperHandle | null = null;
   private starting = false;
   private failedError: string | null = null;
+  private readonly recoveryLedger: KeeperRecoveryLedger;
 
   constructor(
     private readonly config: AppConfig,
     private readonly db: Transactional,
     private readonly logger: Logger,
-  ) {}
+    recoveryLedger?: KeeperRecoveryLedger,
+  ) {
+    this.recoveryLedger =
+      recoveryLedger ?? new KeeperRecoveryLedger(config.keeper.retention.maxCompletedJobs * 4);
+  }
+
+  getRecoveryLedger(): KeeperRecoveryLedger {
+    return this.recoveryLedger;
+  }
+
+  async recoverFailedJob(
+    jobId: string,
+    options?: { readonly lookupClient?: KeeperTxLookupClient },
+  ): Promise<KeeperRecoveryDecision> {
+    if (this.handle === null) {
+      throw new Error("Keeper queue is not active.");
+    }
+    return this.handle.recoverFailedJob(jobId, options);
+  }
 
   readiness(): ReadinessReport {
     if (!this.config.keeper.enabled) {
@@ -35,7 +56,7 @@ export class KeeperWorker implements ReadinessSource {
       return {
         name: this.name,
         state: "degraded",
-        detail: `redis connection failure: ${this.failedError}`,
+        detail: `redis connection failure: ${sanitizeKeeperText(this.failedError)}`,
       };
     }
     if (this.handle === null) {
@@ -43,6 +64,16 @@ export class KeeperWorker implements ReadinessSource {
         name: this.name,
         state: "degraded",
         detail: this.starting ? "connecting to Redis" : "not started yet",
+      };
+    }
+    const uncertainCount = this.recoveryLedger
+      .allFailedJobEvidence()
+      .filter((ev) => ev.uncertain && ev.pendingSubmissions.length > 0).length;
+    if (uncertainCount > 0) {
+      return {
+        name: this.name,
+        state: "degraded",
+        detail: `${String(uncertainCount)} failed keeper job(s) awaiting uncertain transaction reconciliation`,
       };
     }
     return {
@@ -57,7 +88,12 @@ export class KeeperWorker implements ReadinessSource {
     this.starting = true;
 
     startKeeperQueue(
-      { db: this.db, config: this.config, logger: this.logger },
+      {
+        db: this.db,
+        config: this.config,
+        logger: this.logger,
+        recoveryLedger: this.recoveryLedger,
+      },
       this.config.redisUrl,
     )
       .then((handle) => {
@@ -67,8 +103,9 @@ export class KeeperWorker implements ReadinessSource {
       })
       .catch((err: unknown) => {
         this.starting = false;
-        this.failedError = err instanceof Error ? err.message : String(err);
-        this.logger.error({ err }, "failed to start keeper queue");
+        const raw = err instanceof Error ? err.message : String(err);
+        this.failedError = sanitizeKeeperText(raw);
+        this.logger.error({ reason: this.failedError }, "failed to start keeper queue");
       });
   }
 

@@ -93,11 +93,19 @@ export interface IndexerConfig {
   readonly evm: readonly EvmWatchConfig[];
 }
 
+export interface KeeperRetentionConfig {
+  readonly maxCompletedJobs: number;
+  readonly completedMaxAgeSeconds: number;
+  readonly maxFailedJobs: number;
+  readonly failedMaxAgeSeconds: number;
+}
+
 export interface KeeperConfig {
   readonly enabled: boolean;
   readonly pollIntervalMs: number;
   readonly concurrency: number;
   readonly stellarSecret: string | null;
+  readonly retention: KeeperRetentionConfig;
 }
 
 export interface AppConfig {
@@ -323,6 +331,49 @@ const KEEPER_STELLAR_SECRET: VarSpec = {
     "Secret key for submitting Stellar keep_alive and claim transactions. Optional; runs dry-run when absent.",
 };
 
+const KEEPER_MAX_COMPLETED_JOBS: VarSpec = {
+  name: "KEEPER_MAX_COMPLETED_JOBS",
+  kind: "integer",
+  required: false,
+  fallback: "100",
+  min: 1,
+  max: 10_000,
+  printable: true,
+  purpose: "Maximum completed BullMQ keeper jobs retained in Redis.",
+};
+
+const KEEPER_COMPLETED_MAX_AGE_SECONDS: VarSpec = {
+  name: "KEEPER_COMPLETED_MAX_AGE_SECONDS",
+  kind: "integer",
+  required: false,
+  fallback: "86400",
+  min: 60,
+  printable: true,
+  purpose: "Maximum age in seconds for completed BullMQ keeper jobs before eviction.",
+};
+
+const KEEPER_MAX_FAILED_JOBS: VarSpec = {
+  name: "KEEPER_MAX_FAILED_JOBS",
+  kind: "integer",
+  required: false,
+  fallback: "250",
+  min: 1,
+  max: 10_000,
+  printable: true,
+  purpose:
+    "Maximum deterministic failed BullMQ keeper jobs retained; uncertain pending submissions are preserved until reconciled.",
+};
+
+const KEEPER_FAILED_MAX_AGE_SECONDS: VarSpec = {
+  name: "KEEPER_FAILED_MAX_AGE_SECONDS",
+  kind: "integer",
+  required: false,
+  fallback: "604800",
+  min: 60,
+  printable: true,
+  purpose: "Maximum age in seconds for deterministic failed BullMQ keeper jobs before eviction.",
+};
+
 const SHUTDOWN_TIMEOUT_MS: VarSpec = {
   name: "SHUTDOWN_TIMEOUT_MS",
   kind: "integer",
@@ -471,6 +522,10 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const keeperStellarSecret = reader.has(KEEPER_STELLAR_SECRET.name)
     ? reader.string(KEEPER_STELLAR_SECRET)
     : null;
+  const keeperMaxCompletedJobs = reader.integer(KEEPER_MAX_COMPLETED_JOBS);
+  const keeperCompletedMaxAgeSeconds = reader.integer(KEEPER_COMPLETED_MAX_AGE_SECONDS);
+  const keeperMaxFailedJobs = reader.integer(KEEPER_MAX_FAILED_JOBS);
+  const keeperFailedMaxAgeSeconds = reader.integer(KEEPER_FAILED_MAX_AGE_SECONDS);
   const stellarRpcOverride = reader.url(STELLAR_RPC_URL);
   const startLedgerOverride = reader.has(STELLAR_START_LEDGER.name)
     ? reader.integer(STELLAR_START_LEDGER)
@@ -526,6 +581,12 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       pollIntervalMs: keeperPollIntervalMs,
       concurrency: keeperConcurrency,
       stellarSecret: keeperStellarSecret,
+      retention: {
+        maxCompletedJobs: keeperMaxCompletedJobs,
+        completedMaxAgeSeconds: keeperCompletedMaxAgeSeconds,
+        maxFailedJobs: keeperMaxFailedJobs,
+        failedMaxAgeSeconds: keeperFailedMaxAgeSeconds,
+      },
     },
     shutdownTimeoutMs,
   };
