@@ -10,18 +10,45 @@ import type { AppConfig } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
 import { startKeeperQueue, type KeeperHandle } from "./queue.js";
+import {
+  KeeperSignerManager,
+  sanitizeKeeperDiagnostic,
+  type KeeperSignerManagerOptions,
+} from "./stellar.js";
+import type { KeeperSignerReadinessSnapshot } from "./types.js";
 
 export class KeeperWorker implements ReadinessSource {
   readonly name = "keeper";
   private handle: KeeperHandle | null = null;
   private starting = false;
   private failedError: string | null = null;
+  private readonly signerManager: KeeperSignerManager;
 
   constructor(
     private readonly config: AppConfig,
     private readonly db: Transactional,
     private readonly logger: Logger,
-  ) {}
+    signerOptions: KeeperSignerManagerOptions = {},
+  ) {
+    this.signerManager = new KeeperSignerManager(config, signerOptions);
+  }
+
+  signerDiagnostics(): KeeperSignerReadinessSnapshot {
+    return this.signerManager.snapshot();
+  }
+
+  async refreshSignerReadiness(): Promise<KeeperSignerReadinessSnapshot> {
+    try {
+      return await this.signerManager.refreshReadiness(this.config);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.logger.warn(
+        { reason: sanitizeKeeperDiagnostic(reason) },
+        "keeper signer readiness check failed",
+      );
+      return this.signerManager.snapshot();
+    }
+  }
 
   readiness(): ReadinessReport {
     if (!this.config.keeper.enabled) {
@@ -35,7 +62,7 @@ export class KeeperWorker implements ReadinessSource {
       return {
         name: this.name,
         state: "degraded",
-        detail: `redis connection failure: ${this.failedError}`,
+        detail: `redis connection failure: ${sanitizeKeeperDiagnostic(this.failedError)}`,
       };
     }
     if (this.handle === null) {
@@ -45,10 +72,14 @@ export class KeeperWorker implements ReadinessSource {
         detail: this.starting ? "connecting to Redis" : "not started yet",
       };
     }
+    const signerReport = this.signerManager.readinessReport();
+    if (signerReport.state !== "ready") {
+      return signerReport;
+    }
     return {
       name: this.name,
       state: "ready",
-      detail: "active on BullMQ with 2 scheduled Stellar upkeep jobs",
+      detail: `active on BullMQ with 2 scheduled Stellar upkeep jobs (${signerReport.detail})`,
     };
   }
 
@@ -57,18 +88,31 @@ export class KeeperWorker implements ReadinessSource {
     this.starting = true;
 
     startKeeperQueue(
-      { db: this.db, config: this.config, logger: this.logger },
+      {
+        db: this.db,
+        config: this.config,
+        logger: this.logger,
+        signerManager: this.signerManager,
+      },
       this.config.redisUrl,
     )
       .then((handle) => {
         this.handle = handle;
         this.starting = false;
-        this.logger.info("keeper BullMQ worker and queue ready");
+        this.logger.info(
+          {
+            activeSigner: this.signerManager.snapshot().activeSigner,
+            stagedSigner: this.signerManager.snapshot().stagedSigner,
+            phase: this.signerManager.snapshot().phase,
+          },
+          "keeper BullMQ worker and queue ready",
+        );
       })
       .catch((err: unknown) => {
         this.starting = false;
-        this.failedError = err instanceof Error ? err.message : String(err);
-        this.logger.error({ err }, "failed to start keeper queue");
+        const raw = err instanceof Error ? err.message : String(err);
+        this.failedError = sanitizeKeeperDiagnostic(raw);
+        this.logger.error({ reason: this.failedError }, "failed to start keeper queue");
       });
   }
 

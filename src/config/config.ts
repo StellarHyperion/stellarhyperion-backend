@@ -98,6 +98,8 @@ export interface KeeperConfig {
   readonly pollIntervalMs: number;
   readonly concurrency: number;
   readonly stellarSecret: string | null;
+  readonly nextStellarSecret: string | null;
+  readonly minBalanceStroops: bigint;
 }
 
 export interface AppConfig {
@@ -323,6 +325,26 @@ const KEEPER_STELLAR_SECRET: VarSpec = {
     "Secret key for submitting Stellar keep_alive and claim transactions. Optional; runs dry-run when absent.",
 };
 
+const KEEPER_NEXT_STELLAR_SECRET: VarSpec = {
+  name: "KEEPER_NEXT_STELLAR_SECRET",
+  kind: "string",
+  required: false,
+  printable: false,
+  purpose:
+    "Optional staged replacement Stellar secret key for safe keeper signer rotation after pending submissions drain.",
+};
+
+const KEEPER_MIN_BALANCE_STROOPS: VarSpec = {
+  name: "KEEPER_MIN_BALANCE_STROOPS",
+  kind: "integer",
+  required: false,
+  fallback: "50000000",
+  min: 1,
+  printable: true,
+  purpose:
+    "Minimum spendable native XLM balance in stroops above account reserve required before a keeper signer can submit maintenance.",
+};
+
 const SHUTDOWN_TIMEOUT_MS: VarSpec = {
   name: "SHUTDOWN_TIMEOUT_MS",
   kind: "integer",
@@ -471,6 +493,10 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const keeperStellarSecret = reader.has(KEEPER_STELLAR_SECRET.name)
     ? reader.string(KEEPER_STELLAR_SECRET)
     : null;
+  const keeperNextStellarSecret = reader.has(KEEPER_NEXT_STELLAR_SECRET.name)
+    ? reader.string(KEEPER_NEXT_STELLAR_SECRET)
+    : null;
+  const keeperMinBalanceStroops = BigInt(reader.integer(KEEPER_MIN_BALANCE_STROOPS));
   const stellarRpcOverride = reader.url(STELLAR_RPC_URL);
   const startLedgerOverride = reader.has(STELLAR_START_LEDGER.name)
     ? reader.integer(STELLAR_START_LEDGER)
@@ -526,6 +552,8 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       pollIntervalMs: keeperPollIntervalMs,
       concurrency: keeperConcurrency,
       stellarSecret: keeperStellarSecret,
+      nextStellarSecret: keeperNextStellarSecret,
+      minBalanceStroops: keeperMinBalanceStroops,
     },
     shutdownTimeoutMs,
   };
