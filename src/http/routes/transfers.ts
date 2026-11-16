@@ -11,7 +11,7 @@ import type { AppConfig } from "../../config/config.js";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
-import { integer, text, textOrNull } from "../../db/rows.js";
+import { bigintOf, integer, integerOrNull, text, textOrNull, timestamp } from "../../db/rows.js";
 import type { ServerDeps } from "../server.js";
 
 export type TransferLifecycleStage =
@@ -23,6 +23,38 @@ export type TransferLifecycleStage =
   | "parked"
   | "settled"
   | "failed";
+
+export interface FormattedItsCommandProvenance {
+  readonly commandId: string;
+  readonly messageId: string | null;
+  readonly parentMessageId: string | null;
+  readonly sourceChain: string | null;
+  readonly sourceAddress: string | null;
+  readonly dataHash: string | null;
+  readonly executionTxHash: string | null;
+  readonly itsLogIndex: number | null;
+}
+
+export interface FormattedItsTokenManagerProvenance {
+  readonly chain: string;
+  readonly proofBlock: string;
+  readonly proofBlockHash: string;
+  readonly interchainTokenService: string;
+  readonly tokenId: string;
+  readonly tokenManager: string;
+  readonly implementationType: number | null;
+  readonly registeredToken: string;
+  readonly paymentFrom: string;
+  readonly paymentLogIndex: number | null;
+}
+
+export interface FormattedItsProvenance {
+  readonly status: "verified" | "unavailable" | "pending";
+  readonly unavailableReason: string | null;
+  readonly command: FormattedItsCommandProvenance | null;
+  readonly tokenManager: FormattedItsTokenManagerProvenance | null;
+  readonly verifiedAt: string | null;
+}
 
 export interface FormattedTransfer {
   readonly id: string;
@@ -65,6 +97,7 @@ export interface FormattedTransfer {
     readonly id: string;
     readonly settled: boolean;
   } | null;
+  readonly provenance: FormattedItsProvenance | null;
 }
 
 function deriveStage(
@@ -130,11 +163,75 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
   const railStatus = textOrNull(row, "attestation_status");
 
   const stage = deriveStage(delivered, hasClaim, claimSettled, railStatus);
+  const routeNumber = integer(row, "route");
+  const itsCommandId = textOrNull(row, "its_command_id");
+  const hasHistoricalInbound =
+    delivered || (row.destination_tx !== null && row.destination_tx !== undefined);
+  const inboundRailMessageId = textOrNull(row, "inbound_rail_message_id");
+
+  const provenance: FormattedItsProvenance | null =
+    routeNumber !== 1
+      ? null
+      : itsCommandId !== null
+        ? {
+            status: "verified",
+            unavailableReason: null,
+            command: {
+              commandId: itsCommandId,
+              messageId: textOrNull(row, "its_gmp_message_id"),
+              parentMessageId: textOrNull(row, "its_parent_message_id"),
+              sourceChain: text(row, "its_axelar_source_chain"),
+              sourceAddress: text(row, "its_source_address_hex"),
+              dataHash: text(row, "its_data_hash"),
+              executionTxHash: text(row, "its_execution_tx"),
+              itsLogIndex: integerOrNull(row, "its_log_index"),
+            },
+            tokenManager: {
+              chain: destinationChain,
+              proofBlock: bigintOf(row, "its_proof_block").toString(),
+              proofBlockHash: text(row, "its_proof_block_hash"),
+              interchainTokenService: text(row, "its_service_address"),
+              tokenId: text(row, "its_token_id"),
+              tokenManager: text(row, "its_token_manager"),
+              implementationType: integerOrNull(row, "its_token_manager_type"),
+              registeredToken: text(row, "its_registered_token"),
+              paymentFrom: text(row, "its_payment_from"),
+              paymentLogIndex: integerOrNull(row, "its_payment_log_index"),
+            },
+            verifiedAt: timestamp(row, "its_verified_at").toISOString(),
+          }
+        : hasHistoricalInbound
+          ? {
+              status: "unavailable",
+              unavailableReason: "historical_record_missing_provenance",
+              command:
+                inboundRailMessageId !== null
+                  ? {
+                      commandId: inboundRailMessageId,
+                      messageId: textOrNull(row, "rail_reference"),
+                      parentMessageId: null,
+                      sourceChain: null,
+                      sourceAddress: null,
+                      dataHash: null,
+                      executionTxHash: textOrNull(row, "destination_tx"),
+                      itsLogIndex: null,
+                    }
+                  : null,
+              tokenManager: null,
+              verifiedAt: null,
+            }
+          : {
+              status: "pending",
+              unavailableReason: null,
+              command: null,
+              tokenManager: null,
+              verifiedAt: null,
+            };
 
   return {
     id: text(row, "id"),
     stage,
-    route: integer(row, "route"),
+    route: routeNumber,
     origin: {
       chain: text(row, "origin_chain"),
       nonce: text(row, "nonce"),
@@ -181,6 +278,7 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
           settled: claimSettled,
         }
       : null,
+    provenance,
   };
 }
 
@@ -206,11 +304,30 @@ const TRANSFER_QUERY = `
          a.attested_at,
          a.last_error,
          d.delivered AS inbound_delivered,
+         d.rail_message_id AS inbound_rail_message_id,
          d.destination_block,
          d.destination_tx,
          d.token AS received_token,
          d.amount AS received_amount,
          d.observed_at AS delivered_at,
+         p.command_id AS its_command_id,
+         p.gmp_message_id AS its_gmp_message_id,
+         p.parent_message_id AS its_parent_message_id,
+         p.axelar_source_chain AS its_axelar_source_chain,
+         p.source_address_hex AS its_source_address_hex,
+         p.data_hash AS its_data_hash,
+         p.execution_tx AS its_execution_tx,
+         p.its_log_index AS its_log_index,
+         p.proof_block AS its_proof_block,
+         p.proof_block_hash AS its_proof_block_hash,
+         p.interchain_token_service AS its_service_address,
+         p.token_id AS its_token_id,
+         p.token_manager AS its_token_manager,
+         p.token_manager_type AS its_token_manager_type,
+         p.registered_token AS its_registered_token,
+         p.payment_from AS its_payment_from,
+         p.payment_log_index AS its_payment_log_index,
+         p.verified_at AS its_verified_at,
          c.claim_id,
          c.settled AS claim_settled
     FROM outbound_transfer t
@@ -220,6 +337,11 @@ const TRANSFER_QUERY = `
      AND d.route = t.route
      AND d.source_chain = t.origin_chain
      AND d.source_nonce = t.nonce
+    LEFT JOIN axelar_its_provenance p
+      ON p.destination_chain = t.destination_chain
+     AND p.route = t.route
+     AND p.source_chain = t.origin_chain
+     AND p.source_nonce = t.nonce
     LEFT JOIN pending_claim c
       ON c.chain = t.destination_chain
      AND c.route = t.route

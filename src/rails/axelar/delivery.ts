@@ -17,17 +17,114 @@ import {
   toHex,
   toEvmAddress,
 } from "@hyperion/protocol";
-import { createPublicClient, http, stringToHex } from "viem";
+import { createPublicClient, http, stringToHex, type Hex } from "viem";
 import type { AppConfig } from "../../config/config.js";
 import type { Transactional } from "../../db/pool.js";
 import { bigintOf, text } from "../../db/rows.js";
-import type { InboundRow, Position } from "../../chains/writers.js";
+import type { InboundRow, ItsProvenanceRow, Position } from "../../chains/writers.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 
-import { ITS_ABI, matchingPayment } from "./events.js";
+import { ITS_ABI, TOKEN_MANAGER_ABI, matchItsDelivery, type DeliveryLog } from "./events.js";
+
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+
+export interface ItsReceipt {
+  readonly status: "success" | "reverted";
+  readonly blockNumber: bigint;
+  readonly blockHash: Hex;
+  readonly transactionHash: Hex;
+  readonly logs: readonly DeliveryLog[];
+}
+
+export interface ItsBlock {
+  readonly hash: Hex | null;
+  readonly timestamp: bigint;
+}
+
+export interface ItsEvmClient {
+  getChainId(): Promise<number>;
+  getBlockNumber(): Promise<bigint>;
+  getTransactionReceipt(args: { hash: Hex }): Promise<ItsReceipt>;
+  getBlock(args: { blockNumber: bigint }): Promise<ItsBlock>;
+  readRegisteredToken(its: Hex, tokenId: Hex, blockNumber: bigint): Promise<Hex>;
+  readDeployedTokenManager(its: Hex, tokenId: Hex, blockNumber: bigint): Promise<Hex>;
+  readManagerTokenAddress(tokenManager: Hex, blockNumber: bigint): Promise<Hex>;
+  readManagerImplementationType(tokenManager: Hex, blockNumber: bigint): Promise<bigint | null>;
+}
+
+export interface VerifyItsDeliveryOptions {
+  readonly stellarView?: (
+    contract: string,
+    method: string,
+    args?: ReturnType<typeof nativeToScVal>[],
+  ) => Promise<unknown>;
+  readonly evmClient?: ItsEvmClient;
+  readonly now?: () => Date;
+}
+
 export interface VerifiedDelivery {
   readonly at: Position;
   readonly row: InboundRow;
+  readonly itsProvenance?: ItsProvenanceRow | undefined;
+}
+
+function createDefaultEvmClient(rpcUrl: string): ItsEvmClient {
+  const client = createPublicClient({
+    transport: http(rpcUrl, { timeout: 15_000, retryCount: 0 }),
+  });
+  return {
+    getChainId: () => client.getChainId(),
+    getBlockNumber: () => client.getBlockNumber(),
+    getTransactionReceipt: async ({ hash }) => {
+      const receipt = await client.getTransactionReceipt({ hash });
+      return {
+        status: receipt.status,
+        blockNumber: receipt.blockNumber,
+        blockHash: receipt.blockHash,
+        transactionHash: receipt.transactionHash,
+        logs: receipt.logs,
+      };
+    },
+    getBlock: async ({ blockNumber }) => {
+      const block = await client.getBlock({ blockNumber });
+      return { hash: block.hash, timestamp: block.timestamp };
+    },
+    readRegisteredToken: (its, tokenId, blockNumber) =>
+      client.readContract({
+        address: its,
+        abi: ITS_ABI,
+        functionName: "registeredTokenAddress",
+        args: [tokenId],
+        blockNumber,
+      }),
+    readDeployedTokenManager: (its, tokenId, blockNumber) =>
+      client.readContract({
+        address: its,
+        abi: ITS_ABI,
+        functionName: "deployedTokenManager",
+        args: [tokenId],
+        blockNumber,
+      }),
+    readManagerTokenAddress: (tokenManager, blockNumber) =>
+      client.readContract({
+        address: tokenManager,
+        abi: TOKEN_MANAGER_ABI,
+        functionName: "tokenAddress",
+        blockNumber,
+      }),
+    readManagerImplementationType: async (tokenManager, blockNumber) => {
+      try {
+        return await client.readContract({
+          address: tokenManager,
+          abi: TOKEN_MANAGER_ABI,
+          functionName: "implementationType",
+          blockNumber,
+        });
+      } catch {
+        return null;
+      }
+    },
+  };
 }
 
 // The rail API supplies a candidate receipt. Only matching confirmed chain events establish delivery.
@@ -36,6 +133,7 @@ export async function verifyItsDelivery(
   db: Transactional,
   transfer: PendingTransfer,
   report: RailReport,
+  options?: VerifyItsDeliveryOptions,
 ): Promise<VerifiedDelivery | null> {
   const execution = report.execution;
   const source = config.indexer.stellar;
@@ -63,12 +161,12 @@ export async function verifyItsDelivery(
   if (!deployment) return null;
   const adapter = deployment.adapters[RouteKind.AxelarIts];
   if (!adapter) return null;
-  const stellar = new rpc.Server(source.rpcUrl, { timeout: 15_000 });
-  const view = async (
+  const defaultView = async (
     contract: string,
     method: string,
     args: ReturnType<typeof nativeToScVal>[] = [],
   ) => {
+    const stellar = new rpc.Server(source.rpcUrl, { timeout: 15_000 });
     const tx = new TransactionBuilder(new Account(deployment.admin, "0"), {
       fee: BASE_FEE,
       networkPassphrase: source.networkPassphrase,
@@ -81,30 +179,50 @@ export async function verifyItsDelivery(
       throw new Error("Source lane cannot be verified.");
     return scValToNative(result.result.retval) as unknown;
   };
+  const view = options?.stellarView ?? defaultView;
   const id = await view(adapter, "token_id_for", [new Address(token).toScVal()]);
   if (!(id instanceof Uint8Array) || id.length !== 32)
     throw new Error("Source token id is invalid.");
   const tokenId = toHex(id);
-  const client = createPublicClient({
-    transport: http(destination.defaultRpcUrl, { timeout: 15_000, retryCount: 0 }),
-  });
+  const client = options?.evmClient ?? createDefaultEvmClient(destination.defaultRpcUrl);
   if ((await client.getChainId()) !== destination.chainId)
     throw new Error("Destination RPC chain mismatch.");
   const receipt = await client.getTransactionReceipt({ hash: execution.txHash });
   if (receipt.status !== "success") return null;
   const head = await client.getBlockNumber();
   if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations)) return null;
-  const destinationToken = await client.readContract({
-    address: its as `0x${string}`,
-    abi: ITS_ABI,
-    functionName: "registeredTokenAddress",
-    args: [tokenId],
-  });
+  const block = await client.getBlock({ blockNumber: receipt.blockNumber });
+  if (block.hash?.toLowerCase() !== receipt.blockHash.toLowerCase()) return null;
+
+  const itsAddress = its as Hex;
+  const destinationToken = await client.readRegisteredToken(
+    itsAddress,
+    tokenId,
+    receipt.blockNumber,
+  );
+  if (destinationToken.toLowerCase() === ZERO_ADDRESS) return null;
+
+  const tokenManager = await client.readDeployedTokenManager(
+    itsAddress,
+    tokenId,
+    receipt.blockNumber,
+  );
+  if (tokenManager.toLowerCase() === ZERO_ADDRESS) return null;
+
+  const managerToken = await client.readManagerTokenAddress(tokenManager, receipt.blockNumber);
+  if (managerToken.toLowerCase() !== destinationToken.toLowerCase()) return null;
+
+  const rawImplType = await client.readManagerImplementationType(tokenManager, receipt.blockNumber);
+  const tokenManagerType =
+    rawImplType !== null && rawImplType >= 0n && rawImplType <= BigInt(Number.MAX_SAFE_INTEGER)
+      ? Number(rawImplType)
+      : null;
+
   const adapterConfig = (await view(adapter, "get_config")) as { its?: string };
   if (!adapterConfig.its) return null;
   const sourceName = await view(adapterConfig.its, "chain_name");
   if (typeof sourceName !== "string") return null;
-  const payment = matchingPayment(receipt.logs, {
+  const matched = matchItsDelivery(receipt.logs, {
     its,
     token: destinationToken,
     commandId: execution.commandId,
@@ -114,16 +232,20 @@ export async function verifyItsDelivery(
     recipient,
     amount,
   });
-  if (!payment) return null;
-  const block = await client.getBlock({ blockNumber: receipt.blockNumber });
-  if (block.hash !== receipt.blockHash) return null;
+  if (!matched) return null;
+
+  const observedAt = new Date(Number(block.timestamp) * 1000);
+  const verifiedAt = options?.now ? options.now() : new Date();
+  const gmpMessageId = report.commandProvenance?.messageId ?? report.reference;
+  const parentMessageId = report.commandProvenance?.parentMessageId ?? null;
+
   return {
     at: {
       chainKey: transfer.destinationChain,
       block: receipt.blockNumber,
       txHash: receipt.transactionHash,
-      logIndex: payment.logIndex,
-      observedAt: new Date(Number(block.timestamp) * 1000),
+      logIndex: matched.paymentLog.logIndex,
+      observedAt,
     },
     row: {
       route: transfer.route,
@@ -135,6 +257,30 @@ export async function verifyItsDelivery(
       amount,
       delivered: true,
       claimId: null,
+    },
+    itsProvenance: {
+      destinationChain: transfer.destinationChain,
+      route: transfer.route,
+      sourceChain: transfer.originChain,
+      sourceNonce: transfer.nonce,
+      commandId: matched.commandId.toLowerCase(),
+      gmpMessageId,
+      parentMessageId,
+      axelarSourceChain: matched.sourceChain,
+      sourceAddressHex: matched.sourceAddress.toLowerCase(),
+      dataHash: matched.dataHash.toLowerCase(),
+      executionTx: receipt.transactionHash.toLowerCase(),
+      itsLogIndex: matched.receivedLog.logIndex,
+      proofBlock: receipt.blockNumber,
+      proofBlockHash: block.hash.toLowerCase(),
+      interchainTokenService: its.toLowerCase(),
+      tokenId: matched.tokenId.toLowerCase(),
+      tokenManager: tokenManager.toLowerCase(),
+      tokenManagerType,
+      registeredToken: destinationToken.toLowerCase(),
+      paymentFrom: matched.paymentFrom.toLowerCase(),
+      paymentLogIndex: matched.paymentLog.logIndex,
+      verifiedAt,
     },
   };
 }

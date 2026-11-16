@@ -176,20 +176,43 @@ export class AxelarGmpClient implements RailClient {
     if (FATAL_FLAGS.some((flag) => row[flag] === true)) mapped = "failed";
 
     const words = [status, simplified, ...flags].filter((part): part is string => part !== null);
+    const fullMessageId =
+      typeof row.message_id === "string" && row.message_id.length > 0
+        ? row.message_id
+        : typeof row.id === "string" && row.id.length > 0
+          ? row.id
+          : null;
+    const parentMessageId =
+      typeof row.call?.parentMessageID === "string" && row.call.parentMessageID.length > 0
+        ? row.call.parentMessageID
+        : null;
+    const execTxHash =
+      typeof row.executed?.transactionHash === "string" &&
+      /^0x[0-9a-fA-F]{64}$/.test(row.executed.transactionHash)
+        ? (row.executed.transactionHash as `0x${string}`)
+        : null;
+    const commandId =
+      typeof row.command_id === "string" && /^0x[0-9a-fA-F]{64}$/.test(row.command_id)
+        ? (row.command_id as `0x${string}`)
+        : null;
+
     return {
       status: mapped,
       railStatus: words.join("/"),
       // The message id, because that is what Axelar's support asks for.
       reference: typeof row.message_id === "string" ? row.message_id : null,
       attestedAt: stampOf(row.approved) ?? stampOf(row.executed),
-      ...(typeof row.executed?.transactionHash === "string" &&
-      /^0x[0-9a-fA-F]{64}$/.test(row.executed.transactionHash) &&
-      typeof row.command_id === "string" &&
-      /^0x[0-9a-fA-F]{64}$/.test(row.command_id)
+      ...(execTxHash !== null && commandId !== null
         ? {
             execution: {
-              txHash: row.executed.transactionHash as `0x${string}`,
-              commandId: row.command_id as `0x${string}`,
+              txHash: execTxHash,
+              commandId,
+            },
+            commandProvenance: {
+              commandId,
+              txHash: execTxHash,
+              messageId: fullMessageId,
+              parentMessageId,
             },
           }
         : {}),

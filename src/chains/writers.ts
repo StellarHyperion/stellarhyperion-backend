@@ -68,6 +68,31 @@ export interface InboundRow {
   readonly claimId: bigint | null;
 }
 
+export interface ItsProvenanceRow {
+  readonly destinationChain: string;
+  readonly route: number;
+  readonly sourceChain: string;
+  readonly sourceNonce: bigint;
+  readonly commandId: string;
+  readonly gmpMessageId: string | null;
+  readonly parentMessageId: string | null;
+  readonly axelarSourceChain: string;
+  readonly sourceAddressHex: string;
+  readonly dataHash: string;
+  readonly executionTx: string;
+  readonly itsLogIndex: number | null;
+  readonly proofBlock: bigint;
+  readonly proofBlockHash: string;
+  readonly interchainTokenService: string;
+  readonly tokenId: string;
+  readonly tokenManager: string;
+  readonly tokenManagerType: number | null;
+  readonly registeredToken: string;
+  readonly paymentFrom: string;
+  readonly paymentLogIndex: number | null;
+  readonly verifiedAt: Date;
+}
+
 export interface ClaimRow {
   readonly claimId: bigint;
   readonly recipient: string;
@@ -177,6 +202,62 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
       at.txHash,
       at.logIndex,
       at.observedAt,
+    ],
+  );
+}
+
+export async function writeItsProvenance(db: Queryable, row: ItsProvenanceRow): Promise<void> {
+  await db.query(
+    `INSERT INTO axelar_its_provenance
+       (destination_chain, route, source_chain, source_nonce, command_id, gmp_message_id,
+        parent_message_id, axelar_source_chain, source_address_hex, data_hash, execution_tx,
+        its_log_index, proof_block, proof_block_hash, interchain_token_service, token_id,
+        token_manager, token_manager_type, registered_token, payment_from, payment_log_index,
+        verified_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+             $19, $20, $21, $22)
+     ON CONFLICT (destination_chain, route, source_chain, source_nonce) DO UPDATE
+       SET command_id = EXCLUDED.command_id,
+           gmp_message_id = COALESCE(EXCLUDED.gmp_message_id, axelar_its_provenance.gmp_message_id),
+           parent_message_id = COALESCE(EXCLUDED.parent_message_id, axelar_its_provenance.parent_message_id),
+           axelar_source_chain = EXCLUDED.axelar_source_chain,
+           source_address_hex = EXCLUDED.source_address_hex,
+           data_hash = EXCLUDED.data_hash,
+           execution_tx = EXCLUDED.execution_tx,
+           its_log_index = EXCLUDED.its_log_index,
+           proof_block = EXCLUDED.proof_block,
+           proof_block_hash = EXCLUDED.proof_block_hash,
+           interchain_token_service = EXCLUDED.interchain_token_service,
+           token_id = EXCLUDED.token_id,
+           token_manager = EXCLUDED.token_manager,
+           token_manager_type = EXCLUDED.token_manager_type,
+           registered_token = EXCLUDED.registered_token,
+           payment_from = EXCLUDED.payment_from,
+           payment_log_index = EXCLUDED.payment_log_index,
+           verified_at = EXCLUDED.verified_at`,
+    [
+      row.destinationChain,
+      row.route,
+      row.sourceChain,
+      row.sourceNonce.toString(),
+      row.commandId,
+      row.gmpMessageId,
+      row.parentMessageId,
+      row.axelarSourceChain,
+      row.sourceAddressHex,
+      row.dataHash,
+      row.executionTx,
+      row.itsLogIndex,
+      row.proofBlock.toString(),
+      row.proofBlockHash,
+      row.interchainTokenService,
+      row.tokenId,
+      row.tokenManager,
+      row.tokenManagerType,
+      row.registeredToken,
+      row.paymentFrom,
+      row.paymentLogIndex,
+      row.verifiedAt,
     ],
   );
 }

@@ -24,7 +24,7 @@ import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
-import { writeInbound, writeAttestation } from "../chains/writers.js";
+import { writeInbound, writeItsProvenance, writeAttestation } from "../chains/writers.js";
 import { outstandingForRail, pendingForRail } from "./queue.js";
 import { RailError, isTerminal, type PendingTransfer, type RailClient } from "./types.js";
 
@@ -205,6 +205,9 @@ export class RailPass {
       if (verified) {
         await this.options.db.transaction(async (tx) => {
           await writeInbound(tx, verified.at, verified.row);
+          if (verified.itsProvenance) {
+            await writeItsProvenance(tx, verified.itsProvenance);
+          }
         });
         await this.write(transfer, {
           status: "delivered",
