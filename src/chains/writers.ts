@@ -19,7 +19,30 @@
  * had handled the case. `observed_at` is deliberately left out of every update: it records when
  * this indexer first saw the row, and a reorg does not change that.
  */
+import { createHash } from "node:crypto";
+
 import type { Queryable } from "../db/pool.js";
+import {
+  bigintOf,
+  integerOrNull,
+  json,
+  maybeOne,
+  sha256Digest,
+  text,
+  textOrNull,
+  timestamp,
+} from "../db/rows.js";
+
+/** Ceiling on stored JSON provenance envelopes (64 KiB) matching the SQL check constraint. */
+export const MAX_PROVENANCE_ENVELOPE_BYTES = 65_536;
+
+/** Hard upper bound on rows returned by a single provenance read query. */
+export const MAX_PROVENANCE_QUERY_LIMIT = 100;
+
+/** Hard upper bound on telemetry provenance rows pruned per maintenance batch. */
+export const MAX_PROVENANCE_PRUNE_BATCH = 5_000;
+
+export type ProvenanceRetentionClass = "monetary" | "telemetry";
 
 /** Where on a chain a row was observed. One shape for a ledger and for a block. */
 export interface Position {
@@ -31,6 +54,8 @@ export interface Position {
   readonly logIndex: number | null;
   /** The chain's own timestamp, never ours. Lag measured against our clock hides a stall. */
   readonly observedAt: Date;
+  /** Optional immutable raw_event_provenance row id backing this materialized write. */
+  readonly provenanceId?: bigint | null;
 }
 
 export interface OutboundRow {
@@ -105,13 +130,19 @@ export interface HealthSample {
   readonly flowAvailable: bigint | null;
 }
 
+function provenanceIdParam(at: Position): string | null {
+  return at.provenanceId === undefined || at.provenanceId === null
+    ? null
+    : at.provenanceId.toString();
+}
+
 export async function writeOutbound(db: Queryable, at: Position, row: OutboundRow): Promise<void> {
   await db.query(
     `INSERT INTO outbound_transfer
        (origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
         destination_chain, destination, rail_ref, origin_block, origin_tx, origin_log_index,
-        observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        observed_at, provenance_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
      ON CONFLICT (origin_chain, nonce) DO UPDATE
        SET route = EXCLUDED.route,
            sender = EXCLUDED.sender,
@@ -124,7 +155,8 @@ export async function writeOutbound(db: Queryable, at: Position, row: OutboundRo
            rail_ref = COALESCE(EXCLUDED.rail_ref, outbound_transfer.rail_ref),
            origin_block = EXCLUDED.origin_block,
            origin_tx = EXCLUDED.origin_tx,
-           origin_log_index = EXCLUDED.origin_log_index`,
+           origin_log_index = EXCLUDED.origin_log_index,
+           provenance_id = COALESCE(outbound_transfer.provenance_id, EXCLUDED.provenance_id)`,
     [
       at.chainKey,
       row.route,
@@ -141,6 +173,7 @@ export async function writeOutbound(db: Queryable, at: Position, row: OutboundRo
       at.txHash,
       at.logIndex,
       at.observedAt,
+      provenanceIdParam(at),
     ],
   );
 }
@@ -150,8 +183,8 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
     `INSERT INTO inbound_delivery
        (destination_chain, route, source_chain, source_nonce, rail_message_id, recipient, token,
         amount, delivered, claim_id, destination_block, destination_tx, destination_log_index,
-        observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        observed_at, provenance_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
      ON CONFLICT (destination_chain, route, source_chain, source_nonce) DO UPDATE
        SET rail_message_id = COALESCE(EXCLUDED.rail_message_id, inbound_delivery.rail_message_id),
            recipient = EXCLUDED.recipient,
@@ -161,7 +194,8 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
            claim_id = EXCLUDED.claim_id,
            destination_block = EXCLUDED.destination_block,
            destination_tx = EXCLUDED.destination_tx,
-           destination_log_index = EXCLUDED.destination_log_index`,
+           destination_log_index = EXCLUDED.destination_log_index,
+           provenance_id = COALESCE(inbound_delivery.provenance_id, EXCLUDED.provenance_id)`,
     [
       at.chainKey,
       row.route,
@@ -177,6 +211,7 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
       at.txHash,
       at.logIndex,
       at.observedAt,
+      provenanceIdParam(at),
     ],
   );
 }
@@ -185,8 +220,8 @@ export async function writeClaim(db: Queryable, at: Position, row: ClaimRow): Pr
   await db.query(
     `INSERT INTO pending_claim
        (chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
-        created_at, settled, observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, $10)
+        created_at, settled, observed_at, provenance_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, $10, $11)
      ON CONFLICT (chain, claim_id) DO UPDATE
        SET recipient = EXCLUDED.recipient,
            token = EXCLUDED.token,
@@ -194,7 +229,8 @@ export async function writeClaim(db: Queryable, at: Position, row: ClaimRow): Pr
            route = EXCLUDED.route,
            source_chain = EXCLUDED.source_chain,
            source_nonce = EXCLUDED.source_nonce,
-           created_at = EXCLUDED.created_at`,
+           created_at = EXCLUDED.created_at,
+           provenance_id = COALESCE(pending_claim.provenance_id, EXCLUDED.provenance_id)`,
     [
       at.chainKey,
       row.claimId.toString(),
@@ -206,6 +242,7 @@ export async function writeClaim(db: Queryable, at: Position, row: ClaimRow): Pr
       row.sourceNonce.toString(),
       row.createdAt,
       at.observedAt,
+      provenanceIdParam(at),
     ],
   );
 }
@@ -244,14 +281,16 @@ export async function settleClaim(
 export async function writeAction(db: Queryable, at: Position, row: ActionRow): Promise<void> {
   await db.query(
     `INSERT INTO admin_action
-       (chain, action_id, kind, state, payload, eta, expires_at, queued_at, observed_at)
-     VALUES ($1, $2, $3, 'queued', $4, $5, $6, $7, $8)
+       (chain, action_id, kind, state, payload, eta, expires_at, queued_at, observed_at,
+        provenance_id)
+     VALUES ($1, $2, $3, 'queued', $4, $5, $6, $7, $8, $9)
      ON CONFLICT (chain, action_id) DO UPDATE
        SET kind = EXCLUDED.kind,
            payload = EXCLUDED.payload,
            eta = EXCLUDED.eta,
            expires_at = EXCLUDED.expires_at,
-           queued_at = EXCLUDED.queued_at`,
+           queued_at = EXCLUDED.queued_at,
+           provenance_id = COALESCE(admin_action.provenance_id, EXCLUDED.provenance_id)`,
     [
       at.chainKey,
       row.actionId.toString(),
@@ -261,6 +300,7 @@ export async function writeAction(db: Queryable, at: Position, row: ActionRow): 
       row.expiresAt,
       at.observedAt,
       at.observedAt,
+      provenanceIdParam(at),
     ],
   );
 }
@@ -371,4 +411,387 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
       row.lastError,
     ],
   );
+}
+
+const SENSITIVE_KEY_PATTERN = /^(?:authorization|api_?key|password|secret|private_?key)$/i;
+const URL_CREDENTIALS_PATTERN = /([a-z][a-z0-9+.-]*:\/\/)([^/\s@]+@)/gi;
+
+function sanitizeProvenanceValue(value: unknown): unknown {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "string") {
+    return value.replace(URL_CREDENTIALS_PATTERN, "$1[REDACTED]@");
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : String(value);
+  }
+  if (typeof value === "boolean") return value;
+  if (value instanceof Date) return value.toISOString();
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeProvenanceValue(item));
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) =>
+      left.localeCompare(right),
+    );
+    const normalized: Record<string, unknown> = {};
+    for (const [key, entryValue] of entries) {
+      if (entryValue === undefined) continue;
+      normalized[key] = SENSITIVE_KEY_PATTERN.test(key)
+        ? "[REDACTED]"
+        : sanitizeProvenanceValue(entryValue);
+    }
+    return normalized;
+  }
+  if (typeof value === "symbol") return value.toString();
+  return "[unsupported]";
+}
+
+export interface CanonicalPayloadDigest {
+  readonly digest: string;
+  readonly envelopeJson: string;
+  readonly truncated: boolean;
+}
+
+/**
+ * Canonicalizes an event payload into a deterministic JSON envelope and SHA-256 hex digest.
+ *
+ * The digest always covers the full canonical payload, even when the stored JSON envelope is
+ * truncated to fit within MAX_PROVENANCE_ENVELOPE_BYTES.
+ */
+export function canonicalizePayload(payload: unknown): CanonicalPayloadDigest {
+  const normalized = sanitizeProvenanceValue(payload);
+  const serialized = JSON.stringify(normalized);
+  const digest = createHash("sha256").update(serialized, "utf8").digest("hex");
+  const byteLength = Buffer.byteLength(serialized, "utf8");
+  if (byteLength <= MAX_PROVENANCE_ENVELOPE_BYTES) {
+    return { digest, envelopeJson: serialized, truncated: false };
+  }
+
+  let previewLength = 4_096;
+  while (previewLength > 0) {
+    const candidate = JSON.stringify({
+      originalBytes: byteLength,
+      preview: serialized.slice(0, previewLength),
+      truncated: true,
+    });
+    if (Buffer.byteLength(candidate, "utf8") <= MAX_PROVENANCE_ENVELOPE_BYTES) {
+      return { digest, envelopeJson: candidate, truncated: true };
+    }
+    previewLength = Math.floor(previewLength / 2);
+  }
+
+  return {
+    digest,
+    envelopeJson: JSON.stringify({ originalBytes: byteLength, preview: "", truncated: true }),
+    truncated: true,
+  };
+}
+
+export class ProvenanceConflictError extends Error {
+  readonly provenanceId: bigint;
+  readonly expectedDigest: string;
+  readonly observedDigest: string;
+
+  constructor(params: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly eventKey: string;
+    readonly provenanceId: bigint;
+    readonly expectedDigest: string;
+    readonly observedDigest: string;
+  }) {
+    super(
+      `conflicting payload digest for ${params.chainKey}/${params.contract}/${params.eventKey}: ` +
+        `stored ${params.expectedDigest}, observed ${params.observedDigest}`,
+    );
+    this.name = "ProvenanceConflictError";
+    this.provenanceId = params.provenanceId;
+    this.expectedDigest = params.expectedDigest;
+    this.observedDigest = params.observedDigest;
+  }
+}
+
+export interface RawEventProvenanceInput {
+  readonly chainKey: string;
+  readonly family: "stellar" | "evm";
+  readonly contract: string;
+  readonly eventKey: string;
+  readonly blockNumber: bigint;
+  readonly blockHash: string | null;
+  readonly txHash: string;
+  readonly logIndex: number | null;
+  readonly eventTag: string;
+  readonly retentionClass: ProvenanceRetentionClass;
+  readonly chainTimestamp: Date;
+  readonly payload: unknown;
+}
+
+export type RawEventProvenanceResult =
+  | {
+      readonly status: "created" | "existing";
+      readonly provenanceId: bigint;
+      readonly payloadSha256: string;
+    }
+  | {
+      readonly status: "untracked";
+      readonly provenanceId: null;
+      readonly payloadSha256: string;
+    }
+  | {
+      readonly status: "conflict";
+      readonly provenanceId: bigint;
+      readonly payloadSha256: string;
+      readonly observedPayloadSha256: string;
+    };
+
+/**
+ * Persist source event identity and payload digest without allowing conflicting payloads to
+ * overwrite original provenance.
+ */
+export async function recordRawEventProvenance(
+  db: Queryable,
+  input: RawEventProvenanceInput,
+  options: { readonly throwOnConflict?: boolean } = {},
+): Promise<RawEventProvenanceResult> {
+  const { digest, envelopeJson } = canonicalizePayload(input.payload);
+  const inserted = await db.query(
+    `INSERT INTO raw_event_provenance
+       (chain_key, family, contract, event_key, block_number, block_hash, tx_hash, log_index,
+        event_tag, retention_class, payload_sha256, canonical_envelope, chain_timestamp)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13)
+     ON CONFLICT (chain_key, contract, event_key) DO NOTHING
+     RETURNING id, payload_sha256`,
+    [
+      input.chainKey,
+      input.family,
+      input.contract,
+      input.eventKey,
+      input.blockNumber.toString(),
+      input.blockHash,
+      input.txHash,
+      input.logIndex,
+      input.eventTag,
+      input.retentionClass,
+      digest,
+      envelopeJson,
+      input.chainTimestamp,
+    ],
+  );
+
+  const createdRow = maybeOne(inserted.rows, "inserted raw_event_provenance");
+  if (createdRow !== null) {
+    return {
+      status: "created",
+      provenanceId: bigintOf(createdRow, "id"),
+      payloadSha256: sha256Digest(createdRow, "payload_sha256"),
+    };
+  }
+
+  const existing = await db.query(
+    `SELECT id, payload_sha256
+       FROM raw_event_provenance
+      WHERE chain_key = $1 AND contract = $2 AND event_key = $3`,
+    [input.chainKey, input.contract, input.eventKey],
+  );
+  const existingRow = maybeOne(existing.rows, "existing raw_event_provenance");
+  if (existingRow === null) {
+    return {
+      status: "untracked",
+      provenanceId: null,
+      payloadSha256: digest,
+    };
+  }
+
+  const provenanceId = bigintOf(existingRow, "id");
+  const storedDigest = sha256Digest(existingRow, "payload_sha256");
+  if (storedDigest === digest) {
+    return {
+      status: "existing",
+      provenanceId,
+      payloadSha256: storedDigest,
+    };
+  }
+
+  await db.query(
+    `INSERT INTO raw_event_provenance_conflict
+       (provenance_id, chain_key, contract, event_key, expected_payload_sha256,
+        observed_payload_sha256, observed_envelope)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+     ON CONFLICT (provenance_id, observed_payload_sha256) DO NOTHING`,
+    [
+      provenanceId.toString(),
+      input.chainKey,
+      input.contract,
+      input.eventKey,
+      storedDigest,
+      digest,
+      envelopeJson,
+    ],
+  );
+
+  if (options.throwOnConflict === true) {
+    throw new ProvenanceConflictError({
+      chainKey: input.chainKey,
+      contract: input.contract,
+      eventKey: input.eventKey,
+      provenanceId,
+      expectedDigest: storedDigest,
+      observedDigest: digest,
+    });
+  }
+
+  return {
+    status: "conflict",
+    provenanceId,
+    payloadSha256: storedDigest,
+    observedPayloadSha256: digest,
+  };
+}
+
+export interface ProvenanceQuery {
+  readonly chainKey: string;
+  readonly contract?: string;
+  readonly txHash?: string;
+  readonly retentionClass?: ProvenanceRetentionClass;
+  readonly afterId?: bigint;
+  readonly limit?: number;
+  /** Envelopes are omitted by default so routine audit reads only transfer digests and metadata. */
+  readonly includeEnvelope?: boolean;
+}
+
+export interface RawEventProvenanceRecord {
+  readonly id: bigint;
+  readonly chainKey: string;
+  readonly family: string;
+  readonly contract: string;
+  readonly eventKey: string;
+  readonly blockNumber: bigint;
+  readonly blockHash: string | null;
+  readonly txHash: string;
+  readonly logIndex: number | null;
+  readonly eventTag: string;
+  readonly retentionClass: ProvenanceRetentionClass;
+  readonly payloadSha256: string;
+  readonly canonicalEnvelope: unknown;
+  readonly chainTimestamp: Date;
+  readonly firstObservedAt: Date;
+}
+
+/**
+ * Bounded internal query helper for audit tools. Requires an explicit chainKey scope and enforces
+ * MAX_PROVENANCE_QUERY_LIMIT per call.
+ */
+export async function listRawEventProvenance(
+  db: Queryable,
+  query: ProvenanceQuery,
+): Promise<readonly RawEventProvenanceRecord[]> {
+  if (query.chainKey.trim() === "") {
+    throw new RangeError("provenance queries must specify a non-empty chainKey");
+  }
+  const limit = query.limit ?? 50;
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_PROVENANCE_QUERY_LIMIT) {
+    throw new RangeError(
+      `provenance query limit must be an integer between 1 and ${String(MAX_PROVENANCE_QUERY_LIMIT)}`,
+    );
+  }
+
+  const conditions = ["chain_key = $1"];
+  const params: unknown[] = [query.chainKey];
+
+  if (query.contract !== undefined) {
+    params.push(query.contract);
+    conditions.push(`contract = $${String(params.length)}`);
+  }
+  if (query.txHash !== undefined) {
+    params.push(query.txHash);
+    conditions.push(`tx_hash = $${String(params.length)}`);
+  }
+  if (query.retentionClass !== undefined) {
+    params.push(query.retentionClass);
+    conditions.push(`retention_class = $${String(params.length)}`);
+  }
+  if (query.afterId !== undefined) {
+    params.push(query.afterId.toString());
+    conditions.push(`id > $${String(params.length)}`);
+  }
+
+  params.push(limit);
+  const limitParam = `$${String(params.length)}`;
+  const envelopeSelect =
+    query.includeEnvelope === true ? "canonical_envelope" : "NULL::jsonb AS canonical_envelope";
+
+  const { rows } = await db.query(
+    `SELECT id, chain_key, family, contract, event_key, block_number, block_hash, tx_hash,
+            log_index, event_tag, retention_class, payload_sha256, ${envelopeSelect},
+            chain_timestamp, first_observed_at
+       FROM raw_event_provenance
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY id ASC
+      LIMIT ${limitParam}`,
+    params,
+  );
+
+  return rows.map((row) => {
+    const retention = text(row, "retention_class");
+    if (retention !== "monetary" && retention !== "telemetry") {
+      throw new Error(`unexpected raw_event_provenance.retention_class: ${retention}`);
+    }
+    return {
+      id: bigintOf(row, "id"),
+      chainKey: text(row, "chain_key"),
+      family: text(row, "family"),
+      contract: text(row, "contract"),
+      eventKey: text(row, "event_key"),
+      blockNumber: bigintOf(row, "block_number"),
+      blockHash: textOrNull(row, "block_hash"),
+      txHash: text(row, "tx_hash"),
+      logIndex: integerOrNull(row, "log_index"),
+      eventTag: text(row, "event_tag"),
+      retentionClass: retention,
+      payloadSha256: sha256Digest(row, "payload_sha256"),
+      canonicalEnvelope: query.includeEnvelope === true ? json(row, "canonical_envelope") : null,
+      chainTimestamp: timestamp(row, "chain_timestamp"),
+      firstObservedAt: timestamp(row, "first_observed_at"),
+    };
+  });
+}
+
+/**
+ * Bounded retention cleanup for expired telemetry provenance rows.
+ *
+ * Monetary provenance rows (transfers, deliveries, claims, and governance actions) are permanently
+ * excluded so financial history remains auditable across arbitrary horizons.
+ */
+export async function pruneRawEventProvenance(
+  db: Queryable,
+  options: { readonly olderThanDays?: number; readonly batchLimit?: number } = {},
+): Promise<number> {
+  const olderThanDays = options.olderThanDays ?? 30;
+  const batchLimit = options.batchLimit ?? 1_000;
+  if (!Number.isFinite(olderThanDays) || olderThanDays < 1) {
+    throw new RangeError("olderThanDays must be at least 1");
+  }
+  if (!Number.isInteger(batchLimit) || batchLimit < 1 || batchLimit > MAX_PROVENANCE_PRUNE_BATCH) {
+    throw new RangeError(
+      `batchLimit must be an integer between 1 and ${String(MAX_PROVENANCE_PRUNE_BATCH)}`,
+    );
+  }
+
+  const { rowCount } = await db.query(
+    `DELETE FROM raw_event_provenance
+      WHERE id IN (
+        SELECT p.id
+          FROM raw_event_provenance p
+         WHERE p.retention_class = 'telemetry'
+           AND p.first_observed_at < now() - ($1 * INTERVAL '1 day')
+           AND NOT EXISTS (
+             SELECT 1 FROM raw_event_provenance_conflict c WHERE c.provenance_id = p.id
+           )
+         ORDER BY p.first_observed_at ASC, p.id ASC
+         LIMIT $2
+      )`,
+    [olderThanDays, batchLimit],
+  );
+  return rowCount;
 }

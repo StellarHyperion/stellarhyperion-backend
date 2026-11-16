@@ -15,6 +15,13 @@
 import { Pool } from "pg";
 import type { PoolClient, PoolConfig } from "pg";
 
+import {
+  listRawEventProvenance,
+  pruneRawEventProvenance,
+  type ProvenanceQuery,
+  type RawEventProvenanceRecord,
+} from "../chains/writers.js";
+
 export interface QueryResultRows {
   readonly rows: readonly Record<string, unknown>[];
   /** Null from pg for statements that do not report one. Treated as zero by every caller here. */
@@ -114,6 +121,21 @@ export class Database implements Transactional {
     return rowCount;
   }
 
+  /**
+   * Bounded cleanup for expired telemetry provenance rows. Monetary provenance rows are retained
+   * permanently and are never removed by maintenance pruning.
+   */
+  async pruneTelemetryProvenance(olderThanDays = 30, batchLimit = 1_000): Promise<number> {
+    return pruneRawEventProvenance(this, { olderThanDays, batchLimit });
+  }
+
+  /** Bounded, chain-scoped read access to immutable raw-event provenance records. */
+  async queryRawEventProvenance(
+    query: ProvenanceQuery,
+  ): Promise<readonly RawEventProvenanceRecord[]> {
+    return listRawEventProvenance(this, query);
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
@@ -124,6 +146,8 @@ export class Database implements Transactional {
 export interface MaintenanceTaskOptions {
   readonly intervalMs?: number;
   readonly olderThanDays?: number;
+  readonly telemetryRetentionDays?: number;
+  readonly provenanceBatchLimit?: number;
   readonly logger?: {
     info?: (obj: unknown, msg: string) => void;
     error?: (obj: unknown, msg: string) => void;
@@ -141,11 +165,18 @@ export function startMaintenanceTask(
 ): () => void {
   const intervalMs = options.intervalMs ?? 24 * 60 * 60 * 1000;
   const olderThanDays = options.olderThanDays ?? 30;
+  const telemetryRetentionDays = options.telemetryRetentionDays ?? olderThanDays;
+  const provenanceBatchLimit = options.provenanceBatchLimit ?? 1_000;
 
   const timer = setInterval(() => {
     void db.pruneCompletedAttestations(olderThanDays).catch((error: unknown) => {
       options.logger?.warn?.({ err: error }, "maintenance attestation pruning failed");
     });
+    void db
+      .pruneTelemetryProvenance(telemetryRetentionDays, provenanceBatchLimit)
+      .catch((error: unknown) => {
+        options.logger?.warn?.({ err: error }, "maintenance telemetry provenance pruning failed");
+      });
   }, intervalMs);
 
   timer.unref();

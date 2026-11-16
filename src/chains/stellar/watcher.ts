@@ -26,6 +26,7 @@ import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
+import { recordRawEventProvenance, type ProvenanceRetentionClass } from "../writers.js";
 import { completeThrough, endOfLedgerCursor, parseEventCursor } from "./cursor.js";
 import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
 import type { EventSource, EventsQuery } from "./rpc.js";
@@ -321,64 +322,111 @@ export class StellarWatcher {
     raw: RawStellarEvent,
   ): Promise<boolean> {
     const event = decodeStellarEvent(raw);
+    if (event.kind === "ignored") {
+      return false;
+    }
+    if (event.kind === "unknown") {
+      if (!this.reportedUnknown.has(event.tag)) {
+        this.reportedUnknown.add(event.tag);
+        this.options.logger.warn(
+          { chain: context.chainKey, tag: event.tag },
+          "the router emitted an event tag this build does not know; it is running ahead of the indexer",
+        );
+      }
+      return false;
+    }
+
+    const retentionClass: ProvenanceRetentionClass =
+      event.kind === "tokenRegistered" ||
+      event.kind === "pauseSet" ||
+      event.kind === "routeConfigured"
+        ? "telemetry"
+        : "monetary";
+
+    const provenance = await recordRawEventProvenance(tx, {
+      chainKey: context.chainKey,
+      family: "stellar",
+      contract: this.options.router,
+      eventKey: raw.id,
+      blockNumber: BigInt(raw.ledger),
+      blockHash: null,
+      txHash: raw.txHash,
+      logIndex: null,
+      eventTag: event.kind,
+      retentionClass,
+      chainTimestamp: context.closedAt,
+      payload: {
+        operationIndex: raw.operationIndex,
+        topicJson: raw.topicJson,
+        transactionIndex: raw.transactionIndex,
+        valueJson: raw.valueJson,
+      },
+    });
+
+    if (provenance.status === "conflict") {
+      this.options.logger.error(
+        {
+          chain: context.chainKey,
+          eventKey: raw.id,
+          expectedDigest: provenance.payloadSha256,
+          observedDigest: provenance.observedPayloadSha256,
+        },
+        "conflicting raw event payload detected; preserving original provenance",
+      );
+      return false;
+    }
+
+    const linkedContext: EventContext = {
+      ...context,
+      provenanceId: provenance.provenanceId,
+    };
 
     switch (event.kind) {
       case "bridgeOut":
-        await recordBridgeOut(tx, context, event.data);
+        await recordBridgeOut(tx, linkedContext, event.data);
         return true;
       case "bridgeIn":
-        await recordBridgeIn(tx, context, event.data);
+        await recordBridgeIn(tx, linkedContext, event.data);
         return true;
       case "claimParked":
-        await recordClaimParked(tx, context, event.data);
+        await recordClaimParked(tx, linkedContext, event.data);
         return true;
       case "claimSettled": {
-        const matched = await recordClaimSettled(tx, context, event.data);
+        const matched = await recordClaimSettled(tx, linkedContext, event.data);
         if (!matched) {
           // A settlement for a claim never seen parked. The park event is older than the retention
           // window, and inventing a row from a settlement would record a claim with no origin.
           this.options.logger.warn(
-            { chain: context.chainKey, claimId: event.data.claimId.toString() },
+            { chain: linkedContext.chainKey, claimId: event.data.claimId.toString() },
             "settlement for a claim this indexer never saw parked",
           );
         }
         return matched;
       }
       case "actionQueued":
-        await recordActionQueued(tx, context, event.data, raw.valueJson);
+        await recordActionQueued(tx, linkedContext, event.data, raw.valueJson);
         return true;
       case "actionExecuted":
-        await recordActionSettled(tx, context, event.data, "executed");
+        await recordActionSettled(tx, linkedContext, event.data, "executed");
         return true;
       case "actionCancelled":
-        await recordActionSettled(tx, context, event.data, "cancelled");
+        await recordActionSettled(tx, linkedContext, event.data, "cancelled");
         return true;
       case "tokenRegistered":
-        await recordTokenRegistered(tx, context, event.data);
+        await recordTokenRegistered(tx, linkedContext, event.data);
         return true;
       case "pauseSet":
         // A pause is router wide and there is no table for it, so it is recorded as every rail
         // becoming unavailable for the reason the router would give. That is not a cosmetic
         // mapping: a pause is the one operational state somebody needs to see in the same place
         // they look at route health, rather than in a log they have to go and find.
-        await recordPauseSet(tx, context, event.data);
+        await recordPauseSet(tx, linkedContext, event.data);
         return true;
       case "routeConfigured":
         // The sample needs a token and this event names none, so it is attributed to the chain
         // itself. A route being on or off is a property of the router, not of one asset.
-        await recordRouteConfigured(tx, context, event.data, context.chainKey);
+        await recordRouteConfigured(tx, linkedContext, event.data, linkedContext.chainKey);
         return true;
-      case "ignored":
-        return false;
-      case "unknown":
-        if (!this.reportedUnknown.has(event.tag)) {
-          this.reportedUnknown.add(event.tag);
-          this.options.logger.warn(
-            { chain: context.chainKey, tag: event.tag },
-            "the router emitted an event tag this build does not know; it is running ahead of the indexer",
-          );
-        }
-        return false;
       default:
         // Unreachable while the switch covers the union, and the point is that it stops compiling
         // the moment a new event kind is added without a case here. An indexer that silently drops

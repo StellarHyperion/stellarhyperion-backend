@@ -107,6 +107,7 @@ export interface EventContext {
   readonly ledger: number;
   readonly txHash: string;
   readonly closedAt: Date;
+  readonly provenanceId?: bigint | null;
 }
 
 function positionOf(context: EventContext): Position {
@@ -119,6 +120,7 @@ function positionOf(context: EventContext): Position {
     // read as if the two chains agreed about something they do not.
     logIndex: null,
     observedAt: context.closedAt,
+    provenanceId: context.provenanceId ?? null,
   };
 }
 

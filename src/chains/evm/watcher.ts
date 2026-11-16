@@ -30,10 +30,32 @@ import type { Hex } from "viem";
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
-import type { Position } from "../writers.js";
+import {
+  recordRawEventProvenance,
+  type Position,
+  type ProvenanceRetentionClass,
+} from "../writers.js";
 import { ClaimPairing, applyRouterLog } from "./store.js";
 import { decodeRouterLog, signatureOf } from "./logs.js";
-import type { EvmClient, RawEvmLog } from "./client.js";
+import type { BlockStamp, EvmClient, RawEvmLog } from "./client.js";
+
+const EVM_MONETARY_EVENTS = new Set<string>([
+  "BridgeOut",
+  "ClaimParked",
+  "BridgeIn",
+  "ClaimSettled",
+  "ActionQueued",
+  "ActionExecuted",
+  "ActionCancelled",
+]);
+
+const EVM_TELEMETRY_EVENTS = new Set<string>([
+  "TokenRegistered",
+  "FlowLimitLowered",
+  "RouteConfigured",
+  "Paused",
+  "Unpaused",
+]);
 
 /**
  * How far behind the confirmation line still counts as current.
@@ -206,13 +228,13 @@ export class EvmWatcher {
           ignored += 1;
           continue;
         }
-        const timestamp = blocks.get(log.blockNumber)?.timestamp;
-        if (timestamp === undefined) {
+        const stamp = blocks.get(log.blockNumber);
+        if (stamp === undefined) {
           throw new Error(
             `no timestamp for block ${log.blockNumber.toString()} on ${chainKey}, which three columns need`,
           );
         }
-        if (await this.apply(tx, log, timestamp, pairing)) written += 1;
+        if (await this.apply(tx, log, stamp, pairing)) written += 1;
         else ignored += 1;
       }
 
@@ -314,7 +336,7 @@ export class EvmWatcher {
   private async apply(
     tx: Queryable,
     log: RawEvmLog,
-    timestamp: bigint,
+    stamp: BlockStamp,
     pairing: ClaimPairing,
   ): Promise<boolean> {
     const { chainKey, logger } = this.options;
@@ -331,13 +353,55 @@ export class EvmWatcher {
       return false;
     }
 
+    const isMonetary = EVM_MONETARY_EVENTS.has(decoded.name);
+    const isTelemetry = EVM_TELEMETRY_EVENTS.has(decoded.name);
+    if (!isMonetary && !isTelemetry) {
+      return false;
+    }
+
+    const retentionClass: ProvenanceRetentionClass = isMonetary ? "monetary" : "telemetry";
+    const eventKey = `${log.blockNumber.toString()}:${log.transactionHash.toLowerCase()}:${String(log.logIndex)}`;
+    const observedAt = new Date(Number(stamp.timestamp) * 1000);
+    const provenance = await recordRawEventProvenance(tx, {
+      chainKey,
+      family: "evm",
+      contract: this.options.router.toLowerCase(),
+      eventKey,
+      blockNumber: log.blockNumber,
+      blockHash: stamp.hash,
+      txHash: log.transactionHash,
+      logIndex: log.logIndex,
+      eventTag: decoded.name,
+      retentionClass,
+      chainTimestamp: observedAt,
+      payload: {
+        address: log.address.toLowerCase(),
+        data: log.data.toLowerCase(),
+        topics: log.topics.map((topic) => topic.toLowerCase()),
+      },
+    });
+
+    if (provenance.status === "conflict") {
+      logger.error(
+        {
+          chain: chainKey,
+          eventKey,
+          expectedDigest: provenance.payloadSha256,
+          observedDigest: provenance.observedPayloadSha256,
+        },
+        "conflicting raw event payload detected; preserving original provenance",
+      );
+      return false;
+    }
+
     const at: Position = {
       chainKey,
       block: log.blockNumber,
       txHash: log.transactionHash,
       // Unlike Soroban, which orders events within a transaction instead.
       logIndex: log.logIndex,
-      observedAt: new Date(Number(timestamp) * 1000),
+      observedAt,
+      provenanceId: provenance.provenanceId,
     };
 
     const applied = await applyRouterLog(tx, at, decoded, pairing);

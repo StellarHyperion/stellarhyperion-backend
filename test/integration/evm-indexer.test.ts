@@ -39,6 +39,7 @@ const TABLES = [
   ["outbound_transfer", "origin_chain"],
   ["inbound_delivery", "destination_chain"],
   ["pending_claim", "chain"],
+  ["raw_event_provenance", "chain_key"],
 ] as const;
 
 suite("replaying the anvil deployment's logs", () => {

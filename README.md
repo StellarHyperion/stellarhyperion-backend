@@ -49,6 +49,12 @@ For CCTP, Circle's forwarding hash is a candidate only. The backend binds the at
 
 Unknown or unreachable APIs produce errors; there are no fabricated deliveries or fallback attestations. Claims, route health and metrics query the actual migrated schema. Transfer amounts remain base-unit integer strings, with decimals/symbol supplied from deployment metadata when known.
 
+## Raw-event provenance and retention bounds
+
+Source router events are persisted in `raw_event_provenance` separately from mutable materialized rows (`outbound_transfer`, `inbound_delivery`, `pending_claim`, `admin_action`). Each provenance row stores `(chain_key, contract, event_key)`, a lowercase SHA-256 digest of the full canonical event payload, and a canonical JSON envelope bounded to 64 KiB (`MAX_PROVENANCE_ENVELOPE_BYTES = 65536`). Database triggers reject `UPDATE` operations on both `raw_event_provenance` and `raw_event_provenance_conflict`; replaying an identical event resolves the existing `provenance_id`, while a conflicting payload for the same `(chain_key, contract, event_key)` records an immutable conflict row without overwriting the original provenance or mutating materialized state.
+
+Retention is split by `retention_class`: `monetary` rows (transfers, deliveries, claims and governance actions) are retained permanently and protected by `ON DELETE RESTRICT` foreign keys from materialized tables, while `telemetry` rows (operational route-health events) without conflict records expire after the configured window via bounded maintenance batches (`Database.pruneTelemetryProvenance`, up to `5000` rows per batch). Public HTTP endpoints never expose raw provenance envelopes; internal audit reads through `Database.queryRawEventProvenance` require an explicit `chainKey`, cap page size at `100` rows (`MAX_PROVENANCE_QUERY_LIMIT`), redact embedded URL/header credentials, and omit `canonical_envelope` unless `includeEnvelope: true` is requested.
+
 ## Protocol fees and claims
 
 The active Stellar router charges 0.3% on outbound USDC and transfers that fee directly to its configured treasury during the source transaction. The backend indexes the recorded source fee; bridge and network fees are separate. Received amounts reflect actual destination payment after forwarding fees.

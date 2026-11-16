@@ -60,6 +60,8 @@ suite("the schema", () => {
       "outbound_transfer",
       "pending_claim",
       "rail_attestation",
+      "raw_event_provenance",
+      "raw_event_provenance_conflict",
       "route_health",
     ]) {
       expect(names, `${table} is missing; has the migration run`).toContain(table);
@@ -334,5 +336,51 @@ suite("maintenance and pruning", () => {
     expect(ids).not.toContain(999991);
     expect(ids).toContain(999992);
     expect(ids).toContain(999993);
+  });
+});
+
+suite("raw_event_provenance", () => {
+  let db: Database;
+
+  beforeAll(() => {
+    db = Database.open(CONNECTION ?? "", { applicationName: "hyperion-schema-test" });
+  });
+
+  afterAll(async () => {
+    await db.query("DELETE FROM public.outbound_transfer WHERE origin_chain = 'prov-schema-test'");
+    await db.query("DELETE FROM public.raw_event_provenance WHERE chain_key = 'prov-schema-test'");
+    await db.close();
+  });
+
+  it("forbids updating stored provenance rows and prunes only expired telemetry rows", async () => {
+    const digestA = "a".repeat(64);
+    const digestB = "b".repeat(64);
+
+    const inserted = await db.query(
+      `INSERT INTO public.raw_event_provenance
+         (chain_key, family, contract, event_key, block_number, tx_hash, event_tag,
+          retention_class, payload_sha256, canonical_envelope, chain_timestamp, first_observed_at)
+       VALUES
+         ('prov-schema-test', 'stellar', 'CROUTER', 'evt-monetary', 10, '0xtx-m', 'bridgeOut',
+          'monetary', $1, '{"kind":"bridgeOut"}'::jsonb, now(), now() - INTERVAL '90 days'),
+         ('prov-schema-test', 'stellar', 'CROUTER', 'evt-telemetry-old', 11, '0xtx-t1', 'routeConfigured',
+          'telemetry', $2, '{"kind":"routeConfigured"}'::jsonb, now(), now() - INTERVAL '45 days')
+       RETURNING id`,
+      [digestA, digestB],
+    );
+    const firstId = String(inserted.rows[0]?.id);
+
+    await expect(
+      db.query("UPDATE public.raw_event_provenance SET payload_sha256 = $1 WHERE id = $2", [
+        digestB,
+        firstId,
+      ]),
+    ).rejects.toSatisfy((error: unknown) => codeOf(error) === CHECK_VIOLATION);
+
+    const deleted = await db.pruneTelemetryProvenance(30, 100);
+    expect(deleted).toBeGreaterThanOrEqual(1);
+
+    const remaining = await db.queryRawEventProvenance({ chainKey: "prov-schema-test" });
+    expect(remaining.map((entry) => entry.eventKey)).toEqual(["evt-monetary"]);
   });
 });

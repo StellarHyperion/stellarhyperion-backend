@@ -35,6 +35,14 @@ export function textOrNull(row: Row, column: string): string | null {
   return value;
 }
 
+export function sha256Digest(row: Row, column: string): string {
+  const value = text(row, column);
+  if (!/^[0-9a-f]{64}$/.test(value)) {
+    throw new RowError(column, `is not a lowercase sha256 hex digest: ${value}`);
+  }
+  return value;
+}
+
 export function integer(row: Row, column: string): number {
   const value = row[column];
   if (typeof value === "number" && Number.isInteger(value)) return value;
