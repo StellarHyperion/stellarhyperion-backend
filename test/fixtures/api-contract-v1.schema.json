@@ -1,0 +1,335 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Hyperion Public HTTP API Contract v1",
+  "version": "1.0.0",
+  "definitions": {
+    "TransferOrigin": {
+      "type": "object",
+      "required": [
+        "chain",
+        "nonce",
+        "sender",
+        "token",
+        "symbol",
+        "decimals",
+        "grossAmount",
+        "fee",
+        "netAmount",
+        "block",
+        "txHash",
+        "observedAt"
+      ],
+      "properties": {
+        "chain": { "type": "string" },
+        "nonce": { "type": "string", "x-semantic": "u64_string" },
+        "sender": { "type": "string", "x-semantic": "chain_address" },
+        "token": { "type": "string", "x-semantic": "token_identifier" },
+        "symbol": { "type": ["string", "null"] },
+        "decimals": { "type": ["integer", "null"] },
+        "grossAmount": { "type": "string", "x-semantic": "uint256_string" },
+        "fee": { "type": "string", "x-semantic": "uint256_string" },
+        "netAmount": { "type": "string", "x-semantic": "uint256_string" },
+        "block": { "type": "string", "x-semantic": "u64_string" },
+        "txHash": { "type": "string" },
+        "observedAt": { "type": "string", "x-semantic": "iso8601_timestamp" }
+      }
+    },
+    "TransferDestination": {
+      "type": "object",
+      "required": [
+        "token",
+        "amount",
+        "symbol",
+        "decimals",
+        "chain",
+        "recipient",
+        "delivered",
+        "block",
+        "txHash",
+        "deliveredAt"
+      ],
+      "properties": {
+        "token": { "type": ["string", "null"], "x-semantic": "token_identifier" },
+        "amount": { "type": ["string", "null"], "x-semantic": "uint256_string" },
+        "symbol": { "type": ["string", "null"] },
+        "decimals": { "type": ["integer", "null"] },
+        "chain": { "type": "string" },
+        "recipient": { "type": "string", "x-semantic": "chain_address" },
+        "delivered": { "type": "boolean" },
+        "block": { "type": ["string", "null"], "x-semantic": "u64_string" },
+        "txHash": { "type": ["string", "null"] },
+        "deliveredAt": { "type": ["string", "null"], "x-semantic": "iso8601_timestamp" }
+      }
+    },
+    "TransferRail": {
+      "type": "object",
+      "required": ["status", "railStatus", "reference", "attestedAt", "lastError"],
+      "properties": {
+        "status": {
+          "type": ["string", "null"],
+          "enum": ["pending", "attested", "delivered", "failed", "expired", null]
+        },
+        "railStatus": { "type": ["string", "null"] },
+        "reference": { "type": ["string", "null"] },
+        "attestedAt": { "type": ["string", "null"], "x-semantic": "iso8601_timestamp" },
+        "lastError": { "type": ["string", "null"] }
+      }
+    },
+    "TransferClaimSummary": {
+      "type": "object",
+      "required": ["id", "settled"],
+      "properties": {
+        "id": { "type": "string", "x-semantic": "u64_string" },
+        "settled": { "type": "boolean" }
+      }
+    },
+    "FormattedTransfer": {
+      "type": "object",
+      "required": ["id", "stage", "route", "origin", "destination", "rail", "claim"],
+      "properties": {
+        "id": { "type": "string", "x-semantic": "u64_string" },
+        "stage": {
+          "type": "string",
+          "enum": [
+            "initiated",
+            "attesting",
+            "attested",
+            "delivering",
+            "delivered",
+            "parked",
+            "settled",
+            "failed"
+          ]
+        },
+        "route": { "type": "integer", "minimum": 0, "maximum": 3 },
+        "origin": { "$ref": "#/definitions/TransferOrigin" },
+        "destination": { "$ref": "#/definitions/TransferDestination" },
+        "rail": { "oneOf": [{ "$ref": "#/definitions/TransferRail" }, { "type": "null" }] },
+        "claim": {
+          "oneOf": [{ "$ref": "#/definitions/TransferClaimSummary" }, { "type": "null" }]
+        }
+      }
+    },
+    "FormattedClaim": {
+      "type": "object",
+      "required": [
+        "id",
+        "chain",
+        "claimId",
+        "recipient",
+        "token",
+        "amount",
+        "route",
+        "sourceChain",
+        "sourceNonce",
+        "settled",
+        "createdAt",
+        "observedAt"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "chain": { "type": "string" },
+        "claimId": { "type": "string", "x-semantic": "u64_string" },
+        "recipient": { "type": "string", "x-semantic": "chain_address" },
+        "token": { "type": "string", "x-semantic": "token_identifier" },
+        "amount": { "type": "string", "x-semantic": "uint256_string" },
+        "route": { "type": "integer", "minimum": 0, "maximum": 3 },
+        "sourceChain": { "type": "string" },
+        "sourceNonce": { "type": "string", "x-semantic": "u64_string" },
+        "settled": { "type": "boolean" },
+        "createdAt": { "type": "string", "x-semantic": "iso8601_timestamp" },
+        "observedAt": { "type": "string", "x-semantic": "iso8601_timestamp" }
+      }
+    },
+    "FormattedRouteHealth": {
+      "type": "object",
+      "required": [
+        "originChain",
+        "destinationChain",
+        "route",
+        "token",
+        "available",
+        "blocker",
+        "flowAvailable",
+        "observedAt"
+      ],
+      "properties": {
+        "originChain": { "type": "string" },
+        "destinationChain": { "type": "string" },
+        "route": { "type": "integer", "minimum": 0, "maximum": 3 },
+        "token": { "type": "string", "x-semantic": "token_identifier" },
+        "available": { "type": "boolean" },
+        "blocker": {
+          "type": "object",
+          "required": ["code", "label", "detail"],
+          "properties": {
+            "code": { "type": "integer" },
+            "label": { "type": "string" },
+            "detail": { "type": "string" }
+          }
+        },
+        "flowAvailable": { "type": ["string", "null"], "x-semantic": "uint256_string" },
+        "observedAt": { "type": "string", "x-semantic": "iso8601_timestamp" }
+      }
+    },
+    "ErrorResponse": {
+      "type": "object",
+      "required": ["error", "message"],
+      "properties": {
+        "error": { "type": "string" },
+        "message": { "type": "string" },
+        "requestId": { "type": "string" }
+      }
+    }
+  },
+  "endpoints": {
+    "GET /health": {
+      "200": {
+        "type": "object",
+        "required": ["status", "meaning", "service", "network", "uptimeSeconds"],
+        "properties": {
+          "status": { "type": "string", "enum": ["ok"] },
+          "meaning": { "type": "string" },
+          "service": { "type": "string" },
+          "network": { "type": "string" },
+          "uptimeSeconds": { "type": "integer" }
+        }
+      }
+    },
+    "GET /ready": {
+      "200": {
+        "type": "object",
+        "required": ["status", "meaning", "network", "indexer", "checks"],
+        "properties": {
+          "status": { "type": "string", "enum": ["ready", "degraded"] },
+          "meaning": { "type": "string" },
+          "network": { "type": "string" },
+          "indexer": { "type": "string", "enum": ["enabled", "disabled"] },
+          "checks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "state", "detail"],
+              "properties": {
+                "name": { "type": "string" },
+                "state": { "type": "string", "enum": ["ready", "degraded", "down"] },
+                "detail": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /v1/transfers": {
+      "200": {
+        "type": "object",
+        "required": ["transfers", "limit", "offset", "count"],
+        "properties": {
+          "transfers": {
+            "type": "array",
+            "items": { "$ref": "#/definitions/FormattedTransfer" }
+          },
+          "limit": { "type": "integer" },
+          "offset": { "type": "integer" },
+          "count": { "type": "integer" }
+        }
+      }
+    },
+    "GET /v1/transfers/:id": {
+      "200": { "$ref": "#/definitions/FormattedTransfer" },
+      "404": { "$ref": "#/definitions/ErrorResponse" }
+    },
+    "GET /v1/transfers/:originChain/:nonce": {
+      "200": { "$ref": "#/definitions/FormattedTransfer" },
+      "404": { "$ref": "#/definitions/ErrorResponse" }
+    },
+    "GET /v1/transfers/by-tx/:txHash": {
+      "200": { "$ref": "#/definitions/FormattedTransfer" },
+      "404": { "$ref": "#/definitions/ErrorResponse" }
+    },
+    "GET /v1/claims": {
+      "200": {
+        "type": "object",
+        "required": ["claims", "limit", "offset", "count"],
+        "properties": {
+          "claims": {
+            "type": "array",
+            "items": { "$ref": "#/definitions/FormattedClaim" }
+          },
+          "limit": { "type": "integer" },
+          "offset": { "type": "integer" },
+          "count": { "type": "integer" }
+        }
+      }
+    },
+    "GET /v1/claims/:chain/:claimId": {
+      "200": { "$ref": "#/definitions/FormattedClaim" },
+      "404": { "$ref": "#/definitions/ErrorResponse" }
+    },
+    "GET /v1/routes/health": {
+      "200": {
+        "type": "object",
+        "required": ["routes", "count"],
+        "properties": {
+          "routes": {
+            "type": "array",
+            "items": { "$ref": "#/definitions/FormattedRouteHealth" }
+          },
+          "count": { "type": "integer" }
+        }
+      }
+    },
+    "GET /v1/metrics": {
+      "200": {
+        "type": "object",
+        "required": [
+          "service",
+          "network",
+          "uptimeSeconds",
+          "transfers",
+          "claims",
+          "railAttestations",
+          "cursors"
+        ],
+        "properties": {
+          "service": { "type": "string" },
+          "network": { "type": "string" },
+          "uptimeSeconds": { "type": "integer" },
+          "transfers": {
+            "type": "object",
+            "required": ["totalOutbound", "totalInbound"],
+            "properties": {
+              "totalOutbound": { "type": "integer" },
+              "totalInbound": { "type": "integer" }
+            }
+          },
+          "claims": {
+            "type": "object",
+            "required": ["total", "settled", "unsettled"],
+            "properties": {
+              "total": { "type": "integer" },
+              "settled": { "type": "integer" },
+              "unsettled": { "type": "integer" }
+            }
+          },
+          "railAttestations": {
+            "type": "object"
+          },
+          "cursors": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["chain", "block", "hash", "updatedAt"],
+              "properties": {
+                "chain": { "type": "string" },
+                "block": { "type": "string", "x-semantic": "u64_string" },
+                "hash": { "type": ["string", "null"] },
+                "updatedAt": { "type": "string", "x-semantic": "iso8601_timestamp" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

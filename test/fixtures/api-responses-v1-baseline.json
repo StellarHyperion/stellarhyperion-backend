@@ -1,0 +1,335 @@
+{
+  "version": "1.0.0",
+  "responses": [
+    {
+      "id": "health_200",
+      "endpoint": "GET /health",
+      "requestPath": "/health",
+      "statusCode": 200,
+      "body": {
+        "status": "ok",
+        "meaning": "This process is running and answering. It says nothing about Postgres or the chains. Use /ready for that.",
+        "service": "hyperion-backend",
+        "network": "testnet",
+        "uptimeSeconds": 0
+      }
+    },
+    {
+      "id": "ready_200",
+      "endpoint": "GET /ready",
+      "requestPath": "/ready",
+      "statusCode": 200,
+      "body": {
+        "status": "ready",
+        "meaning": "This process can do its job: Postgres and Redis answer and every watcher is current. A 503 here means take this replica out of rotation, not restart it.",
+        "network": "testnet",
+        "indexer": "enabled",
+        "checks": [
+          { "name": "postgres", "state": "ready", "detail": "answering" },
+          { "name": "redis", "state": "ready", "detail": "answering" }
+        ]
+      }
+    },
+    {
+      "id": "transfer_by_nonce_delivered_200",
+      "endpoint": "GET /v1/transfers/:originChain/:nonce",
+      "requestPath": "/v1/transfers/stellar-testnet/18446744073709551600",
+      "statusCode": 200,
+      "body": {
+        "id": "1",
+        "stage": "delivered",
+        "route": 0,
+        "origin": {
+          "chain": "stellar-testnet",
+          "nonce": "18446744073709551600",
+          "sender": "GC4FD5G3CZJ57VPYTVNWU4FRDLLV37EYDGT3OVZA35WKHBWDI6PKTYTN",
+          "token": "CD5IB466XCQIUDYWV22PUMJTF6EE3KPXBDGLLBSKAPNE6QPXVUZLXJGA",
+          "symbol": "USDC",
+          "decimals": 7,
+          "grossAmount": "340282366920938463463374607431768211455",
+          "fee": "1000000000000000000000000000000000000",
+          "netAmount": "339282366920938463463374607431768211455",
+          "block": "5001200",
+          "txHash": "stellar-cctp-tx-1001",
+          "observedAt": "2026-10-16T10:00:00.000Z"
+        },
+        "destination": {
+          "token": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+          "amount": "33928236692093846346337460743176821145",
+          "symbol": "USDC",
+          "decimals": 6,
+          "chain": "sepolia",
+          "recipient": "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
+          "delivered": true,
+          "block": "9413000",
+          "txHash": "evm-cctp-mint-1001",
+          "deliveredAt": "2026-10-16T10:01:00.000Z"
+        },
+        "rail": {
+          "status": "delivered",
+          "railStatus": "complete",
+          "reference": "cctp-nonce-9001",
+          "attestedAt": "2026-10-16T10:00:30.000Z",
+          "lastError": null
+        },
+        "claim": null
+      }
+    },
+    {
+      "id": "transfer_by_tx_parked_200",
+      "endpoint": "GET /v1/transfers/by-tx/:txHash",
+      "requestPath": "/v1/transfers/by-tx/evm-axelar-tx-1002",
+      "statusCode": 200,
+      "body": {
+        "id": "2",
+        "stage": "parked",
+        "route": 1,
+        "origin": {
+          "chain": "sepolia",
+          "nonce": "42",
+          "sender": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+          "token": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+          "symbol": "USDC",
+          "decimals": 6,
+          "grossAmount": "10000000",
+          "fee": "30000",
+          "netAmount": "9970000",
+          "block": "9413100",
+          "txHash": "evm-axelar-tx-1002",
+          "observedAt": "2026-10-16T10:05:00.000Z"
+        },
+        "destination": {
+          "token": "CD5IB466XCQIUDYWV22PUMJTF6EE3KPXBDGLLBSKAPNE6QPXVUZLXJGA",
+          "amount": "99700000",
+          "symbol": null,
+          "decimals": null,
+          "chain": "stellar-testnet",
+          "recipient": "GD4IEL76RCF2CULJZAKDTEZOQIIUTH3JDKY52W7SR6GBI42PZFIZGWIB",
+          "delivered": false,
+          "block": "5001300",
+          "txHash": "stellar-parked-tx-1002",
+          "deliveredAt": "2026-10-16T10:06:00.000Z"
+        },
+        "rail": {
+          "status": "attested",
+          "railStatus": "executed",
+          "reference": "axelar-msg-1002",
+          "attestedAt": "2026-10-16T10:05:30.000Z",
+          "lastError": null
+        },
+        "claim": {
+          "id": "77",
+          "settled": false
+        }
+      }
+    },
+    {
+      "id": "transfer_by_id_404",
+      "endpoint": "GET /v1/transfers/:id",
+      "requestPath": "/v1/transfers/999999",
+      "statusCode": 404,
+      "body": {
+        "error": "not_found",
+        "message": "no transfer found with id 999999"
+      }
+    },
+    {
+      "id": "transfers_list_200",
+      "endpoint": "GET /v1/transfers",
+      "requestPath": "/v1/transfers?limit=10",
+      "statusCode": 200,
+      "body": {
+        "transfers": [
+          {
+            "id": "2",
+            "stage": "parked",
+            "route": 1,
+            "origin": {
+              "chain": "sepolia",
+              "nonce": "42",
+              "sender": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+              "token": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+              "symbol": "USDC",
+              "decimals": 6,
+              "grossAmount": "10000000",
+              "fee": "30000",
+              "netAmount": "9970000",
+              "block": "9413100",
+              "txHash": "evm-axelar-tx-1002",
+              "observedAt": "2026-10-16T10:05:00.000Z"
+            },
+            "destination": {
+              "token": "CD5IB466XCQIUDYWV22PUMJTF6EE3KPXBDGLLBSKAPNE6QPXVUZLXJGA",
+              "amount": "99700000",
+              "symbol": null,
+              "decimals": null,
+              "chain": "stellar-testnet",
+              "recipient": "GD4IEL76RCF2CULJZAKDTEZOQIIUTH3JDKY52W7SR6GBI42PZFIZGWIB",
+              "delivered": false,
+              "block": "5001300",
+              "txHash": "stellar-parked-tx-1002",
+              "deliveredAt": "2026-10-16T10:06:00.000Z"
+            },
+            "rail": {
+              "status": "attested",
+              "railStatus": "executed",
+              "reference": "axelar-msg-1002",
+              "attestedAt": "2026-10-16T10:05:30.000Z",
+              "lastError": null
+            },
+            "claim": {
+              "id": "77",
+              "settled": false
+            }
+          },
+          {
+            "id": "1",
+            "stage": "delivered",
+            "route": 0,
+            "origin": {
+              "chain": "stellar-testnet",
+              "nonce": "18446744073709551600",
+              "sender": "GC4FD5G3CZJ57VPYTVNWU4FRDLLV37EYDGT3OVZA35WKHBWDI6PKTYTN",
+              "token": "CD5IB466XCQIUDYWV22PUMJTF6EE3KPXBDGLLBSKAPNE6QPXVUZLXJGA",
+              "symbol": "USDC",
+              "decimals": 7,
+              "grossAmount": "340282366920938463463374607431768211455",
+              "fee": "1000000000000000000000000000000000000",
+              "netAmount": "339282366920938463463374607431768211455",
+              "block": "5001200",
+              "txHash": "stellar-cctp-tx-1001",
+              "observedAt": "2026-10-16T10:00:00.000Z"
+            },
+            "destination": {
+              "token": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+              "amount": "33928236692093846346337460743176821145",
+              "symbol": "USDC",
+              "decimals": 6,
+              "chain": "sepolia",
+              "recipient": "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
+              "delivered": true,
+              "block": "9413000",
+              "txHash": "evm-cctp-mint-1001",
+              "deliveredAt": "2026-10-16T10:01:00.000Z"
+            },
+            "rail": {
+              "status": "delivered",
+              "railStatus": "complete",
+              "reference": "cctp-nonce-9001",
+              "attestedAt": "2026-10-16T10:00:30.000Z",
+              "lastError": null
+            },
+            "claim": null
+          }
+        ],
+        "limit": 10,
+        "offset": 0,
+        "count": 2
+      }
+    },
+    {
+      "id": "claim_by_id_200",
+      "endpoint": "GET /v1/claims/:chain/:claimId",
+      "requestPath": "/v1/claims/stellar-testnet/77",
+      "statusCode": 200,
+      "body": {
+        "id": "stellar-testnet:77",
+        "chain": "stellar-testnet",
+        "claimId": "77",
+        "recipient": "GD4IEL76RCF2CULJZAKDTEZOQIIUTH3JDKY52W7SR6GBI42PZFIZGWIB",
+        "token": "CD5IB466XCQIUDYWV22PUMJTF6EE3KPXBDGLLBSKAPNE6QPXVUZLXJGA",
+        "amount": "99700000",
+        "route": 1,
+        "sourceChain": "sepolia",
+        "sourceNonce": "42",
+        "settled": false,
+        "createdAt": "2026-10-16T10:06:00.000Z",
+        "observedAt": "2026-10-16T10:06:00.000Z"
+      }
+    },
+    {
+      "id": "claims_list_200",
+      "endpoint": "GET /v1/claims",
+      "requestPath": "/v1/claims?chain=stellar-testnet",
+      "statusCode": 200,
+      "body": {
+        "claims": [
+          {
+            "id": "stellar-testnet:77",
+            "chain": "stellar-testnet",
+            "claimId": "77",
+            "recipient": "GD4IEL76RCF2CULJZAKDTEZOQIIUTH3JDKY52W7SR6GBI42PZFIZGWIB",
+            "token": "CD5IB466XCQIUDYWV22PUMJTF6EE3KPXBDGLLBSKAPNE6QPXVUZLXJGA",
+            "amount": "99700000",
+            "route": 1,
+            "sourceChain": "sepolia",
+            "sourceNonce": "42",
+            "settled": false,
+            "createdAt": "2026-10-16T10:06:00.000Z",
+            "observedAt": "2026-10-16T10:06:00.000Z"
+          }
+        ],
+        "limit": 20,
+        "offset": 0,
+        "count": 1
+      }
+    },
+    {
+      "id": "routes_health_200",
+      "endpoint": "GET /v1/routes/health",
+      "requestPath": "/v1/routes/health",
+      "statusCode": 200,
+      "body": {
+        "routes": [
+          {
+            "originChain": "stellar-testnet",
+            "destinationChain": "sepolia",
+            "route": 0,
+            "token": "CD5IB466XCQIUDYWV22PUMJTF6EE3KPXBDGLLBSKAPNE6QPXVUZLXJGA",
+            "available": true,
+            "blocker": {
+              "code": 0,
+              "label": "Ready",
+              "detail": "This rail can carry the transfer right now."
+            },
+            "flowAvailable": "10000000000000",
+            "observedAt": "2026-10-16T10:07:00.000Z"
+          }
+        ],
+        "count": 1
+      }
+    },
+    {
+      "id": "metrics_200",
+      "endpoint": "GET /v1/metrics",
+      "requestPath": "/v1/metrics",
+      "statusCode": 200,
+      "body": {
+        "service": "hyperion-backend",
+        "network": "testnet",
+        "uptimeSeconds": 0,
+        "transfers": {
+          "totalOutbound": 2,
+          "totalInbound": 2
+        },
+        "claims": {
+          "total": 1,
+          "settled": 0,
+          "unsettled": 1
+        },
+        "railAttestations": {
+          "delivered": 1,
+          "attested": 1
+        },
+        "cursors": [
+          {
+            "chain": "stellar-testnet",
+            "block": "5001300",
+            "hash": null,
+            "updatedAt": "2026-10-16T10:08:00.000Z"
+          }
+        ]
+      }
+    }
+  ]
+}
