@@ -197,3 +197,18 @@ export class ReadinessRegistry {
     return { state: worstOf(checks), checks };
   }
 }
+
+export function proofRejectionsReadiness(integrityRejections: number): ReadinessReport {
+  if (integrityRejections > 0) {
+    return {
+      name: "proof-verification",
+      state: "degraded",
+      detail: `${String(integrityRejections)} destination proof candidate(s) rejected for recipient, token, or amount mismatch`,
+    };
+  }
+  return {
+    name: "proof-verification",
+    state: "ready",
+    detail: "no destination proof integrity mismatches recorded",
+  };
+}

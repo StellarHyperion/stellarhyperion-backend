@@ -47,7 +47,7 @@ For direct Stellar ITS transfers, Axelar's status API supplies a candidate desti
 
 For CCTP, Circle's forwarding hash is a candidate only. The backend binds the attested message to the source transfer, then verifies finalized Circle message execution and the exact native-USDC mint to the recipient in a successful confirmed canonical destination receipt. Activity exposes the actual received amount, token and six-decimal precision, separately from the source amount before forwarding fees. Real acceptance on all three destinations is recorded in `deployments/evidence/2026-10-29-cctp.json` in the contracts repository.
 
-Unknown or unreachable APIs produce errors; there are no fabricated deliveries or fallback attestations. Claims, route health and metrics query the actual migrated schema. Transfer amounts remain base-unit integer strings, with decimals/symbol supplied from deployment metadata when known.
+Unknown or unreachable APIs produce errors; there are no fabricated deliveries or fallback attestations. Rejected destination candidate proofs across both CCTP and Axelar ITS increment shared bounded categories (`recipient_mismatch`, `token_mismatch`, `amount_mismatch`, `insufficient_finality`, `provider_inconsistency`) in `proof_rejection_counter` for `/v1/metrics` and `/ready` without exposing arbitrary hashes or RPC credentials. Claims, route health and metrics query the actual migrated schema. Transfer amounts remain base-unit integer strings, with decimals/symbol supplied from deployment metadata when known.
 
 ## Protocol fees and claims
 

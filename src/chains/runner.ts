@@ -29,6 +29,7 @@ import { RouteKind } from "@hyperion/protocol";
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
 import { IrisClient } from "../rails/cctp/iris.js";
 import { RailPass } from "../rails/pass.js";
+import { PROOF_REJECTION_REASONS } from "../rails/proof-reasons.js";
 import type { RailClient } from "../rails/types.js";
 import { KeeperWorker } from "../keeper/worker.js";
 import { viemClient } from "./evm/client.js";
@@ -262,7 +263,11 @@ function railWorkers(
   ];
 
   return clients.map(({ route, client }) => {
-    const child = logger.child({ rail: client.rail, route });
+    const child = logger.child({
+      rail: client.rail,
+      route,
+      proofRejectionCategories: PROOF_REJECTION_REASONS.length,
+    });
     const pass = new RailPass({
       route,
       config: appConfig,

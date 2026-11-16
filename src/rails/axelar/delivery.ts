@@ -17,17 +17,48 @@ import {
   toHex,
   toEvmAddress,
 } from "@hyperion/protocol";
-import { createPublicClient, http, stringToHex } from "viem";
+import { createPublicClient, http, stringToHex, type Hex } from "viem";
 import type { AppConfig } from "../../config/config.js";
 import type { Transactional } from "../../db/pool.js";
 import { bigintOf, text } from "../../db/rows.js";
 import type { InboundRow, Position } from "../../chains/writers.js";
+import { recordProofRejection, type ProofRejectionLogger } from "../proof-reasons.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 
-import { ITS_ABI, matchingPayment } from "./events.js";
+import { ITS_ABI, classifyItsReceipt, type DeliveryLog } from "./events.js";
+
 export interface VerifiedDelivery {
   readonly at: Position;
   readonly row: InboundRow;
+}
+
+export interface ItsPublicClientLike {
+  getChainId(): Promise<number>;
+  getTransactionReceipt(args: { hash: Hex }): Promise<{
+    readonly status: string;
+    readonly blockNumber: bigint;
+    readonly blockHash: Hex;
+    readonly transactionHash: Hex;
+    readonly logs: readonly DeliveryLog[];
+  }>;
+  getBlockNumber(): Promise<bigint>;
+  readContract(args: {
+    address: Hex;
+    abi: typeof ITS_ABI;
+    functionName: "registeredTokenAddress";
+    args: readonly [Hex];
+  }): Promise<Hex>;
+  getBlock(args: { blockNumber: bigint }): Promise<{
+    readonly hash: Hex | null;
+    readonly timestamp: bigint;
+  }>;
+}
+
+export interface ItsDeliveryDeps {
+  readonly publicClient?: ItsPublicClientLike | undefined;
+  readonly simulateView?:
+    ((contract: string, method: string, args?: unknown[]) => Promise<unknown>) | undefined;
+  readonly logger?: ProofRejectionLogger | undefined;
 }
 
 // The rail API supplies a candidate receipt. Only matching confirmed chain events establish delivery.
@@ -36,26 +67,29 @@ export async function verifyItsDelivery(
   db: Transactional,
   transfer: PendingTransfer,
   report: RailReport,
+  deps: ItsDeliveryDeps = {},
 ): Promise<VerifiedDelivery | null> {
   const execution = report.execution;
   const source = config.indexer.stellar;
-  if (
-    !execution ||
-    !source ||
-    transfer.route !== RouteKind.AxelarIts ||
-    transfer.originChain !== source.chain ||
-    !isChainKey(transfer.destinationChain)
-  )
+  if (!execution || !source || transfer.route !== RouteKind.AxelarIts) {
     return null;
+  }
+  if (transfer.originChain !== source.chain || !isChainKey(transfer.destinationChain)) {
+    await recordProofRejection(db, "axelar-its", "provider_inconsistency", deps.logger);
+    return null;
+  }
+
   const destination = CHAINS[transfer.destinationChain];
   const its = RAIL_CONTRACTS[transfer.destinationChain]?.axelar?.interchainTokenService;
   if (!isEvmChain(destination) || !its?.startsWith("0x")) return null;
+
   const { rows } = await db.query(
     "SELECT sender, token, net_amount, destination FROM outbound_transfer WHERE id = $1",
     [String(transfer.transferId)],
   );
   const stored = rows[0];
   if (!stored) return null;
+
   const token = text(stored, "token");
   const amount = bigintOf(stored, "net_amount");
   const recipient = toEvmAddress(text(stored, "destination") as `0x${string}`);
@@ -63,12 +97,13 @@ export async function verifyItsDelivery(
   if (!deployment) return null;
   const adapter = deployment.adapters[RouteKind.AxelarIts];
   if (!adapter) return null;
-  const stellar = new rpc.Server(source.rpcUrl, { timeout: 15_000 });
-  const view = async (
+
+  const defaultView = async (
     contract: string,
     method: string,
     args: ReturnType<typeof nativeToScVal>[] = [],
   ) => {
+    const stellar = new rpc.Server(source.rpcUrl, { timeout: 15_000 });
     const tx = new TransactionBuilder(new Account(deployment.admin, "0"), {
       fee: BASE_FEE,
       networkPassphrase: source.networkPassphrase,
@@ -81,30 +116,71 @@ export async function verifyItsDelivery(
       throw new Error("Source lane cannot be verified.");
     return scValToNative(result.result.retval) as unknown;
   };
+  const view = deps.simulateView ?? defaultView;
+
   const id = await view(adapter, "token_id_for", [new Address(token).toScVal()]);
-  if (!(id instanceof Uint8Array) || id.length !== 32)
+  if (!(id instanceof Uint8Array) || id.length !== 32) {
+    await recordProofRejection(db, "axelar-its", "token_mismatch", deps.logger);
     throw new Error("Source token id is invalid.");
+  }
   const tokenId = toHex(id);
-  const client = createPublicClient({
-    transport: http(destination.defaultRpcUrl, { timeout: 15_000, retryCount: 0 }),
-  });
-  if ((await client.getChainId()) !== destination.chainId)
+
+  const client: ItsPublicClientLike =
+    deps.publicClient ??
+    createPublicClient({
+      transport: http(destination.defaultRpcUrl, { timeout: 15_000, retryCount: 0 }),
+    });
+
+  if ((await client.getChainId()) !== destination.chainId) {
+    await recordProofRejection(db, "axelar-its", "provider_inconsistency", deps.logger);
     throw new Error("Destination RPC chain mismatch.");
-  const receipt = await client.getTransactionReceipt({ hash: execution.txHash });
-  if (receipt.status !== "success") return null;
+  }
+
+  let receipt: Awaited<ReturnType<ItsPublicClientLike["getTransactionReceipt"]>>;
+  try {
+    receipt = await client.getTransactionReceipt({ hash: execution.txHash });
+  } catch (error) {
+    if (isReceiptNotFound(error)) {
+      await recordProofRejection(db, "axelar-its", "provider_inconsistency", deps.logger);
+      return null;
+    }
+    throw error;
+  }
+
+  if (receipt.status !== "success") {
+    await recordProofRejection(db, "axelar-its", "provider_inconsistency", deps.logger);
+    return null;
+  }
+
   const head = await client.getBlockNumber();
-  if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations)) return null;
+  if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations)) {
+    await recordProofRejection(db, "axelar-its", "insufficient_finality", deps.logger);
+    return null;
+  }
+
   const destinationToken = await client.readContract({
     address: its as `0x${string}`,
     abi: ITS_ABI,
     functionName: "registeredTokenAddress",
     args: [tokenId],
   });
+  if (/^0x0{40}$/i.test(destinationToken)) {
+    await recordProofRejection(db, "axelar-its", "token_mismatch", deps.logger);
+    return null;
+  }
+
   const adapterConfig = (await view(adapter, "get_config")) as { its?: string };
-  if (!adapterConfig.its) return null;
+  if (!adapterConfig.its) {
+    await recordProofRejection(db, "axelar-its", "provider_inconsistency", deps.logger);
+    return null;
+  }
   const sourceName = await view(adapterConfig.its, "chain_name");
-  if (typeof sourceName !== "string") return null;
-  const payment = matchingPayment(receipt.logs, {
+  if (typeof sourceName !== "string") {
+    await recordProofRejection(db, "axelar-its", "provider_inconsistency", deps.logger);
+    return null;
+  }
+
+  const receiptOutcome = classifyItsReceipt(receipt.logs, {
     its,
     token: destinationToken,
     commandId: execution.commandId,
@@ -114,15 +190,23 @@ export async function verifyItsDelivery(
     recipient,
     amount,
   });
-  if (!payment) return null;
+  if (!receiptOutcome.ok) {
+    await recordProofRejection(db, "axelar-its", receiptOutcome.reason, deps.logger);
+    return null;
+  }
+
   const block = await client.getBlock({ blockNumber: receipt.blockNumber });
-  if (block.hash !== receipt.blockHash) return null;
+  if (block.hash !== receipt.blockHash) {
+    await recordProofRejection(db, "axelar-its", "insufficient_finality", deps.logger);
+    return null;
+  }
+
   return {
     at: {
       chainKey: transfer.destinationChain,
       block: receipt.blockNumber,
       txHash: receipt.transactionHash,
-      logIndex: payment.logIndex,
+      logIndex: receiptOutcome.payment.logIndex,
       observedAt: new Date(Number(block.timestamp) * 1000),
     },
     row: {
@@ -137,4 +221,12 @@ export async function verifyItsDelivery(
       claimId: null,
     },
   };
+}
+
+function isReceiptNotFound(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.name === "TransactionReceiptNotFoundError" ||
+      /receipt.*could not be found|not found/i.test(error.message))
+  );
 }

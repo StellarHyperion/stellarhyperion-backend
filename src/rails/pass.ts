@@ -18,8 +18,8 @@
  * second would spend those five minutes refreshing the block.
  */
 import type { AppConfig } from "../config/config.js";
-import { verifyItsDelivery } from "./axelar/delivery.js";
-import { verifyCctpDelivery } from "./cctp/delivery.js";
+import { verifyItsDelivery, type ItsDeliveryDeps } from "./axelar/delivery.js";
+import { verifyCctpDelivery, type CctpDeliveryDeps } from "./cctp/delivery.js";
 import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
@@ -48,6 +48,8 @@ export interface RailPassOptions {
   readonly maxCheckFailures: number;
   readonly now?: () => Date;
   readonly config?: AppConfig;
+  readonly itsDeliveryDeps?: ItsDeliveryDeps | undefined;
+  readonly cctpDeliveryDeps?: CctpDeliveryDeps | undefined;
 }
 
 export interface RailProgress {
@@ -200,8 +202,14 @@ export class RailPass {
     const { report } = lookup;
     if (this.options.config && (report.execution || report.forwardTxHash)) {
       const verified =
-        (await verifyItsDelivery(this.options.config, this.options.db, transfer, report)) ??
-        (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report));
+        (await verifyItsDelivery(this.options.config, this.options.db, transfer, report, {
+          logger: this.options.logger,
+          ...(this.options.itsDeliveryDeps ?? {}),
+        })) ??
+        (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report, {
+          logger: this.options.logger,
+          ...(this.options.cctpDeliveryDeps ?? {}),
+        }));
       if (verified) {
         await this.options.db.transaction(async (tx) => {
           await writeInbound(tx, verified.at, verified.row);

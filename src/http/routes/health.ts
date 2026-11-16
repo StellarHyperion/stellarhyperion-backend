@@ -15,9 +15,10 @@
  */
 import type { FastifyInstance } from "fastify";
 
+import { readProofRejectionMetrics } from "../../rails/proof-reasons.js";
 import type { ServerDeps } from "../server.js";
-import type { ReadinessReport } from "../../runtime/readiness.js";
-import { checkRedisHealth, worstOf } from "../../runtime/readiness.js";
+import type { ReadinessReport, ReadinessState } from "../../runtime/readiness.js";
+import { checkRedisHealth, proofRejectionsReadiness, worstOf } from "../../runtime/readiness.js";
 
 const LIVENESS_MEANING =
   "This process is running and answering. It says nothing about Postgres or the chains. Use /ready for that.";
@@ -37,7 +38,8 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
   }));
 
   app.get("/ready", async (_request, reply) => {
-    const checks: ReadinessReport[] = [await checkDatabase(deps), await checkRedis(deps)];
+    const dbCheck = await checkDatabase(deps);
+    const checks: ReadinessReport[] = [dbCheck, await checkRedis(deps)];
 
     for (const source of deps.readiness) {
       try {
@@ -55,6 +57,29 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
       }
     }
 
+    let proofRejections: {
+      readonly state: ReadinessState;
+      readonly totalRejected: number;
+      readonly integrityRejections: number;
+    } = {
+      state: "ready",
+      totalRejected: 0,
+      integrityRejections: 0,
+    };
+
+    if (dbCheck.state === "ready") {
+      const snapshot = await readProofRejectionMetrics(deps.db);
+      const proofReport = proofRejectionsReadiness(snapshot.integrityRejections);
+      proofRejections = {
+        state: proofReport.state,
+        totalRejected: snapshot.totalRejected,
+        integrityRejections: snapshot.integrityRejections,
+      };
+      if (proofReport.state === "degraded") {
+        checks.push(proofReport);
+      }
+    }
+
     const state = worstOf(checks);
     // Degraded still serves. One stalled chain watcher is a reason to alert, not a reason to stop
     // answering questions about the three chains that are fine.
@@ -65,6 +90,7 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
       network: deps.config.network,
       indexer: deps.config.indexer.enabled ? "enabled" : "disabled",
       checks,
+      proofRejections,
     });
   });
 }
