@@ -110,15 +110,30 @@ export class RailPass {
   /** One pass. Returns true when it filled a batch, which means there is more behind it. */
   async tick(signal: AbortSignal): Promise<boolean> {
     const { db, logger, batchSize, client } = this.options;
+    const currentNow = this.now();
 
-    const cooldown = this.cooldownUntil;
-    if (cooldown !== null && cooldown > this.now()) return false;
-    this.cooldownUntil = null;
+    const persisted = await this.loadPersistedCooldown();
+    const activeCooldown =
+      this.cooldownUntil !== null && persisted !== null
+        ? this.cooldownUntil > persisted
+          ? this.cooldownUntil
+          : persisted
+        : (this.cooldownUntil ?? persisted);
+
+    if (activeCooldown !== null && activeCooldown > currentNow) {
+      this.cooldownUntil = activeCooldown;
+      return false;
+    }
+
+    if (this.cooldownUntil !== null || persisted !== null) {
+      this.cooldownUntil = null;
+      await this.clearExpiredCooldown(currentNow);
+    }
 
     const queue = await pendingForRail(db, {
       route: this.options.route,
       limit: batchSize,
-      notCheckedSince: new Date(this.now().getTime() - this.options.recheckAfterMs),
+      notCheckedSince: new Date(currentNow.getTime() - this.options.recheckAfterMs),
       maxCheckFailures: this.options.maxCheckFailures,
     });
 
@@ -133,11 +148,14 @@ export class RailPass {
         checked += 1;
       } catch (error) {
         if (error instanceof RailError && error.kind === "rateLimited") {
-          // The whole rail, not this transfer. Stop the pass and hold off.
+          // The whole rail, not this transfer. Stop the pass and hold off durably.
           const waitMs = error.retryAfterMs ?? 60_000;
-          this.cooldownUntil = new Date(this.now().getTime() + waitMs);
+          const stamp = this.now();
+          const until = new Date(stamp.getTime() + waitMs);
+          this.cooldownUntil = until;
+          await this.savePersistedCooldown(until, error.message, stamp);
           logger.warn(
-            { rail: client.rail, until: this.cooldownUntil.toISOString() },
+            { rail: client.rail, until: until.toISOString() },
             "the rail rate limited us, holding off rather than retrying",
           );
           break;
@@ -218,8 +236,10 @@ export class RailPass {
         return true;
       }
     }
+    // Never allow a rail status alone to establish `delivered` without confirmed destination proof.
+    const safeStatus = report.status === "delivered" ? "attested" : report.status;
     await this.write(transfer, {
-      status: report.status,
+      status: safeStatus,
       railStatus: report.railStatus,
       reference: report.reference,
       attestedAt: report.attestedAt,
@@ -227,7 +247,7 @@ export class RailPass {
       failures: 0,
       error: null,
     });
-    return isTerminal(report.status);
+    return isTerminal(safeStatus);
   }
 
   private async recordFailure(transfer: PendingTransfer, error: unknown): Promise<void> {
@@ -292,7 +312,73 @@ export class RailPass {
     });
   }
 
+  private async loadPersistedCooldown(): Promise<Date | null> {
+    try {
+      const { rows } = await this.options.db.query(
+        "SELECT cooldown_until FROM rail_cooldown WHERE rail = $1",
+        [this.options.client.rail],
+      );
+      const raw = rows[0]?.cooldown_until;
+      if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
+        return raw;
+      }
+      if (typeof raw === "string" || typeof raw === "number") {
+        const parsed = new Date(raw);
+        if (!Number.isNaN(parsed.getTime())) {
+          return parsed;
+        }
+      }
+      return null;
+    } catch (error) {
+      // Unmigrated mock databases in isolated unit tests may omit rail_cooldown; degrade to memory.
+      if (isMissingTableError(error)) return null;
+      throw error;
+    }
+  }
+
+  private async savePersistedCooldown(until: Date, reason: string, updatedAt: Date): Promise<void> {
+    try {
+      await this.options.db.transaction(async (tx: Queryable) => {
+        await tx.query(
+          `INSERT INTO rail_cooldown (rail, cooldown_until, reason, updated_at)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (rail) DO UPDATE
+             SET cooldown_until = GREATEST(rail_cooldown.cooldown_until, EXCLUDED.cooldown_until),
+                 reason = EXCLUDED.reason,
+                 updated_at = EXCLUDED.updated_at`,
+          [this.options.client.rail, until, reason, updatedAt],
+        );
+      });
+    } catch (error) {
+      if (isMissingTableError(error)) return;
+      throw error;
+    }
+  }
+
+  private async clearExpiredCooldown(asOf: Date): Promise<void> {
+    try {
+      await this.options.db.transaction(async (tx: Queryable) => {
+        await tx.query("DELETE FROM rail_cooldown WHERE rail = $1 AND cooldown_until <= $2", [
+          this.options.client.rail,
+          asOf,
+        ]);
+      });
+    } catch (error) {
+      if (isMissingTableError(error)) return;
+      throw error;
+    }
+  }
+
   private now(): Date {
     return this.options.now?.() ?? new Date();
   }
+}
+
+function isMissingTableError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "42P01"
+  );
 }

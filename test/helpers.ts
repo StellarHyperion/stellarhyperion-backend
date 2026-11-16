@@ -36,3 +36,13 @@ export function completeEnv(
     ...overrides,
   };
 }
+
+export {
+  applyRailSimulatorMigrations,
+  createRailProviderSimulator,
+  createSimulatorPGliteDb,
+  type RailProviderSimulator,
+  type SimulatedRailAction,
+  type SimulatedRequestRecord,
+  type SimulatorDb,
+} from "./rail-rate-limit-simulator.js";

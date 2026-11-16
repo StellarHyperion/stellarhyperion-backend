@@ -107,3 +107,28 @@ export interface RailClient {
   /** Throws `RailError`; returns `missing` rather than throwing for a transfer not yet indexed. */
   look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup>;
 }
+
+/**
+ * Parse an HTTP `Retry-After` header (RFC 9110 delta-seconds or HTTP-date) into milliseconds.
+ * Returns `null` when absent, empty, non-positive, or unparseable so the caller can fall back
+ * to the rail's documented default cooldown.
+ */
+export function parseRetryAfterMs(
+  headerValue: string | null | undefined,
+  nowMs = Date.now(),
+): number | null {
+  if (typeof headerValue !== "string") return null;
+  const trimmed = headerValue.trim();
+  if (trimmed === "") return null;
+
+  if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+    const seconds = Number(trimmed);
+    if (!Number.isFinite(seconds) || seconds <= 0) return null;
+    return Math.ceil(seconds * 1_000);
+  }
+
+  const targetMs = Date.parse(trimmed);
+  if (Number.isNaN(targetMs)) return null;
+  const deltaMs = targetMs - nowMs;
+  return deltaMs > 0 ? deltaMs : null;
+}

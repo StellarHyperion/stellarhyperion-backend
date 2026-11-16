@@ -32,7 +32,7 @@ import type {
   RailReport,
   AttestationStatus,
 } from "../types.js";
-import { RailError } from "../types.js";
+import { RailError, parseRetryAfterMs } from "../types.js";
 
 /** Circle's own status values. */
 const PENDING = "pending_confirmations";
@@ -214,6 +214,8 @@ export interface IrisOptions {
   readonly fetch?: typeof globalThis.fetch;
   readonly page?: number;
   readonly pageSize?: number;
+  /** Clock injection for deterministic Retry-After HTTP-date calculation. */
+  readonly now?: () => Date;
 }
 
 export class IrisClient implements RailClient {
@@ -245,11 +247,14 @@ export class IrisClient implements RailClient {
 
     if (response.status === 404) return { kind: "missing" };
     if (response.status === 429) {
+      const nowMs = this.options.now ? this.options.now().getTime() : Date.now();
+      const retryAfterMs =
+        parseRetryAfterMs(response.headers.get("retry-after"), nowMs) ?? RATE_LIMIT_COOLDOWN_MS;
       throw new RailError(
         this.rail,
         "rateLimited",
         "rate limited, and Circle blocks every request for five minutes after one",
-        RATE_LIMIT_COOLDOWN_MS,
+        retryAfterMs,
       );
     }
     if (!response.ok) {

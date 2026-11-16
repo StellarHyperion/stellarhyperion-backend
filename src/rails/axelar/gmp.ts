@@ -6,7 +6,7 @@ import type {
   RailLookup,
   RailReport,
 } from "../types.js";
-import { RailError } from "../types.js";
+import { RailError, parseRetryAfterMs } from "../types.js";
 
 /**
  * Axelar's statuses, mapped onto ours.
@@ -78,6 +78,8 @@ export interface GmpOptions {
   readonly fetch?: typeof globalThis.fetch;
   /** Called once per status value this build does not know. */
   readonly onUnknownStatus?: (status: string) => void;
+  /** Clock injection for deterministic Retry-After HTTP-date calculation. */
+  readonly now?: () => Date;
 }
 
 export class AxelarGmpClient implements RailClient {
@@ -136,8 +138,11 @@ export class AxelarGmpClient implements RailClient {
 
   private async rowsFor(txHash: string, signal?: AbortSignal): Promise<GmpRow[]> {
     const response = await this.send({ txHash }, signal);
-    if (response.status === 429)
-      throw new RailError(this.rail, "rateLimited", "rate limited", 60_000);
+    if (response.status === 429) {
+      const nowMs = this.options.now ? this.options.now().getTime() : Date.now();
+      const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"), nowMs) ?? 60_000;
+      throw new RailError(this.rail, "rateLimited", "rate limited", retryAfterMs);
+    }
     if (!response.ok)
       throw new RailError(
         this.rail,
