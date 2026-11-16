@@ -14,6 +14,7 @@
 import { pino, stdSerializers } from "pino";
 import type { Logger } from "pino";
 
+import { isSafePublicRunId } from "../chains/run-correlation.js";
 import type { AppConfig } from "../config/config.js";
 
 export type { Logger };
@@ -31,7 +32,10 @@ const REDACTED_PATHS = [
   "connectionString",
   "password",
   "stellarSecret",
+  "authorization",
   "*.stellarSecret",
+  "*.authorization",
+  "headers.authorization",
   "config.keeper.stellarSecret",
   "*.databaseUrl",
   "*.redisUrl",
@@ -95,4 +99,12 @@ function stringifyBigints(value: Record<string, unknown>): Record<string, unknow
 /** A logger for tests and for the config failure path, where there is no config yet. */
 export function createBootLogger(level: string): Logger {
   return pino({ level, base: { service: "hyperion-backend" } });
+}
+
+/** Attach a validated public worker run identifier to structured log entries. */
+export function withRunCorrelation(logger: Logger, runId: string): Logger {
+  if (!isSafePublicRunId(runId)) {
+    return logger;
+  }
+  return logger.child({ runId });
 }

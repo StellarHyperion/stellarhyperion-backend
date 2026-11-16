@@ -24,6 +24,7 @@ import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
+import type { WorkerRunTracker } from "../chains/run-correlation.js";
 import { writeInbound, writeAttestation } from "../chains/writers.js";
 import { outstandingForRail, pendingForRail } from "./queue.js";
 import { RailError, isTerminal, type PendingTransfer, type RailClient } from "./types.js";
@@ -48,6 +49,7 @@ export interface RailPassOptions {
   readonly maxCheckFailures: number;
   readonly now?: () => Date;
   readonly config?: AppConfig;
+  readonly runTracker?: WorkerRunTracker | undefined;
 }
 
 export interface RailProgress {
@@ -151,6 +153,7 @@ export class RailPass {
 
     const outstanding = await outstandingForRail(db, this.options.route);
     this.lastProgress = { checked, settled, failures, outstanding, at: this.now() };
+    await this.options.runTracker?.recordRailPassOutcome(this.name, outstanding, failures);
 
     if (checked > 0 || failures > 0) {
       logger.info(
@@ -178,6 +181,13 @@ export class RailPass {
         checkedAt: at,
         failures: 0,
         error: null,
+      });
+      await this.options.runTracker?.recordVerificationTransition({
+        transferId: transfer.transferId,
+        route: transfer.route,
+        previousStatus: transfer.status,
+        nextStatus: "delivered",
+        verifiedDelivery: true,
       });
       return true;
     }
@@ -215,6 +225,13 @@ export class RailPass {
           failures: 0,
           error: null,
         });
+        await this.options.runTracker?.recordVerificationTransition({
+          transferId: transfer.transferId,
+          route: transfer.route,
+          previousStatus: transfer.status,
+          nextStatus: "delivered",
+          verifiedDelivery: true,
+        });
         return true;
       }
     }
@@ -227,6 +244,15 @@ export class RailPass {
       failures: 0,
       error: null,
     });
+    if (report.status !== transfer.status) {
+      await this.options.runTracker?.recordVerificationTransition({
+        transferId: transfer.transferId,
+        route: transfer.route,
+        previousStatus: transfer.status,
+        nextStatus: report.status,
+        verifiedDelivery: false,
+      });
+    }
     return isTerminal(report.status);
   }
 

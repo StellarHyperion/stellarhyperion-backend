@@ -29,6 +29,7 @@ import type { Hex } from "viem";
 
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
+import type { WorkerRunTracker } from "../run-correlation.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
 import type { Position } from "../writers.js";
 import { ClaimPairing, applyRouterLog } from "./store.js";
@@ -61,6 +62,7 @@ export interface EvmWatcherOptions {
   readonly client: EvmClient;
   readonly db: Transactional;
   readonly logger: Logger;
+  readonly runTracker?: WorkerRunTracker | undefined;
 }
 
 export interface EvmProgress {
@@ -160,15 +162,17 @@ export class EvmWatcher {
 
     if (from > confirmed) {
       // Caught up to the confirmation line. Normal, and the common case on a fast chain.
+      const idleBehind = Number(confirmed - (stored?.position ?? this.options.startBlock - 1n));
       this.lastProgress = {
         block: stored?.position ?? this.options.startBlock - 1n,
         written: 0,
         ignored: 0,
         head,
-        behind: Number(confirmed - (stored?.position ?? this.options.startBlock - 1n)),
+        behind: idleBehind,
         reorgs: this.reorgs,
         at: new Date(),
       };
+      await this.options.runTracker?.recordIdleHeadObservation(chainKey, Math.max(idleBehind, 0));
       return false;
     }
 
@@ -195,6 +199,7 @@ export class EvmWatcher {
     let written = 0;
     let ignored = 0;
     const pairing = new ClaimPairing();
+    const behind = Number(confirmed - to);
 
     // One transaction for the range and the cursor advance past it. This is the restart guarantee,
     // and splitting it would turn every crash into either a lost range or a duplicated one.
@@ -226,9 +231,21 @@ export class EvmWatcher {
         // being handed a different history.
         hash: endHash,
       });
+
+      await this.options.runTracker?.recordScan(
+        {
+          chainKey,
+          family: "evm",
+          fromPosition: from,
+          toPosition: to,
+          decodedCount: written,
+          skippedCount: ignored,
+          behindCount: Math.max(behind, 0),
+        },
+        tx,
+      );
     });
 
-    const behind = Number(confirmed - to);
     this.lastProgress = {
       block: to,
       written,

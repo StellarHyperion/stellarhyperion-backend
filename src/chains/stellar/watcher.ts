@@ -26,6 +26,7 @@ import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
+import type { WorkerRunTracker } from "../run-correlation.js";
 import { completeThrough, endOfLedgerCursor, parseEventCursor } from "./cursor.js";
 import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
 import type { EventSource, EventsQuery } from "./rpc.js";
@@ -77,6 +78,7 @@ export interface StellarWatcherOptions {
   readonly db: Transactional;
   readonly logger: Logger;
   readonly maxPagesPerTick?: number;
+  readonly runTracker?: WorkerRunTracker | undefined;
 }
 
 export interface WatcherProgress {
@@ -168,13 +170,15 @@ export class StellarWatcher {
     if (scan.through <= base && scan.events.length === 0) {
       // No window crossed and nothing read. Report where we still are so readiness keeps telling
       // the truth about the lag rather than going quiet.
+      const idleBehind = Math.max(scan.latestLedger - base, 0);
       this.lastProgress = {
         ledger: base,
         decoded: 0,
         skipped: 0,
-        behind: Math.max(scan.latestLedger - base, 0),
+        behind: idleBehind,
         at: new Date(),
       };
+      await this.options.runTracker?.recordIdleHeadObservation(chainKey, idleBehind);
       return false;
     }
 
@@ -184,6 +188,8 @@ export class StellarWatcher {
     for (const raw of scan.events) {
       if (raw.ledger <= scan.through) closedAt = new Date(raw.ledgerClosedAt);
     }
+
+    const behind = Math.max(scan.latestLedger - scan.through, 0);
 
     // One transaction for the page and the cursor. This is the restart guarantee, and splitting it
     // would turn every crash into either a lost page or a duplicated one.
@@ -215,9 +221,21 @@ export class StellarWatcher {
         // Nothing to record: a closed ledger cannot be replaced by a different one.
         hash: null,
       });
+
+      await this.options.runTracker?.recordScan(
+        {
+          chainKey,
+          family: "stellar",
+          fromPosition: BigInt(base + 1),
+          toPosition: BigInt(scan.through),
+          decodedCount: decoded,
+          skippedCount: skipped,
+          behindCount: behind,
+        },
+        tx,
+      );
     });
 
-    const behind = Math.max(scan.latestLedger - scan.through, 0);
     this.lastProgress = { ledger: scan.through, decoded, skipped, behind, at: new Date() };
     logger.info(
       { chain: chainKey, ledger: scan.through, decoded, skipped, behind, pages: scan.pages },

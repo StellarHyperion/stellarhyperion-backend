@@ -197,3 +197,12 @@ export class ReadinessRegistry {
     return { state: worstOf(checks), checks };
   }
 }
+
+export function summarizeWorkerRunState(
+  status: "running" | "partial" | "completed" | "failed" | null,
+): ReadinessState {
+  if (status === null || status === "completed" || status === "running") {
+    return "ready";
+  }
+  return "degraded";
+}

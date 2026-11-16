@@ -31,8 +31,10 @@ import { IrisClient } from "../rails/cctp/iris.js";
 import { RailPass } from "../rails/pass.js";
 import type { RailClient } from "../rails/types.js";
 import { KeeperWorker } from "../keeper/worker.js";
+import { withRunCorrelation } from "../logging/logger.js";
 import { viemClient } from "./evm/client.js";
 import { EvmWatcher } from "./evm/watcher.js";
+import { WorkerRunTracker, type WorkerRunSummary } from "./run-correlation.js";
 import { StellarRpc } from "./stellar/rpc.js";
 import { StellarWatcher } from "./stellar/watcher.js";
 
@@ -55,13 +57,14 @@ export interface Worker extends ReadinessSource {
 export interface IndexerHandle {
   readonly workers: readonly Worker[];
   readonly readiness: readonly ReadinessSource[];
+  readonly runTracker?: WorkerRunTracker | undefined;
   /** Begin polling. Separate from building, the way `listen` is separate from `buildServer`. */
   start(): void;
   stop(): Promise<void>;
 }
 
 /** One pass is one `tick`, and the component reports its own health. */
-interface Pass extends ReadinessSource {
+export interface Pass extends ReadinessSource {
   readonly name: string;
   tick(signal: AbortSignal): Promise<boolean>;
 }
@@ -148,9 +151,23 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
 
   const workers: Worker[] = [];
   const extra: ReadinessSource[] = [];
+  const expectedChains: string[] = [];
+  if (config.indexer.stellar !== null) {
+    expectedChains.push(config.indexer.stellar.chain);
+  }
+  for (const chain of config.indexer.evm) {
+    expectedChains.push(chain.chain);
+  }
+  const expectedRails = config.rails.enabled ? ["rail:cctp", "rail:axelar"] : [];
+  const runTracker = new WorkerRunTracker({
+    db,
+    network: config.network,
+    expectedChains,
+    expectedRails,
+  });
 
   if (config.indexer.stellar !== null) {
-    workers.push(stellarWorker(config.indexer.stellar, db, logger));
+    workers.push(stellarWorker(config.indexer.stellar, db, logger, runTracker));
   } else {
     logger.warn("the deployment record has no Stellar router, so nothing is watching Stellar");
   }
@@ -158,7 +175,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // One per chain in the record. Each carries its own confirmations from the registry, which is
   // the honest way to treat one block on Arc and twelve on Ethereum as the same kind of fact.
   for (const chain of config.indexer.evm) {
-    workers.push(evmWorker(chain, db, logger));
+    workers.push(evmWorker(chain, db, logger, runTracker));
   }
 
   // Counted before the rail pollers join the list, because the two questions are different. "Is
@@ -171,7 +188,14 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // They are not conditional on a router being watched: a transfer indexed by a previous run is
   // still waiting on its rail whether or not this replica is watching the chain it left.
   if (config.rails.enabled) {
-    for (const worker of railWorkers(config.rails, config.network, db, logger, config)) {
+    for (const worker of railWorkers(
+      config.rails,
+      config.network,
+      db,
+      logger,
+      config,
+      runTracker,
+    )) {
       workers.push(worker);
     }
   } else {
@@ -210,20 +234,42 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
     );
   }
 
+  let runInit: Promise<unknown> | null = null;
+
   return {
     workers,
     readiness: [...workers, ...extra],
+    runTracker,
     start: () => {
+      runInit = runTracker
+        .beginRun()
+        .then(({ runId, rejectedCandidate }) => {
+          const runLogger = withRunCorrelation(logger, runId);
+          if (rejectedCandidate) {
+            runLogger.warn(
+              "rejected unsafe worker run identifier candidate; generated a fresh public runId",
+            );
+          }
+          if (workers.length > 0) {
+            runLogger.info({ workers: workers.map((worker) => worker.name) }, "watchers started");
+          }
+        })
+        .catch((err: unknown) => {
+          logger.warn({ err }, "failed to initialize persisted worker run correlation");
+        });
       for (const worker of workers) worker.start();
-      if (workers.length > 0) {
-        logger.info({ workers: workers.map((worker) => worker.name) }, "watchers started");
-      }
     },
     stop: async () => {
+      if (runInit !== null) {
+        await runInit;
+      }
       // In parallel. Each watcher stops after its own current tick, and they share no state, so
       // serialising them would only make shutdown take as long as the slowest chain times the
       // number of chains.
       await Promise.all(workers.map((worker) => worker.stop()));
+      await runTracker.finishRun().catch((err: unknown) => {
+        logger.warn({ err }, "failed to finalize persisted worker run correlation");
+      });
     },
   };
 }
@@ -242,6 +288,7 @@ function railWorkers(
   db: Transactional,
   logger: Logger,
   appConfig: AppConfig,
+  runTracker: WorkerRunTracker,
 ): readonly Worker[] {
   const clients: readonly { readonly route: RouteKind; readonly client: RailClient }[] = [
     {
@@ -272,12 +319,18 @@ function railWorkers(
       batchSize: config.batchSize,
       recheckAfterMs: config.recheckAfterMs,
       maxCheckFailures: config.maxCheckFailures,
+      runTracker,
     });
     return new PolledWorker(pass, config.pollIntervalMs, child);
   });
 }
 
-function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): Worker {
+function evmWorker(
+  config: EvmWatchConfig,
+  db: Transactional,
+  logger: Logger,
+  runTracker: WorkerRunTracker,
+): Worker {
   const child = logger.child({ chain: config.chain, chainId: config.chainId });
   const watcher = new EvmWatcher({
     chainKey: config.chain,
@@ -290,11 +343,17 @@ function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): W
     client: viemClient(config.rpcUrls, { logger: child }),
     db,
     logger: child,
+    runTracker,
   });
   return new PolledWorker(watcher, config.pollIntervalMs, child);
 }
 
-function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Logger): Worker {
+function stellarWorker(
+  config: StellarWatchConfig,
+  db: Transactional,
+  logger: Logger,
+  runTracker: WorkerRunTracker,
+): Worker {
   const child = logger.child({ chain: config.chain });
   const watcher = new StellarWatcher({
     chainKey: config.chain,
@@ -304,6 +363,64 @@ function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Lo
     rpc: new StellarRpc(config.rpcUrl),
     db,
     logger: child,
+    runTracker,
   });
   return new PolledWorker(watcher, config.pollIntervalMs, child);
+}
+
+export interface CorrelatedCatchUpOptions {
+  readonly runTracker: WorkerRunTracker;
+  readonly passes: readonly Pass[];
+  readonly logger: Logger;
+  readonly requestedRunId?: string | null | undefined;
+  readonly maxTicksPerPass?: number | undefined;
+  readonly signal?: AbortSignal | undefined;
+}
+
+/**
+ * Execute one bounded, correlated catch-up run across the provided chain and rail passes.
+ */
+export async function runCorrelatedCatchUpJob(
+  options: CorrelatedCatchUpOptions,
+): Promise<WorkerRunSummary | null> {
+  const maxTicks = options.maxTicksPerPass ?? 25;
+  const signal = options.signal ?? new AbortController().signal;
+  const { runId, rejectedCandidate } = await options.runTracker.beginRun(options.requestedRunId);
+  const runLogger = withRunCorrelation(options.logger, runId);
+
+  if (rejectedCandidate) {
+    runLogger.warn(
+      "rejected unsafe worker run identifier candidate; generated a fresh public runId",
+    );
+  }
+
+  const isAborted = (): boolean => signal.aborted;
+  for (const pass of options.passes) {
+    if (isAborted()) break;
+    let ticks = 0;
+    try {
+      while (ticks < maxTicks && !isAborted()) {
+        ticks += 1;
+        const moreWork = await pass.tick(signal);
+        if (!moreWork) break;
+      }
+    } catch (error) {
+      options.runTracker.recordWorkerFailure();
+      runLogger.error({ pass: pass.name, err: error }, "pass failed during correlated catch-up");
+    }
+  }
+
+  const summary = await options.runTracker.finishRun();
+  if (summary !== null) {
+    runLogger.info(
+      {
+        status: summary.status,
+        scanWindows: summary.scanWindows,
+        verificationTransitions: summary.verificationTransitions,
+        verifiedDeliveries: summary.verifiedDeliveries,
+      },
+      "completed correlated worker catch-up execution",
+    );
+  }
+  return summary;
 }
