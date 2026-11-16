@@ -10,7 +10,9 @@ import { describe, expect, it } from "vitest";
 
 import { endOfLedgerCursor } from "../../src/chains/stellar/cursor.js";
 import type { RawStellarEvent } from "../../src/chains/stellar/events.js";
+import type { EventSource, EventsPage, EventsQuery } from "../../src/chains/stellar/rpc.js";
 import { StellarWatcher } from "../../src/chains/stellar/watcher.js";
+import type { Queryable, QueryResultRows, Transactional } from "../../src/db/pool.js";
 import {
   FakeRpc,
   LIVE_ROUTER,
@@ -342,5 +344,230 @@ describe("gaps it cannot close", () => {
 
     const warnings = lines.filter((line) => line.message.includes("running ahead of the indexer"));
     expect(warnings).toHaveLength(1);
+  });
+});
+
+describe("graceful watcher draining", () => {
+  it("stops new requests mid-ledger without persisting a partially applied scan boundary", async () => {
+    const crowded = [0, 1, 2, 3].map((index) =>
+      syntheticEvent({
+        ledger: FIRST_EVENT_LEDGER,
+        id: `${toid(FIRST_EVENT_LEDGER, 0, index).toString().padStart(19, "0")}-0000000000`,
+        txHash: `tx-drain-${String(index)}`,
+      }),
+    );
+    const baseRpc = new FakeRpc({
+      events: crowded,
+      latestLedger: FIRST_EVENT_LEDGER + 2,
+    });
+    const db = new RecordingDb();
+    const { logger } = capturingLogger();
+
+    const holder: { current: StellarWatcher | null } = { current: null };
+    let calls = 0;
+    const gatingRpc: EventSource = {
+      events: async (query: EventsQuery): Promise<EventsPage> => {
+        calls += 1;
+        const page = await baseRpc.events(query);
+        if (calls === 1 && holder.current !== null) {
+          // Trigger drain after the first mid-ledger page returns, before page 2 can be requested.
+          void holder.current.drain(200);
+        }
+        return page;
+      },
+    };
+
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 2,
+      rpc: gatingRpc,
+      db,
+      logger,
+    });
+    holder.current = watcher;
+
+    const progressed = await watcher.tick(AbortSignal.timeout(5_000));
+    await watcher.drain(200);
+
+    expect(progressed).toBe(false);
+    expect(calls).toBe(1);
+    expect(db.commits).toEqual([]);
+    expect(cursorWrites(db)).toEqual([]);
+    expect(watcher.readiness().state).toBe("degraded");
+
+    // Subsequent ticks while drained issue zero RPC calls.
+    expect(await watcher.tick(AbortSignal.timeout(5_000))).toBe(false);
+    expect(calls).toBe(1);
+  });
+
+  it("terminates hung in-flight rpc requests within the configured drain deadline", async () => {
+    const db = new RecordingDb();
+    const { logger } = capturingLogger();
+    const hungRpc: EventSource = {
+      events: () =>
+        new Promise<EventsPage>(() => {
+          // intentionally never resolves
+        }),
+    };
+
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 200,
+      rpc: hungRpc,
+      db,
+      logger,
+      drainDeadlineMs: 40,
+    });
+
+    const startedAt = Date.now();
+    const tickPromise = watcher.tick(AbortSignal.timeout(5_000));
+    await watcher.drain(40);
+    const result = await tickPromise;
+    const elapsed = Date.now() - startedAt;
+
+    expect(result).toBe(false);
+    expect(elapsed).toBeLessThan(1_000);
+    expect(cursorWrites(db)).toEqual([]);
+  });
+
+  it("rolls back an open event transaction that exceeds drain deadline and resumes from last committed cursor", async () => {
+    const queued = ROUTER_HISTORY.filter((entry) => entry.topicJson[1]?.symbol === "queued").slice(
+      0,
+      3,
+    );
+    const rpc = new FakeRpc({
+      events: queued,
+      latestLedger: FIRST_EVENT_LEDGER + 25_000,
+    });
+
+    const state: { cursor: Record<string, unknown> | null } = { cursor: null };
+    const commits: number[] = [];
+    const rollbacks: number[] = [];
+    let txCount = 0;
+    let slowWrites = false;
+    let triggerDrainOnWrite: (() => void) | null = null;
+
+    const db: Transactional = {
+      query: (sql: string, params: readonly unknown[] = []): Promise<QueryResultRows> => {
+        if (sql.includes("FROM indexer_cursor")) {
+          return Promise.resolve({
+            rows: state.cursor === null ? [] : [state.cursor],
+            rowCount: state.cursor === null ? 0 : 1,
+          });
+        }
+        return Promise.resolve({ rows: [], rowCount: params.length >= 0 ? 0 : 0 });
+      },
+      transaction: async <T>(work: (tx: Queryable) => Promise<T>): Promise<T> => {
+        const id = ++txCount;
+        let stagedCursor: Record<string, unknown> | null = state.cursor;
+        const tx: Queryable = {
+          query: async (sql: string, params: readonly unknown[] = []): Promise<QueryResultRows> => {
+            if (triggerDrainOnWrite !== null && sql.includes("INSERT INTO admin_action")) {
+              const fn = triggerDrainOnWrite;
+              triggerDrainOnWrite = null;
+              fn();
+            }
+            if (slowWrites && sql.includes("INSERT INTO admin_action")) {
+              await new Promise((resolve) => setTimeout(resolve, 35));
+            }
+            if (sql.includes("INSERT INTO indexer_cursor")) {
+              stagedCursor = {
+                contract: String(params[2]),
+                last_processed: String(params[3]),
+                last_processed_at: params[4] ?? null,
+                last_processed_hash: null,
+              };
+            }
+            return { rows: [], rowCount: 1 };
+          },
+        };
+
+        try {
+          const out = await work(tx);
+          state.cursor = stagedCursor;
+          commits.push(id);
+          return out;
+        } catch (error) {
+          rollbacks.push(id);
+          throw error;
+        }
+      },
+    };
+
+    const { logger } = capturingLogger();
+    const firstWatcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 200,
+      rpc,
+      db,
+      logger,
+    });
+
+    // Pass 1 commits the first 10,000-ledger window cleanly.
+    expect(await firstWatcher.tick(AbortSignal.timeout(5_000))).toBe(true);
+    expect(commits).toEqual([1]);
+    const committedAfterPass1 = Number(state.cursor?.last_processed);
+    expect(committedAfterPass1).toBe(FIRST_EVENT_LEDGER + 9_999);
+
+    // Simulate a second pass with events in the next window whose DB writes exceed drain deadline.
+    const lateEvents = queued.map((entry, idx) => ({
+      ...entry,
+      ledger: committedAfterPass1 + 5 + idx,
+      id: `${toid(committedAfterPass1 + 5 + idx, 0, idx)
+        .toString()
+        .padStart(19, "0")}-0000000000`,
+    }));
+    const secondRpc = new FakeRpc({
+      events: lateEvents,
+      latestLedger: committedAfterPass1 + 50,
+    });
+    const secondWatcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 200,
+      rpc: secondRpc,
+      db,
+      logger,
+      drainDeadlineMs: 15,
+    });
+
+    slowWrites = true;
+    triggerDrainOnWrite = () => {
+      void secondWatcher.drain(15);
+    };
+
+    const abortedTick = await secondWatcher.tick(AbortSignal.timeout(5_000));
+    await secondWatcher.drain(15);
+
+    expect(abortedTick).toBe(false);
+    expect(rollbacks).toEqual([2]);
+    expect(Number(state.cursor?.last_processed)).toBe(committedAfterPass1);
+
+    // Restart with a fresh watcher: resumes from the exact last committed cursor and finishes.
+    slowWrites = false;
+    const restartRpc = new FakeRpc({
+      events: lateEvents,
+      latestLedger: committedAfterPass1 + 50,
+    });
+    const restartedWatcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 200,
+      rpc: restartRpc,
+      db,
+      logger,
+    });
+
+    await restartedWatcher.tick(AbortSignal.timeout(5_000));
+    expect(restartRpc.requests[0]?.cursor).toBe(endOfLedgerCursor(committedAfterPass1));
+    expect(Number(state.cursor?.last_processed)).toBe(committedAfterPass1 + 50);
   });
 });

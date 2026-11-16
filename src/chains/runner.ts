@@ -64,6 +64,7 @@ export interface IndexerHandle {
 interface Pass extends ReadinessSource {
   readonly name: string;
   tick(signal: AbortSignal): Promise<boolean>;
+  drain?(deadlineMs?: number): Promise<void>;
 }
 
 /**
@@ -97,8 +98,12 @@ export class PolledWorker implements Worker {
     this.poller.start();
   }
 
-  stop(): Promise<void> {
-    return this.poller.stop();
+  async stop(): Promise<void> {
+    if (this.pass.drain !== undefined) {
+      await Promise.all([this.pass.drain(), this.poller.stop()]);
+      return;
+    }
+    await this.poller.stop();
   }
 
   async readiness(): Promise<ReadinessReport> {

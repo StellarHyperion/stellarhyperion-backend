@@ -182,6 +182,34 @@ export class StellarRpc {
   }
 }
 
+export function withDeadlineSignal<T>(
+  work: (signal: AbortSignal) => Promise<T>,
+  options: {
+    readonly signal?: AbortSignal;
+    readonly timeoutMs: number;
+    readonly onTimeout: () => Error;
+  },
+): Promise<T> {
+  const timeoutController = new AbortController();
+  const composed =
+    options.signal === undefined
+      ? timeoutController.signal
+      : AbortSignal.any([options.signal, timeoutController.signal]);
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const err = options.onTimeout();
+      timeoutController.abort(err);
+      reject(err);
+    }, options.timeoutMs);
+  });
+
+  return Promise.race([work(composed), timeoutPromise]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
 function describe(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }

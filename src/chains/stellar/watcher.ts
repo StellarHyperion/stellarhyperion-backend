@@ -28,8 +28,8 @@ import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { completeThrough, endOfLedgerCursor, parseEventCursor } from "./cursor.js";
 import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
-import type { EventSource, EventsQuery } from "./rpc.js";
-import { StellarRpcError } from "./rpc.js";
+import type { EventSource, EventsPage, EventsQuery } from "./rpc.js";
+import { StellarRpcError, withDeadlineSignal } from "./rpc.js";
 import {
   readCursor,
   recordActionQueued,
@@ -66,6 +66,15 @@ const CURRENT_WITHIN_LEDGERS = 5;
  * what it read.
  */
 const MAX_PAGES_PER_TICK = 20;
+const DEFAULT_DRAIN_DEADLINE_MS = 5_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
+
+export class StellarWatcherDrainError extends Error {
+  constructor(reason: string) {
+    super(`stellar watcher drain aborted work: ${reason}`);
+    this.name = "StellarWatcherDrainError";
+  }
+}
 
 export interface StellarWatcherOptions {
   readonly chainKey: string;
@@ -77,6 +86,10 @@ export interface StellarWatcherOptions {
   readonly db: Transactional;
   readonly logger: Logger;
   readonly maxPagesPerTick?: number;
+  /** Maximum milliseconds allowed for in-flight RPC or open DB transaction work during drain. */
+  readonly drainDeadlineMs?: number;
+  /** Per-request deadline for `EventSource.events` calls. */
+  readonly requestTimeoutMs?: number;
 }
 
 export interface WatcherProgress {
@@ -93,6 +106,12 @@ export class StellarWatcher {
   private lastProgress: WatcherProgress | null = null;
   /** Tags seen once and logged once. A contract ahead of this build should not be a log flood. */
   private readonly reportedUnknown = new Set<string>();
+  private drainRequested = false;
+  private drainDeadlineExceeded = false;
+  private drainPromise: Promise<void> | null = null;
+  private activeTick: Promise<boolean> | null = null;
+  private readonly drainDeadlineController = new AbortController();
+  private readonly inFlightRejectors = new Set<(error: Error) => void>();
 
   constructor(private readonly options: StellarWatcherOptions) {}
 
@@ -104,6 +123,68 @@ export class StellarWatcher {
     return this.lastProgress;
   }
 
+  get draining(): boolean {
+    return this.isDraining();
+  }
+
+  private isDraining(): boolean {
+    return this.drainRequested;
+  }
+
+  private isDeadlineExceeded(): boolean {
+    return this.drainDeadlineExceeded;
+  }
+
+  /**
+   * Stop issuing new RPC requests and give any in-flight request or open event transaction up to
+   * `deadlineMs` to finish cleanly or roll back before returning.
+   */
+  drain(deadlineMs?: number): Promise<void> {
+    this.drainPromise ??= this.executeDrain(
+      deadlineMs ?? this.options.drainDeadlineMs ?? DEFAULT_DRAIN_DEADLINE_MS,
+    );
+    return this.drainPromise;
+  }
+
+  private async executeDrain(budgetMs: number): Promise<void> {
+    this.drainRequested = true;
+    const active = this.activeTick;
+    if (active === null) {
+      return;
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expire = (): void => {
+      this.drainDeadlineExceeded = true;
+      const err = new StellarWatcherDrainError(
+        `in-flight work exceeded drain deadline of ${String(budgetMs)}ms`,
+      );
+      this.drainDeadlineController.abort(err);
+      for (const reject of this.inFlightRejectors) {
+        reject(err);
+      }
+    };
+
+    if (budgetMs <= 0) {
+      expire();
+    } else {
+      timer = setTimeout(expire, budgetMs);
+    }
+
+    try {
+      await active;
+    } catch (error) {
+      if (!(error instanceof StellarWatcherDrainError)) {
+        this.options.logger.warn(
+          { err: error, chain: this.options.chainKey },
+          "in-flight pass aborted during drain",
+        );
+      }
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
   /**
    * Readiness from cached state, never from a network call.
    *
@@ -113,6 +194,13 @@ export class StellarWatcher {
    * is something to alert on; taking the replica out of rotation would only move the outage.
    */
   readiness(): ReadinessReport {
+    if (this.isDraining()) {
+      return {
+        name: this.name,
+        state: "degraded",
+        detail: "draining in-flight work for shutdown; new rpc requests are paused",
+      };
+    }
     const progress = this.lastProgress;
     if (progress === null) {
       return {
@@ -140,6 +228,21 @@ export class StellarWatcher {
    * a watcher starting thousands of ledgers back catches up without sleeping between windows.
    */
   async tick(signal: AbortSignal): Promise<boolean> {
+    if (this.isDraining() || isSignalAborted(signal)) {
+      return false;
+    }
+    const running = this.runTick(signal);
+    this.activeTick = running;
+    try {
+      return await running;
+    } finally {
+      if (this.activeTick === running) {
+        this.activeTick = null;
+      }
+    }
+  }
+
+  private async runTick(signal: AbortSignal): Promise<boolean> {
     const { chainKey, router, db, logger } = this.options;
 
     const stored = await readCursor(db, chainKey);
@@ -153,8 +256,18 @@ export class StellarWatcher {
       );
     }
 
+    if (this.isDraining() || isSignalAborted(signal)) {
+      return false;
+    }
+
     const base = stored === null ? this.options.startLedger - 1 : Number(stored.position);
     const scan = await this.scan(base, stored === null, signal);
+
+    if (scan.interrupted || this.isDraining() || isSignalAborted(signal)) {
+      // Stopped before opening the commit transaction, or interrupted mid-ledger. Refuse to
+      // persist a partial scan boundary so restart resumes cleanly from the last committed cursor.
+      return false;
+    }
 
     if (scan.oldestLedger > base + 1 && stored !== null) {
       // The retention window moved past where we stopped. Anything between the two is gone from
@@ -185,37 +298,79 @@ export class StellarWatcher {
       if (raw.ledger <= scan.through) closedAt = new Date(raw.ledgerClosedAt);
     }
 
-    // One transaction for the page and the cursor. This is the restart guarantee, and splitting it
-    // would turn every crash into either a lost page or a duplicated one.
-    await db.transaction(async (tx: Queryable) => {
-      for (const raw of scan.events) {
-        if (raw.type !== "contract" || raw.inSuccessfulContractCall === false) {
-          // getEvents no longer returns the deprecated success flag (RPC30).
-          // Diagnostic events are excluded by current RPC; retain legacy explicit-failure checks.
-          // https://github.com/stellar/stellar-rpc/releases/tag/v30.0.0
-          skipped += 1;
-          continue;
-        }
-        const context: EventContext = {
-          chainKey,
-          ledger: raw.ledger,
-          txHash: raw.txHash,
-          closedAt: new Date(raw.ledgerClosedAt),
-        };
-        if (await this.apply(tx, context, raw)) decoded += 1;
-        else skipped += 1;
-      }
+    let signalCancelTimer: ReturnType<typeof setTimeout> | undefined;
+    let signalDeadlineExceeded = false;
+    const armSignalGrace = (): void => {
+      if (signalCancelTimer !== undefined || this.isDraining()) return;
+      const graceMs = this.options.drainDeadlineMs ?? DEFAULT_DRAIN_DEADLINE_MS;
+      signalCancelTimer = setTimeout(() => {
+        signalDeadlineExceeded = true;
+      }, graceMs);
+    };
+    if (isSignalAborted(signal)) {
+      armSignalGrace();
+    } else {
+      signal.addEventListener("abort", armSignalGrace, { once: true });
+    }
 
-      await writeCursor(tx, {
-        chainKey,
-        family: "stellar",
-        contract: router,
-        position: BigInt(scan.through),
-        observedAt: closedAt,
-        // Nothing to record: a closed ledger cannot be replaced by a different one.
-        hash: null,
+    const assertTxWithinBudget = (): void => {
+      if (this.isDeadlineExceeded() || signalDeadlineExceeded) {
+        throw new StellarWatcherDrainError(
+          "event transaction exceeded shutdown deadline; rolling back uncommitted scan boundary",
+        );
+      }
+    };
+
+    try {
+      // One transaction for the page and the cursor. This is the restart guarantee, and splitting it
+      // would turn every crash into either a lost page or a duplicated one.
+      await db.transaction(async (tx: Queryable) => {
+        for (const raw of scan.events) {
+          assertTxWithinBudget();
+          if (raw.type !== "contract" || raw.inSuccessfulContractCall === false) {
+            // getEvents no longer returns the deprecated success flag (RPC30).
+            // Diagnostic events are excluded by current RPC; retain legacy explicit-failure checks.
+            // https://github.com/stellar/stellar-rpc/releases/tag/v30.0.0
+            skipped += 1;
+            continue;
+          }
+          const context: EventContext = {
+            chainKey,
+            ledger: raw.ledger,
+            txHash: raw.txHash,
+            closedAt: new Date(raw.ledgerClosedAt),
+          };
+          if (await this.apply(tx, context, raw)) decoded += 1;
+          else skipped += 1;
+        }
+
+        assertTxWithinBudget();
+        await writeCursor(tx, {
+          chainKey,
+          family: "stellar",
+          contract: router,
+          position: BigInt(scan.through),
+          observedAt: closedAt,
+          // Nothing to record: a closed ledger cannot be replaced by a different one.
+          hash: null,
+        });
       });
-    });
+    } catch (error) {
+      if (
+        error instanceof StellarWatcherDrainError &&
+        (this.isDraining() || isSignalAborted(signal))
+      ) {
+        logger.warn(
+          { chain: chainKey },
+          "rolled back uncommitted stellar event transaction after shutdown deadline expired",
+        );
+        return false;
+      }
+      throw error;
+    } finally {
+      signal.removeEventListener("abort", armSignalGrace);
+      if (signalCancelTimer !== undefined) clearTimeout(signalCancelTimer);
+    }
 
     const behind = Math.max(scan.latestLedger - scan.through, 0);
     this.lastProgress = { ledger: scan.through, decoded, skipped, behind, at: new Date() };
@@ -223,6 +378,10 @@ export class StellarWatcher {
       { chain: chainKey, ledger: scan.through, decoded, skipped, behind, pages: scan.pages },
       "stellar window indexed",
     );
+
+    if (this.isDraining() || isSignalAborted(signal)) {
+      return false;
+    }
 
     // Behind the head means there is another window waiting, so say we progressed and let the
     // poller come straight back rather than sleeping out the interval mid-backfill.
@@ -246,6 +405,7 @@ export class StellarWatcher {
     readonly latestLedger: number;
     readonly oldestLedger: number;
     readonly pages: number;
+    readonly interrupted: boolean;
   }> {
     const { router, pageSize, logger, chainKey } = this.options;
     const maxPages = this.options.maxPagesPerTick ?? MAX_PAGES_PER_TICK;
@@ -255,6 +415,7 @@ export class StellarWatcher {
     let latestLedger = 0;
     let oldestLedger = 0;
     let pages = 0;
+    let interrupted = false;
     // A fresh cursor starts by ledger. Everything after resumes from a cursor, which is the only
     // account of where the previous scan actually stopped.
     let pagination: Pick<EventsQuery, "startLedger" | "cursor"> = fresh
@@ -262,10 +423,25 @@ export class StellarWatcher {
       : { cursor: endOfLedgerCursor(base) };
 
     while (pages < maxPages) {
-      const page = await this.fetch(
-        { ...pagination, contractIds: [router], limit: pageSize },
-        signal,
-      );
+      if (this.isDraining() || isSignalAborted(signal)) {
+        interrupted = true;
+        break;
+      }
+
+      let page: EventsPage;
+      try {
+        page = await this.fetch({ ...pagination, contractIds: [router], limit: pageSize }, signal);
+      } catch (error) {
+        if (
+          this.isDraining() ||
+          isSignalAborted(signal) ||
+          error instanceof StellarWatcherDrainError
+        ) {
+          interrupted = true;
+          break;
+        }
+        throw error;
+      }
       pages += 1;
       events.push(...(page.events as readonly RawStellarEvent[]));
       latestLedger = page.latestLedger;
@@ -289,21 +465,55 @@ export class StellarWatcher {
       pagination = { cursor: page.cursor };
     }
 
-    if (pages >= maxPages && through <= base) {
+    if (!interrupted && pages >= maxPages && through <= base) {
       logger.error(
         { chain: chainKey, ledger: base + 1, pages, pageSize },
         "a single ledger holds more router events than this many pages could drain; raise STELLAR_EVENT_PAGE_SIZE",
       );
     }
 
-    return { events, through, latestLedger, oldestLedger, pages };
+    return { events, through, latestLedger, oldestLedger, pages, interrupted };
   }
 
-  private async fetch(query: EventsQuery, signal: AbortSignal) {
+  private async fetch(query: EventsQuery, signal: AbortSignal): Promise<EventsPage> {
+    const requestTimeoutMs = this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    const combinedSignal = AbortSignal.any([signal, this.drainDeadlineController.signal]);
+    let rejectInFlight: ((error: Error) => void) | undefined;
+    let onCallerAbort: (() => void) | undefined;
+    const drainRace = new Promise<never>((_resolve, reject) => {
+      rejectInFlight = reject;
+      this.inFlightRejectors.add(reject);
+      if (isSignalAborted(signal)) {
+        reject(new StellarWatcherDrainError("caller signal aborted in-flight rpc request"));
+      } else {
+        onCallerAbort = () => {
+          reject(new StellarWatcherDrainError("caller signal aborted in-flight rpc request"));
+        };
+        signal.addEventListener("abort", onCallerAbort, { once: true });
+      }
+    });
+
     try {
-      return await this.options.rpc.events(query, signal);
+      return await Promise.race([
+        withDeadlineSignal((innerSignal) => this.options.rpc.events(query, innerSignal), {
+          signal: combinedSignal,
+          timeoutMs: requestTimeoutMs,
+          onTimeout: () =>
+            new StellarRpcError(
+              "getEvents",
+              `request exceeded deadline of ${String(requestTimeoutMs)}ms`,
+              true,
+            ),
+        }),
+        drainRace,
+      ]);
     } catch (error) {
-      if (error instanceof StellarRpcError && !error.retryable) {
+      if (
+        error instanceof StellarRpcError &&
+        !error.retryable &&
+        !this.isDraining() &&
+        !isSignalAborted(signal)
+      ) {
         // Almost always the start ledger or the cursor having fallen out of the node's retention
         // window. Said plainly, because the fix is an archive source rather than another retry.
         this.options.logger.error(
@@ -312,6 +522,13 @@ export class StellarWatcher {
         );
       }
       throw error;
+    } finally {
+      if (onCallerAbort !== undefined) {
+        signal.removeEventListener("abort", onCallerAbort);
+      }
+      if (rejectInFlight !== undefined) {
+        this.inFlightRejectors.delete(rejectInFlight);
+      }
     }
   }
 
@@ -386,6 +603,10 @@ export class StellarWatcher {
         return assertNever(event);
     }
   }
+}
+
+function isSignalAborted(signal: AbortSignal): boolean {
+  return signal.aborted;
 }
 
 /** A compile time exhaustiveness check. The runtime throw is a formality. */
