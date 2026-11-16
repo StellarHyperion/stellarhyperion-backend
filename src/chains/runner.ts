@@ -243,7 +243,7 @@ function railWorkers(
   logger: Logger,
   appConfig: AppConfig,
 ): readonly Worker[] {
-  const clients: readonly { readonly route: RouteKind; readonly client: RailClient }[] = [
+  const clients: { readonly route: RouteKind; readonly client: RailClient }[] = [
     {
       route: RouteKind.Cctp,
       client: new IrisClient(network, { baseUrl: config.irisUrl }),
@@ -260,6 +260,21 @@ function railWorkers(
       }),
     },
   ];
+
+  if ((config.gmpLanes?.length ?? 0) > 0) {
+    clients.push({
+      route: RouteKind.AxelarGmp,
+      client: new AxelarGmpClient(config.axelarUrl, {
+        railName: "axelar-gmp",
+        onUnknownStatus: (status) => {
+          logger.warn(
+            { rail: "axelar-gmp", status },
+            "the rail reported a status this build does not know; it is recorded verbatim and the transfer stays pending",
+          );
+        },
+      }),
+    });
+  }
 
   return clients.map(({ route, client }) => {
     const child = logger.child({ rail: client.rail, route });

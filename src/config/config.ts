@@ -16,15 +16,21 @@ import { resolve as resolvePath } from "node:path";
 
 import type { Chain, ChainKey, DeploymentSet, Hex, NetworkMode } from "@hyperion/protocol";
 import {
+  AddressKind,
   CHAINS,
   DeploymentFormatError,
   IRIS_API,
+  RAIL_CONTRACTS,
+  RouteKind,
   chainsFor,
+  encodeStellarAddress,
+  isChainKey,
   isEvmChain,
   isEvmDeployment,
   isStellarChain,
   isStellarDeployment,
   parseDeploymentSet,
+  parseStellarAddress,
 } from "@hyperion/protocol";
 
 import type { EnumSpec, VarSpec } from "./env.js";
@@ -74,12 +80,33 @@ export interface EvmWatchConfig {
   readonly pollIntervalMs: number;
 }
 
+export interface GmpAdmittedLane {
+  readonly originChain: ChainKey;
+  readonly destinationChain: ChainKey;
+  readonly symbol: string;
+  readonly originAxelarChain: string;
+  readonly destinationAxelarChain: string;
+  readonly originGateway: string;
+  readonly destinationGateway: string;
+  readonly originAdapter: string;
+  readonly destinationReceiver: string;
+  readonly destinationRouter: string;
+  readonly originToken: string;
+  readonly destinationToken: string;
+  readonly originDecimals: number;
+  readonly destinationDecimals: number;
+}
+
 /** Everything the rail status pollers need. One per rail that has a status API. */
 export interface RailsConfig {
   readonly enabled: boolean;
   /** Circle's Iris, from the shared registry unless overridden. */
   readonly irisUrl: string;
   readonly axelarUrl: string;
+  /** Admitted authenticated GMP lanes backed by deployed source adapters and destination receivers. */
+  readonly gmpLanes?: readonly GmpAdmittedLane[];
+  /** Non-live fixture provenance marker when the deployment file originates from a local rehearsal capture. */
+  readonly fixtureProvenance?: string | null;
   readonly pollIntervalMs: number;
   readonly batchSize: number;
   readonly recheckAfterMs: number;
@@ -484,7 +511,8 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     : null;
 
   const absoluteDeployments = deploymentsPath === "" ? "" : resolvePath(cwd, deploymentsPath);
-  const deployments = readDeployments(reader, read, absoluteDeployments);
+  const loaded = readDeployments(reader, read, absoluteDeployments);
+  const deployments = loaded.set;
   const indexer = planIndexer(reader, {
     network,
     deployments,
@@ -498,6 +526,13 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     reorgDepthOverride,
     env,
   });
+  const gmpLanes = validateAndPlanGmpLanes(
+    reader,
+    network,
+    deployments,
+    loaded.gmpReceivers,
+    loaded.fixtureProvenance,
+  );
 
   // One throw, after everything has had a chance to complain.
   reader.finish();
@@ -516,6 +551,8 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       enabled: railsEnabled,
       irisUrl: irisOverride === "" ? IRIS_API[network] : irisOverride,
       axelarUrl: axelarOverride === "" ? AXELARSCAN_API[network] : axelarOverride,
+      gmpLanes,
+      fixtureProvenance: loaded.fixtureProvenance,
       pollIntervalMs: railPollIntervalMs,
       batchSize: railBatchSize,
       recheckAfterMs: railRecheckAfterMs,
@@ -533,12 +570,23 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
 
 const EMPTY_SET: DeploymentSet = { schemaVersion: 1, generatedAt: "", networks: {} };
 
+interface GmpReceiverRecord {
+  readonly receiver: string | null;
+  readonly enabled: boolean;
+}
+
+interface LoadedDeployments {
+  readonly set: DeploymentSet;
+  readonly gmpReceivers: Readonly<Partial<Record<ChainKey, GmpReceiverRecord>>>;
+  readonly fixtureProvenance: string | null;
+}
+
 function readDeployments(
   reader: EnvReader,
   read: (path: string) => string,
   path: string,
-): DeploymentSet {
-  if (path === "") return EMPTY_SET;
+): LoadedDeployments {
+  if (path === "") return { set: EMPTY_SET, gmpReceivers: {}, fixtureProvenance: null };
 
   let text: string;
   try {
@@ -548,7 +596,7 @@ function readDeployments(
     // directory is the single most common way this fails, and the resolved absolute path is the
     // thing that makes it obvious.
     reader.reject(DEPLOYMENTS_FILE, `cannot be read at ${path}`);
-    return EMPTY_SET;
+    return { set: EMPTY_SET, gmpReceivers: {}, fixtureProvenance: null };
   }
 
   let parsed: unknown;
@@ -556,21 +604,25 @@ function readDeployments(
     parsed = JSON.parse(text);
   } catch (error) {
     reader.reject(DEPLOYMENTS_FILE, `is not valid JSON: ${messageOf(error)}`);
-    return EMPTY_SET;
+    return { set: EMPTY_SET, gmpReceivers: {}, fixtureProvenance: null };
   }
 
+  let set: DeploymentSet;
   try {
     // Validated rather than cast. An address with a transposed character parses fine as a string
     // and turns into a watcher reading an empty contract for a week without complaining.
-    return parseDeploymentSet(parsed);
+    set = parseDeploymentSet(parsed);
   } catch (error) {
     const detail =
       error instanceof DeploymentFormatError
         ? error.message
         : `is not a deployment set: ${messageOf(error)}`;
     reader.reject(DEPLOYMENTS_FILE, detail);
-    return EMPTY_SET;
+    return { set: EMPTY_SET, gmpReceivers: {}, fixtureProvenance: null };
   }
+
+  const { gmpReceivers, fixtureProvenance } = extractGmpMetadata(reader, parsed, set);
+  return { set, gmpReceivers, fixtureProvenance };
 }
 
 interface PlanInput {
@@ -700,4 +752,332 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+const LOCAL_FIXTURE_KEYWORDS = ["local", "anvil", "hardhat", "fixture", "mock", "synthetic"];
+
+export function isNonLiveFixtureProvenance(value: unknown): boolean {
+  if (typeof value !== "string" || value.trim() === "") return false;
+  const lower = value.toLowerCase();
+  return LOCAL_FIXTURE_KEYWORDS.some((word) => lower.includes(word));
+}
+
+function isValidContractForChain(chain: Chain, value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  if (isEvmChain(chain)) {
+    return /^0x[0-9a-fA-F]{40}$/.test(value) && !/^0x0{40}$/.test(value);
+  }
+  if (isStellarChain(chain)) {
+    try {
+      const parsed = parseStellarAddress(value);
+      return (
+        parsed.kind === AddressKind.Contract &&
+        encodeStellarAddress(parsed.kind, parsed.key, parsed.muxedId) === value
+      );
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+function extractGmpMetadata(
+  reader: EnvReader,
+  rawJson: unknown,
+  set: DeploymentSet,
+): {
+  readonly gmpReceivers: Readonly<Partial<Record<ChainKey, GmpReceiverRecord>>>;
+  readonly fixtureProvenance: string | null;
+} {
+  const gmpReceivers: Partial<Record<ChainKey, GmpReceiverRecord>> = {};
+  if (typeof rawJson !== "object" || rawJson === null || Array.isArray(rawJson)) {
+    return { gmpReceivers, fixtureProvenance: null };
+  }
+  const top = rawJson as Record<string, unknown>;
+  const rawProvenance =
+    typeof top.provenance === "string"
+      ? top.provenance
+      : typeof top.capturedFrom === "string"
+        ? top.capturedFrom
+        : null;
+  const fixtureProvenance = isNonLiveFixtureProvenance(rawProvenance) ? rawProvenance : null;
+
+  const rawNetworks = top.networks;
+  if (typeof rawNetworks !== "object" || rawNetworks === null || Array.isArray(rawNetworks)) {
+    return { gmpReceivers, fixtureProvenance };
+  }
+
+  for (const key of Object.keys(set.networks)) {
+    if (!isChainKey(key)) continue;
+    const chain = CHAINS[key];
+    const rawEntry = (rawNetworks as Record<string, unknown>)[key];
+    if (typeof rawEntry !== "object" || rawEntry === null || Array.isArray(rawEntry)) continue;
+    const rawReceiver = (rawEntry as Record<string, unknown>).gmpReceiver;
+    if (rawReceiver === undefined || rawReceiver === null) continue;
+    if (typeof rawReceiver !== "object" || Array.isArray(rawReceiver)) {
+      reader.reject(DEPLOYMENTS_FILE, `networks.${key}.gmpReceiver must be an object when present`);
+      continue;
+    }
+    const fields = rawReceiver as Record<string, unknown>;
+    const enabled = fields.enabled === undefined ? true : Boolean(fields.enabled);
+    if (fields.enabled !== undefined && typeof fields.enabled !== "boolean") {
+      reader.reject(DEPLOYMENTS_FILE, `networks.${key}.gmpReceiver.enabled must be a boolean`);
+      continue;
+    }
+    if (!enabled) {
+      gmpReceivers[key] = { receiver: null, enabled: false };
+      continue;
+    }
+    if (!isValidContractForChain(chain, fields.receiver)) {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        `networks.${key}.gmpReceiver.receiver must be a valid non-zero ${chain.family} contract address`,
+      );
+      continue;
+    }
+    gmpReceivers[key] = { receiver: fields.receiver, enabled: true };
+  }
+
+  return { gmpReceivers, fixtureProvenance };
+}
+
+function tokenOnDeployment(
+  deployment: DeploymentSet["networks"][ChainKey],
+  symbol: string,
+): {
+  readonly address: string;
+  readonly decimals: number;
+  readonly routes: readonly number[];
+} | null {
+  if (deployment === undefined) return null;
+  if (isStellarDeployment(deployment)) {
+    const token = deployment.tokens[symbol];
+    if (token === undefined) return null;
+    return { address: token.sacId, decimals: token.decimals, routes: token.routes };
+  }
+  if (isEvmDeployment(deployment)) {
+    const token = deployment.tokens[symbol];
+    if (token === undefined) return null;
+    return { address: token.address, decimals: token.decimals, routes: token.routes };
+  }
+  return null;
+}
+
+function symbolsOnDeployment(deployment: DeploymentSet["networks"][ChainKey]): readonly string[] {
+  if (deployment === undefined) return [];
+  return Object.keys(deployment.tokens);
+}
+
+function receiverForChain(
+  chain: ChainKey,
+  deployment: DeploymentSet["networks"][ChainKey],
+  gmpReceivers: Readonly<Partial<Record<ChainKey, GmpReceiverRecord>>>,
+): string | null {
+  const explicit = gmpReceivers[chain];
+  if (explicit !== undefined) {
+    return explicit.enabled ? explicit.receiver : null;
+  }
+  return deployment?.adapters[RouteKind.AxelarGmp] ?? null;
+}
+
+function validateAndPlanGmpLanes(
+  reader: EnvReader,
+  network: NetworkMode,
+  deployments: DeploymentSet,
+  gmpReceivers: Readonly<Partial<Record<ChainKey, GmpReceiverRecord>>>,
+  fixtureProvenance: string | null,
+): readonly GmpAdmittedLane[] {
+  if (reader.failed(HYPERION_NETWORK) || reader.failed(DEPLOYMENTS_FILE)) {
+    return [];
+  }
+
+  const allowed = new Set(chainsFor(network).map((entry) => entry.key));
+  const configuredChains = Object.keys(deployments.networks).filter(
+    (key): key is ChainKey => isChainKey(key) && allowed.has(key),
+  );
+
+  // Check every network that mentions `axelar-gmp` for missing adapter, gateway, or deployed receiver support.
+  for (const chainKey of configuredChains) {
+    const deployment = deployments.networks[chainKey];
+    if (deployment === undefined) continue;
+    const adapter = deployment.adapters[RouteKind.AxelarGmp];
+    const gmpSymbols = symbolsOnDeployment(deployment).filter((symbol) => {
+      const tok = tokenOnDeployment(deployment, symbol);
+      return tok?.routes.includes(RouteKind.AxelarGmp) === true;
+    });
+    const usesGmp = adapter !== undefined || gmpSymbols.length > 0;
+    if (!usesGmp) continue;
+
+    if (chainKey === "local" || fixtureProvenance !== null) {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        `cannot admit Axelar GMP on ${chainKey} from local rehearsal or synthetic fixture metadata`,
+      );
+      return [];
+    }
+
+    const axelar = RAIL_CONTRACTS[chainKey]?.axelar;
+    if (!axelar?.gateway || !axelar.chainName) {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        `enables axelar-gmp on ${chainKey}, which has no deployed Axelar gateway in the protocol registry`,
+      );
+      return [];
+    }
+
+    if (adapter === undefined || !isValidContractForChain(CHAINS[chainKey], adapter)) {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        `enables axelar-gmp on ${chainKey} without a valid deployed axelar-gmp adapter`,
+      );
+      return [];
+    }
+
+    const localReceiver = receiverForChain(chainKey, deployment, gmpReceivers);
+    if (localReceiver === null) {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        `enables axelar-gmp on ${chainKey} while its deployed GMP receiver support is disabled or missing`,
+      );
+      return [];
+    }
+
+    for (const symbol of gmpSymbols) {
+      const hasDeployedPeerReceiver = configuredChains.some((peerKey) => {
+        if (peerKey === chainKey || peerKey === "local") return false;
+        const peerDep = deployments.networks[peerKey];
+        const peerTok = tokenOnDeployment(peerDep, symbol);
+        const peerGateway = RAIL_CONTRACTS[peerKey]?.axelar?.gateway;
+        const peerReceiver = receiverForChain(peerKey, peerDep, gmpReceivers);
+        return (
+          peerDep !== undefined &&
+          peerTok?.routes.includes(RouteKind.AxelarGmp) === true &&
+          Boolean(peerGateway) &&
+          peerReceiver !== null
+        );
+      });
+      if (!hasDeployedPeerReceiver) {
+        reader.reject(
+          DEPLOYMENTS_FILE,
+          `enables axelar-gmp for ${symbol} on ${chainKey} without a deployed peer GMP receiver in the deployment set`,
+        );
+        return [];
+      }
+    }
+  }
+
+  const lanes: GmpAdmittedLane[] = [];
+  for (const originChain of configuredChains) {
+    for (const destinationChain of configuredChains) {
+      if (originChain === destinationChain) continue;
+      if (originChain === "local" || destinationChain === "local") continue;
+      const originDep = deployments.networks[originChain];
+      const destDep = deployments.networks[destinationChain];
+      const originAxelar = RAIL_CONTRACTS[originChain]?.axelar;
+      const destAxelar = RAIL_CONTRACTS[destinationChain]?.axelar;
+      const originAdapter = originDep?.adapters[RouteKind.AxelarGmp];
+      const destReceiver = receiverForChain(destinationChain, destDep, gmpReceivers);
+
+      if (
+        originDep === undefined ||
+        destDep === undefined ||
+        !originAxelar?.gateway ||
+        !destAxelar?.gateway ||
+        originAdapter === undefined ||
+        destReceiver === null
+      ) {
+        continue;
+      }
+
+      for (const symbol of symbolsOnDeployment(originDep)) {
+        const originTok = tokenOnDeployment(originDep, symbol);
+        const destTok = tokenOnDeployment(destDep, symbol);
+        if (
+          originTok === null ||
+          destTok === null ||
+          !originTok.routes.includes(RouteKind.AxelarGmp) ||
+          !destTok.routes.includes(RouteKind.AxelarGmp)
+        ) {
+          continue;
+        }
+        lanes.push({
+          originChain,
+          destinationChain,
+          symbol,
+          originAxelarChain: originAxelar.chainName,
+          destinationAxelarChain: destAxelar.chainName,
+          originGateway: originAxelar.gateway,
+          destinationGateway: destAxelar.gateway,
+          originAdapter,
+          destinationReceiver: destReceiver,
+          destinationRouter: destDep.router,
+          originToken: originTok.address,
+          destinationToken: destTok.address,
+          originDecimals: originTok.decimals,
+          destinationDecimals: destTok.decimals,
+        });
+      }
+    }
+  }
+
+  return lanes;
+}
+
+export type GmpLaneAdmission =
+  | { readonly admitted: true; readonly lane: GmpAdmittedLane }
+  | { readonly admitted: false; readonly reason: string };
+
+/**
+ * Admit an authenticated Axelar GMP lane only when both endpoints are live network chains with
+ * deployed Axelar gateways, source GMP adapters, and destination GMP receivers.
+ */
+export function admitGmpLane(
+  config: Pick<AppConfig, "network" | "deployments" | "rails">,
+  originChain: string,
+  destinationChain: string,
+  symbol = "USDC",
+): GmpLaneAdmission {
+  if (config.rails.fixtureProvenance) {
+    return { admitted: false, reason: "local_or_fixture_provenance" };
+  }
+  if (!isChainKey(originChain) || !isChainKey(destinationChain)) {
+    return { admitted: false, reason: "unknown_chain_key" };
+  }
+  if (originChain === "local" || destinationChain === "local") {
+    return { admitted: false, reason: "local_chain_prohibited" };
+  }
+  if (originChain === destinationChain) {
+    return { admitted: false, reason: "same_chain_lane" };
+  }
+  const allowed = new Set(chainsFor(config.network).map((entry) => entry.key));
+  if (!allowed.has(originChain) || !allowed.has(destinationChain)) {
+    return { admitted: false, reason: "wrong_network_mode" };
+  }
+  if (
+    !RAIL_CONTRACTS[originChain]?.axelar?.gateway ||
+    !RAIL_CONTRACTS[destinationChain]?.axelar?.gateway
+  ) {
+    return { admitted: false, reason: "missing_axelar_gateway" };
+  }
+  const originDep = config.deployments.networks[originChain];
+  const destDep = config.deployments.networks[destinationChain];
+  if (originDep === undefined || destDep === undefined) {
+    return { admitted: false, reason: "missing_deployment_record" };
+  }
+  if (originDep.adapters[RouteKind.AxelarGmp] === undefined) {
+    return { admitted: false, reason: "missing_source_gmp_adapter" };
+  }
+  if (destDep.adapters[RouteKind.AxelarGmp] === undefined) {
+    return { admitted: false, reason: "missing_deployed_receiver" };
+  }
+  const matched = (config.rails.gmpLanes ?? []).find(
+    (entry) =>
+      entry.originChain === originChain &&
+      entry.destinationChain === destinationChain &&
+      entry.symbol === symbol,
+  );
+  if (matched === undefined) {
+    return { admitted: false, reason: "missing_deployed_receiver" };
+  }
+  return { admitted: true, lane: matched };
 }

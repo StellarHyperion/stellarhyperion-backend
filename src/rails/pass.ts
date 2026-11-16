@@ -19,6 +19,7 @@
  */
 import type { AppConfig } from "../config/config.js";
 import { verifyItsDelivery } from "./axelar/delivery.js";
+import { verifyGmpDelivery, type GmpVerifyDeps } from "./axelar/gmp-delivery.js";
 import { verifyCctpDelivery } from "./cctp/delivery.js";
 import type { Logger } from "pino";
 
@@ -26,7 +27,13 @@ import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
 import { writeInbound, writeAttestation } from "../chains/writers.js";
 import { outstandingForRail, pendingForRail } from "./queue.js";
-import { RailError, isTerminal, type PendingTransfer, type RailClient } from "./types.js";
+import {
+  RailError,
+  clampProviderAttestationStatus,
+  isTerminal,
+  type PendingTransfer,
+  type RailClient,
+} from "./types.js";
 
 /**
  * How many outstanding transfers still counts as keeping up.
@@ -48,6 +55,7 @@ export interface RailPassOptions {
   readonly maxCheckFailures: number;
   readonly now?: () => Date;
   readonly config?: AppConfig;
+  readonly gmpVerifyDeps?: GmpVerifyDeps;
 }
 
 export interface RailProgress {
@@ -201,6 +209,13 @@ export class RailPass {
     if (this.options.config && (report.execution || report.forwardTxHash)) {
       const verified =
         (await verifyItsDelivery(this.options.config, this.options.db, transfer, report)) ??
+        (await verifyGmpDelivery(
+          this.options.config,
+          this.options.db,
+          transfer,
+          report,
+          this.options.gmpVerifyDeps,
+        )) ??
         (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report));
       if (verified) {
         await this.options.db.transaction(async (tx) => {
@@ -218,8 +233,9 @@ export class RailPass {
         return true;
       }
     }
+    const safeStatus = clampProviderAttestationStatus(report.status);
     await this.write(transfer, {
-      status: report.status,
+      status: safeStatus,
       railStatus: report.railStatus,
       reference: report.reference,
       attestedAt: report.attestedAt,
@@ -227,7 +243,7 @@ export class RailPass {
       failures: 0,
       error: null,
     });
-    return isTerminal(report.status);
+    return isTerminal(safeStatus);
   }
 
   private async recordFailure(transfer: PendingTransfer, error: unknown): Promise<void> {

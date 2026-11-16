@@ -51,6 +51,7 @@ export async function pendingForRail(
                  AND d.route = t.route
                  AND d.source_chain = t.origin_chain
                  AND d.source_nonce = t.nonce
+                 AND d.delivered
             ) AS delivered
        FROM outbound_transfer t
        LEFT JOIN rail_attestation a ON a.transfer_id = t.id

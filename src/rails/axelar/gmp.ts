@@ -1,6 +1,7 @@
 /** Axelar status lookup uses the API root and a searchGMP JSON method. */
 import type {
   AttestationStatus,
+  GmpCandidateMetadata,
   PendingTransfer,
   RailClient,
   RailLookup,
@@ -61,19 +62,40 @@ interface GmpRow {
   readonly simplified_status?: unknown;
   readonly message_id?: unknown;
   readonly id?: unknown;
-  readonly call?: { readonly transactionHash?: unknown; readonly parentMessageID?: unknown } | null;
+  readonly call?: {
+    readonly transactionHash?: unknown;
+    readonly parentMessageID?: unknown;
+    readonly chain?: unknown;
+    readonly returnValues?: {
+      readonly sender?: unknown;
+      readonly destinationContractAddress?: unknown;
+      readonly payloadHash?: unknown;
+      readonly payload?: unknown;
+    } | null;
+  } | null;
   readonly command_id?: unknown;
   readonly executed?: {
     readonly block_timestamp?: unknown;
     readonly transactionHash?: unknown;
     readonly childMessageIDs?: unknown;
   } | null;
-  readonly approved?: { readonly block_timestamp?: unknown } | null;
+  readonly approved?: {
+    readonly block_timestamp?: unknown;
+    readonly returnValues?: {
+      readonly sourceChain?: unknown;
+      readonly sourceAddress?: unknown;
+      readonly contractAddress?: unknown;
+      readonly payloadHash?: unknown;
+    } | null;
+  } | null;
+  readonly provenance?: unknown;
   readonly [flag: string]: unknown;
 }
 
 export interface GmpOptions {
   readonly timeoutMs?: number;
+  /** Optional rail name override when polling dedicated `axelar-gmp` vs `axelar` ITS queues. */
+  readonly railName?: string;
   /** Injected so the unit suite can answer without a network. */
   readonly fetch?: typeof globalThis.fetch;
   /** Called once per status value this build does not know. */
@@ -81,7 +103,7 @@ export interface GmpOptions {
 }
 
 export class AxelarGmpClient implements RailClient {
-  readonly rail = "axelar";
+  readonly rail: string;
   private readonly baseUrl: string;
   private readonly request: typeof globalThis.fetch;
   private readonly reported = new Set<string>();
@@ -90,6 +112,7 @@ export class AxelarGmpClient implements RailClient {
     baseUrl: string,
     private readonly options: GmpOptions = {},
   ) {
+    this.rail = options.railName ?? "axelar";
     this.baseUrl = baseUrl.replace(/\/+$/, "");
     this.request = options.fetch ?? globalThis.fetch;
   }
@@ -176,6 +199,7 @@ export class AxelarGmpClient implements RailClient {
     if (FATAL_FLAGS.some((flag) => row[flag] === true)) mapped = "failed";
 
     const words = [status, simplified, ...flags].filter((part): part is string => part !== null);
+    const gmpCandidate = extractCandidateMetadata(row);
     return {
       status: mapped,
       railStatus: words.join("/"),
@@ -193,6 +217,7 @@ export class AxelarGmpClient implements RailClient {
             },
           }
         : {}),
+      ...(gmpCandidate !== null ? { gmpCandidate } : {}),
     };
   }
 
@@ -232,4 +257,60 @@ export { MAPPING as AXELAR_STATUS_MAPPING, FATAL_FLAGS, RECOVERABLE_FLAGS };
 
 function normalized(value: unknown): string {
   return typeof value === "string" ? value.toLowerCase().replace(/^0x/, "") : "";
+}
+
+function extractCandidateMetadata(row: GmpRow): GmpCandidateMetadata | null {
+  const sourceChain =
+    typeof row.approved?.returnValues?.sourceChain === "string"
+      ? row.approved.returnValues.sourceChain
+      : typeof row.call?.chain === "string"
+        ? row.call.chain
+        : undefined;
+  const sourceAddress =
+    typeof row.approved?.returnValues?.sourceAddress === "string"
+      ? row.approved.returnValues.sourceAddress
+      : typeof row.call?.returnValues?.sender === "string"
+        ? row.call.returnValues.sender
+        : undefined;
+  const destinationContractAddress =
+    typeof row.approved?.returnValues?.contractAddress === "string"
+      ? row.approved.returnValues.contractAddress
+      : typeof row.call?.returnValues?.destinationContractAddress === "string"
+        ? row.call.returnValues.destinationContractAddress
+        : undefined;
+  const rawPayloadHash =
+    typeof row.approved?.returnValues?.payloadHash === "string"
+      ? row.approved.returnValues.payloadHash
+      : typeof row.call?.returnValues?.payloadHash === "string"
+        ? row.call.returnValues.payloadHash
+        : undefined;
+  const payloadHash =
+    rawPayloadHash !== undefined && /^0x[0-9a-fA-F]{64}$/.test(rawPayloadHash)
+      ? (rawPayloadHash.toLowerCase() as `0x${string}`)
+      : undefined;
+  const rawPayload = row.call?.returnValues?.payload;
+  const payload =
+    typeof rawPayload === "string" && /^0x[0-9a-fA-F]+$/.test(rawPayload)
+      ? (rawPayload.toLowerCase() as `0x${string}`)
+      : undefined;
+  const provenance = typeof row.provenance === "string" ? row.provenance : undefined;
+
+  if (
+    sourceChain === undefined &&
+    sourceAddress === undefined &&
+    destinationContractAddress === undefined &&
+    payloadHash === undefined &&
+    payload === undefined &&
+    provenance === undefined
+  ) {
+    return null;
+  }
+  return {
+    ...(sourceChain !== undefined ? { sourceChain } : {}),
+    ...(sourceAddress !== undefined ? { sourceAddress } : {}),
+    ...(destinationContractAddress !== undefined ? { destinationContractAddress } : {}),
+    ...(payloadHash !== undefined ? { payloadHash } : {}),
+    ...(payload !== undefined ? { payload } : {}),
+    ...(provenance !== undefined ? { provenance } : {}),
+  };
 }
