@@ -25,8 +25,19 @@ import type { Logger } from "pino";
 import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
 import { writeInbound, writeAttestation } from "../chains/writers.js";
-import { outstandingForRail, pendingForRail } from "./queue.js";
-import { RailError, isTerminal, type PendingTransfer, type RailClient } from "./types.js";
+import {
+  inspectRailBacklog,
+  outstandingForRail,
+  pendingForRail,
+  type InspectRailBacklogOptions,
+} from "./queue.js";
+import {
+  RailError,
+  isTerminal,
+  type BacklogInspectionReport,
+  type PendingTransfer,
+  type RailClient,
+} from "./types.js";
 
 /**
  * How many outstanding transfers still counts as keeping up.
@@ -70,6 +81,22 @@ export class RailPass {
 
   get progress(): RailProgress | null {
     return this.lastProgress;
+  }
+
+  /**
+   * Read-only inspection of this rail's unfinalized candidates, proof stages, and retry classes
+   * without mutating database state or cached pass readiness.
+   */
+  inspectBacklog(
+    options: Omit<InspectRailBacklogOptions, "routes" | "recheckAfterMs" | "maxCheckFailures"> = {},
+  ): Promise<BacklogInspectionReport> {
+    return inspectRailBacklog(this.options.db, {
+      ...options,
+      routes: [this.options.route],
+      recheckAfterMs: this.options.recheckAfterMs,
+      maxCheckFailures: this.options.maxCheckFailures,
+      now: options.now ?? (() => this.now()),
+    });
   }
 
   readiness(): ReadinessReport {

@@ -9,7 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { writeOutbound, writeInbound } from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
-import { outstandingForRail, pendingForRail } from "../../src/rails/queue.js";
+import { inspectRailBacklog, outstandingForRail, pendingForRail } from "../../src/rails/queue.js";
 import { RailPass } from "../../src/rails/pass.js";
 import type { PendingTransfer, RailClient, RailLookup } from "../../src/rails/types.js";
 import { capturingLogger } from "../stellar-fakes.js";
@@ -214,5 +214,55 @@ suite("rail pollers against real Postgres", () => {
     // Outstanding should now be 0 for this transfer since delivered is terminal
     const outstanding = await outstandingForRail(db, 1);
     expect(outstanding).toBe(0);
+  });
+
+  it("inspects rail backlog stages and retry classes in read-only mode without mutating state", async () => {
+    await clean();
+    const fixedNow = new Date("2026-10-30T01:00:00.000Z");
+
+    await db.transaction(async (tx) => {
+      await writeOutbound(
+        tx,
+        {
+          chainKey: ORIGIN_CHAIN,
+          block: 2100n,
+          txHash: "0xbacklog301",
+          logIndex: 0,
+          observedAt: new Date("2026-10-30T00:58:00.000Z"),
+        },
+        {
+          route: 0,
+          nonce: 301n,
+          sender: "0x1111111111111111111111111111111111111111",
+          token: "0x3333333333333333333333333333333333333333",
+          grossAmount: 1001000n,
+          fee: 1000n,
+          netAmount: 1000000n,
+          destinationChain: DESTINATION_CHAIN,
+          destination: "0x2222222222222222222222222222222222222222",
+          railRef: "0x0000",
+        },
+      );
+    });
+
+    const before = await db.query(
+      "SELECT id::text, nonce::text, observed_at FROM outbound_transfer WHERE route = 0 ORDER BY id",
+    );
+    const report = await inspectRailBacklog(db, {
+      routes: [0],
+      recheckAfterMs: 10_000,
+      maxCheckFailures: 5,
+      now: () => fixedNow,
+    });
+    const after = await db.query(
+      "SELECT id::text, nonce::text, observed_at FROM outbound_transfer WHERE route = 0 ORDER BY id",
+    );
+    const attestationsAfter = await db.query("SELECT * FROM rail_attestation WHERE route = 0");
+
+    expect(report.readOnly).toBe(true);
+    expect(report.summary.byStage.provider_discovery).toBe(1);
+    expect(report.summary.byRetryClass.never_checked).toBe(1);
+    expect(after.rows).toEqual(before.rows);
+    expect(attestationsAfter.rows).toHaveLength(0);
   });
 });

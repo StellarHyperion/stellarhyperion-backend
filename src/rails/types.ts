@@ -107,3 +107,87 @@ export interface RailClient {
   /** Throws `RailError`; returns `missing` rather than throwing for a transfer not yet indexed. */
   look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup>;
 }
+
+/**
+ * Which verification stage is still missing for an unfinalized outbound transfer:
+ * - `provider_discovery`: rail provider has not yet reported an attestation (`rail_attestation`
+ *   is absent or still `pending`).
+ * - `destination_receipt_verification`: rail provider reported `attested` (or a candidate tx),
+ *   and Hyperion is waiting on canonical destination chain receipt/event verification.
+ * - `attestation_reconciliation`: destination delivery or parked claim is already indexed locally,
+ *   waiting only for `rail_attestation` status reconciliation.
+ */
+export type MissingProofStage =
+  "provider_discovery" | "destination_receipt_verification" | "attestation_reconciliation";
+
+export type BacklogRetryClass =
+  "never_checked" | "cooling_down" | "overdue" | "retry_overdue" | "exhausted";
+
+export interface BacklogDelayBreakdown {
+  readonly totalAgeMs: number;
+  readonly providerDiscoveryDelayMs: number | null;
+  readonly receiptVerificationDelayMs: number | null;
+  readonly overdueByMs: number;
+}
+
+export interface BacklogCandidate {
+  readonly transferId: string;
+  readonly route: number;
+  readonly originChain: string;
+  readonly destinationChain: string;
+  readonly nonce: string;
+  readonly grossAmount: string;
+  readonly fee: string;
+  readonly netAmount: string;
+  readonly originBlock: string;
+  readonly originTx: string;
+  readonly observedAt: string;
+  readonly attestationStatus: AttestationStatus | null;
+  readonly railStatus: string | null;
+  readonly railReference: string | null;
+  readonly attestedAt: string | null;
+  readonly lastCheckedAt: string | null;
+  readonly checkFailures: number;
+  readonly lastError: string | null;
+  readonly missingProofStage: MissingProofStage;
+  readonly retryClass: BacklogRetryClass;
+  readonly overdue: boolean;
+  readonly delays: BacklogDelayBreakdown;
+}
+
+export interface BacklogSummary {
+  readonly totalMatching: number;
+  readonly overdueCount: number;
+  readonly exhaustedCount: number;
+  readonly oldestAgeMs: number | null;
+  readonly maxProviderDiscoveryDelayMs: number | null;
+  readonly maxReceiptVerificationDelayMs: number | null;
+  readonly byDestination: Readonly<Record<string, number>>;
+  readonly byRoute: Readonly<Record<string, number>>;
+  readonly byStage: Readonly<Record<MissingProofStage, number>>;
+  readonly byRetryClass: Readonly<Record<BacklogRetryClass, number>>;
+}
+
+export interface BacklogPageInfo {
+  readonly limit: number;
+  readonly sort: "asc" | "desc";
+  readonly hasMore: boolean;
+  readonly nextCursor: string | null;
+}
+
+export interface BacklogInspectionReport {
+  readonly generatedAt: string;
+  readonly readOnly: true;
+  readonly parameters: {
+    readonly routes: readonly number[];
+    readonly destinationChain: string | null;
+    readonly stage: MissingProofStage | null;
+    readonly retryClass: BacklogRetryClass | null;
+    readonly overdueOnly: boolean;
+    readonly recheckAfterMs: number;
+    readonly maxCheckFailures: number;
+  };
+  readonly summary: BacklogSummary;
+  readonly pageInfo: BacklogPageInfo;
+  readonly candidates: readonly BacklogCandidate[];
+}

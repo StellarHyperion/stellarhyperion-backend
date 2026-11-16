@@ -68,6 +68,7 @@ One process serializes its Stellar submissions to avoid sequence conflicts. Run 
 - `GET /v1/transfers/by-tx/:txHash`, `GET /v1/transfers/:originChain/:nonce`
 - `GET /v1/claims`, `GET /v1/claims/:chain/:claimId`
 - `GET /v1/routes/health`, `GET /v1/metrics`
+- `npm run rails:backlog -- [--route 0|1] [--destination <chain>] [--stage <stage>] [--retry-class <class>] [--overdue-only] [--limit <n>] [--cursor <token>] [--format table|json]` for read-only inspection of overdue rail candidates, retry classes and missing proof stages
 
 `npm run check` runs formatting, lint, type checking and tests. Schema/API regressions execute repository migrations in embedded PostgreSQL (PGlite). The full PostgreSQL integration suite requires `TEST_DATABASE_URL`; it is skipped when unset. Use `npm run build` for emitted production code.
 

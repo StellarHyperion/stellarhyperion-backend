@@ -17,6 +17,7 @@
     "dev": "node --watch --experimental-strip-types src/main.ts",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/main.js",
+    "rails:backlog": "node --experimental-strip-types src/rails/inspect.ts",
     "migrate": "node-pg-migrate --envPath .env --migrations-dir migrations --migrations-table pgmigrations",
     "migrate:up": "npm run migrate -- up",
     "migrate:down": "npm run migrate -- down",
