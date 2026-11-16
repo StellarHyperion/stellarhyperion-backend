@@ -7,6 +7,7 @@ import rateLimit from "@fastify/rate-limit";
 import type { AppConfig } from "../config/config.js";
 import type { Database } from "../db/pool.js";
 import type { BullMQWorkerState, RedisPingable, ReadinessSource } from "../runtime/readiness.js";
+import { registerOpenApiRoutes } from "./openapi.js";
 import { registerClaimRoutes } from "./routes/claims.js";
 import { registerHealthRoutes } from "./routes/health.js";
 import { registerMetricsRoutes } from "./routes/metrics.js";
@@ -68,6 +69,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   registerHealthRoutes(app, deps);
+  registerOpenApiRoutes(app, deps.config);
   registerTransferRoutes(app, deps);
   registerClaimRoutes(app, deps);
   registerRouteHealthRoutes(app, deps);

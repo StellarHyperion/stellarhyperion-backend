@@ -1,0 +1,158 @@
+[
+  {
+    "name": "transfer_unknown_token_metadata_and_pending_rail",
+    "pathTemplate": "/v1/transfers/{originChain}/{nonce}",
+    "method": "GET",
+    "statusCode": 200,
+    "body": {
+      "id": "18446744073709551615",
+      "stage": "attesting",
+      "route": 0,
+      "origin": {
+        "chain": "stellar-testnet",
+        "nonce": "18446744073709551614",
+        "sender": "GDXRQQETEZHGRJTE3U7DYGIWGGYGMM6EAS5NWGPGN2WXFXZYZ6QZIANA",
+        "token": "CCUNKNOWNTOKENCONTRACTID",
+        "symbol": null,
+        "decimals": null,
+        "grossAmount": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+        "fee": "0",
+        "netAmount": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+        "block": "5433808",
+        "txHash": "d2d112fdef5b381534eb10e92806bd0025f307ffb0b2da0d0d3194d3f7892ca2",
+        "observedAt": "2026-10-29T10:03:44.000Z"
+      },
+      "destination": {
+        "token": null,
+        "amount": null,
+        "symbol": null,
+        "decimals": null,
+        "chain": "sepolia",
+        "recipient": "0x6ef8032ffe4943f27388172549f6700f18bb8b38",
+        "delivered": false,
+        "block": null,
+        "txHash": null,
+        "deliveredAt": null
+      },
+      "rail": {
+        "status": "pending",
+        "railStatus": null,
+        "reference": null,
+        "attestedAt": null,
+        "lastError": null
+      },
+      "claim": null
+    }
+  },
+  {
+    "name": "transfer_delivered_cctp_evidence",
+    "pathTemplate": "/v1/transfers/by-tx/{txHash}",
+    "method": "GET",
+    "statusCode": 200,
+    "body": {
+      "id": "2",
+      "stage": "delivered",
+      "route": 0,
+      "origin": {
+        "chain": "stellar-testnet",
+        "nonce": "43",
+        "sender": "GDXRQQETEZHGRJTE3U7DYGIWGGYGMM6EAS5NWGPGN2WXFXZYZ6QZIANA",
+        "token": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+        "symbol": "USDC",
+        "decimals": 7,
+        "grossAmount": "10000000",
+        "fee": "30000",
+        "netAmount": "9970000",
+        "block": "5433910",
+        "txHash": "d2d112fdef5b381534eb10e92806bd0025f307ffb0b2da0d0d3194d3f7892ca2",
+        "observedAt": "2026-10-29T10:03:44.000Z"
+      },
+      "destination": {
+        "token": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+        "amount": "897000",
+        "symbol": "USDC",
+        "decimals": 6,
+        "chain": "sepolia",
+        "recipient": "0x6ef8032ffe4943f27388172549f6700f18bb8b38",
+        "delivered": true,
+        "block": "7400123",
+        "txHash": "0xb8a185a1e723443ab0b787225006fe56db80009fe796c69e8c4f6b8bf31db555",
+        "deliveredAt": "2026-10-29T10:05:12.000Z"
+      },
+      "rail": {
+        "status": "delivered",
+        "railStatus": "complete",
+        "reference": "iris-msg-43",
+        "attestedAt": "2026-10-29T10:04:10.000Z",
+        "lastError": null
+      },
+      "claim": null
+    }
+  },
+  {
+    "name": "claim_detail_wide_identifiers",
+    "pathTemplate": "/v1/claims/{chain}/{claimId}",
+    "method": "GET",
+    "statusCode": 200,
+    "body": {
+      "id": "stellar-testnet:9007199254740993",
+      "chain": "stellar-testnet",
+      "claimId": "9007199254740993",
+      "recipient": "GDXRQQETEZHGRJTE3U7DYGIWGGYGMM6EAS5NWGPGN2WXFXZYZ6QZIANA",
+      "token": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+      "amount": "997000000000000000000",
+      "route": 1,
+      "sourceChain": "sepolia",
+      "sourceNonce": "9007199254740999",
+      "settled": false,
+      "createdAt": "2026-10-29T10:10:00.000Z",
+      "observedAt": "2026-10-29T10:10:05.000Z"
+    }
+  },
+  {
+    "name": "route_health_unknown_flow_limit",
+    "pathTemplate": "/v1/routes/health",
+    "method": "GET",
+    "statusCode": 200,
+    "body": {
+      "routes": [
+        {
+          "originChain": "stellar-testnet",
+          "destinationChain": "sepolia",
+          "route": 0,
+          "token": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+          "available": false,
+          "blocker": {
+            "code": 1,
+            "label": "Paused",
+            "detail": "Router or adapter is paused."
+          },
+          "flowAvailable": null,
+          "observedAt": "2026-10-29T10:15:00.000Z"
+        }
+      ],
+      "count": 1
+    }
+  },
+  {
+    "name": "error_not_found",
+    "pathTemplate": "/v1/transfers/{id}",
+    "method": "GET",
+    "statusCode": 404,
+    "body": {
+      "error": "not_found",
+      "message": "no transfer found with id 999999"
+    }
+  },
+  {
+    "name": "error_bad_request",
+    "pathTemplate": "/v1/transfers/{id}",
+    "method": "GET",
+    "statusCode": 400,
+    "body": {
+      "error": "bad_request",
+      "message": "transfer id must be a decimal integer",
+      "requestId": "req-1"
+    }
+  }
+]

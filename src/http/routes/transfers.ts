@@ -250,6 +250,13 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       reply: FastifyReply,
     ) => {
       const { originChain, nonce } = request.params;
+      if (!isChainKey(originChain) || !/^[0-9]+$/.test(nonce)) {
+        return reply.code(400).send({
+          error: "bad_request",
+          message: "originChain must be a valid chain key and nonce must be a decimal integer",
+          requestId: request.id,
+        });
+      }
       const { rows } = await db.query(
         `${TRANSFER_QUERY} WHERE t.origin_chain = $1 AND t.nonce = $2 LIMIT 1`,
         [originChain, nonce],
@@ -405,6 +412,13 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     reply: FastifyReply,
   ) => {
     const { id } = request.params;
+    if (!/^[0-9]+$/.test(id)) {
+      return reply.code(400).send({
+        error: "bad_request",
+        message: "transfer id must be a decimal integer",
+        requestId: request.id,
+      });
+    }
     const transfer = await queryTransferById(id);
     if (transfer === null) {
       return reply.code(404).send({

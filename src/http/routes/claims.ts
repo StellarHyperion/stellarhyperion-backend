@@ -54,6 +54,13 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       reply: FastifyReply,
     ) => {
       const { chain, claimId } = request.params;
+      if (!/^[0-9]+$/.test(claimId)) {
+        return reply.code(400).send({
+          error: "bad_request",
+          message: "claimId must be a decimal integer",
+          requestId: request.id,
+        });
+      }
       const { rows } = await db.query(
         `SELECT chain || ':' || claim_id::text AS id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
                 created_at, settled, observed_at

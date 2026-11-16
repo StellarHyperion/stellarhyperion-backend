@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Database } from "../../src/db/pool.js";
+import { type OpenApiDocument, validateOpenApiResponse } from "../../src/http/openapi.js";
 import { buildServer } from "../../src/http/server.js";
 import { loadConfig } from "../../src/config/config.js";
 import { completeEnv } from "../helpers.js";
@@ -123,5 +124,54 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     expect(response.json().destination.decimals).toBe(6);
     expect(response.json().destination.symbol).toBe("USDC");
     expect(response.json().origin.netAmount).toBe("9970000");
+  });
+
+  it("publishes a versioned OpenAPI contract that validates actual migrated database responses", async () => {
+    const specRes = await app.inject("/v1/openapi.json");
+    expect(specRes.statusCode).toBe(200);
+    const contract = specRes.json<OpenApiDocument>();
+    expect(contract.openapi).toBe("3.1.0");
+
+    const checks: { url: string; template: string; status: number }[] = [
+      { url: "/health", template: "/health", status: 200 },
+      { url: "/ready", template: "/ready", status: 200 },
+      { url: "/v1/metrics", template: "/v1/metrics", status: 200 },
+      { url: "/v1/routes/health", template: "/v1/routes/health", status: 200 },
+      { url: "/v1/claims", template: "/v1/claims", status: 200 },
+      {
+        url: "/v1/claims/stellar-testnet/7",
+        template: "/v1/claims/{chain}/{claimId}",
+        status: 200,
+      },
+      { url: "/v1/transfers", template: "/v1/transfers", status: 200 },
+      {
+        url: "/v1/transfers/by-tx/cctp-source",
+        template: "/v1/transfers/by-tx/{txHash}",
+        status: 200,
+      },
+      {
+        url: "/v1/transfers/stellar-testnet/999999",
+        template: "/v1/transfers/{originChain}/{nonce}",
+        status: 404,
+      },
+      {
+        url: "/v1/transfers/not-a-number",
+        template: "/v1/transfers/{id}",
+        status: 400,
+      },
+    ];
+
+    for (const check of checks) {
+      const res = await app.inject(check.url);
+      expect(res.statusCode, `status mismatch on ${check.url}`).toBe(check.status);
+      const errors = validateOpenApiResponse(
+        contract,
+        check.template,
+        "GET",
+        res.statusCode,
+        res.json(),
+      );
+      expect(errors, `OpenAPI validation failed on ${check.url}`).toEqual([]);
+    }
   });
 });
