@@ -16,6 +16,16 @@ import type { Queryable } from "../db/pool.js";
 import { bigintOf, integer, text, textOrNull } from "../db/rows.js";
 import type { AttestationStatus, PendingTransfer } from "./types.js";
 
+export {
+  DEFAULT_RAIL_LEASE_DURATION_MS,
+  RailLeaseLostError,
+  claimPendingForRail,
+  commitWithRailLease,
+  releaseRailLease,
+  renewRailLease,
+  type ClaimQueueQuery,
+} from "./leases.js";
+
 const STATUSES: readonly string[] = ["pending", "attested", "delivered", "failed", "expired"];
 
 export interface QueueQuery {

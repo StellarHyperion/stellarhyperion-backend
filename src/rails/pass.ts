@@ -3,39 +3,51 @@
  *
  * Shaped exactly like a chain watcher's pass, and joining the same `PolledWorker` list, because
  * the lifecycle problems are identical: one at a time, catch up without sleeping, back off on
- * failure, report readiness from cached state. What differs is what a failure means, and there are
- * two kinds of backoff here rather than one.
+ * failure, report readiness from cached state.
  *
- * The poller's backoff is about the rail being unreachable. `check_failures` on the row is about
- * one transfer being unanswerable while the rail is otherwise fine, which happens when a transfer
- * was filed under the wrong rail or its chain has no domain. Those are different situations and
- * conflating them means either one bad transfer backs off the whole rail, or a dead rail is
- * hammered once per transfer per tick. So a per transfer failure is counted on the row and the
- * queue stops offering it after `maxCheckFailures`; only a rail level failure reaches the poller.
- *
- * A rate limit is its own case again. Circle blocks every request for five minutes after one, so
- * the pass records a cooldown and returns without asking anything until it passes. Doubling from a
- * second would spend those five minutes refreshing the block.
+ * Candidate processing across replicas is coordinated with database-backed `rail_work_lease` rows
+ * and monotonic fencing tokens so two workers cannot commit conflicting verification decisions and
+ * a stale worker that lost its lease cannot mark delivery.
  */
+import { randomUUID } from "node:crypto";
+
 import type { AppConfig } from "../config/config.js";
-import { verifyItsDelivery } from "./axelar/delivery.js";
+import { verifyItsDelivery, type VerifiedDelivery } from "./axelar/delivery.js";
 import { verifyCctpDelivery } from "./cctp/delivery.js";
 import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
 import { writeInbound, writeAttestation } from "../chains/writers.js";
-import { outstandingForRail, pendingForRail } from "./queue.js";
-import { RailError, isTerminal, type PendingTransfer, type RailClient } from "./types.js";
+import {
+  DEFAULT_RAIL_LEASE_DURATION_MS,
+  RailLeaseLostError,
+  claimPendingForRail,
+  commitWithRailLease,
+  releaseRailLease,
+  renewRailLease,
+} from "./leases.js";
+import { outstandingForRail } from "./queue.js";
+import {
+  RailError,
+  isTerminal,
+  type LeasedPendingTransfer,
+  type PendingTransfer,
+  type RailClient,
+  type RailReport,
+  type RailWorkLease,
+} from "./types.js";
 
-/**
- * How many outstanding transfers still counts as keeping up.
- *
- * The batch is the limit on one tick, so a backlog larger than a batch means the rail is more than
- * one tick behind. A couple of batches is a busy minute; ten is something worth looking at, and
- * the number itself goes in the readiness detail either way.
- */
 const BACKLOG_MULTIPLE_BEFORE_DEGRADED = 3;
+
+function isAborted(signal: AbortSignal): boolean {
+  return signal.aborted;
+}
+
+export type CandidateProofVerifier = (
+  transfer: PendingTransfer,
+  report: RailReport,
+) => Promise<VerifiedDelivery | null>;
 
 export interface RailPassOptions {
   readonly route: number;
@@ -46,14 +58,18 @@ export interface RailPassOptions {
   /** Don't re-check a transfer sooner than this, so one stuck row cannot starve the queue. */
   readonly recheckAfterMs: number;
   readonly maxCheckFailures: number;
-  readonly now?: () => Date;
-  readonly config?: AppConfig;
+  readonly now?: (() => Date) | undefined;
+  readonly config?: AppConfig | undefined;
+  readonly workerId?: string | undefined;
+  readonly leaseDurationMs?: number | undefined;
+  readonly verifyCandidateDelivery?: CandidateProofVerifier | undefined;
 }
 
 export interface RailProgress {
   readonly checked: number;
   readonly settled: number;
   readonly failures: number;
+  readonly leaseLosses: number;
   readonly outstanding: number;
   readonly at: Date;
 }
@@ -61,11 +77,24 @@ export interface RailProgress {
 export class RailPass {
   private lastProgress: RailProgress | null = null;
   private cooldownUntil: Date | null = null;
+  private readonly workerOwnerId: string;
+  private readonly leaseDurationMs: number;
 
-  constructor(private readonly options: RailPassOptions) {}
+  constructor(private readonly options: RailPassOptions) {
+    const providedOwner = options.workerId?.trim();
+    this.workerOwnerId =
+      providedOwner !== undefined && providedOwner.length > 0
+        ? providedOwner
+        : `rail-${options.client.rail}-${randomUUID()}`;
+    this.leaseDurationMs = options.leaseDurationMs ?? DEFAULT_RAIL_LEASE_DURATION_MS;
+  }
 
   get name(): string {
     return `rail:${this.options.client.rail}`;
+  }
+
+  get workerId(): string {
+    return this.workerOwnerId;
   }
 
   get progress(): RailProgress | null {
@@ -107,7 +136,7 @@ export class RailPass {
     };
   }
 
-  /** One pass. Returns true when it filled a batch, which means there is more behind it. */
+  /** One pass. Returns true when it claimed a full batch, which means there is more behind it. */
   async tick(signal: AbortSignal): Promise<boolean> {
     const { db, logger, batchSize, client } = this.options;
 
@@ -115,82 +144,137 @@ export class RailPass {
     if (cooldown !== null && cooldown > this.now()) return false;
     this.cooldownUntil = null;
 
-    const queue = await pendingForRail(db, {
+    const claimTime = this.now();
+    const queue = await claimPendingForRail(db, {
       route: this.options.route,
       limit: batchSize,
-      notCheckedSince: new Date(this.now().getTime() - this.options.recheckAfterMs),
+      notCheckedSince: new Date(claimTime.getTime() - this.options.recheckAfterMs),
       maxCheckFailures: this.options.maxCheckFailures,
+      owner: this.workerOwnerId,
+      now: claimTime,
+      leaseDurationMs: this.leaseDurationMs,
     });
 
     let checked = 0;
     let settled = 0;
     let failures = 0;
+    let leaseLosses = 0;
 
-    for (const transfer of queue) {
-      if (signal.aborted) break;
+    for (let index = 0; index < queue.length; index += 1) {
+      const transfer = queue[index];
+      if (transfer === undefined) continue;
+
+      if (isAborted(signal)) {
+        await this.releaseRemaining(queue.slice(index));
+        break;
+      }
+
+      let activeLease = transfer.lease;
       try {
-        if (await this.handle(transfer)) settled += 1;
+        const outcome = await this.handle(transfer, signal, (updated) => {
+          activeLease = updated;
+        });
+        if (outcome) settled += 1;
         checked += 1;
       } catch (error) {
+        if (error instanceof RailLeaseLostError) {
+          leaseLosses += 1;
+          logger.warn(
+            {
+              rail: client.rail,
+              workerId: this.workerOwnerId,
+              transferId: transfer.transferId.toString(),
+              reason: error.reason,
+            },
+            "worker lost transfer lease before commit; skipping stale write",
+          );
+          continue;
+        }
         if (error instanceof RailError && error.kind === "rateLimited") {
-          // The whole rail, not this transfer. Stop the pass and hold off.
           const waitMs = error.retryAfterMs ?? 60_000;
           this.cooldownUntil = new Date(this.now().getTime() + waitMs);
           logger.warn(
             { rail: client.rail, until: this.cooldownUntil.toISOString() },
             "the rail rate limited us, holding off rather than retrying",
           );
+          await this.releaseRemaining([
+            { ...transfer, lease: activeLease },
+            ...queue.slice(index + 1),
+          ]);
           break;
         }
-        // Everything else is this transfer's problem, recorded on its own row so one unanswerable
-        // transfer cannot back off the rest of the queue.
-        failures += 1;
-        await this.recordFailure(transfer, error);
+        try {
+          failures += 1;
+          await this.recordFailure(transfer, activeLease, error);
+        } catch (commitError) {
+          if (commitError instanceof RailLeaseLostError) {
+            failures -= 1;
+            leaseLosses += 1;
+            logger.warn(
+              {
+                rail: client.rail,
+                workerId: this.workerOwnerId,
+                transferId: transfer.transferId.toString(),
+                reason: commitError.reason,
+              },
+              "worker lost transfer lease while recording failure; skipping stale write",
+            );
+          } else {
+            throw commitError;
+          }
+        }
       }
     }
 
     const outstanding = await outstandingForRail(db, this.options.route);
-    this.lastProgress = { checked, settled, failures, outstanding, at: this.now() };
+    this.lastProgress = { checked, settled, failures, leaseLosses, outstanding, at: this.now() };
 
-    if (checked > 0 || failures > 0) {
+    if (checked > 0 || failures > 0 || leaseLosses > 0) {
       logger.info(
-        { rail: client.rail, checked, settled, failures, outstanding },
+        { rail: client.rail, checked, settled, failures, leaseLosses, outstanding },
         "rail statuses refreshed",
       );
     }
 
-    // A full batch means the queue is longer than one pass, so come straight back.
     return queue.length >= batchSize;
   }
 
-  /** Returns true when the transfer reached a terminal state on this pass. */
-  private async handle(transfer: PendingTransfer): Promise<boolean> {
-    const at = this.now();
+  private async releaseRemaining(remaining: readonly LeasedPendingTransfer[]): Promise<void> {
+    const releaseAt = this.now();
+    for (const item of remaining) {
+      await releaseRailLease(this.options.db, item.lease, releaseAt);
+    }
+  }
 
+  /** Returns true when the transfer reached a terminal state on this pass. */
+  private async handle(
+    transfer: LeasedPendingTransfer,
+    signal: AbortSignal,
+    onLeaseRenewed: (lease: RailWorkLease) => void,
+  ): Promise<boolean> {
     if (transfer.delivered) {
-      // Our own inbound index already says the money arrived, which outranks anything the rail
-      // would tell us. No request, and the transfer leaves the queue for good.
-      await this.write(transfer, {
+      const checkedAt = this.now();
+      await this.writeFenced(transfer, transfer.lease, {
         status: "delivered",
         railStatus: null,
         reference: null,
         attestedAt: null,
-        checkedAt: at,
+        checkedAt,
         failures: 0,
         error: null,
       });
       return true;
     }
 
-    const lookup = await this.options.client.look(transfer);
+    const lookup = await this.options.client.look(transfer, signal);
     if (lookup.kind === "missing") {
-      // Normal. The rail has not indexed the burn yet, which is where every transfer starts.
-      await this.write(transfer, {
+      const checkedAt = this.now();
+      await this.writeFenced(transfer, transfer.lease, {
         status: transfer.status ?? "pending",
         railStatus: null,
         reference: null,
         attestedAt: null,
-        checkedAt: at,
+        checkedAt,
         failures: 0,
         error: null,
       });
@@ -198,46 +282,76 @@ export class RailPass {
     }
 
     const { report } = lookup;
-    if (this.options.config && (report.execution || report.forwardTxHash)) {
+    let activeLease = transfer.lease;
+
+    const shouldVerify =
+      (this.options.verifyCandidateDelivery !== undefined || this.options.config !== undefined) &&
+      (report.execution !== undefined || report.forwardTxHash !== undefined);
+
+    if (shouldVerify) {
+      // Renew and validate lease ownership before running destination proof verification so an
+      // already-expired worker stops early.
+      activeLease = await renewRailLease(
+        this.options.db,
+        activeLease,
+        this.now(),
+        this.leaseDurationMs,
+      );
+      onLeaseRenewed(activeLease);
+
       const verified =
-        (await verifyItsDelivery(this.options.config, this.options.db, transfer, report)) ??
-        (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report));
-      if (verified) {
-        await this.options.db.transaction(async (tx) => {
+        this.options.verifyCandidateDelivery !== undefined
+          ? await this.options.verifyCandidateDelivery(transfer, report)
+          : this.options.config !== undefined
+            ? ((await verifyItsDelivery(this.options.config, this.options.db, transfer, report)) ??
+              (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report)))
+            : null;
+
+      if (verified !== null) {
+        // Atomic fenced commit: both inbound_delivery and delivered rail_attestation succeed only
+        // if this worker STILL owns an unexpired lease with the exact fencing token at commit time.
+        const commitAt = this.now();
+        await commitWithRailLease(this.options.db, activeLease, commitAt, async (tx) => {
           await writeInbound(tx, verified.at, verified.row);
-        });
-        await this.write(transfer, {
-          status: "delivered",
-          railStatus: report.railStatus,
-          reference: report.reference,
-          attestedAt: report.attestedAt,
-          checkedAt: at,
-          failures: 0,
-          error: null,
+          await writeAttestation(tx, {
+            transferId: transfer.transferId,
+            route: transfer.route,
+            status: "delivered",
+            railStatus: report.railStatus,
+            railReference: report.reference,
+            attestedAt: report.attestedAt,
+            checkedAt: commitAt,
+            checkFailures: 0,
+            lastError: null,
+          });
         });
         return true;
       }
     }
-    await this.write(transfer, {
+
+    const checkedAt = this.now();
+    await this.writeFenced(transfer, activeLease, {
       status: report.status,
       railStatus: report.railStatus,
       reference: report.reference,
       attestedAt: report.attestedAt,
-      checkedAt: at,
+      checkedAt,
       failures: 0,
       error: null,
     });
     return isTerminal(report.status);
   }
 
-  private async recordFailure(transfer: PendingTransfer, error: unknown): Promise<void> {
+  private async recordFailure(
+    transfer: PendingTransfer,
+    lease: RailWorkLease,
+    error: unknown,
+  ): Promise<void> {
     const failures = transfer.checkFailures + 1;
     const reason = error instanceof Error ? error.message : String(error);
     const permanent = error instanceof RailError && error.kind === "permanent";
 
     if (permanent || failures >= this.options.maxCheckFailures) {
-      // Said out loud, because the queue is about to stop offering this transfer and a transfer
-      // that quietly stops being chased is the thing somebody notices a week later.
       this.options.logger.error(
         {
           rail: this.options.client.rail,
@@ -251,22 +365,21 @@ export class RailPass {
       );
     }
 
-    await this.write(transfer, {
-      // Still pending, not failed. A transfer we cannot ask about is not a transfer that failed,
-      // and writing `failed` here would claim the money did not move on the strength of our own
-      // inability to get an answer.
+    const checkedAt = this.now();
+    await this.writeFenced(transfer, lease, {
       status: transfer.status ?? "pending",
       railStatus: null,
       reference: null,
       attestedAt: null,
-      checkedAt: this.now(),
+      checkedAt,
       failures,
       error: reason,
     });
   }
 
-  private async write(
+  private async writeFenced(
     transfer: PendingTransfer,
+    lease: RailWorkLease,
     fields: {
       readonly status: string;
       readonly railStatus: string | null;
@@ -277,7 +390,7 @@ export class RailPass {
       readonly error: string | null;
     },
   ): Promise<void> {
-    await this.options.db.transaction(async (tx: Queryable) => {
+    await commitWithRailLease(this.options.db, lease, fields.checkedAt, async (tx: Queryable) => {
       await writeAttestation(tx, {
         transferId: transfer.transferId,
         route: transfer.route,

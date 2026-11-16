@@ -12,6 +12,8 @@
  * them apart is why the watcher tests do not sleep, and why the retry policy is one file rather
  * than one per chain.
  */
+import { randomUUID } from "node:crypto";
+import { hostname } from "node:os";
 import type { Logger } from "pino";
 
 import type {
@@ -261,6 +263,8 @@ function railWorkers(
     },
   ];
 
+  const replicaPrefix = `${hostname()}-${String(process.pid)}-${randomUUID().slice(0, 8)}`;
+
   return clients.map(({ route, client }) => {
     const child = logger.child({ rail: client.rail, route });
     const pass = new RailPass({
@@ -272,6 +276,7 @@ function railWorkers(
       batchSize: config.batchSize,
       recheckAfterMs: config.recheckAfterMs,
       maxCheckFailures: config.maxCheckFailures,
+      workerId: `${replicaPrefix}-${client.rail}`,
     });
     return new PolledWorker(pass, config.pollIntervalMs, child);
   });

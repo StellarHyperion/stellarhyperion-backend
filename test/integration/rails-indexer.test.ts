@@ -9,7 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { writeOutbound, writeInbound } from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
-import { outstandingForRail, pendingForRail } from "../../src/rails/queue.js";
+import { claimPendingForRail, outstandingForRail, pendingForRail } from "../../src/rails/queue.js";
 import { RailPass } from "../../src/rails/pass.js";
 import type { PendingTransfer, RailClient, RailLookup } from "../../src/rails/types.js";
 import { capturingLogger } from "../stellar-fakes.js";
@@ -214,5 +214,55 @@ suite("rail pollers against real Postgres", () => {
     // Outstanding should now be 0 for this transfer since delivered is terminal
     const outstanding = await outstandingForRail(db, 1);
     expect(outstanding).toBe(0);
+  });
+
+  it("coordinates multi-replica claims via database-backed rail_work_lease rows", async () => {
+    await db.transaction(async (tx) => {
+      await writeOutbound(
+        tx,
+        {
+          chainKey: ORIGIN_CHAIN,
+          block: 1030n,
+          txHash: "0xaaa501",
+          logIndex: 0,
+          observedAt: new Date(),
+        },
+        {
+          route: 0,
+          nonce: 501n,
+          sender: "0x1111111111111111111111111111111111111111",
+          token: "0x3333333333333333333333333333333333333333",
+          grossAmount: 1001000n,
+          fee: 1000n,
+          netAmount: 1000000n,
+          destinationChain: DESTINATION_CHAIN,
+          destination: "0x2222222222222222222222222222222222222222",
+          railRef: "0x0000",
+        },
+      );
+    });
+
+    const now = new Date();
+    const firstReplica = await claimPendingForRail(db, {
+      route: 0,
+      limit: 10,
+      notCheckedSince: new Date(now.getTime() + 1000),
+      maxCheckFailures: 5,
+      owner: "integration-replica-1",
+      now,
+      leaseDurationMs: 30_000,
+    });
+    expect(firstReplica.some((item) => item.nonce === 501n)).toBe(true);
+
+    const secondReplica = await claimPendingForRail(db, {
+      route: 0,
+      limit: 10,
+      notCheckedSince: new Date(now.getTime() + 1000),
+      maxCheckFailures: 5,
+      owner: "integration-replica-2",
+      now,
+      leaseDurationMs: 30_000,
+    });
+    expect(secondReplica.some((item) => item.nonce === 501n)).toBe(false);
   });
 });

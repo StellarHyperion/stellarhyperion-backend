@@ -107,3 +107,18 @@ export interface RailClient {
   /** Throws `RailError`; returns `missing` rather than throwing for a transfer not yet indexed. */
   look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup>;
 }
+
+export interface RailWorkLease {
+  readonly transferId: bigint;
+  readonly route: number;
+  readonly owner: string;
+  readonly fencingToken: bigint;
+  readonly acquiredAt: Date;
+  readonly expiresAt: Date;
+}
+
+export interface LeasedPendingTransfer extends PendingTransfer {
+  readonly lease: RailWorkLease;
+}
+
+export type LeaseLossReason = "lease_missing" | "lease_stolen" | "lease_expired";
