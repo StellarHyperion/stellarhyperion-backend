@@ -27,6 +27,8 @@ import {
   parseDeploymentSet,
 } from "@hyperion/protocol";
 
+import type { NetworkAdmissionConfig } from "./admission.js";
+import { planAndValidateNetworkAdmission } from "./admission.js";
 import type { EnumSpec, VarSpec } from "./env.js";
 import { EnvReader } from "./env.js";
 
@@ -112,6 +114,7 @@ export interface AppConfig {
   readonly indexer: IndexerConfig;
   readonly rails: RailsConfig;
   readonly keeper: KeeperConfig;
+  readonly admission: NetworkAdmissionConfig;
   readonly shutdownTimeoutMs: number;
 }
 
@@ -224,7 +227,7 @@ const IRIS_API_URL: VarSpec = {
   kind: "url",
   protocols: ["http", "https"],
   required: false,
-  printable: true,
+  printable: false,
   purpose:
     "Circle's attestation API. Defaults to the chain registry's entry for this network, which is the sandbox on testnet.",
 };
@@ -234,7 +237,7 @@ const AXELAR_API_URL: VarSpec = {
   kind: "url",
   protocols: ["http", "https"],
   required: false,
-  printable: true,
+  printable: false,
   purpose:
     "Axelar's GMP status API. Defaults to axelarscan for this network. Unlike Iris there is no entry for it in the shared registry, so this is the only place it is named.",
 };
@@ -333,12 +336,32 @@ const SHUTDOWN_TIMEOUT_MS: VarSpec = {
   purpose: "How long shutdown waits for in-flight work before it stops waiting.",
 };
 
+const NETWORK_ADMISSION_RPC_CHECKS: VarSpec = {
+  name: "NETWORK_ADMISSION_RPC_CHECKS",
+  kind: "boolean",
+  required: false,
+  fallback: "true",
+  printable: true,
+  purpose:
+    "Compare live Stellar passphrase, EVM chain IDs and provider contract code before starting background workers.",
+};
+
+const NETWORK_ADMISSION_STRICT_CONNECTIVITY: VarSpec = {
+  name: "NETWORK_ADMISSION_STRICT_CONNECTIVITY",
+  kind: "boolean",
+  required: false,
+  fallback: "false",
+  printable: true,
+  purpose:
+    "When true, transient RPC reachability failures during startup admission also abort worker startup instead of degrading gracefully.",
+};
+
 const STELLAR_RPC_URL: VarSpec = {
   name: "STELLAR_RPC_URL",
   kind: "url",
   protocols: ["http", "https"],
   required: false,
-  printable: true,
+  printable: false,
   purpose:
     "Soroban RPC. Defaults to the chain registry endpoint, which is public and will rate limit you under real load.",
 };
@@ -418,7 +441,7 @@ function rpcOverrideSpec(chain: ChainKey): VarSpec {
     // inside viem on the first request.
     protocols: ["http", "https"],
     required: false,
-    printable: true,
+    printable: false,
     purpose: `RPC endpoint for ${CHAINS[chain].name}. Defaults to the chain registry entry.`,
   };
 }
@@ -429,7 +452,7 @@ function rpcUrlsOverrideSpec(chain: ChainKey): VarSpec {
     kind: "url",
     protocols: ["http", "https"],
     required: false,
-    printable: true,
+    printable: false,
     purpose: `RPC endpoints for ${CHAINS[chain].name}, comma-separated. Defaults to EVM_RPC_URL_${envSuffixFor(chain)} or the chain registry entry.`,
   };
 }
@@ -484,7 +507,14 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     : null;
 
   const absoluteDeployments = deploymentsPath === "" ? "" : resolvePath(cwd, deploymentsPath);
-  const deployments = readDeployments(reader, read, absoluteDeployments);
+  const { deployments, rawJson: rawDeploymentsJson } = readDeployments(
+    reader,
+    read,
+    absoluteDeployments,
+  );
+  const verifyRpcOnStartup = reader.boolean(NETWORK_ADMISSION_RPC_CHECKS);
+  const strictRpcConnectivity = reader.boolean(NETWORK_ADMISSION_STRICT_CONNECTIVITY);
+
   const indexer = planIndexer(reader, {
     network,
     deployments,
@@ -498,6 +528,36 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     reorgDepthOverride,
     env,
   });
+
+  const resolvedIrisUrl = irisOverride === "" ? IRIS_API[network] : irisOverride;
+  const resolvedAxelarUrl = axelarOverride === "" ? AXELARSCAN_API[network] : axelarOverride;
+
+  const admission: NetworkAdmissionConfig =
+    reader.failed(HYPERION_NETWORK) || reader.failed(DEPLOYMENTS_FILE)
+      ? {
+          destinationOnlyMode: false,
+          lanes: [],
+          verifyRpcOnStartup,
+          strictRpcConnectivity,
+        }
+      : planAndValidateNetworkAdmission({
+          reader,
+          env,
+          network,
+          rawDeploymentsJson,
+          deployments,
+          deploymentsSpec: DEPLOYMENTS_FILE,
+          irisSpec: IRIS_API_URL,
+          irisUrl: resolvedIrisUrl,
+          axelarSpec: AXELAR_API_URL,
+          axelarUrl: resolvedAxelarUrl,
+          stellarRpcSpec: STELLAR_RPC_URL,
+          stellarRpcUrl: indexer.stellar?.rpcUrl ?? (stellarRpcOverride || null),
+          keeperSecretSpec: KEEPER_STELLAR_SECRET,
+          keeperStellarSecret,
+          verifyRpcOnStartup,
+          strictRpcConnectivity,
+        });
 
   // One throw, after everything has had a chance to complain.
   reader.finish();
@@ -514,8 +574,8 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     indexer,
     rails: {
       enabled: railsEnabled,
-      irisUrl: irisOverride === "" ? IRIS_API[network] : irisOverride,
-      axelarUrl: axelarOverride === "" ? AXELARSCAN_API[network] : axelarOverride,
+      irisUrl: resolvedIrisUrl,
+      axelarUrl: resolvedAxelarUrl,
       pollIntervalMs: railPollIntervalMs,
       batchSize: railBatchSize,
       recheckAfterMs: railRecheckAfterMs,
@@ -527,6 +587,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       concurrency: keeperConcurrency,
       stellarSecret: keeperStellarSecret,
     },
+    admission,
     shutdownTimeoutMs,
   };
 }
@@ -537,8 +598,8 @@ function readDeployments(
   reader: EnvReader,
   read: (path: string) => string,
   path: string,
-): DeploymentSet {
-  if (path === "") return EMPTY_SET;
+): { readonly deployments: DeploymentSet; readonly rawJson: unknown } {
+  if (path === "") return { deployments: EMPTY_SET, rawJson: null };
 
   let text: string;
   try {
@@ -548,7 +609,7 @@ function readDeployments(
     // directory is the single most common way this fails, and the resolved absolute path is the
     // thing that makes it obvious.
     reader.reject(DEPLOYMENTS_FILE, `cannot be read at ${path}`);
-    return EMPTY_SET;
+    return { deployments: EMPTY_SET, rawJson: null };
   }
 
   let parsed: unknown;
@@ -556,20 +617,20 @@ function readDeployments(
     parsed = JSON.parse(text);
   } catch (error) {
     reader.reject(DEPLOYMENTS_FILE, `is not valid JSON: ${messageOf(error)}`);
-    return EMPTY_SET;
+    return { deployments: EMPTY_SET, rawJson: null };
   }
 
   try {
     // Validated rather than cast. An address with a transposed character parses fine as a string
     // and turns into a watcher reading an empty contract for a week without complaining.
-    return parseDeploymentSet(parsed);
+    return { deployments: parseDeploymentSet(parsed), rawJson: parsed };
   } catch (error) {
     const detail =
       error instanceof DeploymentFormatError
         ? error.message
         : `is not a deployment set: ${messageOf(error)}`;
     reader.reject(DEPLOYMENTS_FILE, detail);
-    return EMPTY_SET;
+    return { deployments: EMPTY_SET, rawJson: parsed };
   }
 }
 

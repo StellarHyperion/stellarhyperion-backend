@@ -27,6 +27,14 @@ The SDK is installed from the committed protocol tarball. `npm run dev` does not
 
 Run the watchers and rail pollers in a continuous process or in regular scheduled catch-up windows. Deploying only `api/index.ts` provides reads from an existing database; it does not run indexing in the background. Set the frontend's `NEXT_PUBLIC_HYPERION_API_URL` to this service's origin. Public API reads support cross-origin GET requests.
 
+### Network environment admission
+
+Configuration and pre-worker startup enforce explicit mainnet/testnet isolation:
+
+- Cross-network settings (such as a mainnet `IRIS_API_URL`, `AXELAR_API_URL`, `STELLAR_RPC_URL`, `EVM_RPC_URL_*` override or cross-network deployment destination metadata under `HYPERION_NETWORK=testnet`, or the reverse) fail admission immediately with exact field paths (`$.rails.irisUrl`, `$.indexer.stellar.networkPassphrase`, `$.verification.lanes[chain=...].chainId`).
+- Destination-only verification is first-class: deployments like `deployments/testnet.json` that deploy only a Stellar router verify destination EVM chain IDs and Circle CCTP / Axelar ITS provider contracts (`NETWORK_ADMISSION_RPC_CHECKS=true`, optional `NETWORK_ADMISSION_STRICT_CONNECTIVITY=true`) without requiring an EVM Hyperion router.
+- Admission diagnostics strip URL credentials, path API keys, query parameters and signer/database secrets.
+
 ## Deploy on Vercel
 
 The `hyperion-backend` Vercel project serves [stellarhyperion-backend.vercel.app](https://stellarhyperion-backend.vercel.app). Configure its production `DATABASE_URL` through Vercel environment variables with a managed PostgreSQL connection and TLS. Keep the value server-side. Redis and signing keys are unnecessary while `KEEPER_ENABLED=false`.

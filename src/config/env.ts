@@ -60,6 +60,7 @@ export type EnumSpec<T extends string> = Omit<VarSpec, "choices"> & {
 /** One variable that did not work out, with enough detail to fix it without reading this file. */
 export interface ConfigFault {
   readonly name: string;
+  readonly fieldPath?: string | undefined;
   readonly problem: string;
   readonly purpose: string;
 }
@@ -78,7 +79,10 @@ export class ConfigError extends Error {
 }
 
 function renderFaults(faults: readonly ConfigFault[]): string {
-  const lines = faults.map((fault) => `  ${fault.name}: ${fault.problem}\n      ${fault.purpose}`);
+  const lines = faults.map((fault) => {
+    const location = fault.fieldPath ? `${fault.name} (${fault.fieldPath})` : fault.name;
+    return `  ${location}: ${fault.problem}\n      ${fault.purpose}`;
+  });
   const count =
     faults.length === 1 ? "1 environment variable" : `${faults.length} environment variables`;
   return [
@@ -248,8 +252,8 @@ export class EnvReader {
   }
 
   /** Record a fault found by something other than a kind check, such as a file that is not there. */
-  reject(spec: VarSpec, problem: string): void {
-    this.record(spec, problem);
+  reject(spec: VarSpec, problem: string, fieldPath?: string): void {
+    this.record(spec, problem, fieldPath);
   }
 
   /**
@@ -282,12 +286,17 @@ export class EnvReader {
     return null;
   }
 
-  private record(spec: VarSpec, problem: string): void {
+  private record(spec: VarSpec, problem: string, fieldPath?: string): void {
     // One line per variable. The first problem found is the root cause and anything after it is
     // a consequence, so a list that names one variable three times reads as three separate things
     // to fix when it is one.
     if (this.failed(spec)) return;
-    this.faults.push({ name: spec.name, problem, purpose: spec.purpose });
+    this.faults.push({
+      name: spec.name,
+      ...(fieldPath === undefined ? {} : { fieldPath }),
+      problem,
+      purpose: spec.purpose,
+    });
   }
 
   /** A value in an error message, or a description of it when printing it would leak a secret. */

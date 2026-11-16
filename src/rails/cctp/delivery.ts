@@ -9,6 +9,7 @@ import {
   toEvmAddress,
 } from "@hyperion/protocol";
 import { createPublicClient, http, type Hex } from "viem";
+import { destinationRpcUrlFor } from "../../config/admission.js";
 import type { AppConfig } from "../../config/config.js";
 import type { Transactional } from "../../db/pool.js";
 import { bigintOf, text } from "../../db/rows.js";
@@ -69,8 +70,9 @@ export async function verifyCctpDelivery(
   const raw = report.messageBytes as Hex;
   const message = verifiedCctpMessage(raw, expected);
   if (!message) return null;
+  const destinationRpcUrl = destinationRpcUrlFor(config, transfer.destinationChain);
   const client = createPublicClient({
-    transport: http(destination.defaultRpcUrl, { timeout: 15000, retryCount: 0 }),
+    transport: http(destinationRpcUrl, { timeout: 15000, retryCount: 0 }),
   });
   if ((await client.getChainId()) !== destination.chainId)
     throw new Error("CCTP destination RPC chain mismatch.");

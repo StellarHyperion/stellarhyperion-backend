@@ -15,7 +15,8 @@ ENV NODE_ENV=production \
     HYPERION_DEPLOYMENTS_FILE=./deployments/testnet.json \
     INDEXER_ENABLED=true \
     RAILS_ENABLED=true \
-    KEEPER_ENABLED=false
+    KEEPER_ENABLED=false \
+    NETWORK_ADMISSION_RPC_CHECKS=true
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./

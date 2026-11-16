@@ -7,6 +7,7 @@
  * JSON with the whole explanation escaped inside one field.
  */
 import { buildIndexer } from "./chains/runner.js";
+import { NetworkAdmissionError, verifyWorkerNetworkAdmission } from "./config/admission.js";
 import { loadConfig } from "./config/config.js";
 import { ConfigError } from "./config/env.js";
 import { Database } from "./db/pool.js";
@@ -61,8 +62,34 @@ async function main(): Promise<void> {
   shutdown.add("http", () => server.close());
 
   await server.listen({ host: config.http.host, port: config.http.port });
-  // After listen, so the probes are answering before the first page is read. A watcher that
-  // starts first makes its initial RPC calls while nothing can report on them.
+
+  if (
+    config.admission.verifyRpcOnStartup &&
+    (config.indexer.enabled || config.rails.enabled || config.keeper.enabled)
+  ) {
+    try {
+      const admission = await verifyWorkerNetworkAdmission(config, { logger });
+      logger.info(
+        {
+          network: admission.network,
+          destinationOnlyMode: admission.destinationOnlyMode,
+          checkedStellarChain: admission.checkedStellarChain,
+          checkedEvmRouters: admission.checkedEvmRouters,
+          checkedDestinationLanes: admission.checkedDestinationLanes,
+        },
+        "network environment admission verified",
+      );
+    } catch (error) {
+      if (error instanceof NetworkAdmissionError) {
+        process.stderr.write(`\n${error.message}\n\n`);
+        await shutdown.run("network-admission-failed");
+        process.exit(78);
+      }
+      throw error;
+    }
+  }
+
+  // After listen and environment admission, so probes are answering and no mismatched worker ever polls.
   indexer.start();
   logger.info(
     {
