@@ -55,6 +55,7 @@ suite("the schema", () => {
     const names = rows.map((row) => String(row.table_name));
     for (const table of [
       "admin_action",
+      "health_sample_compaction",
       "inbound_delivery",
       "indexer_cursor",
       "outbound_transfer",
@@ -334,5 +335,49 @@ suite("maintenance and pruning", () => {
     expect(ids).not.toContain(999991);
     expect(ids).toContain(999992);
     expect(ids).toContain(999993);
+  });
+
+  it("enforces route_health compaction window constraints and folds old steady-state samples", async () => {
+    await db.query("DELETE FROM public.route_health WHERE origin_chain = 'compaction-schema-test'");
+
+    await expect(
+      db.query(
+        `INSERT INTO public.route_health
+           (origin_chain, destination_chain, route, token, available, blocker,
+            sampled_at, compacted_count, window_ended_at)
+         VALUES ('compaction-schema-test', 'stellar-testnet', 0, '0xtoken', true, 0,
+                 '2026-10-01T00:00:00Z', 2, NULL)`,
+      ),
+    ).rejects.toSatisfy((error: unknown) => codeOf(error) === CHECK_VIOLATION);
+
+    await db.query(
+      `INSERT INTO public.route_health
+         (origin_chain, destination_chain, route, token, available, blocker, flow_available, sampled_at)
+       VALUES
+         ('compaction-schema-test', 'stellar-testnet', 0, '0xtoken', true, 0, 500, '2026-10-01T00:00:00Z'),
+         ('compaction-schema-test', 'stellar-testnet', 0, '0xtoken', true, 0, 500, '2026-10-01T00:05:00Z'),
+         ('compaction-schema-test', 'stellar-testnet', 0, '0xtoken', false, 1, NULL, '2026-10-01T00:10:00Z'),
+         ('compaction-schema-test', 'stellar-testnet', 0, '0xtoken', false, 1, NULL, '2026-10-01T00:15:00Z')`,
+    );
+
+    const compacted = await db.compactRouteHealth({
+      rawWindowSeconds: 3600,
+      batchSize: 10,
+      now: () => new Date("2026-10-02T00:00:00Z"),
+    });
+    expect(compacted.deletedRows).toBeGreaterThanOrEqual(2);
+
+    const { rows } = await db.query(
+      `SELECT available, blocker, compacted_count
+         FROM public.route_health
+        WHERE origin_chain = 'compaction-schema-test'
+        ORDER BY sampled_at ASC`,
+    );
+    expect(rows).toEqual([
+      { available: true, blocker: 0, compacted_count: 2 },
+      { available: false, blocker: 1, compacted_count: 2 },
+    ]);
+
+    await db.query("DELETE FROM public.route_health WHERE origin_chain = 'compaction-schema-test'");
   });
 });

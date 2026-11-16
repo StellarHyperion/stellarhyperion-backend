@@ -15,6 +15,12 @@
 import { Pool } from "pg";
 import type { PoolClient, PoolConfig } from "pg";
 
+import {
+  compactRouteHealthSamples,
+  type RouteHealthCompactionOptions,
+  type RouteHealthCompactionResult,
+} from "../chains/writers.js";
+
 export interface QueryResultRows {
   readonly rows: readonly Record<string, unknown>[];
   /** Null from pg for statements that do not report one. Treated as zero by every caller here. */
@@ -114,6 +120,16 @@ export class Database implements Transactional {
     return rowCount;
   }
 
+  /**
+   * Compacts steady-state route_health samples older than the raw diagnostic window in bounded
+   * batches while preserving every configuration transition boundary.
+   */
+  async compactRouteHealth(
+    options: RouteHealthCompactionOptions = {},
+  ): Promise<RouteHealthCompactionResult> {
+    return compactRouteHealthSamples(this, options);
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
@@ -124,6 +140,8 @@ export class Database implements Transactional {
 export interface MaintenanceTaskOptions {
   readonly intervalMs?: number;
   readonly olderThanDays?: number;
+  readonly rawHealthWindowSeconds?: number;
+  readonly compactionBatchSize?: number;
   readonly logger?: {
     info?: (obj: unknown, msg: string) => void;
     error?: (obj: unknown, msg: string) => void;
@@ -132,7 +150,7 @@ export interface MaintenanceTaskOptions {
 }
 
 /**
- * Periodically runs the attestation cleanup maintenance task.
+ * Periodically runs the attestation cleanup and route-health compaction maintenance tasks.
  * Returns a function to cancel the scheduled task.
  */
 export function startMaintenanceTask(
@@ -146,6 +164,18 @@ export function startMaintenanceTask(
     void db.pruneCompletedAttestations(olderThanDays).catch((error: unknown) => {
       options.logger?.warn?.({ err: error }, "maintenance attestation pruning failed");
     });
+    void db
+      .compactRouteHealth({
+        ...(options.rawHealthWindowSeconds === undefined
+          ? {}
+          : { rawWindowSeconds: options.rawHealthWindowSeconds }),
+        ...(options.compactionBatchSize === undefined
+          ? {}
+          : { batchSize: options.compactionBatchSize }),
+      })
+      .catch((error: unknown) => {
+        options.logger?.warn?.({ err: error }, "maintenance route-health compaction failed");
+      });
   }, intervalMs);
 
   timer.unref();

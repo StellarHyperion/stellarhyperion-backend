@@ -19,7 +19,18 @@
  * had handled the case. `observed_at` is deliberately left out of every update: it records when
  * this indexer first saw the row, and a reorg does not change that.
  */
-import type { Queryable } from "../db/pool.js";
+import type { Queryable, Transactional } from "../db/pool.js";
+import {
+  bigintOf,
+  bigintOrNull,
+  boolean,
+  integer,
+  integerOrNull,
+  maybeOne,
+  text,
+  timestamp,
+  timestampOrNull,
+} from "../db/rows.js";
 
 /** Where on a chain a row was observed. One shape for a ledger and for a block. */
 export interface Position {
@@ -371,4 +382,419 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
       row.lastError,
     ],
   );
+}
+
+export const DEFAULT_RAW_HEALTH_WINDOW_SECONDS = 24 * 60 * 60;
+export const DEFAULT_HEALTH_COMPACTION_BATCH_SIZE = 500;
+export const MAX_HEALTH_COMPACTION_BATCH_SIZE = 5_000;
+export const DEFAULT_HEALTH_COMPACTION_MAX_BATCHES = 20;
+
+export interface RouteHealthCompactionOptions {
+  /** Raw diagnostic retention window in seconds before steady-state compaction applies. */
+  readonly rawWindowSeconds?: number;
+  /** Maximum redundant rows folded and deleted in one bounded transaction. */
+  readonly batchSize?: number;
+  /** Maximum bounded batches executed in a single compaction pass. */
+  readonly maxBatches?: number;
+  /** Per-batch lock acquisition timeout in milliseconds so ingestion is never blocked. */
+  readonly lockTimeoutMs?: number;
+  /** Clock override for deterministic testing. */
+  readonly now?: () => Date;
+  /** Optional hook invoked between bounded batches (for testing concurrent ingestion). */
+  readonly onBatchComplete?: (batchIndex: number, deletedInBatch: number) => Promise<void> | void;
+}
+
+export interface RouteHealthCompactionResult {
+  readonly deletedRows: number;
+  readonly updatedBoundaryRows: number;
+  readonly batchesRun: number;
+  readonly hasMore: boolean;
+  readonly compactedBefore: Date;
+  readonly rawWindowSeconds: number;
+}
+
+export interface RouteHealthCompactionWatermark {
+  readonly rawWindowSeconds: number;
+  readonly compactedBefore: Date;
+  readonly lastCompactedAt: Date;
+  readonly totalRowsDeleted: bigint;
+  readonly totalRuns: bigint;
+}
+
+export interface RouteHealthHistoryEntry {
+  readonly id: bigint;
+  readonly originChain: string;
+  readonly destinationChain: string;
+  readonly route: number;
+  readonly token: string;
+  readonly available: boolean;
+  readonly blocker: number;
+  readonly flowAvailable: string | null;
+  readonly medianSeconds: number | null;
+  readonly sampledAt: Date;
+  readonly windowEndedAt: Date | null;
+  readonly compactedCount: number;
+  readonly resolution: "raw" | "compacted";
+}
+
+export interface RouteHealthCoverage {
+  readonly rawFrom: Date | null;
+  readonly compactedBefore: Date | null;
+  readonly rawWindowSeconds: number | null;
+  readonly lastCompactedAt: Date | null;
+  readonly earliestSampleAt: Date | null;
+  readonly latestSampleAt: Date | null;
+  readonly storedRowCount: number;
+  readonly representedSampleCount: number;
+  readonly compactedBoundaryRowCount: number;
+  readonly rawRowCount: number;
+}
+
+export interface RouteHealthHistoryResult {
+  readonly samples: readonly RouteHealthHistoryEntry[];
+  readonly coverage: RouteHealthCoverage;
+}
+
+interface LeaderFoldAggregate {
+  addedCount: number;
+  maxEndedAt: Date;
+  latestMedianSeconds: number | null;
+}
+
+async function runCompactionBatch(
+  db: Transactional,
+  cutoff: Date,
+  batchSize: number,
+  lockTimeoutMs: number,
+): Promise<{ readonly deletedRows: number; readonly updatedBoundaryRows: number }> {
+  return db.transaction(async (tx) => {
+    await tx.query(
+      `SET LOCAL lock_timeout = '${String(Math.max(100, Math.trunc(lockTimeoutMs)))}ms'`,
+    );
+
+    const { rows } = await tx.query(
+      `WITH ordered AS (
+         SELECT id,
+                origin_chain,
+                destination_chain,
+                route,
+                token,
+                sampled_at,
+                available,
+                blocker,
+                flow_available,
+                CASE
+                  WHEN LAG(id) OVER w IS NULL THEN 1
+                  WHEN available IS DISTINCT FROM LAG(available) OVER w THEN 1
+                  WHEN blocker IS DISTINCT FROM LAG(blocker) OVER w THEN 1
+                  WHEN flow_available IS DISTINCT FROM LAG(flow_available) OVER w THEN 1
+                  ELSE 0
+                END AS is_boundary
+           FROM route_health
+          WHERE sampled_at < $1
+         WINDOW w AS (
+           PARTITION BY origin_chain, destination_chain, route, token
+           ORDER BY sampled_at ASC, id ASC
+         )
+       ),
+       islands AS (
+         SELECT id,
+                origin_chain,
+                destination_chain,
+                route,
+                token,
+                sampled_at,
+                is_boundary,
+                SUM(is_boundary) OVER (
+                  PARTITION BY origin_chain, destination_chain, route, token
+                  ORDER BY sampled_at ASC, id ASC
+                  ROWS UNBOUNDED PRECEDING
+                ) AS island_id
+           FROM ordered
+       ),
+       candidates AS (
+         SELECT id,
+                FIRST_VALUE(id) OVER (
+                  PARTITION BY origin_chain, destination_chain, route, token, island_id
+                  ORDER BY sampled_at ASC, id ASC
+                ) AS leader_id,
+                sampled_at
+           FROM islands
+       ),
+       doomed_ids AS (
+         SELECT id, leader_id
+           FROM candidates
+          WHERE id <> leader_id
+          ORDER BY sampled_at ASC, id ASC
+          LIMIT $2
+       )
+       SELECT rh.id,
+              d.leader_id,
+              rh.compacted_count,
+              COALESCE(rh.window_ended_at, rh.sampled_at) AS effective_end,
+              rh.median_seconds
+         FROM doomed_ids d
+         JOIN route_health rh ON rh.id = d.id
+         JOIN route_health leader ON leader.id = d.leader_id
+        WHERE rh.sampled_at < $1
+          AND rh.available IS NOT DISTINCT FROM leader.available
+          AND rh.blocker IS NOT DISTINCT FROM leader.blocker
+          AND rh.flow_available IS NOT DISTINCT FROM leader.flow_available
+        ORDER BY rh.id ASC
+        FOR UPDATE OF rh, leader SKIP LOCKED`,
+      [cutoff, batchSize],
+    );
+
+    if (rows.length === 0) {
+      return { deletedRows: 0, updatedBoundaryRows: 0 };
+    }
+
+    const doomedIds: string[] = [];
+    const byLeader = new Map<string, LeaderFoldAggregate>();
+
+    for (const row of rows) {
+      const id = bigintOf(row, "id").toString();
+      const leaderId = bigintOf(row, "leader_id").toString();
+      const count = integer(row, "compacted_count");
+      const effectiveEnd = timestamp(row, "effective_end");
+      const medianSeconds = integerOrNull(row, "median_seconds");
+
+      doomedIds.push(id);
+      const existing = byLeader.get(leaderId);
+      if (existing === undefined) {
+        byLeader.set(leaderId, {
+          addedCount: count,
+          maxEndedAt: effectiveEnd,
+          latestMedianSeconds: medianSeconds,
+        });
+      } else {
+        existing.addedCount += count;
+        if (effectiveEnd.getTime() > existing.maxEndedAt.getTime()) {
+          existing.maxEndedAt = effectiveEnd;
+        }
+        if (medianSeconds !== null) {
+          existing.latestMedianSeconds = medianSeconds;
+        }
+      }
+    }
+
+    for (const [leaderId, agg] of byLeader.entries()) {
+      await tx.query(
+        `UPDATE route_health
+            SET compacted_count = compacted_count + $2,
+                window_ended_at = GREATEST(COALESCE(window_ended_at, sampled_at), $3),
+                median_seconds = COALESCE(median_seconds, $4)
+          WHERE id = $1`,
+        [leaderId, agg.addedCount, agg.maxEndedAt, agg.latestMedianSeconds],
+      );
+    }
+
+    const deleted = await tx.query(`DELETE FROM route_health WHERE id = ANY($1::bigint[])`, [
+      doomedIds,
+    ]);
+
+    return {
+      deletedRows: deleted.rowCount,
+      updatedBoundaryRows: byLeader.size,
+    };
+  });
+}
+
+export async function compactRouteHealthSamples(
+  db: Transactional,
+  options: RouteHealthCompactionOptions = {},
+): Promise<RouteHealthCompactionResult> {
+  const rawWindowSeconds = Math.max(
+    1,
+    Math.trunc(options.rawWindowSeconds ?? DEFAULT_RAW_HEALTH_WINDOW_SECONDS),
+  );
+  const batchSize = Math.min(
+    Math.max(1, Math.trunc(options.batchSize ?? DEFAULT_HEALTH_COMPACTION_BATCH_SIZE)),
+    MAX_HEALTH_COMPACTION_BATCH_SIZE,
+  );
+  const maxBatches = Math.max(
+    1,
+    Math.trunc(options.maxBatches ?? DEFAULT_HEALTH_COMPACTION_MAX_BATCHES),
+  );
+  const lockTimeoutMs = options.lockTimeoutMs ?? 2_000;
+  const now = options.now ? options.now() : new Date();
+  const cutoff = new Date(now.getTime() - rawWindowSeconds * 1_000);
+
+  let totalDeleted = 0;
+  let totalUpdatedLeaders = 0;
+  let batchesRun = 0;
+  let hasMore = false;
+
+  while (batchesRun < maxBatches) {
+    const batchResult = await runCompactionBatch(db, cutoff, batchSize, lockTimeoutMs);
+    batchesRun += 1;
+    totalDeleted += batchResult.deletedRows;
+    totalUpdatedLeaders += batchResult.updatedBoundaryRows;
+
+    if (options.onBatchComplete !== undefined) {
+      await options.onBatchComplete(batchesRun - 1, batchResult.deletedRows);
+    }
+
+    if (batchResult.deletedRows < batchSize) {
+      hasMore = false;
+      break;
+    }
+
+    hasMore = true;
+    // Yield between bounded batches so concurrent ingestion queries are never starved.
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+  }
+
+  await db.query(
+    `INSERT INTO health_sample_compaction
+       (id, raw_window_seconds, compacted_before, last_compacted_at, total_rows_deleted, total_runs)
+     VALUES (1, $1, $2, $3, $4, 1)
+     ON CONFLICT (id) DO UPDATE
+       SET raw_window_seconds = EXCLUDED.raw_window_seconds,
+           compacted_before = GREATEST(health_sample_compaction.compacted_before, EXCLUDED.compacted_before),
+           last_compacted_at = EXCLUDED.last_compacted_at,
+           total_rows_deleted = health_sample_compaction.total_rows_deleted + $4,
+           total_runs = health_sample_compaction.total_runs + 1`,
+    [rawWindowSeconds, cutoff, now, String(totalDeleted)],
+  );
+
+  return {
+    deletedRows: totalDeleted,
+    updatedBoundaryRows: totalUpdatedLeaders,
+    batchesRun,
+    hasMore,
+    compactedBefore: cutoff,
+    rawWindowSeconds,
+  };
+}
+
+export async function readRouteHealthCompactionWatermark(
+  db: Queryable,
+): Promise<RouteHealthCompactionWatermark | null> {
+  const { rows } = await db.query(
+    `SELECT raw_window_seconds, compacted_before, last_compacted_at, total_rows_deleted, total_runs
+       FROM health_sample_compaction
+      WHERE id = 1`,
+  );
+  const row = maybeOne(rows, "health_sample_compaction");
+  if (row === null) return null;
+  return {
+    rawWindowSeconds: integer(row, "raw_window_seconds"),
+    compactedBefore: timestamp(row, "compacted_before"),
+    lastCompactedAt: timestamp(row, "last_compacted_at"),
+    totalRowsDeleted: bigintOf(row, "total_rows_deleted"),
+    totalRuns: bigintOf(row, "total_runs"),
+  };
+}
+
+export async function queryRouteHealthHistory(
+  db: Queryable,
+  options: {
+    readonly originChain?: string;
+    readonly destinationChain?: string;
+    readonly route?: number;
+    readonly token?: string;
+    readonly since?: Date;
+    readonly limit?: number;
+  } = {},
+): Promise<RouteHealthHistoryResult> {
+  const limit = Math.min(Math.max(1, Math.trunc(options.limit ?? 200)), 1_000);
+  const filterParams = [
+    options.originChain ?? null,
+    options.destinationChain ?? null,
+    options.route ?? null,
+    options.token ?? null,
+    options.since ?? null,
+  ];
+
+  const watermark = await readRouteHealthCompactionWatermark(db);
+
+  const { rows } = await db.query(
+    `SELECT id,
+            origin_chain,
+            destination_chain,
+            route,
+            token,
+            available,
+            blocker,
+            flow_available,
+            median_seconds,
+            sampled_at,
+            window_ended_at,
+            compacted_count
+       FROM route_health
+      WHERE ($1::text IS NULL OR origin_chain = $1)
+        AND ($2::text IS NULL OR destination_chain = $2)
+        AND ($3::smallint IS NULL OR route = $3)
+        AND ($4::text IS NULL OR token = $4)
+        AND ($5::timestamptz IS NULL OR COALESCE(window_ended_at, sampled_at) >= $5)
+      ORDER BY sampled_at ASC, id ASC
+      LIMIT $6`,
+    [...filterParams, limit],
+  );
+
+  const statsResult = await db.query(
+    `SELECT COUNT(*)::int AS stored_rows,
+            COALESCE(SUM(compacted_count), 0)::numeric(20, 0) AS represented_samples,
+            COUNT(*) FILTER (WHERE compacted_count > 1)::int AS compacted_rows,
+            COUNT(*) FILTER (WHERE compacted_count = 1)::int AS raw_rows,
+            MIN(sampled_at) AS earliest_sample_at,
+            MAX(COALESCE(window_ended_at, sampled_at)) AS latest_sample_at
+       FROM route_health
+      WHERE ($1::text IS NULL OR origin_chain = $1)
+        AND ($2::text IS NULL OR destination_chain = $2)
+        AND ($3::smallint IS NULL OR route = $3)
+        AND ($4::text IS NULL OR token = $4)
+        AND ($5::timestamptz IS NULL OR COALESCE(window_ended_at, sampled_at) >= $5)`,
+    filterParams,
+  );
+
+  const samples: RouteHealthHistoryEntry[] = rows.map((row) => {
+    const compactedCount = integerOrNull(row, "compacted_count") ?? 1;
+    const flow = bigintOrNull(row, "flow_available");
+    return {
+      id: bigintOf(row, "id"),
+      originChain: text(row, "origin_chain"),
+      destinationChain: text(row, "destination_chain"),
+      route: integer(row, "route"),
+      token: text(row, "token"),
+      available: boolean(row, "available"),
+      blocker: integer(row, "blocker"),
+      flowAvailable: flow === null ? null : flow.toString(),
+      medianSeconds: integerOrNull(row, "median_seconds"),
+      sampledAt: timestamp(row, "sampled_at"),
+      windowEndedAt: timestampOrNull(row, "window_ended_at"),
+      compactedCount,
+      resolution: compactedCount > 1 ? "compacted" : "raw",
+    };
+  });
+
+  const statsRow = maybeOne(statsResult.rows, "route_health coverage stats");
+  const storedRowCount = statsRow === null ? 0 : (integerOrNull(statsRow, "stored_rows") ?? 0);
+  const representedSampleCount =
+    statsRow === null ? 0 : Number(bigintOrNull(statsRow, "represented_samples") ?? 0n);
+  const compactedBoundaryRowCount =
+    statsRow === null ? 0 : (integerOrNull(statsRow, "compacted_rows") ?? 0);
+  const rawRowCount = statsRow === null ? 0 : (integerOrNull(statsRow, "raw_rows") ?? 0);
+  const earliestSampleAt =
+    statsRow === null ? null : timestampOrNull(statsRow, "earliest_sample_at");
+  const latestSampleAt = statsRow === null ? null : timestampOrNull(statsRow, "latest_sample_at");
+
+  return {
+    samples,
+    coverage: {
+      rawFrom: watermark?.compactedBefore ?? earliestSampleAt,
+      compactedBefore: watermark?.compactedBefore ?? null,
+      rawWindowSeconds: watermark?.rawWindowSeconds ?? null,
+      lastCompactedAt: watermark?.lastCompactedAt ?? null,
+      earliestSampleAt,
+      latestSampleAt,
+      storedRowCount,
+      representedSampleCount,
+      compactedBoundaryRowCount,
+      rawRowCount,
+    },
+  };
 }
