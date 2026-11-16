@@ -11,6 +11,11 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import {
+  createPgSessionSource,
+  inspectMigrationStatusReadOnly,
+  withMigrationAdvisoryLock,
+} from "../../src/db/migration-lock.js";
 import { Database } from "../../src/db/pool.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
@@ -334,5 +339,41 @@ suite("maintenance and pruning", () => {
     expect(ids).not.toContain(999991);
     expect(ids).toContain(999992);
     expect(ids).toContain(999993);
+  });
+
+  it("serializes concurrent PostgreSQL advisory lock holders and releases ownership on failure", async () => {
+    const source = createPgSessionSource(CONNECTION ?? "", {
+      applicationName: "hyperion-migration-lock-test",
+    });
+    const order: string[] = [];
+
+    const first = withMigrationAdvisoryLock(
+      source,
+      async () => {
+        order.push("first-enter");
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        order.push("first-exit");
+        return "ok-1";
+      },
+      { lockNamespace: "hyperion-schema-test-lock", pollIntervalMs: 10 },
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const second = withMigrationAdvisoryLock(
+      source,
+      () => {
+        order.push("second-enter");
+        return Promise.resolve("ok-2");
+      },
+      { lockNamespace: "hyperion-schema-test-lock", pollIntervalMs: 10 },
+    );
+
+    const results = await Promise.all([first, second]);
+    expect(results).toEqual(["ok-1", "ok-2"]);
+    expect(order).toEqual(["first-enter", "first-exit", "second-enter"]);
+
+    const status = await inspectMigrationStatusReadOnly(db);
+    expect(status.migrationsTableExists).toBe(true);
   });
 });

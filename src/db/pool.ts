@@ -38,20 +38,41 @@ export interface Transactional extends Queryable {
   transaction<T>(work: (tx: Queryable) => Promise<T>): Promise<T>;
 }
 
+export class ReadOnlyDatabaseError extends Error {
+  readonly code = "read_only_database" as const;
+
+  constructor(operation: string) {
+    super(`read-only database instance forbids write or migration operation: ${operation}`);
+    this.name = "ReadOnlyDatabaseError";
+  }
+}
+
 export interface OpenOptions {
   /** Low by default. Two watchers and an HTTP server do not need twenty connections. */
   readonly maxConnections?: number;
   readonly connectionTimeoutMs?: number;
   readonly statementTimeoutMs?: number;
   readonly applicationName?: string;
+  /**
+   * Marks this handle as belonging to a read-only API instance (`default_transaction_read_only=on`).
+   * Read-only instances never perform implicit migrations or background pruning writes.
+   */
+  readonly readOnly?: boolean;
 }
 
 export class Database implements Transactional {
   private closed = false;
+  readonly isReadOnly: boolean;
 
-  private constructor(private readonly pool: Pool) {}
+  private constructor(
+    private readonly pool: Pool,
+    readOnly = false,
+  ) {
+    this.isReadOnly = readOnly;
+  }
 
   static open(connectionString: string, options: OpenOptions = {}): Database {
+    const readOnly = options.readOnly === true;
     const config: PoolConfig = {
       connectionString,
       max: options.maxConnections ?? 10,
@@ -62,11 +83,22 @@ export class Database implements Transactional {
       // A watcher query that has not finished in thirty seconds is wedged, not slow, and holding
       // the connection does not help it.
       statement_timeout: options.statementTimeoutMs ?? 30_000,
+      ...(readOnly ? { options: "-c default_transaction_read_only=on" } : {}),
     };
-    return new Database(new Pool(config));
+    return new Database(new Pool(config), readOnly);
+  }
+
+  /**
+   * Construct a `Database` wrapper over an injected pool-like object for unit tests.
+   */
+  static wrapPool(pool: Pool, options: { readonly readOnly?: boolean } = {}): Database {
+    return new Database(pool, options.readOnly === true);
   }
 
   async query(text: string, params: readonly unknown[] = []): Promise<QueryResultRows> {
+    if (this.isReadOnly && isMigrationOrWriteDdl(text)) {
+      throw new ReadOnlyDatabaseError("DDL or migration write");
+    }
     const result = await this.pool.query(text, params as unknown[]);
     return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount ?? 0 };
   }
@@ -79,6 +111,9 @@ export class Database implements Transactional {
    * only as good as nobody being able to write one without the other.
    */
   async transaction<T>(work: (tx: Queryable) => Promise<T>): Promise<T> {
+    if (this.isReadOnly) {
+      throw new ReadOnlyDatabaseError("read-write transaction");
+    }
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -105,6 +140,9 @@ export class Database implements Transactional {
    * Returns the count of deleted rows.
    */
   async pruneCompletedAttestations(olderThanDays = 30): Promise<number> {
+    if (this.isReadOnly) {
+      throw new ReadOnlyDatabaseError("pruneCompletedAttestations");
+    }
     const { rowCount } = await this.query(
       `DELETE FROM rail_attestation
         WHERE status = 'delivered'
@@ -152,6 +190,13 @@ export function startMaintenanceTask(
   return () => {
     clearInterval(timer);
   };
+}
+
+function isMigrationOrWriteDdl(sql: string): boolean {
+  return (
+    /^\s*(?:CREATE|ALTER|DROP|TRUNCATE|INSERT|UPDATE|DELETE)\b/i.test(sql) ||
+    /\bpg_advisory_lock\b|\bpg_try_advisory_lock\b/i.test(sql)
+  );
 }
 
 function wrapClient(client: PoolClient): Queryable {

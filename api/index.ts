@@ -22,9 +22,11 @@ async function getApp(): Promise<FastifyInstance> {
   const logger = createLogger(config);
   const startedAt = new Date();
 
+  // Serverless API instances are strictly read-only and must never perform implicit migrations.
   const db = Database.open(config.databaseUrl, {
     applicationName: "hyperion-vercel-api",
     connectionTimeoutMs: 2000,
+    readOnly: true,
   });
 
   app = buildServer({
