@@ -29,10 +29,13 @@ export interface FormattedRouteHealth {
 export function registerRouteHealthRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
 
-  app.get("/v1/routes/health", async (_request, reply: FastifyReply) => {
-    // Return latest sample per (origin_chain, destination_chain, route, token)
-    const { rows } = await db.query(
-      `SELECT DISTINCT ON (origin_chain, destination_chain, route, token)
+  app.get(
+    "/v1/routes/health",
+    { config: { rateLimitScope: "public_read" } },
+    async (_request, reply: FastifyReply) => {
+      // Return latest sample per (origin_chain, destination_chain, route, token)
+      const { rows } = await db.query(
+        `SELECT DISTINCT ON (origin_chain, destination_chain, route, token)
               origin_chain,
               destination_chain,
               route,
@@ -43,28 +46,29 @@ export function registerRouteHealthRoutes(app: FastifyInstance, deps: ServerDeps
               sampled_at AS observed_at
          FROM route_health
         ORDER BY origin_chain, destination_chain, route, token, id DESC`,
-    );
+      );
 
-    const routes: FormattedRouteHealth[] = rows.map((row) => {
-      const blockerCode = integer(row, "blocker") as QuoteBlocker;
-      const blockerInfo = describeBlocker(blockerCode);
+      const routes: FormattedRouteHealth[] = rows.map((row) => {
+        const blockerCode = integer(row, "blocker") as QuoteBlocker;
+        const blockerInfo = describeBlocker(blockerCode);
 
-      return {
-        originChain: text(row, "origin_chain"),
-        destinationChain: text(row, "destination_chain"),
-        route: integer(row, "route"),
-        token: text(row, "token"),
-        available: row.available === true,
-        blocker: {
-          code: blockerCode,
-          label: blockerInfo.label,
-          detail: blockerInfo.detail,
-        },
-        flowAvailable: textOrNull(row, "flow_available"),
-        observedAt: new Date(row.observed_at as string | number | Date).toISOString(),
-      };
-    });
+        return {
+          originChain: text(row, "origin_chain"),
+          destinationChain: text(row, "destination_chain"),
+          route: integer(row, "route"),
+          token: text(row, "token"),
+          available: row.available === true,
+          blocker: {
+            code: blockerCode,
+            label: blockerInfo.label,
+            detail: blockerInfo.detail,
+          },
+          flowAvailable: textOrNull(row, "flow_available"),
+          observedAt: new Date(row.observed_at as string | number | Date).toISOString(),
+        };
+      });
 
-    return reply.send({ routes, count: routes.length });
-  });
+      return reply.send({ routes, count: routes.length });
+    },
+  );
 }

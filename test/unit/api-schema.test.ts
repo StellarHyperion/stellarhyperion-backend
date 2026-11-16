@@ -84,8 +84,22 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
   it("reads actual cursor position/hash column names in metrics", async () => {
     const response = await app.inject("/v1/metrics");
     expect(response.statusCode).toBe(200);
+    expect(response.headers["x-ratelimit-scope"]).toBe("operational");
+    expect(response.headers["ratelimit-policy"]).toBe('60;w=60;scope="operational"');
     expect(response.json().cursors[0].block).toBe("123");
     expect(response.json().cursors[0].hash).toBeNull();
+  });
+
+  it("exposes documented rate-limit policy metadata across probe and public read scopes", async () => {
+    const health = await app.inject("/health");
+    expect(health.statusCode).toBe(200);
+    expect(health.headers["x-ratelimit-scope"]).toBe("probe");
+    expect(health.headers["ratelimit-policy"]).toBe('300;w=60;scope="probe"');
+
+    const transfers = await app.inject("/v1/transfers");
+    expect(transfers.statusCode).toBe(200);
+    expect(transfers.headers["x-ratelimit-scope"]).toBe("public_read");
+    expect(transfers.headers["ratelimit-policy"]).toBe('120;w=60;scope="public_read"');
   });
 
   it("renders EVM recipient words as actual addresses for wallet and explorer links", async () => {

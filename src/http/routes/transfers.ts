@@ -245,6 +245,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
   // 1. Look up by originChain and nonce
   app.get(
     "/v1/transfers/:originChain/:nonce",
+    { config: { rateLimitScope: "public_read" } },
     async (
       request: FastifyRequest<{ Params: { originChain: string; nonce: string } }>,
       reply: FastifyReply,
@@ -270,6 +271,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
   // 2. Look up by transaction hash
   app.get(
     "/v1/transfers/by-tx/:txHash",
+    { config: { rateLimitScope: "public_read" } },
     async (request: FastifyRequest<{ Params: { txHash: string } }>, reply: FastifyReply) => {
       const { txHash } = request.params;
       const { rows } = await db.query(
@@ -396,8 +398,16 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     }, heartbeatInterval);
   };
 
-  app.get("/v1/transfers/:id/stream", handleStream);
-  app.get("/api/v1/transfers/:id/stream", handleStream);
+  app.get(
+    "/v1/transfers/:id/stream",
+    { config: { rateLimitScope: "public_stream" } },
+    handleStream,
+  );
+  app.get(
+    "/api/v1/transfers/:id/stream",
+    { config: { rateLimitScope: "public_stream" } },
+    handleStream,
+  );
 
   // 4. Look up by ID
   const getTransferById = async (
@@ -415,12 +425,13 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     return reply.send(transfer);
   };
 
-  app.get("/v1/transfers/:id", getTransferById);
-  app.get("/api/v1/transfers/:id", getTransferById);
+  app.get("/v1/transfers/:id", { config: { rateLimitScope: "public_read" } }, getTransferById);
+  app.get("/api/v1/transfers/:id", { config: { rateLimitScope: "public_read" } }, getTransferById);
 
   // 3. List transfers with filtering
   app.get(
     "/v1/transfers",
+    { config: { rateLimitScope: "public_read" } },
     async (
       request: FastifyRequest<{
         Querystring: {

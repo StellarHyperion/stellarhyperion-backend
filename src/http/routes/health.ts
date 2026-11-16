@@ -28,7 +28,7 @@ const READINESS_MEANING =
 export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const startedAt = deps.startedAt ?? new Date();
 
-  app.get("/health", () => ({
+  app.get("/health", { config: { rateLimitScope: "probe" } }, () => ({
     status: "ok",
     meaning: LIVENESS_MEANING,
     service: "hyperion-backend",
@@ -36,7 +36,7 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
     uptimeSeconds: Math.floor((Date.now() - startedAt.getTime()) / 1000),
   }));
 
-  app.get("/ready", async (_request, reply) => {
+  app.get("/ready", { config: { rateLimitScope: "probe" } }, async (_request, reply) => {
     const checks: ReadinessReport[] = [await checkDatabase(deps), await checkRedis(deps)];
 
     for (const source of deps.readiness) {

@@ -100,10 +100,16 @@ export interface KeeperConfig {
   readonly stellarSecret: string | null;
 }
 
+export interface HttpConfig {
+  readonly host: string;
+  readonly port: number;
+  readonly trustProxyHops: number;
+}
+
 export interface AppConfig {
   readonly nodeEnv: NodeEnv;
   readonly logLevel: LogLevel;
-  readonly http: { readonly host: string; readonly port: number };
+  readonly http: HttpConfig;
   readonly databaseUrl: string;
   readonly redisUrl: string;
   readonly network: NetworkMode;
@@ -161,6 +167,18 @@ const HTTP_PORT: VarSpec = {
   max: 65_535,
   printable: true,
   purpose: "The port the API listens on.",
+};
+
+const HTTP_TRUST_PROXY_HOPS: VarSpec = {
+  name: "HTTP_TRUST_PROXY_HOPS",
+  kind: "integer",
+  required: false,
+  fallback: "0",
+  min: 0,
+  max: 10,
+  printable: true,
+  purpose:
+    "Number of reverse proxy hops appended to X-Forwarded-For that rate limiting trusts. Zero ignores forwarded headers so untrusted callers cannot spoof client addresses.",
 };
 
 const DATABASE_URL: VarSpec = {
@@ -450,6 +468,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const logLevel = reader.choice(LOG_LEVEL);
   const host = reader.string(HTTP_HOST);
   const port = reader.integer(HTTP_PORT);
+  const trustProxyHops = reader.integer(HTTP_TRUST_PROXY_HOPS);
   const databaseUrl = reader.url(DATABASE_URL);
   const keeperEnabled = reader.boolean(KEEPER_ENABLED);
   const redisUrl = reader.url({ ...REDIS_URL, required: keeperEnabled });
@@ -505,7 +524,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   return {
     nodeEnv,
     logLevel,
-    http: { host, port },
+    http: { host, port, trustProxyHops },
     databaseUrl,
     redisUrl,
     network,

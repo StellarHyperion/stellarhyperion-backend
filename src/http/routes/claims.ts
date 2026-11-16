@@ -49,6 +49,7 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
   // 1. Get specific claim by chain and claim id
   app.get(
     "/v1/claims/:chain/:claimId",
+    { config: { rateLimitScope: "public_read" } },
     async (
       request: FastifyRequest<{ Params: { chain: string; claimId: string } }>,
       reply: FastifyReply,
@@ -78,6 +79,7 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
   // 2. List claims
   app.get(
     "/v1/claims",
+    { config: { rateLimitScope: "public_read" } },
     async (
       request: FastifyRequest<{
         Querystring: {

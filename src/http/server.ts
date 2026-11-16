@@ -2,11 +2,10 @@ import Fastify, { LogController } from "fastify";
 import type { FastifyBaseLogger, FastifyError, FastifyInstance } from "fastify";
 import type { Logger } from "pino";
 
-import rateLimit from "@fastify/rate-limit";
-
 import type { AppConfig } from "../config/config.js";
 import type { Database } from "../db/pool.js";
 import type { BullMQWorkerState, RedisPingable, ReadinessSource } from "../runtime/readiness.js";
+import { registerPublicRateLimiting, type RateLimitConfig } from "./rate-limit.js";
 import { registerClaimRoutes } from "./routes/claims.js";
 import { registerHealthRoutes } from "./routes/health.js";
 import { registerMetricsRoutes } from "./routes/metrics.js";
@@ -23,6 +22,8 @@ export interface ServerDeps {
   readonly readiness: readonly ReadinessSource[];
   /** Set at boot so `/health` can report how long the process has been up. */
   readonly startedAt?: Date;
+  /** Optional rate-limiting configuration and shared deployment store overrides. */
+  readonly rateLimit?: Omit<RateLimitConfig, "network">;
 }
 
 export function buildServer(deps: ServerDeps): FastifyInstance {
@@ -33,14 +34,16 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // annotation does the widening without an assertion, which keeps the intent visible instead of
   // looking like a cast somebody added to silence the compiler.
   const loggerInstance: FastifyBaseLogger = deps.logger;
+  const trustProxyHops = deps.rateLimit?.trustProxyHops ?? deps.config.http.trustProxyHops;
 
   const app = Fastify({
     // Fastify gets the same instance the watchers use, so a request line and a watcher line carry
     // the same service fields and the same redaction rules.
     loggerInstance,
-    // Behind a load balancer the client address is in the header, and rate limiting in B7 needs
-    // the real one. Only trustworthy because this never faces the internet directly.
-    trustProxy: true,
+    // Forwarded headers are ignored by default and only trusted up to the configured proxy hop
+    // count so untrusted callers cannot spoof client addresses.
+    trustProxy:
+      trustProxyHops > 0 ? (_address: string, hop: number) => hop <= trustProxyHops : false,
     // A request id that survives into every log line for that request. Fastify generates one;
     // naming the header means a caller can supply theirs and have it show up in our logs.
     requestIdHeader: "x-request-id",
@@ -53,18 +56,24 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     reply.header("Access-Control-Allow-Origin", "*");
     reply.header("Access-Control-Allow-Methods", "GET, OPTIONS");
     reply.header("Access-Control-Allow-Headers", "Accept, Content-Type");
+    reply.header(
+      "Access-Control-Expose-Headers",
+      "Retry-After, RateLimit-Policy, X-RateLimit-Scope, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset",
+    );
   });
   app.options("/*", async (_request, reply) => reply.code(204).send());
 
-  void app.register(rateLimit, {
-    max: 120,
-    timeWindow: "1 minute",
-    allowList: (req) => deps.config.nodeEnv === "test" || req.url.includes("/stream"),
-    errorResponseBuilder: () => ({
-      error: "too_many_requests",
-      message:
-        "rate limit exceeded; status endpoints must not be polled faster than twice a second",
-    }),
+  registerPublicRateLimiting(app, {
+    network: deps.config.network,
+    enabled: deps.rateLimit?.enabled ?? deps.config.nodeEnv !== "test",
+    trustProxyHops,
+    ...(deps.rateLimit?.trustedProxies ? { trustedProxies: deps.rateLimit.trustedProxies } : {}),
+    ...(deps.rateLimit?.budgets ? { budgets: deps.rateLimit.budgets } : {}),
+    ...(deps.rateLimit?.store ? { store: deps.rateLimit.store } : {}),
+    ...(deps.rateLimit?.maxLocalEntries !== undefined
+      ? { maxLocalEntries: deps.rateLimit.maxLocalEntries }
+      : {}),
+    ...(deps.rateLimit?.now ? { now: deps.rateLimit.now } : {}),
   });
 
   registerHealthRoutes(app, deps);
