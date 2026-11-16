@@ -36,3 +36,26 @@ export function completeEnv(
     ...overrides,
   };
 }
+
+export {
+  applyRepositoryMigrations,
+  computeReferenceRangeDigests,
+  createMigratedPGliteDb,
+  loadUpMigrationSql,
+  readDatabaseHistorySnapshot,
+  reconcileRestoredDatabase,
+  replayMissingHistoryIntervals,
+  sortReferenceSnapshot,
+  type BlockInterval,
+  type ChainCoverageReport,
+  type ChainExpectedRange,
+  type DigestMismatch,
+  type HistoryDigests,
+  type NormalizedAttestationFact,
+  type NormalizedClaimFact,
+  type NormalizedInboundFact,
+  type NormalizedOutboundFact,
+  type PGliteTestDb,
+  type ReconciliationReport,
+  type ReferenceHistorySnapshot,
+} from "./reconciliation-runner.js";
