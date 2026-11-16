@@ -9,6 +9,7 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import { UNCACHEABLE_LIST_CACHE_CONTROL } from "../etag.js";
 import type { ServerDeps } from "../server.js";
 
 export interface FormattedRouteHealth {
@@ -65,6 +66,7 @@ export function registerRouteHealthRoutes(app: FastifyInstance, deps: ServerDeps
       };
     });
 
+    reply.header("Cache-Control", UNCACHEABLE_LIST_CACHE_CONTROL);
     return reply.send({ routes, count: routes.length });
   });
 }

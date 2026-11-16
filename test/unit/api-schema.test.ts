@@ -123,5 +123,16 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     expect(response.json().destination.decimals).toBe(6);
     expect(response.json().destination.symbol).toBe("USDC");
     expect(response.json().origin.netAmount).toBe("9970000");
+
+    const etag = response.headers.etag;
+    expect(typeof etag).toBe("string");
+    const conditionalRes = await app.inject({
+      method: "GET",
+      url: "/v1/transfers/stellar-testnet/43",
+      headers: { "if-none-match": String(etag) },
+    });
+    expect(conditionalRes.statusCode).toBe(304);
+    expect(conditionalRes.payload).toBe("");
+    expect(conditionalRes.headers.etag).toBe(etag);
   });
 });

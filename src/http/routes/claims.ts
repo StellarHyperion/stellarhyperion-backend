@@ -8,7 +8,12 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
-import { integer, text } from "../../db/rows.js";
+import { integer, text, textOrNull, timestampOrNull } from "../../db/rows.js";
+import {
+  UNCACHEABLE_LIST_CACHE_CONTROL,
+  computeCanonicalETag,
+  sendConditionalDetailResponse,
+} from "../etag.js";
 import type { ServerDeps } from "../server.js";
 
 export interface FormattedClaim {
@@ -56,7 +61,7 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       const { chain, claimId } = request.params;
       const { rows } = await db.query(
         `SELECT chain || ':' || claim_id::text AS id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
-                created_at, settled, observed_at
+                created_at, settled, settled_at, settled_by, settled_tx, observed_at
            FROM pending_claim
           WHERE chain = $1 AND claim_id = $2
           LIMIT 1`,
@@ -71,7 +76,22 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
         });
       }
 
-      return reply.send(formatClaimRow(row));
+      const formatted = formatClaimRow(row);
+      const settledAt = timestampOrNull(row, "settled_at");
+      const etag = computeCanonicalETag("hyp-claim-v1", {
+        claim: formatted,
+        settlement: {
+          settledAt: settledAt ? settledAt.toISOString() : null,
+          settledBy: textOrNull(row, "settled_by"),
+          settledTx: textOrNull(row, "settled_tx"),
+        },
+      });
+
+      return sendConditionalDetailResponse(request, reply, {
+        payload: formatted,
+        etag,
+        isFinalized: formatted.settled,
+      });
     },
   );
 
@@ -128,6 +148,7 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
         params,
       );
 
+      reply.header("Cache-Control", UNCACHEABLE_LIST_CACHE_CONTROL);
       return reply.send({
         claims: rows.map(formatClaimRow),
         limit: parsedLimit,
