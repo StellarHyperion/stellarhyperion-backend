@@ -7,10 +7,14 @@
  * rather than pointed at anvil, which will mine on demand but will not rewrite history underneath
  * a running watcher.
  */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { PGlite } from "@electric-sql/pglite";
 import { describe, expect, it } from "vitest";
 
 import { EvmWatcher } from "../../src/chains/evm/watcher.js";
 import { viemClient, type EvmClient } from "../../src/chains/evm/client.js";
+import type { Queryable, Transactional } from "../../src/db/pool.js";
 import {
   ANVIL_HISTORY,
   ANVIL_CHAIN_ID,
@@ -545,5 +549,365 @@ describe("RPC endpoint failover", () => {
 
     // Cursor now advances properly from cursorRow(20n)
     expect(cursorWrites(db)).toEqual([{ block: 57n, family: "evm", hash: expect.any(String) }]);
+  });
+});
+
+async function openRollbackDb(): Promise<{
+  readonly db: Transactional;
+  readonly close: () => Promise<void>;
+}> {
+  const pg = new PGlite();
+  for (const migration of [
+    "1790900000000_initial-schema.sql",
+    "1791000000000_cursor-block-hash.sql",
+    "1791100000000_cursor-autovacuum-tuning.sql",
+    "1791200000000_evm-reorg-provenance-rollback.sql",
+  ]) {
+    const filePath = fileURLToPath(new URL(`../../migrations/${migration}`, import.meta.url));
+    const upSql = readFileSync(filePath, "utf8").split("-- Down Migration")[0]!;
+    await pg.exec(upSql);
+  }
+
+  const runQuery = async (sql: string, params: readonly unknown[] = []) => {
+    const result = await pg.query(sql, [...params]);
+    const int8 = result.fields.filter((f) => f.dataTypeID === 20).map((f) => f.name);
+    const rows = result.rows.map((raw) => {
+      const row = { ...(raw as Record<string, unknown>) };
+      for (const col of int8) {
+        const val = row[col];
+        if (typeof val === "number" || typeof val === "bigint") row[col] = String(val);
+      }
+      return row;
+    });
+    return { rows, rowCount: result.affectedRows ?? result.rows.length };
+  };
+
+  const db: Transactional = {
+    query: runQuery,
+    transaction: async <T>(fn: (tx: Queryable) => Promise<T>): Promise<T> => {
+      await pg.exec("BEGIN");
+      try {
+        const value = await fn({ query: runQuery });
+        await pg.exec("COMMIT");
+        return value;
+      } catch (error) {
+        await pg.exec("ROLLBACK");
+        throw error;
+      }
+    },
+  };
+
+  return {
+    db,
+    close: () => pg.close(),
+  };
+}
+
+describe("transactional rollback of orphaned EVM events and derived rows", () => {
+  const SENDER = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+  const RECIPIENT = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8";
+  const SETTLER = "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc";
+  const TOKEN = "0x5fbdb2315678afecb367f032d93f642f64180aa3";
+
+  it("removes transfers present only on the old fork and rebuilds claims and lifecycle state", async () => {
+    const { db, close } = await openRollbackDb();
+    try {
+      // Block 12 (canonical before fork): parked claim #5 + arrival for sourceNonce 101
+      const safeTx = `0x${"10".repeat(32)}` as const;
+      const safeClaim = encodedLog(
+        "ClaimParked",
+        {
+          id: 5n,
+          recipient: RECIPIENT,
+          token: TOKEN,
+          amount: 500_000n,
+          route: 0,
+          sourceChain: "stellar-testnet",
+          sourceNonce: 101n,
+        },
+        { blockNumber: 12n, logIndex: 0, txHash: safeTx },
+      );
+      const safeArrival = encodedLog(
+        "BridgeIn",
+        {
+          route: 0,
+          recipient: RECIPIENT,
+          token: TOKEN,
+          amount: 500_000n,
+          sourceChain: "stellar-testnet",
+          sourceNonce: 101n,
+          messageId: `0x${"11".repeat(32)}`,
+        },
+        { blockNumber: 12n, logIndex: 1, txHash: safeTx },
+      );
+
+      // Block 18 (orphaned fork):
+      // 1) Outbound transfer nonce=77 that vanishes on replacement fork
+      // 2) Settlement of claim #5 that vanishes on replacement fork
+      // 3) Parked claim #9 + arrival for sourceNonce 202 that becomes a direct landed delivery on replacement fork
+      const forkTx = `0x${"20".repeat(32)}` as const;
+      const orphanedOutbound = encodedLog(
+        "BridgeOut",
+        {
+          route: 0,
+          nonce: 77n,
+          sender: SENDER,
+          token: TOKEN,
+          grossAmount: 1_000_000n,
+          fee: 3_000n,
+          netAmount: 997_000n,
+          destinationChain: "stellar-testnet",
+          destinationAddress: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+          railRef: `0x${"00".repeat(32)}`,
+        },
+        { blockNumber: 18n, logIndex: 0, txHash: forkTx },
+      );
+      const orphanedSettle = encodedLog(
+        "ClaimSettled",
+        {
+          id: 5n,
+          recipient: RECIPIENT,
+          token: TOKEN,
+          amount: 500_000n,
+          settledBy: SETTLER,
+        },
+        { blockNumber: 18n, logIndex: 1, txHash: forkTx },
+      );
+      const orphanedParkedClaim = encodedLog(
+        "ClaimParked",
+        {
+          id: 9n,
+          recipient: RECIPIENT,
+          token: TOKEN,
+          amount: 800_000n,
+          route: 0,
+          sourceChain: "stellar-testnet",
+          sourceNonce: 202n,
+        },
+        { blockNumber: 18n, logIndex: 2, txHash: forkTx },
+      );
+      const orphanedParkedArrival = encodedLog(
+        "BridgeIn",
+        {
+          route: 0,
+          recipient: RECIPIENT,
+          token: TOKEN,
+          amount: 800_000n,
+          sourceChain: "stellar-testnet",
+          sourceNonce: 202n,
+          messageId: `0x${"22".repeat(32)}`,
+        },
+        { blockNumber: 18n, logIndex: 3, txHash: forkTx },
+      );
+
+      const client = new FakeEvmClient({
+        logs: [
+          safeClaim,
+          safeArrival,
+          orphanedOutbound,
+          orphanedSettle,
+          orphanedParkedClaim,
+          orphanedParkedArrival,
+        ],
+        head: 20n,
+      });
+      const { logger } = capturingLogger();
+      const watcher = new EvmWatcher({
+        chainKey: CHAIN,
+        router: ANVIL_ROUTER,
+        chainId: ANVIL_CHAIN_ID,
+        startBlock: 10n,
+        confirmations: 0,
+        reorgDepth: 5,
+        logRange: 50,
+        client,
+        db,
+        logger,
+      });
+
+      await watcher.tick(AbortSignal.timeout(5_000));
+
+      // Verify pre-reorg state exists on the old fork.
+      expect(
+        (await db.query("SELECT nonce FROM outbound_transfer WHERE origin_chain = $1", [CHAIN]))
+          .rows,
+      ).toEqual([{ nonce: "77" }]);
+      expect(
+        (
+          await db.query(
+            "SELECT claim_id, settled FROM pending_claim WHERE chain = $1 ORDER BY claim_id",
+            [CHAIN],
+          )
+        ).rows,
+      ).toEqual([
+        { claim_id: "5", settled: true },
+        { claim_id: "9", settled: false },
+      ]);
+
+      // Replacement canonical fork from block 16:
+      // - Outbound nonce=77 never happened
+      // - Claim #5 was NOT settled yet
+      // - Arrival sourceNonce=202 landed directly with delivered=true (no parked claim #9)
+      const replacementArrival = encodedLog(
+        "BridgeIn",
+        {
+          route: 0,
+          recipient: RECIPIENT,
+          token: TOKEN,
+          amount: 800_000n,
+          sourceChain: "stellar-testnet",
+          sourceNonce: 202n,
+          messageId: `0x${"22".repeat(32)}`,
+        },
+        { blockNumber: 19n, logIndex: 0, txHash: `0x${"30".repeat(32)}` },
+      );
+
+      client.reorg(16n, [replacementArrival]);
+      client.advanceHeadTo(21n);
+
+      await watcher.tick(AbortSignal.timeout(5_000));
+
+      // 1) Transfer present only on old fork disappeared completely.
+      const transfersAfter = await db.query(
+        "SELECT nonce FROM outbound_transfer WHERE origin_chain = $1",
+        [CHAIN],
+      );
+      expect(transfersAfter.rows).toEqual([]);
+
+      // 2) Claim #5 reverted to unsettled; orphaned claim #9 disappeared.
+      const claimsAfter = await db.query(
+        "SELECT claim_id, settled, settled_at, settled_by, settled_tx FROM pending_claim WHERE chain = $1 ORDER BY claim_id",
+        [CHAIN],
+      );
+      expect(claimsAfter.rows).toEqual([
+        {
+          claim_id: "5",
+          settled: false,
+          settled_at: null,
+          settled_by: null,
+          settled_tx: null,
+        },
+      ]);
+
+      // 3) Replacement arrival rebuilt sourceNonce=202 as delivered=true with claim_id=null and canonical block hash.
+      const deliveriesAfter = await db.query(
+        `SELECT source_nonce, delivered, claim_id, destination_block, destination_block_hash
+           FROM inbound_delivery
+          WHERE destination_chain = $1
+          ORDER BY source_nonce`,
+        [CHAIN],
+      );
+      expect(deliveriesAfter.rows).toEqual([
+        {
+          source_nonce: "101",
+          delivered: false,
+          claim_id: "5",
+          destination_block: "12",
+          destination_block_hash: client.stampFor(12n).hash,
+        },
+        {
+          source_nonce: "202",
+          delivered: true,
+          claim_id: null,
+          destination_block: "19",
+          destination_block_hash: client.stampFor(19n).hash,
+        },
+      ]);
+      expect(watcher.progress?.lastRollback).toMatchObject({
+        revertedClaimSettlements: 1,
+        deletedPendingClaims: 1,
+        deletedOutboundTransfers: 1,
+      });
+    } finally {
+      await close();
+    }
+  });
+
+  it("commits cursor rewind and derived-state rollback atomically", async () => {
+    const { db, close } = await openRollbackDb();
+    try {
+      const forkOutbound = encodedLog(
+        "BridgeOut",
+        {
+          route: 0,
+          nonce: 88n,
+          sender: SENDER,
+          token: TOKEN,
+          grossAmount: 500_000n,
+          fee: 1_000n,
+          netAmount: 499_000n,
+          destinationChain: "stellar-testnet",
+          destinationAddress: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+          railRef: `0x${"00".repeat(32)}`,
+        },
+        { blockNumber: 18n, logIndex: 0, txHash: `0x${"44".repeat(32)}` },
+      );
+
+      let failCursorWrite = false;
+      const guardedDb: Transactional = {
+        query: (sql, params) => db.query(sql, params),
+        transaction: (fn) =>
+          db.transaction((tx) =>
+            fn({
+              query: (sql, params) => {
+                if (failCursorWrite && sql.includes("INSERT INTO indexer_cursor")) {
+                  return Promise.reject(new Error("simulated cursor commit failure"));
+                }
+                return tx.query(sql, params);
+              },
+            }),
+          ),
+      };
+
+      const client = new FakeEvmClient({ logs: [forkOutbound], head: 20n });
+      const { logger } = capturingLogger();
+      const watcher = new EvmWatcher({
+        chainKey: CHAIN,
+        router: ANVIL_ROUTER,
+        chainId: ANVIL_CHAIN_ID,
+        startBlock: 10n,
+        confirmations: 0,
+        reorgDepth: 5,
+        logRange: 50,
+        client,
+        db: guardedDb,
+        logger,
+      });
+
+      await watcher.tick(AbortSignal.timeout(5_000));
+
+      // Trigger reorg removing forkOutbound, but fail right before cursor commit.
+      client.reorg(16n, []);
+      client.advanceHeadTo(21n);
+      failCursorWrite = true;
+
+      await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+        "simulated cursor commit failure",
+      );
+
+      // Because rollback and cursor commit share one transaction, neither committed partially.
+      expect(
+        (await db.query("SELECT nonce FROM outbound_transfer WHERE origin_chain = $1", [CHAIN]))
+          .rows,
+      ).toEqual([{ nonce: "88" }]);
+
+      // Next pass succeeds and atomically deletes the orphaned transfer + advances the cursor.
+      failCursorWrite = false;
+      await watcher.tick(AbortSignal.timeout(5_000));
+
+      expect(
+        (await db.query("SELECT nonce FROM outbound_transfer WHERE origin_chain = $1", [CHAIN]))
+          .rows,
+      ).toEqual([]);
+      const cursorRowAfter = await db.query(
+        "SELECT last_processed, last_processed_hash FROM indexer_cursor WHERE chain_key = $1",
+        [CHAIN],
+      );
+      expect(cursorRowAfter.rows).toEqual([
+        { last_processed: "21", last_processed_hash: client.stampFor(21n).hash },
+      ]);
+    } finally {
+      await close();
+    }
   });
 });

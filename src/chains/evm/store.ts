@@ -250,3 +250,117 @@ export async function applyRouterLog(
       return { kind: "ignored" };
   }
 }
+
+export interface ReorgRollbackSummary {
+  readonly revertedAttestations: number;
+  readonly revertedClaimSettlements: number;
+  readonly revertedActionSettlements: number;
+  readonly deletedInboundDeliveries: number;
+  readonly deletedPendingClaims: number;
+  readonly deletedOutboundTransfers: number;
+  readonly deletedAdminActions: number;
+  readonly deletedHealthSamples: number;
+}
+
+/**
+ * Roll back all materialized events and derived lifecycle transitions originating from orphaned
+ * blocks at or above `fromBlock` inside the active reorg-rewind transaction.
+ */
+export async function rollbackOrphanedEvmState(
+  tx: Queryable,
+  chainKey: string,
+  fromBlock: bigint,
+): Promise<ReorgRollbackSummary> {
+  const fromParam = fromBlock.toString();
+
+  const revertedAttestations = await tx.query(
+    `UPDATE rail_attestation a
+        SET status = CASE WHEN a.attested_at IS NOT NULL THEN 'attested' ELSE 'pending' END,
+            updated_at = now()
+       FROM outbound_transfer t
+       JOIN inbound_delivery d
+         ON d.destination_chain = t.destination_chain
+        AND d.route = t.route
+        AND d.source_chain = t.origin_chain
+        AND d.source_nonce = t.nonce
+      WHERE a.transfer_id = t.id
+        AND d.destination_chain = $1
+        AND d.destination_block >= $2
+        AND a.status = 'delivered'`,
+    [chainKey, fromParam],
+  );
+
+  const revertedClaimSettlements = await tx.query(
+    `UPDATE pending_claim
+        SET settled = false,
+            settled_at = NULL,
+            settled_by = NULL,
+            settled_tx = NULL,
+            settled_block = NULL,
+            settled_log_index = NULL,
+            settled_block_hash = NULL
+      WHERE chain = $1
+        AND settled_block >= $2`,
+    [chainKey, fromParam],
+  );
+
+  const revertedActionSettlements = await tx.query(
+    `UPDATE admin_action
+        SET state = 'queued',
+            settled_at = NULL,
+            actor = NULL,
+            settled_block = NULL,
+            settled_tx = NULL,
+            settled_log_index = NULL,
+            settled_block_hash = NULL
+      WHERE chain = $1
+        AND settled_block >= $2`,
+    [chainKey, fromParam],
+  );
+
+  const deletedInboundDeliveries = await tx.query(
+    `DELETE FROM inbound_delivery
+      WHERE destination_chain = $1
+        AND destination_block >= $2`,
+    [chainKey, fromParam],
+  );
+
+  const deletedPendingClaims = await tx.query(
+    `DELETE FROM pending_claim
+      WHERE chain = $1
+        AND parked_block >= $2`,
+    [chainKey, fromParam],
+  );
+
+  const deletedOutboundTransfers = await tx.query(
+    `DELETE FROM outbound_transfer
+      WHERE origin_chain = $1
+        AND origin_block >= $2`,
+    [chainKey, fromParam],
+  );
+
+  const deletedAdminActions = await tx.query(
+    `DELETE FROM admin_action
+      WHERE chain = $1
+        AND queued_block >= $2`,
+    [chainKey, fromParam],
+  );
+
+  const deletedHealthSamples = await tx.query(
+    `DELETE FROM route_health
+      WHERE origin_chain = $1
+        AND sample_block >= $2`,
+    [chainKey, fromParam],
+  );
+
+  return {
+    revertedAttestations: revertedAttestations.rowCount,
+    revertedClaimSettlements: revertedClaimSettlements.rowCount,
+    revertedActionSettlements: revertedActionSettlements.rowCount,
+    deletedInboundDeliveries: deletedInboundDeliveries.rowCount,
+    deletedPendingClaims: deletedPendingClaims.rowCount,
+    deletedOutboundTransfers: deletedOutboundTransfers.rowCount,
+    deletedAdminActions: deletedAdminActions.rowCount,
+    deletedHealthSamples: deletedHealthSamples.rowCount,
+  };
+}

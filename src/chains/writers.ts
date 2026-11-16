@@ -29,6 +29,8 @@ export interface Position {
   readonly txHash: string;
   /** Log index on an EVM chain. Null on Stellar, which orders events differently. */
   readonly logIndex: number | null;
+  /** Canonical block hash on EVM chains when available; null on Stellar. */
+  readonly blockHash?: string | null;
   /** The chain's own timestamp, never ours. Lag measured against our clock hides a stall. */
   readonly observedAt: Date;
 }
@@ -110,8 +112,8 @@ export async function writeOutbound(db: Queryable, at: Position, row: OutboundRo
     `INSERT INTO outbound_transfer
        (origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
         destination_chain, destination, rail_ref, origin_block, origin_tx, origin_log_index,
-        observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        observed_at, origin_block_hash)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
      ON CONFLICT (origin_chain, nonce) DO UPDATE
        SET route = EXCLUDED.route,
            sender = EXCLUDED.sender,
@@ -124,7 +126,8 @@ export async function writeOutbound(db: Queryable, at: Position, row: OutboundRo
            rail_ref = COALESCE(EXCLUDED.rail_ref, outbound_transfer.rail_ref),
            origin_block = EXCLUDED.origin_block,
            origin_tx = EXCLUDED.origin_tx,
-           origin_log_index = EXCLUDED.origin_log_index`,
+           origin_log_index = EXCLUDED.origin_log_index,
+           origin_block_hash = EXCLUDED.origin_block_hash`,
     [
       at.chainKey,
       row.route,
@@ -141,6 +144,7 @@ export async function writeOutbound(db: Queryable, at: Position, row: OutboundRo
       at.txHash,
       at.logIndex,
       at.observedAt,
+      at.blockHash ?? null,
     ],
   );
 }
@@ -150,8 +154,8 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
     `INSERT INTO inbound_delivery
        (destination_chain, route, source_chain, source_nonce, rail_message_id, recipient, token,
         amount, delivered, claim_id, destination_block, destination_tx, destination_log_index,
-        observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        observed_at, destination_block_hash)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
      ON CONFLICT (destination_chain, route, source_chain, source_nonce) DO UPDATE
        SET rail_message_id = COALESCE(EXCLUDED.rail_message_id, inbound_delivery.rail_message_id),
            recipient = EXCLUDED.recipient,
@@ -161,7 +165,8 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
            claim_id = EXCLUDED.claim_id,
            destination_block = EXCLUDED.destination_block,
            destination_tx = EXCLUDED.destination_tx,
-           destination_log_index = EXCLUDED.destination_log_index`,
+           destination_log_index = EXCLUDED.destination_log_index,
+           destination_block_hash = EXCLUDED.destination_block_hash`,
     [
       at.chainKey,
       row.route,
@@ -177,6 +182,7 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
       at.txHash,
       at.logIndex,
       at.observedAt,
+      at.blockHash ?? null,
     ],
   );
 }
@@ -185,8 +191,8 @@ export async function writeClaim(db: Queryable, at: Position, row: ClaimRow): Pr
   await db.query(
     `INSERT INTO pending_claim
        (chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
-        created_at, settled, observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, $10)
+        created_at, settled, observed_at, parked_block, parked_tx, parked_log_index, parked_block_hash)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, $10, $11, $12, $13, $14)
      ON CONFLICT (chain, claim_id) DO UPDATE
        SET recipient = EXCLUDED.recipient,
            token = EXCLUDED.token,
@@ -194,7 +200,11 @@ export async function writeClaim(db: Queryable, at: Position, row: ClaimRow): Pr
            route = EXCLUDED.route,
            source_chain = EXCLUDED.source_chain,
            source_nonce = EXCLUDED.source_nonce,
-           created_at = EXCLUDED.created_at`,
+           created_at = EXCLUDED.created_at,
+           parked_block = EXCLUDED.parked_block,
+           parked_tx = EXCLUDED.parked_tx,
+           parked_log_index = EXCLUDED.parked_log_index,
+           parked_block_hash = EXCLUDED.parked_block_hash`,
     [
       at.chainKey,
       row.claimId.toString(),
@@ -206,6 +216,10 @@ export async function writeClaim(db: Queryable, at: Position, row: ClaimRow): Pr
       row.sourceNonce.toString(),
       row.createdAt,
       at.observedAt,
+      at.block.toString(),
+      at.txHash,
+      at.logIndex,
+      at.blockHash ?? null,
     ],
   );
 }
@@ -226,9 +240,24 @@ export async function settleClaim(
 ): Promise<boolean> {
   const { rowCount } = await db.query(
     `UPDATE pending_claim
-        SET settled = true, settled_at = $3, settled_by = $4, settled_tx = $5
+        SET settled = true,
+            settled_at = $3,
+            settled_by = $4,
+            settled_tx = $5,
+            settled_block = $6,
+            settled_log_index = $7,
+            settled_block_hash = $8
       WHERE chain = $1 AND claim_id = $2 AND NOT settled`,
-    [at.chainKey, claimId.toString(), at.observedAt, settledBy, at.txHash],
+    [
+      at.chainKey,
+      claimId.toString(),
+      at.observedAt,
+      settledBy,
+      at.txHash,
+      at.block.toString(),
+      at.logIndex,
+      at.blockHash ?? null,
+    ],
   );
   return rowCount > 0;
 }
@@ -244,14 +273,19 @@ export async function settleClaim(
 export async function writeAction(db: Queryable, at: Position, row: ActionRow): Promise<void> {
   await db.query(
     `INSERT INTO admin_action
-       (chain, action_id, kind, state, payload, eta, expires_at, queued_at, observed_at)
-     VALUES ($1, $2, $3, 'queued', $4, $5, $6, $7, $8)
+       (chain, action_id, kind, state, payload, eta, expires_at, queued_at, observed_at,
+        queued_block, queued_tx, queued_log_index, queued_block_hash)
+     VALUES ($1, $2, $3, 'queued', $4, $5, $6, $7, $8, $9, $10, $11, $12)
      ON CONFLICT (chain, action_id) DO UPDATE
        SET kind = EXCLUDED.kind,
            payload = EXCLUDED.payload,
            eta = EXCLUDED.eta,
            expires_at = EXCLUDED.expires_at,
-           queued_at = EXCLUDED.queued_at`,
+           queued_at = EXCLUDED.queued_at,
+           queued_block = EXCLUDED.queued_block,
+           queued_tx = EXCLUDED.queued_tx,
+           queued_log_index = EXCLUDED.queued_log_index,
+           queued_block_hash = EXCLUDED.queued_block_hash`,
     [
       at.chainKey,
       row.actionId.toString(),
@@ -261,6 +295,10 @@ export async function writeAction(db: Queryable, at: Position, row: ActionRow): 
       row.expiresAt,
       at.observedAt,
       at.observedAt,
+      at.block.toString(),
+      at.txHash,
+      at.logIndex,
+      at.blockHash ?? null,
     ],
   );
 }
@@ -281,9 +319,25 @@ export async function settleAction(
 ): Promise<boolean> {
   const { rowCount } = await db.query(
     `UPDATE admin_action
-        SET state = $3, settled_at = $4, actor = COALESCE($5, actor)
+        SET state = $3,
+            settled_at = $4,
+            actor = COALESCE($5, actor),
+            settled_block = $6,
+            settled_tx = $7,
+            settled_log_index = $8,
+            settled_block_hash = $9
       WHERE chain = $1 AND action_id = $2 AND state = 'queued'`,
-    [at.chainKey, actionId.toString(), state, at.observedAt, actor],
+    [
+      at.chainKey,
+      actionId.toString(),
+      state,
+      at.observedAt,
+      actor,
+      at.block.toString(),
+      at.txHash,
+      at.logIndex,
+      at.blockHash ?? null,
+    ],
   );
   return rowCount > 0;
 }
@@ -304,8 +358,8 @@ export async function writeHealthSample(
   await db.query(
     `INSERT INTO route_health
        (sampled_at, origin_chain, destination_chain, route, token, available, blocker,
-        flow_available)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        flow_available, sample_block, sample_tx, sample_log_index, sample_block_hash)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
     [
       at.observedAt,
       sample.originChain,
@@ -315,6 +369,10 @@ export async function writeHealthSample(
       sample.available,
       sample.blocker,
       sample.flowAvailable === null ? null : sample.flowAvailable.toString(),
+      at.block.toString(),
+      at.txHash,
+      at.logIndex,
+      at.blockHash ?? null,
     ],
   );
 }

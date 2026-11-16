@@ -31,9 +31,14 @@ import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
 import type { Position } from "../writers.js";
-import { ClaimPairing, applyRouterLog } from "./store.js";
+import {
+  ClaimPairing,
+  type ReorgRollbackSummary,
+  applyRouterLog,
+  rollbackOrphanedEvmState,
+} from "./store.js";
 import { decodeRouterLog, signatureOf } from "./logs.js";
-import type { EvmClient, RawEvmLog } from "./client.js";
+import type { BlockStamp, EvmClient, RawEvmLog } from "./client.js";
 
 /**
  * How far behind the confirmation line still counts as current.
@@ -72,6 +77,7 @@ export interface EvmProgress {
   /** Blocks between the cursor and the deepest block this watcher will read. */
   readonly behind: number;
   readonly reorgs: number;
+  readonly lastRollback?: ReorgRollbackSummary;
   readonly at: Date;
 }
 
@@ -153,20 +159,57 @@ export class EvmWatcher {
     const confirmed = head - BigInt(confirmations);
 
     let from = stored === null ? this.options.startBlock : stored.position + 1n;
+    let rewoundFrom: bigint | null = null;
     if (stored !== null && stored.hash !== null) {
-      const rewound = await this.checkForReorg(stored.position, stored.hash, signal);
-      if (rewound !== null) from = rewound;
+      rewoundFrom = await this.checkForReorg(stored.position, stored.hash, signal);
+      if (rewoundFrom !== null) from = rewoundFrom;
     }
 
     if (from > confirmed) {
+      let lastRollback: ReorgRollbackSummary | undefined;
+      let cursorBlock = stored?.position ?? this.options.startBlock - 1n;
+      if (rewoundFrom !== null) {
+        if (rewoundFrom <= this.options.startBlock) {
+          await db.transaction(async (tx: Queryable) => {
+            lastRollback = await rollbackOrphanedEvmState(tx, chainKey, rewoundFrom);
+            await tx.query("DELETE FROM indexer_cursor WHERE chain_key = $1", [chainKey]);
+          });
+          cursorBlock = this.options.startBlock - 1n;
+        } else {
+          const anchorBlock = rewoundFrom - 1n;
+          const anchorStamps = await client.blocks([anchorBlock], signal);
+          const anchorStamp = anchorStamps.get(anchorBlock);
+          if (anchorStamp === undefined) {
+            logger.warn(
+              { chain: chainKey, block: anchorBlock.toString() },
+              "rewind anchor disappeared mid pass, so nothing was committed",
+            );
+            return false;
+          }
+          await db.transaction(async (tx: Queryable) => {
+            lastRollback = await rollbackOrphanedEvmState(tx, chainKey, rewoundFrom);
+            await writeCursor(tx, {
+              chainKey,
+              family: "evm",
+              contract: router,
+              position: anchorBlock,
+              observedAt: timestampOf(anchorStamp.timestamp),
+              hash: anchorStamp.hash,
+            });
+          });
+          cursorBlock = anchorBlock;
+        }
+      }
+
       // Caught up to the confirmation line. Normal, and the common case on a fast chain.
       this.lastProgress = {
-        block: stored?.position ?? this.options.startBlock - 1n,
+        block: cursorBlock,
         written: 0,
         ignored: 0,
         head,
-        behind: Number(confirmed - (stored?.position ?? this.options.startBlock - 1n)),
+        behind: Number(confirmed - cursorBlock),
         reorgs: this.reorgs,
+        ...(lastRollback === undefined ? {} : { lastRollback }),
         at: new Date(),
       };
       return false;
@@ -194,11 +237,16 @@ export class EvmWatcher {
 
     let written = 0;
     let ignored = 0;
+    let lastRollback: ReorgRollbackSummary | undefined;
     const pairing = new ClaimPairing();
 
-    // One transaction for the range and the cursor advance past it. This is the restart guarantee,
-    // and splitting it would turn every crash into either a lost range or a duplicated one.
+    // One transaction for rolling back orphaned state (if rewinding), applying replacement canonical
+    // logs, and advancing the cursor.
     await db.transaction(async (tx: Queryable) => {
+      if (rewoundFrom !== null) {
+        lastRollback = await rollbackOrphanedEvmState(tx, chainKey, rewoundFrom);
+      }
+
       for (const log of logs) {
         if (log.removed) {
           // viem marks a log from an orphaned block. Indexing one would record a transfer that is
@@ -206,13 +254,13 @@ export class EvmWatcher {
           ignored += 1;
           continue;
         }
-        const timestamp = blocks.get(log.blockNumber)?.timestamp;
-        if (timestamp === undefined) {
+        const stamp = blocks.get(log.blockNumber);
+        if (stamp === undefined) {
           throw new Error(
             `no timestamp for block ${log.blockNumber.toString()} on ${chainKey}, which three columns need`,
           );
         }
-        if (await this.apply(tx, log, timestamp, pairing)) written += 1;
+        if (await this.apply(tx, log, stamp, pairing)) written += 1;
         else ignored += 1;
       }
 
@@ -236,6 +284,7 @@ export class EvmWatcher {
       head,
       behind,
       reorgs: this.reorgs,
+      ...(lastRollback === undefined ? {} : { lastRollback }),
       at: new Date(),
     };
     logger.info(
@@ -314,7 +363,7 @@ export class EvmWatcher {
   private async apply(
     tx: Queryable,
     log: RawEvmLog,
-    timestamp: bigint,
+    stamp: BlockStamp,
     pairing: ClaimPairing,
   ): Promise<boolean> {
     const { chainKey, logger } = this.options;
@@ -337,7 +386,8 @@ export class EvmWatcher {
       txHash: log.transactionHash,
       // Unlike Soroban, which orders events within a transaction instead.
       logIndex: log.logIndex,
-      observedAt: new Date(Number(timestamp) * 1000),
+      blockHash: stamp.hash,
+      observedAt: new Date(Number(stamp.timestamp) * 1000),
     };
 
     const applied = await applyRouterLog(tx, at, decoded, pairing);

@@ -197,6 +197,41 @@ suite("replaying the anvil deployment's logs", () => {
     await clean();
     await drain();
   });
+
+  it("removes orphaned outbound transfers atomically during reorg rewind", async () => {
+    await clean();
+    const client = new FakeEvmClient({ head: ANVIL_HEAD });
+    const { logger } = capturingLogger();
+    const watcher = new EvmWatcher({
+      chainKey: CHAIN,
+      router: ANVIL_ROUTER,
+      chainId: ANVIL_CHAIN_ID,
+      startBlock: ANVIL_START_BLOCK,
+      confirmations: 0,
+      reorgDepth: 5,
+      logRange: 2_000,
+      client,
+      db,
+      logger,
+    });
+
+    await watcher.tick(AbortSignal.timeout(20_000));
+    expect(
+      (await db.query("SELECT nonce FROM outbound_transfer WHERE origin_chain = $1", [CHAIN])).rows,
+    ).toEqual([{ nonce: "1" }]);
+
+    // Block 35 held the outbound transfer; reorg from block 34 with empty replacement logs.
+    client.reorg(34n, []);
+    client.advanceHeadTo(ANVIL_HEAD + 1n);
+
+    await watcher.tick(AbortSignal.timeout(20_000));
+    expect(
+      (await db.query("SELECT nonce FROM outbound_transfer WHERE origin_chain = $1", [CHAIN])).rows,
+    ).toEqual([]);
+
+    await clean();
+    await drain();
+  });
 });
 
 /** Everything keyed, in a comparable shape. route_health is append only and deliberately absent. */
