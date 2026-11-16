@@ -30,10 +30,27 @@ export function isTerminal(status: AttestationStatus): boolean {
   return TERMINAL.includes(status);
 }
 
+export type RailProviderSignalKind =
+  | "in_progress"
+  | "recoverable_gas_failure"
+  | "message_failed"
+  | "candidate_approved"
+  | "candidate_executed"
+  | "unknown_status";
+
+export type PaymentUncertaintyKind = "receipt_unavailable" | "payout_unverified";
+
+export interface PaymentUncertainty {
+  readonly kind: PaymentUncertaintyKind;
+  readonly reason: string;
+}
+
 export interface RailReport {
   readonly forwardTxHash?: `0x${string}`;
   readonly execution?: { readonly txHash: `0x${string}`; readonly commandId: `0x${string}` };
   readonly status: AttestationStatus;
+  readonly providerSignal?: RailProviderSignalKind | undefined;
+  readonly paymentUncertainty?: PaymentUncertainty | undefined;
   /**
    * The rail's own word for it, verbatim.
    *

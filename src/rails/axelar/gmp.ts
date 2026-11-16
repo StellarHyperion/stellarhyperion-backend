@@ -1,9 +1,11 @@
 /** Axelar status lookup uses the API root and a searchGMP JSON method. */
 import type {
   AttestationStatus,
+  PaymentUncertainty,
   PendingTransfer,
   RailClient,
   RailLookup,
+  RailProviderSignalKind,
   RailReport,
 } from "../types.js";
 import { RailError } from "../types.js";
@@ -30,6 +32,7 @@ const MAPPING: Readonly<Record<string, AttestationStatus>> = {
   executed: "attested",
   error: "failed",
   insufficient_fee: "pending",
+  gas_unpaid: "pending",
 };
 
 /**
@@ -56,7 +59,7 @@ const FATAL_FLAGS = [
   "is_invalid_symbol",
 ] as const;
 
-interface GmpRow {
+export interface GmpRow {
   readonly status?: unknown;
   readonly simplified_status?: unknown;
   readonly message_id?: unknown;
@@ -70,6 +73,106 @@ interface GmpRow {
   } | null;
   readonly approved?: { readonly block_timestamp?: unknown } | null;
   readonly [flag: string]: unknown;
+}
+
+export interface AxelarProviderClassification {
+  readonly status: AttestationStatus;
+  readonly providerSignal: RailProviderSignalKind;
+  readonly unknownStatus: string | null;
+  readonly execution?: { readonly txHash: `0x${string}`; readonly commandId: `0x${string}` };
+  readonly paymentUncertainty?: PaymentUncertainty;
+}
+
+export function classifyAxelarGmpRow(row: GmpRow): AxelarProviderClassification {
+  const status = typeof row.status === "string" ? row.status : "";
+  const simplified = typeof row.simplified_status === "string" ? row.simplified_status : null;
+
+  const hasFatalFlag = FATAL_FLAGS.some((flag) => row[flag] === true);
+  if (hasFatalFlag) {
+    return {
+      status: "failed",
+      providerSignal: "message_failed",
+      unknownStatus: null,
+    };
+  }
+
+  const hasRecoverableGasSignal =
+    RECOVERABLE_FLAGS.some((flag) => row[flag] === true) ||
+    status === "insufficient_fee" ||
+    status === "gas_unpaid" ||
+    simplified === "insufficient_fee" ||
+    simplified === "gas_unpaid";
+
+  if (hasRecoverableGasSignal) {
+    return {
+      status: "pending",
+      providerSignal: "recoverable_gas_failure",
+      unknownStatus: null,
+    };
+  }
+
+  if (status === "error") {
+    return {
+      status: "failed",
+      providerSignal: "message_failed",
+      unknownStatus: null,
+    };
+  }
+
+  const validExecution =
+    typeof row.executed?.transactionHash === "string" &&
+    /^0x[0-9a-fA-F]{64}$/.test(row.executed.transactionHash) &&
+    typeof row.command_id === "string" &&
+    /^0x[0-9a-fA-F]{64}$/.test(row.command_id)
+      ? {
+          txHash: row.executed.transactionHash as `0x${string}`,
+          commandId: row.command_id as `0x${string}`,
+        }
+      : undefined;
+
+  if (status === "executed") {
+    return {
+      status: "attested",
+      providerSignal: "candidate_executed",
+      unknownStatus: null,
+      ...(validExecution !== undefined
+        ? { execution: validExecution }
+        : {
+            paymentUncertainty: {
+              kind: "payout_unverified",
+              reason: "missing_execution_coordinates",
+            },
+          }),
+    };
+  }
+
+  if (status === "approved" || status === "executing") {
+    return {
+      status: "attested",
+      providerSignal: "candidate_approved",
+      unknownStatus: null,
+      ...(validExecution !== undefined ? { execution: validExecution } : {}),
+    };
+  }
+
+  if (
+    status === "called" ||
+    status === "confirming" ||
+    status === "confirmed" ||
+    status === "approving"
+  ) {
+    return {
+      status: "pending",
+      providerSignal: "in_progress",
+      unknownStatus: null,
+    };
+  }
+
+  return {
+    status: "pending",
+    providerSignal: "unknown_status",
+    unknownStatus: status,
+  };
 }
 
 export interface GmpOptions {
@@ -159,39 +262,24 @@ export class AxelarGmpClient implements RailClient {
     const status = typeof row.status === "string" ? row.status : "";
     const simplified = typeof row.simplified_status === "string" ? row.simplified_status : null;
     const flags = [...RECOVERABLE_FLAGS, ...FATAL_FLAGS].filter((flag) => row[flag] === true);
+    const classified = classifyAxelarGmpRow(row);
 
-    let mapped = MAPPING[status];
-    if (mapped === undefined) {
-      // A status this build has never seen. Reported once and then left alone: the row keeps the
-      // rail's own word, and our status stays pending so the transfer keeps being polled rather
-      // than being written off on the strength of a string nobody has read.
-      if (!this.reported.has(status)) {
-        this.reported.add(status);
-        this.options.onUnknownStatus?.(status);
-      }
-      mapped = "pending";
+    if (classified.unknownStatus !== null && !this.reported.has(classified.unknownStatus)) {
+      this.reported.add(classified.unknownStatus);
+      this.options.onUnknownStatus?.(classified.unknownStatus);
     }
-    // A fatal flag outranks the status. Axelar will happily report `called` on a message whose
-    // destination address is invalid, and that is never going to arrive.
-    if (FATAL_FLAGS.some((flag) => row[flag] === true)) mapped = "failed";
 
     const words = [status, simplified, ...flags].filter((part): part is string => part !== null);
     return {
-      status: mapped,
+      status: classified.status,
+      providerSignal: classified.providerSignal,
       railStatus: words.join("/"),
       // The message id, because that is what Axelar's support asks for.
       reference: typeof row.message_id === "string" ? row.message_id : null,
       attestedAt: stampOf(row.approved) ?? stampOf(row.executed),
-      ...(typeof row.executed?.transactionHash === "string" &&
-      /^0x[0-9a-fA-F]{64}$/.test(row.executed.transactionHash) &&
-      typeof row.command_id === "string" &&
-      /^0x[0-9a-fA-F]{64}$/.test(row.command_id)
-        ? {
-            execution: {
-              txHash: row.executed.transactionHash as `0x${string}`,
-              commandId: row.command_id as `0x${string}`,
-            },
-          }
+      ...(classified.execution !== undefined ? { execution: classified.execution } : {}),
+      ...(classified.paymentUncertainty !== undefined
+        ? { paymentUncertainty: classified.paymentUncertainty }
         : {}),
     };
   }

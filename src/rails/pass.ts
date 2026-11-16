@@ -17,8 +17,9 @@
  * the pass records a cooldown and returns without asking anything until it passes. Doubling from a
  * second would spend those five minutes refreshing the block.
  */
+import { RouteKind } from "@hyperion/protocol";
 import type { AppConfig } from "../config/config.js";
-import { verifyItsDelivery } from "./axelar/delivery.js";
+import { verifyItsDeliveryOutcome, type ItsDeliveryDeps } from "./axelar/delivery.js";
 import { verifyCctpDelivery } from "./cctp/delivery.js";
 import type { Logger } from "pino";
 
@@ -48,6 +49,7 @@ export interface RailPassOptions {
   readonly maxCheckFailures: number;
   readonly now?: () => Date;
   readonly config?: AppConfig;
+  readonly itsDeliveryDeps?: ItsDeliveryDeps | undefined;
 }
 
 export interface RailProgress {
@@ -198,10 +200,48 @@ export class RailPass {
     }
 
     const { report } = lookup;
-    if (this.options.config && (report.execution || report.forwardTxHash)) {
-      const verified =
-        (await verifyItsDelivery(this.options.config, this.options.db, transfer, report)) ??
-        (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report));
+    let uncertaintyNote: string | null =
+      report.paymentUncertainty !== undefined
+        ? `${report.paymentUncertainty.kind}:${report.paymentUncertainty.reason}`
+        : null;
+
+    if (
+      this.options.config &&
+      transfer.route === RouteKind.AxelarIts &&
+      (report.execution !== undefined || report.providerSignal === "candidate_executed")
+    ) {
+      const itsOutcome = await verifyItsDeliveryOutcome(
+        this.options.config,
+        this.options.db,
+        transfer,
+        report,
+        this.options.itsDeliveryDeps,
+      );
+      if (itsOutcome.kind === "verified") {
+        await this.options.db.transaction(async (tx) => {
+          await writeInbound(tx, itsOutcome.delivery.at, itsOutcome.delivery.row);
+        });
+        await this.write(transfer, {
+          status: "delivered",
+          railStatus: report.railStatus,
+          reference: report.reference,
+          attestedAt: report.attestedAt,
+          checkedAt: at,
+          failures: 0,
+          error: null,
+        });
+        return true;
+      }
+      if (itsOutcome.kind === "receipt_unavailable" || itsOutcome.kind === "payout_unverified") {
+        uncertaintyNote = `${itsOutcome.kind}:${itsOutcome.reason}`;
+      }
+    } else if (this.options.config && report.forwardTxHash) {
+      const verified = await verifyCctpDelivery(
+        this.options.config,
+        this.options.db,
+        transfer,
+        report,
+      );
       if (verified) {
         await this.options.db.transaction(async (tx) => {
           await writeInbound(tx, verified.at, verified.row);
@@ -225,7 +265,7 @@ export class RailPass {
       attestedAt: report.attestedAt,
       checkedAt: at,
       failures: 0,
-      error: null,
+      error: uncertaintyNote,
     });
     return isTerminal(report.status);
   }

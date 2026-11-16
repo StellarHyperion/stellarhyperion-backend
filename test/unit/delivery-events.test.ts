@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { encodeAbiParameters, encodeEventTopics, stringToHex, type Hex } from "viem";
 import {
   ITS_ABI,
+  diagnoseItsReceiptLogs,
   matchingPayment,
   type DeliveryLog,
   type ExpectedDelivery,
@@ -70,5 +71,26 @@ describe("Destination delivery evidence", () => {
   it("does not lose a matching receipt event when another transfer shares the transaction", () => {
     const unrelated = { ...received, address: token as Hex };
     expect(matchingPayment([received, unrelated, paid], expected)).toBe(paid);
+  });
+  it("distinguishes missing command, mismatched command fields, and missing ERC-20 payment", () => {
+    expect(diagnoseItsReceiptLogs([paid], expected)).toEqual({
+      kind: "payout_unverified",
+      reason: "missing_its_command_event",
+    });
+    expect(
+      diagnoseItsReceiptLogs([received], { ...expected, amount: expected.amount + 1n }),
+    ).toEqual({
+      kind: "payout_unverified",
+      reason: "mismatched_its_command_fields",
+    });
+    expect(diagnoseItsReceiptLogs([received], expected)).toEqual({
+      kind: "payout_unverified",
+      reason: "missing_erc20_transfer_event",
+    });
+    expect(diagnoseItsReceiptLogs([received, paid], expected)).toEqual({
+      kind: "verified",
+      command: received,
+      payment: paid,
+    });
   });
 });
