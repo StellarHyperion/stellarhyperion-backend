@@ -33,6 +33,7 @@ import type { RailClient } from "../rails/types.js";
 import { KeeperWorker } from "../keeper/worker.js";
 import { viemClient } from "./evm/client.js";
 import { EvmWatcher } from "./evm/watcher.js";
+import { ReorgRecoveryJournal } from "./reorg-journal.js";
 import { StellarRpc } from "./stellar/rpc.js";
 import { StellarWatcher } from "./stellar/watcher.js";
 
@@ -157,8 +158,9 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
 
   // One per chain in the record. Each carries its own confirmations from the registry, which is
   // the honest way to treat one block on Arc and twelve on Ethereum as the same kind of fact.
+  const reorgJournal = new ReorgRecoveryJournal(db);
   for (const chain of config.indexer.evm) {
-    workers.push(evmWorker(chain, db, logger));
+    workers.push(evmWorker(chain, db, logger, reorgJournal));
   }
 
   // Counted before the rail pollers join the list, because the two questions are different. "Is
@@ -277,7 +279,12 @@ function railWorkers(
   });
 }
 
-function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): Worker {
+function evmWorker(
+  config: EvmWatchConfig,
+  db: Transactional,
+  logger: Logger,
+  reorgJournal: ReorgRecoveryJournal,
+): Worker {
   const child = logger.child({ chain: config.chain, chainId: config.chainId });
   const watcher = new EvmWatcher({
     chainKey: config.chain,
@@ -290,6 +297,7 @@ function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): W
     client: viemClient(config.rpcUrls, { logger: child }),
     db,
     logger: child,
+    reorgJournal,
   });
   return new PolledWorker(watcher, config.pollIntervalMs, child);
 }

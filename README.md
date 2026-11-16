@@ -41,7 +41,7 @@ Vercel's installed Git integration publishes `main`. GitHub Actions runs validat
 
 ## What establishes status
 
-Stellar router events establish source transfers and claim changes. The EVM watcher indexes configured Hyperion routers with confirmation and reorg checks. The default record does not deploy an EVM Hyperion router.
+Stellar router events establish source transfers and claim changes. The EVM watcher indexes configured Hyperion routers with confirmation and reorg checks, persisting detected reorganization depth, wind-back block counts, affected canonical proof totals and reconciliation status (`winding_back`, `reconciled`, `rollback_failed`, `operator_intervention_required`) to `reorg_recovery_journal` for `/v1/metrics` and `/ready`. The default record does not deploy an EVM Hyperion router.
 
 For direct Stellar ITS transfers, Axelar's status API supplies a candidate destination transaction. Delivery is recorded only after the destination RPC confirms a successful receipt, sufficient confirmations, the matching ITS command/token/source/recipient/amount event and a matching token payment. The received asset is the ITS representation of Stellar USDC, with seven decimals. A rail API `executed` status alone is not delivery.
 

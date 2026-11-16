@@ -29,6 +29,7 @@ import type { Hex } from "viem";
 
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
+import type { ActiveReorgRecovery, ReorgRecoveryJournal } from "../reorg-journal.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
 import type { Position } from "../writers.js";
 import { ClaimPairing, applyRouterLog } from "./store.js";
@@ -61,6 +62,9 @@ export interface EvmWatcherOptions {
   readonly client: EvmClient;
   readonly db: Transactional;
   readonly logger: Logger;
+  readonly reorgJournal?: ReorgRecoveryJournal | undefined;
+  readonly isAnchorBlockCanonical?:
+    ((block: bigint, signal: AbortSignal) => Promise<boolean>) | undefined;
 }
 
 export interface EvmProgress {
@@ -78,6 +82,9 @@ export interface EvmProgress {
 export class EvmWatcher {
   private lastProgress: EvmProgress | null = null;
   private reorgs = 0;
+  private activeReorg: ActiveReorgRecovery | null = null;
+  private unresolvedReorgDetail: string | null = null;
+  private journalLoaded = false;
   /** Set once the node has confirmed which chain it is. */
   private chainConfirmed = false;
   /** Signatures seen once and logged once. A router ahead of this build is not a log flood. */
@@ -101,6 +108,13 @@ export class EvmWatcher {
    * reason to stop answering about the chains that are reachable.
    */
   readiness(): ReadinessReport {
+    if (this.unresolvedReorgDetail !== null) {
+      return {
+        name: this.name,
+        state: "degraded",
+        detail: this.unresolvedReorgDetail,
+      };
+    }
     const progress = this.lastProgress;
     if (progress === null) {
       return {
@@ -146,6 +160,7 @@ export class EvmWatcher {
     }
 
     await this.confirmChain(signal);
+    await this.restoreJournalState();
 
     const head = await client.blockNumber(signal);
     // The deepest block this chain considers settled. Nothing past it is read, so nothing past it
@@ -154,8 +169,25 @@ export class EvmWatcher {
 
     let from = stored === null ? this.options.startBlock : stored.position + 1n;
     if (stored !== null && stored.hash !== null) {
-      const rewound = await this.checkForReorg(stored.position, stored.hash, signal);
-      if (rewound !== null) from = rewound;
+      if (this.activeReorg?.status === "operator_intervention_required") {
+        return false;
+      }
+      if (
+        this.activeReorg !== null &&
+        (this.activeReorg.status === "winding_back" ||
+          this.activeReorg.status === "rollback_failed")
+      ) {
+        from =
+          stored.position >= this.activeReorg.cursorBlock
+            ? this.activeReorg.rewindToBlock
+            : stored.position + 1n;
+      } else {
+        const reorgCheck = await this.checkForReorg(stored.position, stored.hash, signal);
+        if (reorgCheck.haltedForOperator) {
+          return false;
+        }
+        if (reorgCheck.resumeFrom !== null) from = reorgCheck.resumeFrom;
+      }
     }
 
     if (from > confirmed) {
@@ -173,84 +205,164 @@ export class EvmWatcher {
     }
 
     const to = min(from + BigInt(this.options.logRange) - 1n, confirmed);
-    const logs = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
+    const activeBeforeTx = this.activeReorg;
 
-    // Block timestamps, which `getLogs` does not return and three columns need. One call per block
-    // that actually has logs, plus the range end for its hash, rather than one per block in range.
-    const wanted = new Set<bigint>(logs.map((log) => log.blockNumber));
-    wanted.add(to);
-    const blocks = await client.blocks([...wanted], signal);
+    try {
+      const logs = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
 
-    const endHash = blocks.get(to)?.hash ?? null;
-    if (endHash === null) {
-      // The range end vanished between the log read and the block read, which is a reorg landing
-      // mid pass. Nothing is written and the next pass finds it through the cursor hash.
-      logger.warn(
-        { chain: chainKey, block: to.toString() },
-        "the block at the end of this range disappeared mid pass, so nothing was committed",
-      );
-      return false;
-    }
+      // Block timestamps, which `getLogs` does not return and three columns need. One call per block
+      // that actually has logs, plus the range end for its hash, rather than one per block in range.
+      const wanted = new Set<bigint>(logs.map((log) => log.blockNumber));
+      wanted.add(to);
+      const blocks = await client.blocks([...wanted], signal);
 
-    let written = 0;
-    let ignored = 0;
-    const pairing = new ClaimPairing();
-
-    // One transaction for the range and the cursor advance past it. This is the restart guarantee,
-    // and splitting it would turn every crash into either a lost range or a duplicated one.
-    await db.transaction(async (tx: Queryable) => {
-      for (const log of logs) {
-        if (log.removed) {
-          // viem marks a log from an orphaned block. Indexing one would record a transfer that is
-          // no longer on the chain.
-          ignored += 1;
-          continue;
-        }
-        const timestamp = blocks.get(log.blockNumber)?.timestamp;
-        if (timestamp === undefined) {
-          throw new Error(
-            `no timestamp for block ${log.blockNumber.toString()} on ${chainKey}, which three columns need`,
+      const endHash = blocks.get(to)?.hash ?? null;
+      if (endHash === null) {
+        // The range end vanished between the log read and the block read, which is a reorg landing
+        // mid pass. Nothing is written and the next pass finds it through the cursor hash.
+        logger.warn(
+          { chain: chainKey, block: to.toString() },
+          "the block at the end of this range disappeared mid pass, so nothing was committed",
+        );
+        if (activeBeforeTx !== null && this.options.reorgJournal !== undefined) {
+          this.activeReorg = { ...activeBeforeTx, status: "rollback_failed" };
+          this.unresolvedReorgDetail = await this.options.reorgJournal.recordRollbackFailure(
+            activeBeforeTx,
+            new Error(`range end block ${to.toString()} disappeared during reorg wind-back`),
           );
         }
-        if (await this.apply(tx, log, timestamp, pairing)) written += 1;
-        else ignored += 1;
+        return false;
       }
 
-      await writeCursor(tx, {
-        chainKey,
-        family: "evm",
-        contract: router,
-        position: to,
-        observedAt: timestampOf(blocks.get(to)?.timestamp ?? null),
-        // The whole reason the column exists. Without it the next pass cannot tell advancing from
-        // being handed a different history.
-        hash: endHash,
-      });
-    });
+      let written = 0;
+      let ignored = 0;
+      let rewrittenProofsInWindow = 0;
+      const pairing = new ClaimPairing();
 
-    const behind = Number(confirmed - to);
-    this.lastProgress = {
-      block: to,
-      written,
-      ignored,
-      head,
-      behind,
-      reorgs: this.reorgs,
-      at: new Date(),
-    };
-    logger.info(
-      {
-        chain: chainKey,
-        from: from.toString(),
-        to: to.toString(),
+      // One transaction for the range and the cursor advance past it. This is the restart guarantee,
+      // and splitting it would turn every crash into either a lost range or a duplicated one.
+      const settledOutcome = await db.transaction(async (tx: Queryable) => {
+        for (const log of logs) {
+          if (log.removed) {
+            // viem marks a log from an orphaned block. Indexing one would record a transfer that is
+            // no longer on the chain.
+            ignored += 1;
+            continue;
+          }
+          const timestamp = blocks.get(log.blockNumber)?.timestamp;
+          if (timestamp === undefined) {
+            throw new Error(
+              `no timestamp for block ${log.blockNumber.toString()} on ${chainKey}, which three columns need`,
+            );
+          }
+          const result = await this.applyWithKind(tx, log, timestamp, pairing);
+          if (result.written) {
+            written += 1;
+            if (
+              activeBeforeTx !== null &&
+              result.canonicalProof &&
+              log.blockNumber >= activeBeforeTx.rewindToBlock &&
+              log.blockNumber <= activeBeforeTx.cursorBlock
+            ) {
+              rewrittenProofsInWindow += 1;
+            }
+          } else {
+            ignored += 1;
+          }
+        }
+
+        await writeCursor(tx, {
+          chainKey,
+          family: "evm",
+          contract: router,
+          position: to,
+          observedAt: timestampOf(blocks.get(to)?.timestamp ?? null),
+          // The whole reason the column exists. Without it the next pass cannot tell advancing from
+          // being handed a different history.
+          hash: endHash,
+        });
+
+        if (activeBeforeTx !== null && this.options.reorgJournal !== undefined) {
+          const outcome = await this.options.reorgJournal.advanceRecoveryInTx(tx, activeBeforeTx, {
+            toBlock: to,
+            rewrittenCanonicalProofsInBatch: rewrittenProofsInWindow,
+          });
+          return {
+            nextStatus: outcome.nextStatus,
+            detail: outcome.detail,
+          };
+        }
+        return null;
+      });
+
+      if (activeBeforeTx !== null && settledOutcome !== null) {
+        activeBeforeTx.rewrittenCanonicalProofs += rewrittenProofsInWindow;
+        if (settledOutcome.nextStatus === "reconciled") {
+          this.activeReorg = null;
+          this.unresolvedReorgDetail = null;
+        } else if (settledOutcome.nextStatus === "operator_intervention_required") {
+          this.activeReorg = {
+            ...activeBeforeTx,
+            status: "operator_intervention_required",
+            classification: "deep_operator_required",
+          };
+          this.unresolvedReorgDetail = settledOutcome.detail;
+        } else {
+          this.activeReorg = {
+            ...activeBeforeTx,
+            status: "winding_back",
+          };
+          this.unresolvedReorgDetail = settledOutcome.detail;
+        }
+      }
+
+      const behind = Number(confirmed - to);
+      this.lastProgress = {
+        block: to,
         written,
         ignored,
+        head,
         behind,
-      },
-      "evm range indexed",
-    );
+        reorgs: this.reorgs,
+        at: new Date(),
+      };
+      logger.info(
+        {
+          chain: chainKey,
+          from: from.toString(),
+          to: to.toString(),
+          written,
+          ignored,
+          behind,
+        },
+        "evm range indexed",
+      );
 
-    return behind > 0;
+      return behind > 0;
+    } catch (error) {
+      if (activeBeforeTx !== null && this.options.reorgJournal !== undefined) {
+        this.activeReorg = { ...activeBeforeTx, status: "rollback_failed" };
+        this.unresolvedReorgDetail = await this.options.reorgJournal.recordRollbackFailure(
+          activeBeforeTx,
+          error,
+        );
+      }
+      throw error;
+    }
+  }
+
+  private async restoreJournalState(): Promise<void> {
+    if (this.journalLoaded || this.options.reorgJournal === undefined) return;
+    this.journalLoaded = true;
+    const restored = await this.options.reorgJournal.loadUnresolvedForChain(this.options.chainKey);
+    if (restored === null) return;
+    this.activeReorg = restored;
+    this.unresolvedReorgDetail =
+      restored.status === "operator_intervention_required"
+        ? `deep reorg at block ${restored.cursorBlock.toString()} requires operator reconciliation`
+        : restored.status === "rollback_failed"
+          ? `reorg rollback failed at cursor block ${restored.cursorBlock.toString()}`
+          : `winding back ${String(restored.rollbackBlocks)} block(s) from ${restored.cursorBlock.toString()} to ${restored.rewindToBlock.toString()} after reorg`;
   }
 
   /**
@@ -285,16 +397,53 @@ export class EvmWatcher {
     position: bigint,
     expected: string,
     signal: AbortSignal,
-  ): Promise<bigint | null> {
+  ): Promise<{ readonly resumeFrom: bigint | null; readonly haltedForOperator: boolean }> {
     const { chainKey, logger, reorgDepth, confirmations } = this.options;
     const blocks = await this.options.client.blocks([position], signal);
     const actual = blocks.get(position)?.hash ?? null;
 
-    if (actual !== null && actual.toLowerCase() === expected.toLowerCase()) return null;
+    if (actual !== null && actual.toLowerCase() === expected.toLowerCase()) {
+      return { resumeFrom: null, haltedForOperator: false };
+    }
 
     this.reorgs += 1;
     const rewound = position - BigInt(reorgDepth) + 1n;
     const from = rewound < this.options.startBlock ? this.options.startBlock : rewound;
+    const rollbackBlocks = Number(position - from + 1n);
+
+    let haltedForOperator = false;
+    if (this.options.reorgJournal !== undefined) {
+      let exceedsSafeWindow = false;
+      if (from > this.options.startBlock) {
+        const anchorPos = from - 1n;
+        const anchorBlocks = await this.options.client.blocks([anchorPos], signal);
+        const anchorPresent = (anchorBlocks.get(anchorPos)?.hash ?? null) !== null;
+        const anchorCanonical =
+          anchorPresent &&
+          (this.options.isAnchorBlockCanonical
+            ? await this.options.isAnchorBlockCanonical(anchorPos, signal)
+            : true);
+        exceedsSafeWindow = !anchorCanonical;
+      }
+
+      const detectedDepth = exceedsSafeWindow ? reorgDepth + 1 : rollbackBlocks;
+      const recorded = await this.options.reorgJournal.recordDetectedReorg({
+        chainKey,
+        cursorBlock: position,
+        rewindToBlock: from,
+        detectedDepth,
+        rollbackBlocks,
+        expectedHash: expected,
+        observedHash: actual,
+        exceedsSafeWindow,
+      });
+      this.activeReorg = recorded;
+      haltedForOperator = recorded.status === "operator_intervention_required";
+      this.unresolvedReorgDetail = exceedsSafeWindow
+        ? `deep reorg of depth >= ${String(detectedDepth)} at block ${position.toString()} exceeds reorgDepth ${String(reorgDepth)}; operator intervention required`
+        : `winding back ${String(rollbackBlocks)} block(s) from ${position.toString()} to ${from.toString()} after reorg`;
+    }
+
     logger.error(
       {
         chain: chainKey,
@@ -308,15 +457,15 @@ export class EvmWatcher {
         ? "the block at the cursor is gone from this node, which is a reorg past the confirmation depth; winding back"
         : "the block at the cursor has a different hash, which is a reorg past the confirmation depth; winding back",
     );
-    return from;
+    return { resumeFrom: from, haltedForOperator };
   }
 
-  private async apply(
+  private async applyWithKind(
     tx: Queryable,
     log: RawEvmLog,
     timestamp: bigint,
     pairing: ClaimPairing,
-  ): Promise<boolean> {
+  ): Promise<{ readonly written: boolean; readonly canonicalProof: boolean }> {
     const { chainKey, logger } = this.options;
     const decoded = decodeRouterLog(log);
     if (decoded === null) {
@@ -328,7 +477,7 @@ export class EvmWatcher {
           "the router emitted an event signature this build does not know; it is running ahead of the indexer",
         );
       }
-      return false;
+      return { written: false, canonicalProof: false };
     }
 
     const at: Position = {
@@ -349,9 +498,11 @@ export class EvmWatcher {
         { chain: chainKey, what: applied.what, block: log.blockNumber.toString() },
         "settlement for something this indexer never saw created",
       );
-      return false;
+      return { written: false, canonicalProof: false };
     }
-    return applied.kind === "written";
+    const written = applied.kind === "written";
+    const canonicalProof = written && (decoded.name === "BridgeOut" || decoded.name === "BridgeIn");
+    return { written, canonicalProof };
   }
 }
 

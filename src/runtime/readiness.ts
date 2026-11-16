@@ -197,3 +197,7 @@ export class ReadinessRegistry {
     return { state: worstOf(checks), checks };
   }
 }
+
+export function reorgRecoveryToReadinessState(activeUnresolvedCount: number): ReadinessState {
+  return activeUnresolvedCount > 0 ? "degraded" : "ready";
+}
