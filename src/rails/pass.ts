@@ -18,7 +18,7 @@
  * second would spend those five minutes refreshing the block.
  */
 import type { AppConfig } from "../config/config.js";
-import { verifyItsDelivery } from "./axelar/delivery.js";
+import { verifyItsDelivery, type VerifyItsDeliveryOptions } from "./axelar/delivery.js";
 import { verifyCctpDelivery } from "./cctp/delivery.js";
 import type { Logger } from "pino";
 
@@ -48,6 +48,7 @@ export interface RailPassOptions {
   readonly maxCheckFailures: number;
   readonly now?: () => Date;
   readonly config?: AppConfig;
+  readonly itsDeliveryOptions?: VerifyItsDeliveryOptions | undefined;
 }
 
 export interface RailProgress {
@@ -200,8 +201,24 @@ export class RailPass {
     const { report } = lookup;
     if (this.options.config && (report.execution || report.forwardTxHash)) {
       const verified =
-        (await verifyItsDelivery(this.options.config, this.options.db, transfer, report)) ??
-        (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report));
+        (await verifyItsDelivery(this.options.config, this.options.db, transfer, report, {
+          ...this.options.itsDeliveryOptions,
+          onTokenMappingDrift: (diagnostic) => {
+            this.options.logger.warn(
+              {
+                rail: this.options.client.rail,
+                transferId: diagnostic.transferId,
+                originChain: diagnostic.originChain,
+                destinationChain: diagnostic.destinationChain,
+                driftReasons: diagnostic.driftReasons,
+                expected: diagnostic.expected,
+                observed: diagnostic.observed,
+              },
+              "its token mapping drift detected; refusing automatic payout proof",
+            );
+            this.options.itsDeliveryOptions?.onTokenMappingDrift?.(diagnostic);
+          },
+        })) ?? (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report));
       if (verified) {
         await this.options.db.transaction(async (tx) => {
           await writeInbound(tx, verified.at, verified.row);

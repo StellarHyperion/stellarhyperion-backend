@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { encodeAbiParameters, encodeEventTopics, stringToHex, type Hex } from "viem";
 import {
+  ERC20_METADATA_ABI,
   ITS_ABI,
+  ITS_TOKEN_MANAGER_ABI,
   matchingPayment,
   type DeliveryLog,
   type ExpectedDelivery,
@@ -70,5 +72,9 @@ describe("Destination delivery evidence", () => {
   it("does not lose a matching receipt event when another transfer shares the transaction", () => {
     const unrelated = { ...received, address: token as Hex };
     expect(matchingPayment([received, unrelated, paid], expected)).toBe(paid);
+  });
+  it("exposes ITS manager and ERC-20 metadata ABIs for token mapping verification", () => {
+    expect(ITS_TOKEN_MANAGER_ABI).toHaveLength(1);
+    expect(ERC20_METADATA_ABI).toHaveLength(2);
   });
 });

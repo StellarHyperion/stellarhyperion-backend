@@ -9,6 +9,11 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { writeOutbound, writeInbound } from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
+import { bigintOf } from "../../src/db/rows.js";
+import {
+  evaluateAndRecordItsTokenMapping,
+  listArchivedTokenMappingAssumptions,
+} from "../../src/rails/axelar/delivery.js";
 import { outstandingForRail, pendingForRail } from "../../src/rails/queue.js";
 import { RailPass } from "../../src/rails/pass.js";
 import type { PendingTransfer, RailClient, RailLookup } from "../../src/rails/types.js";
@@ -214,5 +219,65 @@ suite("rail pollers against real Postgres", () => {
     // Outstanding should now be 0 for this transfer since delivered is terminal
     const outstanding = await outstandingForRail(db, 1);
     expect(outstanding).toBe(0);
+  });
+
+  it("archives verified ITS token mapping assumptions and records drift diagnostics", async () => {
+    await db.transaction(async (tx) => {
+      await writeOutbound(
+        tx,
+        {
+          chainKey: ORIGIN_CHAIN,
+          block: 1010n,
+          txHash: "0xaaa303",
+          logIndex: 0,
+          observedAt: new Date(),
+        },
+        {
+          route: 1,
+          nonce: 303n,
+          sender: "0x1111111111111111111111111111111111111111",
+          token: "0x3333333333333333333333333333333333333333",
+          grossAmount: 2002000n,
+          fee: 2000n,
+          netAmount: 2000000n,
+          destinationChain: "sepolia",
+          destination: "0x2222222222222222222222222222222222222222",
+          railRef: "0x0000",
+        },
+      );
+    });
+    const { rows } = await db.query(
+      "SELECT id FROM outbound_transfer WHERE origin_chain = $1 AND nonce = 303",
+      [ORIGIN_CHAIN],
+    );
+    const firstRow = rows[0];
+    if (firstRow === undefined) return;
+    const transferId = bigintOf(firstRow, "id");
+    const tokenId = `0x${"ab".repeat(32)}` as const;
+    const manager = "0x4444444444444444444444444444444444444444";
+    const destToken = "0x5555555555555555555555555555555555555555";
+
+    const verified = await evaluateAndRecordItsTokenMapping(db, {
+      transferId,
+      originChain: ORIGIN_CHAIN,
+      sourceToken: "0x3333333333333333333333333333333333333333",
+      destinationChain: "sepolia",
+      destinationBlock: 5000n,
+      destinationTx: `0x${"11".repeat(32)}`,
+      expected: { tokenId, registrySymbol: "USDC" },
+      observed: {
+        tokenId,
+        tokenManager: manager,
+        registeredTokenAddress: destToken,
+        managerTokenAddress: destToken,
+        decimals: 6,
+        symbol: "USDC",
+      },
+    });
+    expect(verified.ok).toBe(true);
+
+    const history = await listArchivedTokenMappingAssumptions(db, { transferId });
+    expect(history).toHaveLength(1);
+    expect(history[0]?.status).toBe("verified");
   });
 });

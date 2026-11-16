@@ -1,8 +1,17 @@
 import { decodeEventLog, parseAbi, type Hex } from "viem";
 export const ITS_ABI = parseAbi([
   "function registeredTokenAddress(bytes32 tokenId) view returns (address)",
+  "function deployedTokenManager(bytes32 tokenId) view returns (address)",
+  "function tokenManagerAddress(bytes32 tokenId) view returns (address)",
   "event InterchainTransferReceived(bytes32 indexed commandId, bytes32 indexed tokenId, string sourceChain, bytes sourceAddress, address indexed destinationAddress, uint256 amount, bytes32 dataHash)",
   "event Transfer(address indexed from, address indexed to, uint256 value)",
+]);
+
+export const ITS_TOKEN_MANAGER_ABI = parseAbi(["function tokenAddress() view returns (address)"]);
+
+export const ERC20_METADATA_ABI = parseAbi([
+  "function decimals() view returns (uint8)",
+  "function symbol() view returns (string)",
 ]);
 export interface DeliveryLog {
   address: Hex;
