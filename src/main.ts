@@ -10,6 +10,7 @@ import { buildIndexer } from "./chains/runner.js";
 import { loadConfig } from "./config/config.js";
 import { ConfigError } from "./config/env.js";
 import { Database } from "./db/pool.js";
+import { SchemaCompatibilityError, verifySchemaCompatibility } from "./db/schema-check.js";
 import { buildServer } from "./http/server.js";
 import { createKeeperRedis } from "./keeper/queue.js";
 import { createLogger } from "./logging/logger.js";
@@ -36,6 +37,30 @@ async function main(): Promise<void> {
 
   const db = Database.open(config.databaseUrl, { applicationName: "hyperion-backend" });
   shutdown.add("postgres", () => db.close());
+
+  let schemaStatus;
+  try {
+    schemaStatus = await verifySchemaCompatibility(db, config.schema);
+  } catch (error) {
+    if (error instanceof SchemaCompatibilityError) {
+      logger.error(
+        {
+          code: error.code,
+          expectedVersion: error.details.expectedVersion,
+          appliedVersion: error.details.appliedVersion,
+          missingMigrations: error.details.missingMigrations,
+          aheadMigrations: error.details.aheadMigrations,
+          schemaIssues: error.details.schemaIssues,
+        },
+        "database schema compatibility check failed",
+      );
+      process.stderr.write(`\n${error.publicMessage}\n\n`);
+      await db.close().catch(() => undefined);
+      process.exit(78);
+    }
+    await db.close().catch(() => undefined);
+    throw error;
+  }
 
   const redis = config.keeper.enabled ? createKeeperRedis(config.redisUrl) : undefined;
   if (redis)
@@ -70,6 +95,7 @@ async function main(): Promise<void> {
       port: config.http.port,
       network: config.network,
       deploymentsFile: config.deploymentsFile,
+      schemaVersion: schemaStatus.appliedVersion,
       watchingStellar: config.indexer.stellar?.chain ?? null,
       watchingEvm: config.indexer.evm.map((entry) => entry.chain),
       workers: indexer.workers.map((worker) => worker.name),

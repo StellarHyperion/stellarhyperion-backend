@@ -3,7 +3,7 @@
   "version": 2,
   "outputDirectory": "dist",
   "functions": {
-    "api/index.ts": { "includeFiles": "deployments/**" }
+    "api/index.ts": { "includeFiles": "{deployments,migrations}/**" }
   },
   "rewrites": [
     {

@@ -11,8 +11,9 @@
  * cast. That is the point of the shared package: there is one description of where Hyperion is
  * deployed, one validator for it, and the backend is not allowed its own opinion.
  */
-import { readFileSync } from "node:fs";
-import { resolve as resolvePath } from "node:path";
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type { Chain, ChainKey, DeploymentSet, Hex, NetworkMode } from "@hyperion/protocol";
 import {
@@ -100,6 +101,13 @@ export interface KeeperConfig {
   readonly stellarSecret: string | null;
 }
 
+export interface SchemaCheckConfig {
+  readonly migrationsDir: string;
+  readonly migrationsTable: string;
+  readonly expectedMigrations: readonly string[];
+  readonly allowAhead: boolean;
+}
+
 export interface AppConfig {
   readonly nodeEnv: NodeEnv;
   readonly logLevel: LogLevel;
@@ -109,6 +117,7 @@ export interface AppConfig {
   readonly network: NetworkMode;
   readonly deploymentsFile: string;
   readonly deployments: DeploymentSet;
+  readonly schema: SchemaCheckConfig;
   readonly indexer: IndexerConfig;
   readonly rails: RailsConfig;
   readonly keeper: KeeperConfig;
@@ -119,6 +128,7 @@ export interface AppConfig {
 export interface LoadOptions {
   readonly env?: Readonly<Record<string, string | undefined>>;
   readonly readFile?: (path: string) => string;
+  readonly readMigrationsDir?: (path: string) => readonly string[];
   /** Relative paths in `HYPERION_DEPLOYMENTS_FILE` resolve against this. */
   readonly cwd?: string;
 }
@@ -323,6 +333,25 @@ const KEEPER_STELLAR_SECRET: VarSpec = {
     "Secret key for submitting Stellar keep_alive and claim transactions. Optional; runs dry-run when absent.",
 };
 
+const SCHEMA_MIGRATIONS_DIR: VarSpec = {
+  name: "SCHEMA_MIGRATIONS_DIR",
+  kind: "string",
+  required: false,
+  printable: true,
+  purpose:
+    "Optional directory override containing the ordered SQL migrations expected by this build.",
+};
+
+const SCHEMA_ALLOW_AHEAD: VarSpec = {
+  name: "SCHEMA_ALLOW_AHEAD",
+  kind: "boolean",
+  required: false,
+  fallback: "false",
+  printable: true,
+  purpose:
+    "Allow database schemas with newer additive migrations ahead of this build when all required tables and columns still match.",
+};
+
 const SHUTDOWN_TIMEOUT_MS: VarSpec = {
   name: "SHUTDOWN_TIMEOUT_MS",
   kind: "integer",
@@ -434,6 +463,17 @@ function rpcUrlsOverrideSpec(chain: ChainKey): VarSpec {
   };
 }
 
+const DEFAULT_MIGRATIONS_DIR = resolvePath(
+  dirname(fileURLToPath(import.meta.url)),
+  "../../migrations",
+);
+
+const BUILTIN_EXPECTED_MIGRATIONS: readonly string[] = [
+  "1790900000000_initial-schema",
+  "1791000000000_cursor-block-hash",
+  "1791100000000_cursor-autovacuum-tuning",
+];
+
 /**
  * Read the environment and the deployment record, or explain why not.
  *
@@ -443,6 +483,7 @@ function rpcUrlsOverrideSpec(chain: ChainKey): VarSpec {
 export function loadConfig(options: LoadOptions = {}): AppConfig {
   const env = options.env ?? process.env;
   const read = options.readFile ?? ((path: string) => readFileSync(path, "utf8"));
+  const readMigrations = options.readMigrationsDir ?? ((path: string) => readdirSync(path, "utf8"));
   const cwd = options.cwd ?? process.cwd();
   const reader = new EnvReader(env);
 
@@ -456,6 +497,8 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const network = reader.choice(HYPERION_NETWORK);
   const deploymentsPath = reader.string(DEPLOYMENTS_FILE);
   const indexerEnabled = reader.boolean(INDEXER_ENABLED);
+  const schemaMigrationsOverride = reader.string(SCHEMA_MIGRATIONS_DIR);
+  const schemaAllowAhead = reader.boolean(SCHEMA_ALLOW_AHEAD);
   const shutdownTimeoutMs = reader.integer(SHUTDOWN_TIMEOUT_MS);
 
   const railsEnabled = reader.boolean(RAILS_ENABLED);
@@ -485,6 +528,13 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
 
   const absoluteDeployments = deploymentsPath === "" ? "" : resolvePath(cwd, deploymentsPath);
   const deployments = readDeployments(reader, read, absoluteDeployments);
+  const schema = readSchemaConfig(
+    reader,
+    readMigrations,
+    cwd,
+    schemaMigrationsOverride,
+    schemaAllowAhead,
+  );
   const indexer = planIndexer(reader, {
     network,
     deployments,
@@ -511,6 +561,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     network,
     deploymentsFile: absoluteDeployments,
     deployments,
+    schema,
     indexer,
     rails: {
       enabled: railsEnabled,
@@ -532,6 +583,53 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
 }
 
 const EMPTY_SET: DeploymentSet = { schemaVersion: 1, generatedAt: "", networks: {} };
+
+function readSchemaConfig(
+  reader: EnvReader,
+  readMigrations: (path: string) => readonly string[],
+  cwd: string,
+  overrideDir: string,
+  allowAhead: boolean,
+): SchemaCheckConfig {
+  const migrationsDir = overrideDir === "" ? DEFAULT_MIGRATIONS_DIR : resolvePath(cwd, overrideDir);
+
+  let entries: readonly string[];
+  try {
+    entries = readMigrations(migrationsDir);
+  } catch {
+    if (overrideDir === "") {
+      return {
+        migrationsDir,
+        migrationsTable: "pgmigrations",
+        expectedMigrations: BUILTIN_EXPECTED_MIGRATIONS,
+        allowAhead,
+      };
+    }
+    reader.reject(SCHEMA_MIGRATIONS_DIR, `cannot be read at ${migrationsDir}`);
+    return {
+      migrationsDir,
+      migrationsTable: "pgmigrations",
+      expectedMigrations: [],
+      allowAhead,
+    };
+  }
+
+  const expectedMigrations = entries
+    .filter((entry) => entry.endsWith(".sql"))
+    .map((entry) => entry.slice(0, -4))
+    .sort((a, b) => a.localeCompare(b));
+
+  if (expectedMigrations.length === 0) {
+    reader.reject(SCHEMA_MIGRATIONS_DIR, `contains no .sql migration files at ${migrationsDir}`);
+  }
+
+  return {
+    migrationsDir,
+    migrationsTable: "pgmigrations",
+    expectedMigrations,
+    allowAhead,
+  };
+}
 
 function readDeployments(
   reader: EnvReader,

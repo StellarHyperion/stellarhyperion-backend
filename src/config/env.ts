@@ -292,6 +292,24 @@ export class EnvReader {
 
   /** A value in an error message, or a description of it when printing it would leak a secret. */
   private show(spec: VarSpec, raw: string): string {
-    return spec.printable ? `"${raw}"` : `a ${raw.length} character value`;
+    if (!spec.printable) return `a ${raw.length} character value`;
+    return `"${redactConnectionSecrets(raw)}"`;
   }
+}
+
+/**
+ * Strip database/Redis connection strings, URL userinfo, and password assignments from diagnostic text.
+ */
+export function redactConnectionSecrets(input: string): string {
+  let sanitized = input;
+  sanitized = sanitized.replace(
+    /\b(?:postgres(?:ql)?|rediss?):\/\/[^\s"'`,;)]+/gi,
+    "[redacted-connection-url]",
+  );
+  sanitized = sanitized.replace(/([a-z][a-z0-9+.-]*:\/\/)([^/@\s]+)@/gi, "$1");
+  sanitized = sanitized.replace(
+    /\b(password|passwd|pwd)\s*([=:])\s*([^\s"'`,;)]+|"[^"]*"|'[^']*')/gi,
+    "$1$2[redacted]",
+  );
+  return sanitized;
 }
