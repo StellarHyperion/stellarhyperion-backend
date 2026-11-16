@@ -7,6 +7,18 @@ import type {
   RailReport,
 } from "../types.js";
 import { RailError } from "../types.js";
+export {
+  decodeStellarAxelarGasEvent,
+  gasEventsFromEvmLogs,
+  ingestAxelarGasEvents,
+  listTransferGasEvents,
+  listUnresolvedAxelarGasEvents,
+  relinkUnresolvedAxelarGasEvents,
+  type AxelarGasActivityInput,
+  type AxelarGasHistoryRecord,
+  type GasLinkResolutionStatus,
+  type IngestGasEventsSummary,
+} from "./gas-history.js";
 
 /**
  * Axelar's statuses, mapped onto ours.

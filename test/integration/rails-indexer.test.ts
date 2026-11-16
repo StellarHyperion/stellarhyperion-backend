@@ -9,6 +9,11 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { writeOutbound, writeInbound } from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
+import {
+  ingestAxelarGasEvents,
+  listTransferGasEvents,
+  listUnresolvedAxelarGasEvents,
+} from "../../src/rails/axelar/gmp.js";
 import { outstandingForRail, pendingForRail } from "../../src/rails/queue.js";
 import { RailPass } from "../../src/rails/pass.js";
 import type { PendingTransfer, RailClient, RailLookup } from "../../src/rails/types.js";
@@ -24,6 +29,7 @@ suite("rail pollers against real Postgres", () => {
   let db: Database;
 
   const clean = async (): Promise<void> => {
+    await db.query("DELETE FROM axelar_gas_event");
     await db.query("DELETE FROM rail_attestation WHERE route IN (0, 1)");
     await db.query("DELETE FROM inbound_delivery WHERE route IN (0, 1)");
     await db.query("DELETE FROM outbound_transfer WHERE route IN (0, 1)");
@@ -214,5 +220,81 @@ suite("rail pollers against real Postgres", () => {
     // Outstanding should now be 0 for this transfer since delivered is terminal
     const outstanding = await outstandingForRail(db, 1);
     expect(outstanding).toBe(0);
+  });
+
+  it("ingests Axelar gas top-ups and refunds without advancing payout lifecycle and retains unsupported links", async () => {
+    const originTx = `0x${"55".repeat(32)}`;
+    await db.transaction(async (tx) => {
+      await writeOutbound(
+        tx,
+        {
+          chainKey: ORIGIN_CHAIN,
+          block: 1020n,
+          txHash: originTx,
+          logIndex: 0,
+          observedAt: new Date(),
+        },
+        {
+          route: 1,
+          nonce: 505n,
+          sender: "0x1111111111111111111111111111111111111111",
+          token: "0x3333333333333333333333333333333333333333",
+          grossAmount: 3003000n,
+          fee: 3000n,
+          netAmount: 3000000n,
+          destinationChain: DESTINATION_CHAIN,
+          destination: "0x2222222222222222222222222222222222222222",
+          railRef: `${originTx}-0`,
+        },
+      );
+    });
+
+    const summary = await ingestAxelarGasEvents(db, [
+      {
+        chain: ORIGIN_CHAIN,
+        gasService: "0xbE406F0189A0B4cf3A05C286473D23791Dd44Cc6",
+        txHash: `0x${"66".repeat(32)}`,
+        blockNumber: 1025n,
+        logIndex: 1,
+        eventKind: "gas_added",
+        isNative: true,
+        gasToken: null,
+        amount: 90000000000000000n,
+        refundAddress: "0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B",
+        sourceTxRef: originTx,
+      },
+      {
+        chain: ORIGIN_CHAIN,
+        gasService: "0xbE406F0189A0B4cf3A05C286473D23791Dd44Cc6",
+        txHash: `0x${"67".repeat(32)}`,
+        blockNumber: 1026n,
+        logIndex: 0,
+        eventKind: "refunded",
+        isNative: true,
+        gasToken: null,
+        amount: 15000000000000000n,
+        refundAddress: "0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B",
+        messageId: "ibc://unsupported-channel/99",
+      },
+    ]);
+    expect(summary).toEqual({ processed: 2, linked: 1, unresolved: 1 });
+
+    const pending = await pendingForRail(db, {
+      route: 1,
+      limit: 10,
+      notCheckedSince: new Date(Date.now() + 1000),
+      maxCheckFailures: 5,
+    });
+    const target = pending.find((p) => p.nonce === 505n);
+    expect(target?.delivered).toBe(false);
+    if (target) {
+      const linked = await listTransferGasEvents(db, target.transferId);
+      expect(linked).toHaveLength(1);
+      expect(linked[0]?.refundAddress).toBe("0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B");
+    }
+
+    const unresolved = await listUnresolvedAxelarGasEvents(db, ORIGIN_CHAIN);
+    expect(unresolved).toHaveLength(1);
+    expect(unresolved[0]?.unresolvedReason).toBe("unsupported_message_id_format");
   });
 });

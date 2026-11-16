@@ -25,6 +25,26 @@ import type { InboundRow, Position } from "../../chains/writers.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 
 import { ITS_ABI, matchingPayment } from "./events.js";
+export {
+  AXELAR_GAS_SERVICE_ABI,
+  decodeAxelarGasServiceLog,
+  type AxelarGasEventKind,
+  type DecodedAxelarGasLog,
+  type DeliveryLog,
+} from "./events.js";
+export {
+  decodeStellarAxelarGasEvent,
+  gasEventsFromEvmLogs,
+  getAxelarGasEventById,
+  ingestAxelarGasEvents,
+  listTransferGasEvents,
+  listUnresolvedAxelarGasEvents,
+  relinkUnresolvedAxelarGasEvents,
+  type AxelarGasActivityInput,
+  type AxelarGasHistoryRecord,
+  type GasLinkResolutionStatus,
+  type IngestGasEventsSummary,
+} from "./gas-history.js";
 export interface VerifiedDelivery {
   readonly at: Position;
   readonly row: InboundRow;
