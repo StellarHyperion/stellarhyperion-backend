@@ -14,14 +14,17 @@ import {
   RouteKind,
   isChainKey,
   isEvmChain,
+  isStellarChain,
   toHex,
   toEvmAddress,
 } from "@hyperion/protocol";
-import { createPublicClient, http, stringToHex } from "viem";
-import type { AppConfig } from "../../config/config.js";
+import { stringToHex, type Hex } from "viem";
+import { createDestinationVerifierClient } from "../../chains/evm/client.js";
+import { destinationRpcUrlsFor, type AppConfig } from "../../config/config.js";
 import type { Transactional } from "../../db/pool.js";
 import { bigintOf, text } from "../../db/rows.js";
 import type { InboundRow, Position } from "../../chains/writers.js";
+import type { DestinationVerificationOptions } from "../cctp/delivery.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 
 import { ITS_ABI, matchingPayment } from "./events.js";
@@ -30,20 +33,31 @@ export interface VerifiedDelivery {
   readonly row: InboundRow;
 }
 
+export interface ItsDeliveryVerificationOptions extends DestinationVerificationOptions {
+  readonly sourceView?: (
+    contract: string,
+    method: string,
+    args?: ReturnType<typeof nativeToScVal>[],
+  ) => Promise<unknown>;
+}
+
 // The rail API supplies a candidate receipt. Only matching confirmed chain events establish delivery.
 export async function verifyItsDelivery(
   config: AppConfig,
   db: Transactional,
   transfer: PendingTransfer,
   report: RailReport,
+  options: ItsDeliveryVerificationOptions = {},
 ): Promise<VerifiedDelivery | null> {
   const execution = report.execution;
-  const source = config.indexer.stellar;
+  const stellarChainKey =
+    config.indexer.stellar?.chain ?? (config.network === "mainnet" ? "stellar" : "stellar-testnet");
+  const stellarChain = CHAINS[stellarChainKey];
   if (
     !execution ||
-    !source ||
+    !isStellarChain(stellarChain) ||
     transfer.route !== RouteKind.AxelarIts ||
-    transfer.originChain !== source.chain ||
+    transfer.originChain !== stellarChainKey ||
     !isChainKey(transfer.destinationChain)
   )
     return null;
@@ -58,20 +72,24 @@ export async function verifyItsDelivery(
   if (!stored) return null;
   const token = text(stored, "token");
   const amount = bigintOf(stored, "net_amount");
-  const recipient = toEvmAddress(text(stored, "destination") as `0x${string}`);
-  const deployment = config.deployments.networks[source.chain];
+  const recipient = toEvmAddress(text(stored, "destination") as Hex);
+  const deployment = config.deployments.networks[stellarChainKey];
   if (!deployment) return null;
   const adapter = deployment.adapters[RouteKind.AxelarIts];
   if (!adapter) return null;
-  const stellar = new rpc.Server(source.rpcUrl, { timeout: 15_000 });
-  const view = async (
+
+  const stellarRpcUrl = config.indexer.stellar?.rpcUrl ?? stellarChain.defaultRpcUrl;
+  const stellarPassphrase =
+    config.indexer.stellar?.networkPassphrase ?? stellarChain.networkPassphrase;
+  const defaultView = async (
     contract: string,
     method: string,
     args: ReturnType<typeof nativeToScVal>[] = [],
   ) => {
+    const stellar = new rpc.Server(stellarRpcUrl, { timeout: 15_000 });
     const tx = new TransactionBuilder(new Account(deployment.admin, "0"), {
       fee: BASE_FEE,
-      networkPassphrase: source.networkPassphrase,
+      networkPassphrase: stellarPassphrase,
     })
       .addOperation(new Contract(contract).call(method, ...args))
       .setTimeout(60)
@@ -81,25 +99,62 @@ export async function verifyItsDelivery(
       throw new Error("Source lane cannot be verified.");
     return scValToNative(result.result.retval) as unknown;
   };
+  const view = options.sourceView ?? defaultView;
+
   const id = await view(adapter, "token_id_for", [new Address(token).toScVal()]);
   if (!(id instanceof Uint8Array) || id.length !== 32)
     throw new Error("Source token id is invalid.");
   const tokenId = toHex(id);
-  const client = createPublicClient({
-    transport: http(destination.defaultRpcUrl, { timeout: 15_000, retryCount: 0 }),
-  });
-  if ((await client.getChainId()) !== destination.chainId)
+
+  const rpcUrls = destinationRpcUrlsFor(config, transfer.destinationChain);
+  const timeoutMs = config.rails.destinationTimeoutMs;
+  const client =
+    options.client ??
+    options.clientFactory?.({
+      chain: transfer.destinationChain,
+      chainId: destination.chainId,
+      rpcUrls,
+      timeoutMs,
+      ...(options.logger ? { logger: options.logger } : {}),
+    }) ??
+    createDestinationVerifierClient(rpcUrls, destination.chainId, {
+      chainKey: transfer.destinationChain,
+      timeoutMs,
+      ...(options.logger ? { logger: options.logger } : {}),
+      ...(options.fetchFn ? { fetchFn: options.fetchFn } : {}),
+      ...(options.onFailover ? { onFailover: options.onFailover } : {}),
+    });
+
+  if ((await client.getChainId(options.signal)) !== destination.chainId)
     throw new Error("Destination RPC chain mismatch.");
-  const receipt = await client.getTransactionReceipt({ hash: execution.txHash });
-  if (receipt.status !== "success") return null;
-  const head = await client.getBlockNumber();
-  if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations)) return null;
-  const destinationToken = await client.readContract({
-    address: its as `0x${string}`,
-    abi: ITS_ABI,
-    functionName: "registeredTokenAddress",
-    args: [tokenId],
-  });
+  const receipt = await client.getTransactionReceipt(execution.txHash, options.signal);
+  if (
+    receipt.transactionHash.toLowerCase() !== execution.txHash.toLowerCase() ||
+    receipt.status !== "success"
+  )
+    return null;
+  const head = await client.getBlockNumber(options.signal);
+  if (
+    head < receipt.blockNumber ||
+    head - receipt.blockNumber + 1n < BigInt(destination.confirmations)
+  )
+    return null;
+  const rawDestinationToken = await client.readContract(
+    {
+      address: its as Hex,
+      abi: ITS_ABI,
+      functionName: "registeredTokenAddress",
+      args: [tokenId],
+    },
+    options.signal,
+  );
+  if (
+    typeof rawDestinationToken !== "string" ||
+    !/^0x[0-9a-fA-F]{40}$/.test(rawDestinationToken) ||
+    /^0x0{40}$/.test(rawDestinationToken)
+  )
+    return null;
+  const destinationToken = rawDestinationToken as Hex;
   const adapterConfig = (await view(adapter, "get_config")) as { its?: string };
   if (!adapterConfig.its) return null;
   const sourceName = await view(adapterConfig.its, "chain_name");
@@ -115,8 +170,12 @@ export async function verifyItsDelivery(
     amount,
   });
   if (!payment) return null;
-  const block = await client.getBlock({ blockNumber: receipt.blockNumber });
-  if (block.hash !== receipt.blockHash) return null;
+  const block = await client.getBlock(receipt.blockNumber, options.signal);
+  if (
+    block.number !== receipt.blockNumber ||
+    block.hash.toLowerCase() !== receipt.blockHash.toLowerCase()
+  )
+    return null;
   return {
     at: {
       chainKey: transfer.destinationChain,

@@ -8,30 +8,48 @@ import {
   isStellarDeployment,
   toEvmAddress,
 } from "@hyperion/protocol";
-import { createPublicClient, http, type Hex } from "viem";
-import type { AppConfig } from "../../config/config.js";
+import type { Logger } from "pino";
+import type { Hex } from "viem";
+import {
+  createDestinationVerifierClient,
+  type DestinationClientFactory,
+  type DestinationFailoverEvent,
+  type DestinationVerifierClient,
+} from "../../chains/evm/client.js";
+import { destinationRpcUrlsFor, type AppConfig } from "../../config/config.js";
 import type { Transactional } from "../../db/pool.js";
 import { bigintOf, text } from "../../db/rows.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 import type { VerifiedDelivery } from "../axelar/delivery.js";
 import { matchingCctpPayment, verifiedCctpMessage, type ExpectedCctpTransfer } from "./events.js";
 
+export interface DestinationVerificationOptions {
+  readonly client?: DestinationVerifierClient;
+  readonly clientFactory?: DestinationClientFactory;
+  readonly fetchFn?: typeof globalThis.fetch;
+  readonly logger?: Logger;
+  readonly signal?: AbortSignal;
+  readonly onFailover?: (event: DestinationFailoverEvent) => void;
+}
+
 export async function verifyCctpDelivery(
   config: AppConfig,
   db: Transactional,
   transfer: PendingTransfer,
   report: RailReport,
+  options: DestinationVerificationOptions = {},
 ): Promise<VerifiedDelivery | null> {
+  const expectedOrigin = config.network === "mainnet" ? "stellar" : "stellar-testnet";
   if (
     transfer.route !== RouteKind.Cctp ||
-    transfer.originChain !== "stellar-testnet" ||
+    transfer.originChain !== expectedOrigin ||
     !report.forwardTxHash ||
     !report.messageBytes ||
     !/^0x[0-9a-fA-F]+$/.test(report.messageBytes) ||
     !isChainKey(transfer.destinationChain)
   )
     return null;
-  const source = config.deployments.networks["stellar-testnet"];
+  const source = config.deployments.networks[expectedOrigin];
   const destination = CHAINS[transfer.destinationChain];
   const contracts = RAIL_CONTRACTS[transfer.destinationChain]?.cctp;
   const token = assetOn(transfer.destinationChain, "USDC");
@@ -69,19 +87,48 @@ export async function verifyCctpDelivery(
   const raw = report.messageBytes as Hex;
   const message = verifiedCctpMessage(raw, expected);
   if (!message) return null;
-  const client = createPublicClient({
-    transport: http(destination.defaultRpcUrl, { timeout: 15000, retryCount: 0 }),
-  });
-  if ((await client.getChainId()) !== destination.chainId)
+
+  const rpcUrls = destinationRpcUrlsFor(config, transfer.destinationChain);
+  const timeoutMs = config.rails.destinationTimeoutMs;
+  const client =
+    options.client ??
+    options.clientFactory?.({
+      chain: transfer.destinationChain,
+      chainId: destination.chainId,
+      rpcUrls,
+      timeoutMs,
+      ...(options.logger ? { logger: options.logger } : {}),
+    }) ??
+    createDestinationVerifierClient(rpcUrls, destination.chainId, {
+      chainKey: transfer.destinationChain,
+      timeoutMs,
+      ...(options.logger ? { logger: options.logger } : {}),
+      ...(options.fetchFn ? { fetchFn: options.fetchFn } : {}),
+      ...(options.onFailover ? { onFailover: options.onFailover } : {}),
+    });
+
+  if ((await client.getChainId(options.signal)) !== destination.chainId)
     throw new Error("CCTP destination RPC chain mismatch.");
-  const receipt = await client.getTransactionReceipt({ hash: report.forwardTxHash });
-  if (receipt.status !== "success") return null;
-  const head = await client.getBlockNumber();
-  if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations)) return null;
+  const receipt = await client.getTransactionReceipt(report.forwardTxHash, options.signal);
+  if (
+    receipt.transactionHash.toLowerCase() !== report.forwardTxHash.toLowerCase() ||
+    receipt.status !== "success"
+  )
+    return null;
+  const head = await client.getBlockNumber(options.signal);
+  if (
+    head < receipt.blockNumber ||
+    head - receipt.blockNumber + 1n < BigInt(destination.confirmations)
+  )
+    return null;
   const payment = matchingCctpPayment(receipt.logs, raw, expected);
   if (!payment) return null;
-  const block = await client.getBlock({ blockNumber: receipt.blockNumber });
-  if (block.hash !== receipt.blockHash) return null;
+  const block = await client.getBlock(receipt.blockNumber, options.signal);
+  if (
+    block.number !== receipt.blockNumber ||
+    block.hash.toLowerCase() !== receipt.blockHash.toLowerCase()
+  )
+    return null;
   return {
     at: {
       chainKey: transfer.destinationChain,

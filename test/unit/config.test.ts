@@ -1,10 +1,14 @@
 import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
+import { CHAINS } from "@hyperion/protocol";
 import { describe, expect, it } from "vitest";
 
-import { loadConfig } from "../../src/config/config.js";
+import { destinationRpcUrlsFor, loadConfig } from "../../src/config/config.js";
 import { ConfigError } from "../../src/config/env.js";
-import { completeEnv, TESTNET_DEPLOYMENTS } from "../helpers.js";
+import { completeEnv, FIXTURES_DIR, TESTNET_DEPLOYMENTS } from "../helpers.js";
+
+const STELLAR_ONLY_DEPLOYMENTS = join(dirname(FIXTURES_DIR), "..", "deployments", "testnet.json");
 
 function faultNames(run: () => unknown): string[] {
   try {
@@ -246,6 +250,81 @@ describe("watch plan", () => {
       loadConfig({ env, readFile: () => record });
     } catch (error) {
       expect((error as ConfigError).message).toContain("chain id 1");
+      return;
+    }
+    throw new Error("expected a ConfigError");
+  });
+
+  it("retains registry defaults for destination verification when no EVM router exists", () => {
+    const config = loadConfig({
+      env: completeEnv({ HYPERION_DEPLOYMENTS_FILE: STELLAR_ONLY_DEPLOYMENTS }),
+    });
+
+    expect(config.indexer.evm).toEqual([]);
+    expect(destinationRpcUrlsFor(config, "sepolia")).toEqual([CHAINS.sepolia.defaultRpcUrl]);
+    expect(destinationRpcUrlsFor(config, "base-sepolia")).toEqual([
+      CHAINS["base-sepolia"].defaultRpcUrl,
+    ]);
+    expect(destinationRpcUrlsFor(config, "arc-testnet")).toEqual([
+      CHAINS["arc-testnet"].defaultRpcUrl,
+    ]);
+    expect(config.rails.destinationTimeoutMs).toBe(15_000);
+  });
+
+  it("supports ordered destination-only overrides for Sepolia, Base Sepolia, and Arc Testnet without an EVM watcher", () => {
+    const config = loadConfig({
+      env: completeEnv({
+        HYPERION_DEPLOYMENTS_FILE: STELLAR_ONLY_DEPLOYMENTS,
+        INDEXER_ENABLED: "false",
+        RAIL_DESTINATION_RPC_URLS_SEPOLIA:
+          "https://sep-a.example.invalid/v2/key1, https://sep-b.example.invalid/v2/key2",
+        RAIL_DESTINATION_RPC_URL_BASE_SEPOLIA: "https://base-a.example.invalid/rpc",
+        EVM_RPC_URLS_ARC_TESTNET:
+          "https://arc-a.example.invalid/rpc, https://arc-b.example.invalid/rpc",
+        RAIL_DESTINATION_RPC_TIMEOUT_MS: "8000",
+      }),
+    });
+
+    expect(config.indexer.evm).toEqual([]);
+    expect(destinationRpcUrlsFor(config, "sepolia")).toEqual([
+      "https://sep-a.example.invalid/v2/key1",
+      "https://sep-b.example.invalid/v2/key2",
+    ]);
+    expect(destinationRpcUrlsFor(config, "base-sepolia")).toEqual([
+      "https://base-a.example.invalid/rpc",
+    ]);
+    expect(destinationRpcUrlsFor(config, "arc-testnet")).toEqual([
+      "https://arc-a.example.invalid/rpc",
+      "https://arc-b.example.invalid/rpc",
+    ]);
+    expect(config.rails.destinationTimeoutMs).toBe(8_000);
+  });
+
+  it("accumulates malformed, empty, and unsupported destination RPC overrides without leaking secrets", () => {
+    const env = completeEnv({
+      HYPERION_DEPLOYMENTS_FILE: STELLAR_ONLY_DEPLOYMENTS,
+      RAIL_DESTINATION_RPC_URLS_SEPOLIA: "   ",
+      RAIL_DESTINATION_RPC_URL_BASE_SEPOLIA: "user:supersecret@base-node:8545",
+      EVM_RPC_URLS_ARC_TESTNET: " , ",
+      RAIL_DESTINATION_RPC_URLS_ETHEREUM: "https://mainnet.example.invalid/rpc",
+      RAIL_DESTINATION_RPC_URL_POLYGON: "https://polygon.example.invalid/rpc",
+      RAIL_DESTINATION_RPC_URL_LOCAL: "http://127.0.0.1:8545",
+    });
+
+    try {
+      loadConfig({ env });
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      const configErr = error as ConfigError;
+      expect(configErr.faults.map((f) => f.name).sort()).toEqual([
+        "EVM_RPC_URLS_ARC_TESTNET",
+        "RAIL_DESTINATION_RPC_URLS_ETHEREUM",
+        "RAIL_DESTINATION_RPC_URLS_SEPOLIA",
+        "RAIL_DESTINATION_RPC_URL_BASE_SEPOLIA",
+        "RAIL_DESTINATION_RPC_URL_LOCAL",
+        "RAIL_DESTINATION_RPC_URL_POLYGON",
+      ]);
+      expect(configErr.message).not.toContain("supersecret");
       return;
     }
     throw new Error("expected a ConfigError");

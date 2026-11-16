@@ -18,6 +18,7 @@
  * second would spend those five minutes refreshing the block.
  */
 import type { AppConfig } from "../config/config.js";
+import type { DestinationClientFactory } from "../chains/evm/client.js";
 import { verifyItsDelivery } from "./axelar/delivery.js";
 import { verifyCctpDelivery } from "./cctp/delivery.js";
 import type { Logger } from "pino";
@@ -48,6 +49,7 @@ export interface RailPassOptions {
   readonly maxCheckFailures: number;
   readonly now?: () => Date;
   readonly config?: AppConfig;
+  readonly destinationClients?: DestinationClientFactory;
 }
 
 export interface RailProgress {
@@ -129,7 +131,7 @@ export class RailPass {
     for (const transfer of queue) {
       if (signal.aborted) break;
       try {
-        if (await this.handle(transfer)) settled += 1;
+        if (await this.handle(transfer, signal)) settled += 1;
         checked += 1;
       } catch (error) {
         if (error instanceof RailError && error.kind === "rateLimited") {
@@ -164,7 +166,7 @@ export class RailPass {
   }
 
   /** Returns true when the transfer reached a terminal state on this pass. */
-  private async handle(transfer: PendingTransfer): Promise<boolean> {
+  private async handle(transfer: PendingTransfer, signal: AbortSignal): Promise<boolean> {
     const at = this.now();
 
     if (transfer.delivered) {
@@ -182,7 +184,7 @@ export class RailPass {
       return true;
     }
 
-    const lookup = await this.options.client.look(transfer);
+    const lookup = await this.options.client.look(transfer, signal);
     if (lookup.kind === "missing") {
       // Normal. The rail has not indexed the burn yet, which is where every transfer starts.
       await this.write(transfer, {
@@ -199,9 +201,28 @@ export class RailPass {
 
     const { report } = lookup;
     if (this.options.config && (report.execution || report.forwardTxHash)) {
+      const verifyOptions = {
+        logger: this.options.logger,
+        signal,
+        ...(this.options.destinationClients
+          ? { clientFactory: this.options.destinationClients }
+          : {}),
+      };
       const verified =
-        (await verifyItsDelivery(this.options.config, this.options.db, transfer, report)) ??
-        (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report));
+        (await verifyItsDelivery(
+          this.options.config,
+          this.options.db,
+          transfer,
+          report,
+          verifyOptions,
+        )) ??
+        (await verifyCctpDelivery(
+          this.options.config,
+          this.options.db,
+          transfer,
+          report,
+          verifyOptions,
+        ));
       if (verified) {
         await this.options.db.transaction(async (tx) => {
           await writeInbound(tx, verified.at, verified.row);

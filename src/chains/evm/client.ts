@@ -8,9 +8,10 @@
  * return, and batching those lookups in one place keeps the per-pass call count at one per block
  * that actually has logs rather than one per block in the range.
  */
+import type { ChainKey } from "@hyperion/protocol";
 import type { Logger } from "pino";
 import { createPublicClient, fallback, http, shouldThrow } from "viem";
-import type { Hex } from "viem";
+import type { Abi, Hex } from "viem";
 
 export interface RawEvmLog {
   readonly address: Hex;
@@ -63,6 +64,39 @@ export interface EvmClient {
   logs(query: LogQuery, signal?: AbortSignal): Promise<readonly RawEvmLog[]>;
   /** Hash and timestamp for each block asked for. A block missing from the map is gone. */
   blocks(numbers: readonly bigint[], signal?: AbortSignal): Promise<Map<bigint, BlockStamp>>;
+}
+
+/**
+ * Return only the scheme and host[:port] of an RPC URL so credentials, API-key paths, query
+ * parameters, and fragments never reach logs or persisted error text.
+ */
+export function redactRpcEndpoint(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    if (
+      parsed.host === "" ||
+      (parsed.protocol !== "http:" &&
+        parsed.protocol !== "https:" &&
+        parsed.protocol !== "ws:" &&
+        parsed.protocol !== "wss:")
+    ) {
+      return "[redacted-endpoint]";
+    }
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    return "[redacted-endpoint]";
+  }
+}
+
+/**
+ * Scrub full RPC URLs and authorization header fragments from transport error messages.
+ */
+export function sanitizeRpcErrorMessage(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  return raw
+    .replace(/(?:https?|wss?):\/\/[^\s"'<>]+/gi, (match) => redactRpcEndpoint(match))
+    .replace(/authorization\s*[:=]\s*[^\r\n,;]+/gi, "authorization: [redacted]")
+    .replace(/bearer\s+[^\s"',;\r\n]+/gi, "Bearer [redacted]");
 }
 
 export interface ViemClientOptions {
@@ -121,7 +155,11 @@ export function viemClient(
                 urls.find((u) => u !== failedUrl) ??
                 "";
               options.logger?.warn(
-                { failedRpc: failedUrl, fallbackRpc: fallbackUrl, err },
+                {
+                  failedRpc: redactRpcEndpoint(failedUrl),
+                  fallbackRpc: redactRpcEndpoint(fallbackUrl),
+                  reason: sanitizeRpcErrorMessage(err),
+                },
                 "RPC endpoint failed, failing over to secondary RPC endpoint",
               );
               options.onFailover?.({ failedUrl, fallbackUrl, error: err });
@@ -183,5 +221,266 @@ export function viemClient(
       }
       return found;
     },
+  };
+}
+
+export interface DestinationReceiptLog {
+  readonly address: Hex;
+  readonly topics: [] | [Hex, ...Hex[]];
+  readonly data: Hex;
+  readonly logIndex: number;
+}
+
+export interface DestinationReceipt {
+  readonly transactionHash: Hex;
+  readonly blockNumber: bigint;
+  readonly blockHash: Hex;
+  readonly status: "success" | "reverted";
+  readonly logs: readonly DestinationReceiptLog[];
+}
+
+export interface DestinationBlock {
+  readonly number: bigint;
+  readonly hash: Hex;
+  readonly timestamp: bigint;
+}
+
+export interface DestinationContractRead {
+  readonly address: Hex;
+  readonly abi: Abi;
+  readonly functionName: string;
+  readonly args?: readonly unknown[];
+}
+
+export interface DestinationFailoverEvent {
+  readonly chain?: ChainKey;
+  readonly failedEndpoint: string;
+  readonly fallbackEndpoint: string;
+  readonly reason: string;
+}
+
+export interface DestinationVerifierClient {
+  getChainId(signal?: AbortSignal): Promise<number>;
+  getTransactionReceipt(hash: Hex, signal?: AbortSignal): Promise<DestinationReceipt>;
+  getBlockNumber(signal?: AbortSignal): Promise<bigint>;
+  getBlock(blockNumber: bigint, signal?: AbortSignal): Promise<DestinationBlock>;
+  readContract(request: DestinationContractRead, signal?: AbortSignal): Promise<unknown>;
+}
+
+export interface DestinationVerifierClientOptions {
+  readonly chainKey?: ChainKey;
+  readonly timeoutMs?: number;
+  readonly retryCount?: number;
+  readonly logger?: Logger;
+  readonly fetchFn?: typeof globalThis.fetch;
+  readonly headers?: Readonly<Record<string, string>>;
+  readonly onFailover?: (event: DestinationFailoverEvent) => void;
+}
+
+export interface DestinationClientFactoryInput {
+  readonly chain: ChainKey;
+  readonly chainId: number;
+  readonly rpcUrls: readonly string[];
+  readonly timeoutMs: number;
+  readonly logger?: Logger;
+}
+
+export type DestinationClientFactory = (
+  input: DestinationClientFactoryInput,
+) => DestinationVerifierClient;
+
+export class DestinationChainMismatchError extends Error {
+  constructor(
+    readonly expectedChainId: number,
+    readonly actualChainId: number,
+    readonly endpoint: string,
+  ) {
+    super(
+      `Destination RPC chain mismatch at ${endpoint}: expected chain ${String(expectedChainId)}, got ${String(actualChainId)}.`,
+    );
+    this.name = "DestinationChainMismatchError";
+  }
+}
+
+/**
+ * Build a bounded-failover destination verification client for CCTP and ITS payouts.
+ *
+ * Every endpoint must prove `eth_chainId === expectedChainId` before any receipt, head, contract,
+ * or block response from that endpoint is accepted, including after mid-pass failover.
+ */
+export function createDestinationVerifierClient(
+  rpcUrls: string | readonly string[],
+  expectedChainId: number,
+  options: DestinationVerifierClientOptions = {},
+): DestinationVerifierClient {
+  const urls = typeof rpcUrls === "string" ? [rpcUrls] : [...rpcUrls];
+  if (urls.length === 0) {
+    throw new Error("at least one destination RPC URL is required");
+  }
+
+  const timeout = options.timeoutMs ?? 15_000;
+  const retryCount = options.retryCount ?? 0;
+  const baseFetch = options.fetchFn ?? globalThis.fetch;
+  let currentSignal: AbortSignal | undefined;
+
+  const signalAwareFetch: typeof globalThis.fetch = async (input, init) => {
+    currentSignal?.throwIfAborted();
+    const signals: AbortSignal[] = [];
+    if (init?.signal) signals.push(init.signal);
+    if (currentSignal) signals.push(currentSignal);
+    const mergedSignal = signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+    const mergedHeaders =
+      options.headers === undefined
+        ? init?.headers
+        : {
+            ...(init?.headers instanceof Headers
+              ? Object.fromEntries(init.headers.entries())
+              : Array.isArray(init?.headers)
+                ? Object.fromEntries(init.headers)
+                : init?.headers),
+            ...options.headers,
+          };
+    return baseFetch(input, {
+      ...init,
+      ...(mergedSignal ? { signal: mergedSignal } : {}),
+      ...(mergedHeaders ? { headers: mergedHeaders } : {}),
+    });
+  };
+
+  const clients = urls.map((url) =>
+    createPublicClient({
+      transport: http(url, {
+        fetchFn: signalAwareFetch,
+        timeout,
+        retryCount,
+      }),
+    }),
+  );
+
+  let activeIndex = 0;
+  const verifiedEndpoints = new Set<number>();
+
+  async function ensureChainVerified(index: number): Promise<void> {
+    if (verifiedEndpoints.has(index)) return;
+    const client = clients[index];
+    const url = urls[index];
+    if (!client || url === undefined) {
+      throw new Error("destination RPC endpoint index out of bounds");
+    }
+    const actualChainId = await client.getChainId();
+    if (actualChainId !== expectedChainId) {
+      throw new DestinationChainMismatchError(
+        expectedChainId,
+        actualChainId,
+        redactRpcEndpoint(url),
+      );
+    }
+    verifiedEndpoints.add(index);
+  }
+
+  async function executeWithFailover<T>(
+    signal: AbortSignal | undefined,
+    run: (client: (typeof clients)[number]) => Promise<T>,
+  ): Promise<T> {
+    signal?.throwIfAborted();
+    for (let idx = activeIndex; idx < clients.length; idx += 1) {
+      const client = clients[idx];
+      const url = urls[idx];
+      if (!client || url === undefined) continue;
+      const previousSignal = currentSignal;
+      currentSignal = signal;
+      try {
+        signal?.throwIfAborted();
+        await ensureChainVerified(idx);
+        const result = await run(client);
+        activeIndex = idx;
+        return result;
+      } catch (err) {
+        if (signal?.aborted) {
+          throw err;
+        }
+        if (
+          !(err instanceof DestinationChainMismatchError) &&
+          err instanceof Error &&
+          shouldThrow(err)
+        ) {
+          throw new Error(sanitizeRpcErrorMessage(err));
+        }
+        const nextUrl = urls[idx + 1];
+        const failedEndpoint = redactRpcEndpoint(url);
+        const reason = sanitizeRpcErrorMessage(err);
+        if (nextUrl !== undefined) {
+          const fallbackEndpoint = redactRpcEndpoint(nextUrl);
+          options.logger?.warn(
+            {
+              ...(options.chainKey ? { chain: options.chainKey } : {}),
+              failedEndpoint,
+              fallbackEndpoint,
+              reason,
+            },
+            "destination RPC endpoint failed, failing over to secondary endpoint",
+          );
+          options.onFailover?.({
+            ...(options.chainKey ? { chain: options.chainKey } : {}),
+            failedEndpoint,
+            fallbackEndpoint,
+            reason,
+          });
+          activeIndex = idx + 1;
+          continue;
+        }
+        if (err instanceof DestinationChainMismatchError) {
+          throw err;
+        }
+        throw new Error(`Destination RPC verification failed at ${failedEndpoint}: ${reason}`);
+      } finally {
+        currentSignal = previousSignal;
+      }
+    }
+    throw new Error("all destination RPC endpoints exhausted");
+  }
+
+  return {
+    getChainId: (signal) => executeWithFailover(signal, () => Promise.resolve(expectedChainId)),
+
+    getTransactionReceipt: (hash, signal) =>
+      executeWithFailover(signal, async (client) => {
+        const receipt = await client.getTransactionReceipt({ hash });
+        return {
+          transactionHash: receipt.transactionHash,
+          blockNumber: receipt.blockNumber,
+          blockHash: receipt.blockHash,
+          status: receipt.status,
+          logs: receipt.logs.map((log) => ({
+            address: log.address,
+            topics: log.topics,
+            data: log.data,
+            logIndex: log.logIndex,
+          })),
+        };
+      }),
+
+    getBlockNumber: (signal) =>
+      executeWithFailover(signal, (client) => client.getBlockNumber({ cacheTime: 0 })),
+
+    getBlock: (blockNumber, signal) =>
+      executeWithFailover(signal, async (client) => {
+        const block = await client.getBlock({ blockNumber, includeTransactions: false });
+        return {
+          number: block.number,
+          hash: block.hash,
+          timestamp: block.timestamp,
+        };
+      }),
+
+    readContract: (request, signal) =>
+      executeWithFailover(signal, (client) =>
+        client.readContract({
+          address: request.address,
+          abi: request.abi,
+          functionName: request.functionName,
+          ...(request.args ? { args: request.args } : {}),
+        }),
+      ),
   };
 }

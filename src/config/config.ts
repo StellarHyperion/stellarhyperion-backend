@@ -14,12 +14,21 @@
 import { readFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 
-import type { Chain, ChainKey, DeploymentSet, Hex, NetworkMode } from "@hyperion/protocol";
+import type {
+  Chain,
+  ChainKey,
+  DeploymentSet,
+  EvmChain,
+  Hex,
+  NetworkMode,
+} from "@hyperion/protocol";
 import {
   CHAINS,
   DeploymentFormatError,
   IRIS_API,
+  RAIL_CONTRACTS,
   chainsFor,
+  evmChainsFor,
   isEvmChain,
   isEvmDeployment,
   isStellarChain,
@@ -74,6 +83,15 @@ export interface EvmWatchConfig {
   readonly pollIntervalMs: number;
 }
 
+/** Destination RPC settings for verifying CCTP and ITS payouts without requiring an EVM router. */
+export interface DestinationRpcConfig {
+  readonly chain: ChainKey;
+  readonly chainId: number;
+  readonly confirmations: number;
+  readonly rpcUrl: string;
+  readonly rpcUrls: readonly string[];
+}
+
 /** Everything the rail status pollers need. One per rail that has a status API. */
 export interface RailsConfig {
   readonly enabled: boolean;
@@ -84,6 +102,8 @@ export interface RailsConfig {
   readonly batchSize: number;
   readonly recheckAfterMs: number;
   readonly maxCheckFailures: number;
+  readonly destinationTimeoutMs: number;
+  readonly destinationRpcs: Readonly<Partial<Record<ChainKey, DestinationRpcConfig>>>;
 }
 
 export interface IndexerConfig {
@@ -284,6 +304,18 @@ const RAIL_MAX_CHECK_FAILURES: VarSpec = {
     "Consecutive failures before the queue stops offering a transfer. Per transfer, not per rail: one unanswerable transfer must not back off the whole rail.",
 };
 
+const RAIL_DESTINATION_RPC_TIMEOUT_MS: VarSpec = {
+  name: "RAIL_DESTINATION_RPC_TIMEOUT_MS",
+  kind: "integer",
+  required: false,
+  fallback: "15000",
+  min: 500,
+  max: 120_000,
+  printable: true,
+  purpose:
+    "Per-request timeout in milliseconds for CCTP and ITS destination receipt verification RPCs.",
+};
+
 const KEEPER_ENABLED: VarSpec = {
   name: "KEEPER_ENABLED",
   kind: "boolean",
@@ -418,7 +450,7 @@ function rpcOverrideSpec(chain: ChainKey): VarSpec {
     // inside viem on the first request.
     protocols: ["http", "https"],
     required: false,
-    printable: true,
+    printable: false,
     purpose: `RPC endpoint for ${CHAINS[chain].name}. Defaults to the chain registry entry.`,
   };
 }
@@ -429,9 +461,61 @@ function rpcUrlsOverrideSpec(chain: ChainKey): VarSpec {
     kind: "url",
     protocols: ["http", "https"],
     required: false,
-    printable: true,
+    printable: false,
     purpose: `RPC endpoints for ${CHAINS[chain].name}, comma-separated. Defaults to EVM_RPC_URL_${envSuffixFor(chain)} or the chain registry entry.`,
   };
+}
+
+function destinationRpcOverrideSpec(chain: ChainKey): VarSpec {
+  return {
+    name: `RAIL_DESTINATION_RPC_URL_${envSuffixFor(chain)}`,
+    kind: "url",
+    protocols: ["http", "https"],
+    required: false,
+    printable: false,
+    purpose: `Destination verification RPC endpoint for ${CHAINS[chain].name}. Defaults to EVM_RPC_URL_${envSuffixFor(chain)} or the chain registry entry.`,
+  };
+}
+
+function destinationRpcUrlsOverrideSpec(chain: ChainKey): VarSpec {
+  return {
+    name: `RAIL_DESTINATION_RPC_URLS_${envSuffixFor(chain)}`,
+    kind: "url",
+    protocols: ["http", "https"],
+    required: false,
+    printable: false,
+    purpose: `Ordered destination verification RPC endpoints for ${CHAINS[chain].name}, comma-separated. Defaults to RAIL_DESTINATION_RPC_URL_${envSuffixFor(chain)}, EVM_RPC_URLS_${envSuffixFor(chain)}, EVM_RPC_URL_${envSuffixFor(chain)}, or the chain registry entry.`,
+  };
+}
+
+function unknownOverrideSpec(name: string, purpose: string): VarSpec {
+  return {
+    name,
+    kind: "url",
+    protocols: ["http", "https"],
+    required: false,
+    printable: false,
+    purpose,
+  };
+}
+
+/** Supported EVM destination chains for rail receipt verification on the active network. */
+export function supportedDestinationChains(network: NetworkMode): readonly EvmChain[] {
+  return evmChainsFor(network).filter((entry) => {
+    if (entry.cctpDomain === null && entry.axelarName === null) return false;
+    const contracts = RAIL_CONTRACTS[entry.key];
+    return Boolean(contracts?.cctp ?? contracts?.axelar);
+  });
+}
+
+/** Resolve ordered destination RPC URLs for a chain from AppConfig with safe registry fallback. */
+export function destinationRpcUrlsFor(config: AppConfig, chainKey: ChainKey): readonly string[] {
+  const configured = config.rails.destinationRpcs[chainKey]?.rpcUrls;
+  if (configured && configured.length > 0) return configured;
+  const watched = config.indexer.evm.find((entry) => entry.chain === chainKey)?.rpcUrls;
+  if (watched && watched.length > 0) return watched;
+  const target = CHAINS[chainKey];
+  return isEvmChain(target) ? [target.defaultRpcUrl] : [];
 }
 
 /**
@@ -465,6 +549,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const railBatchSize = reader.integer(RAIL_BATCH_SIZE);
   const railRecheckAfterMs = reader.integer(RAIL_RECHECK_AFTER_MS);
   const railMaxCheckFailures = reader.integer(RAIL_MAX_CHECK_FAILURES);
+  const destinationTimeoutMs = reader.integer(RAIL_DESTINATION_RPC_TIMEOUT_MS);
 
   const keeperPollIntervalMs = reader.integer(KEEPER_POLL_INTERVAL_MS);
   const keeperConcurrency = reader.integer(KEEPER_CONCURRENCY);
@@ -498,6 +583,11 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     reorgDepthOverride,
     env,
   });
+  const destinationRpcs = planDestinationRpcs(reader, {
+    network,
+    deployments,
+    env,
+  });
 
   // One throw, after everything has had a chance to complain.
   reader.finish();
@@ -520,6 +610,8 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       batchSize: railBatchSize,
       recheckAfterMs: railRecheckAfterMs,
       maxCheckFailures: railMaxCheckFailures,
+      destinationTimeoutMs,
+      destinationRpcs,
     },
     keeper: {
       enabled: keeperEnabled,
@@ -662,9 +754,9 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
       const override = rpcOverrideSpec(chainKey);
       const urlsOverride = rpcUrlsOverrideSpec(chainKey);
       let rpcUrls: readonly string[];
-      if (reader.has(urlsOverride.name)) {
+      if (reader.isDefined(urlsOverride.name)) {
         rpcUrls = reader.urls(urlsOverride);
-      } else if (reader.has(override.name)) {
+      } else if (reader.isDefined(override.name)) {
         rpcUrls = reader.urls(override);
       } else {
         rpcUrls = [chain.defaultRpcUrl];
@@ -696,6 +788,87 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
   // Stable order so logs and the ready check read the same way on every boot.
   evm.sort((a, b) => a.chain.localeCompare(b.chain));
   return { enabled: input.enabled, stellar, evm };
+}
+
+function planDestinationRpcs(
+  reader: EnvReader,
+  input: {
+    readonly network: NetworkMode;
+    readonly deployments: DeploymentSet;
+    readonly env: Readonly<Record<string, string | undefined>>;
+  },
+): Readonly<Partial<Record<ChainKey, DestinationRpcConfig>>> {
+  if (reader.failed(HYPERION_NETWORK)) return {};
+
+  const supported = supportedDestinationChains(input.network);
+  const destinationBySuffix = new Map<string, EvmChain>(
+    supported.map((entry) => [envSuffixFor(entry.key), entry]),
+  );
+  const validEvmSuffixes = new Set<string>(destinationBySuffix.keys());
+  for (const entry of evmChainsFor(input.network)) {
+    if (Object.prototype.hasOwnProperty.call(input.deployments.networks, entry.key)) {
+      validEvmSuffixes.add(envSuffixFor(entry.key));
+    }
+  }
+
+  const supportedSuffixList = [...destinationBySuffix.keys()].sort().join(", ");
+  const envKeys = Object.keys(input.env).sort();
+  for (const name of envKeys) {
+    if (!reader.isDefined(name)) continue;
+    const destMatch = /^RAIL_DESTINATION_RPC_URLS?_(.+)$/.exec(name);
+    if (destMatch !== null) {
+      const suffix = destMatch[1] ?? "";
+      if (!destinationBySuffix.has(suffix)) {
+        reader.reject(
+          unknownOverrideSpec(
+            name,
+            `Destination verification RPC override for a supported ${input.network} EVM destination (${supportedSuffixList}).`,
+          ),
+          `names ${suffix}, which is not a supported ${input.network} destination chain`,
+        );
+      }
+      continue;
+    }
+    const evmMatch = /^EVM_RPC_URLS?_(.+)$/.exec(name);
+    if (evmMatch !== null) {
+      const suffix = evmMatch[1] ?? "";
+      if (!validEvmSuffixes.has(suffix)) {
+        reader.reject(
+          unknownOverrideSpec(
+            name,
+            `RPC override for a watched or destination ${input.network} EVM chain (${supportedSuffixList}).`,
+          ),
+          `names ${suffix}, which is not an active ${input.network} EVM chain`,
+        );
+      }
+    }
+  }
+
+  const planned: Partial<Record<ChainKey, DestinationRpcConfig>> = {};
+  const ordered = [...supported].sort((a, b) => a.key.localeCompare(b.key));
+  for (const entry of ordered) {
+    const destUrlsSpec = destinationRpcUrlsOverrideSpec(entry.key);
+    const destUrlSpec = destinationRpcOverrideSpec(entry.key);
+    const evmUrlsSpec = rpcUrlsOverrideSpec(entry.key);
+    const evmUrlSpec = rpcOverrideSpec(entry.key);
+
+    // Validate every defined override for this chain so simultaneous mistakes accumulate together.
+    const destUrls = reader.isDefined(destUrlsSpec.name) ? reader.urls(destUrlsSpec) : null;
+    const destUrl = reader.isDefined(destUrlSpec.name) ? reader.urls(destUrlSpec) : null;
+    const evmUrls = reader.isDefined(evmUrlsSpec.name) ? reader.urls(evmUrlsSpec) : null;
+    const evmUrl = reader.isDefined(evmUrlSpec.name) ? reader.urls(evmUrlSpec) : null;
+
+    const rpcUrls = destUrls ?? destUrl ?? evmUrls ?? evmUrl ?? [entry.defaultRpcUrl];
+    planned[entry.key] = {
+      chain: entry.key,
+      chainId: entry.chainId,
+      confirmations: entry.confirmations,
+      rpcUrl: rpcUrls[0] ?? entry.defaultRpcUrl,
+      rpcUrls,
+    };
+  }
+
+  return planned;
 }
 
 function messageOf(error: unknown): string {

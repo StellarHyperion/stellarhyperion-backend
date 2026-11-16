@@ -107,6 +107,13 @@ export class EnvReader {
     return raw !== undefined && raw.trim().length > 0;
   }
 
+  /** Whether the environment explicitly defines a key, including empty or whitespace values. */
+  isDefined(name: string): boolean {
+    return (
+      Object.prototype.hasOwnProperty.call(this.source, name) && this.source[name] !== undefined
+    );
+  }
+
   string(spec: VarSpec): string {
     const raw = this.raw(spec);
     return raw ?? "";
@@ -177,6 +184,15 @@ export class EnvReader {
   }
 
   urls(spec: VarSpec): string[] {
+    if (
+      this.isDefined(spec.name) &&
+      spec.fallback === undefined &&
+      (this.source[spec.name] ?? "").trim().length === 0
+    ) {
+      this.record(spec, "must not be empty; unset the variable to use the default endpoint");
+      return [];
+    }
+
     const raw = this.raw(spec);
     if (raw === null) return [];
 
