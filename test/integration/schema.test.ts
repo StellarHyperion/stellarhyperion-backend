@@ -9,8 +9,10 @@
  * Skipped entirely without `TEST_DATABASE_URL`, so `npm test` on a machine with no database still
  * runs the unit suite rather than failing in a way somebody learns to ignore.
  */
+import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import { auditTransferAndClaimInvariants } from "../../src/db/invariants.js";
 import { Database } from "../../src/db/pool.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
@@ -334,5 +336,63 @@ suite("maintenance and pruning", () => {
     expect(ids).not.toContain(999991);
     expect(ids).toContain(999992);
     expect(ids).toContain(999993);
+  });
+});
+
+suite("invariant auditor", () => {
+  let db: Database;
+
+  beforeAll(async () => {
+    db = Database.open(CONNECTION ?? "", {
+      maxConnections: 1,
+      applicationName: "hyperion-invariant-schema-test",
+    });
+    await db.query("DROP SCHEMA IF EXISTS invariant_audit_test CASCADE");
+    await db.query("CREATE SCHEMA invariant_audit_test");
+    await db.query("SET search_path TO invariant_audit_test");
+    for (const migration of [
+      "1790900000000_initial-schema.sql",
+      "1791000000000_cursor-block-hash.sql",
+      "1791100000000_cursor-autovacuum-tuning.sql",
+    ]) {
+      const fullSql = readFileSync(
+        new URL(`../../migrations/${migration}`, import.meta.url),
+        "utf8",
+      );
+      const upSql = fullSql.split("-- Down Migration")[0] ?? fullSql;
+      await db.query(upSql);
+    }
+  });
+
+  afterAll(async () => {
+    await db.query("DROP SCHEMA IF EXISTS invariant_audit_test CASCADE");
+    await db.close();
+  });
+
+  it("passes on clean migrations and flags provider-only delivered attestations read-only", async () => {
+    const cleanReport = await auditTransferAndClaimInvariants(db);
+    expect(cleanReport.ok).toBe(true);
+    expect(cleanReport.readOnlyEnforced).toBe(true);
+    expect(cleanReport.violations).toEqual([]);
+
+    await db.query(
+      `INSERT INTO outbound_transfer
+         (id, origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
+          destination_chain, destination, origin_block, origin_tx)
+       VALUES (501, 'stellar-testnet', 0, 501, 'GC4FD5G3CZJ57VPYTVNWU4FRDLLV37EYDGT3OVZA35WKHBWDI6PKTYTN',
+               'CD5IB466XCQIUDYWV22PUMJTF6EE3KPXBDGLLBSKAPNE6QPXVUZLXJGA', 10000000, 10000, 9990000,
+               'base-sepolia', '0x0000000000000000000000001111111111111111111111111111111111111111',
+               100, 'aa00501')`,
+    );
+    await db.query(
+      `INSERT INTO rail_attestation (transfer_id, route, status, rail_status)
+       VALUES (501, 0, 'delivered', 'complete')`,
+    );
+
+    const flagged = await auditTransferAndClaimInvariants(db);
+    expect(flagged.ok).toBe(false);
+    expect(flagged.violations.map((v) => v.code)).toContain(
+      "attestation_delivered_without_canonical_inbound",
+    );
   });
 });

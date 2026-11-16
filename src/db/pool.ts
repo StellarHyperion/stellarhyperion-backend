@@ -95,6 +95,25 @@ export class Database implements Transactional {
     }
   }
 
+  /**
+   * Run `work` inside a read-only repeatable-read snapshot so multi-query invariant audits
+   * observe one consistent database boundary and PostgreSQL rejects any accidental mutation.
+   */
+  async readOnlyTransaction<T>(work: (tx: Queryable) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      const value = await work(wrapClient(client));
+      await client.query("COMMIT");
+      return value;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   /** Cheapest possible proof the database is answering, for the ready check. */
   async ping(): Promise<void> {
     await this.query("SELECT 1");
