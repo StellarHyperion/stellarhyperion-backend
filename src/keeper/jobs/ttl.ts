@@ -1,7 +1,8 @@
 import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 import { bigintOf } from "../../db/rows.js";
-import { submitStellar } from "../stellar.js";
+import { assembleDryRunPlan, previewStellarOperation, submitStellar } from "../stellar.js";
 import type { KeeperContext, TtlBumpPayload, TtlBumpResult } from "../types.js";
+
 export async function processTtlBump(
   ctx: KeeperContext,
   payload: TtlBumpPayload = {},
@@ -14,7 +15,9 @@ export async function processTtlBump(
       bumpedTransfers: 0,
       dryRun: true,
       detail: "No Stellar deployment configured.",
+      plan: assembleDryRunPlan([]),
     };
+
   const deployment = ctx.config.deployments.networks[chain.chain];
   const tokens = deployment
     ? Object.values(deployment.tokens)
@@ -31,22 +34,59 @@ export async function processTtlBump(
   );
   const claims = claimRows.rows.map((row) => bigintOf(row, "claim_id"));
   const transfers = transferRows.rows.map((row) => bigintOf(row, "nonce"));
-  const dryRun = ctx.config.keeper.stellarSecret === null;
-  if (dryRun)
+
+  const vector = (values: xdr.ScVal[]) => xdr.ScVal.scvVec(values);
+  const buildArgs = (): xdr.ScVal[] => [
+    vector(tokens.map((token) => new Address(token).toScVal())),
+    vector([0, 1, 2, 3].map((route) => nativeToScVal(route, { type: "u32" }))),
+    vector(claims.map((id) => nativeToScVal(id, { type: "u64" }))),
+    vector(transfers.map((id) => nativeToScVal(id, { type: "u64" }))),
+  ];
+
+  const dryRun = payload.dryRun === true || ctx.config.keeper.stellarSecret === null;
+  if (dryRun) {
+    const targetKeys = [
+      `router:${chain.routerContractId}`,
+      ...tokens.map((sacId) => `token:${sacId}`),
+      "route:0",
+      "route:1",
+      "route:2",
+      "route:3",
+      ...claims.map((id) => `claim:${String(id)}`),
+      ...transfers.map((id) => `transfer:${String(id)}`),
+    ];
+
+    const opPreview = await previewStellarOperation({
+      chain: chain.chain,
+      networkPassphrase: chain.networkPassphrase,
+      rpcUrl: chain.rpcUrl,
+      contract: chain.routerContractId,
+      method: "keep_alive",
+      args: buildArgs,
+      targetKeys,
+      argsSummary: {
+        tokens: [...tokens],
+        routes: [0, 1, 2, 3],
+        claimIds: claims.map((id) => String(id)),
+        transferNonces: transfers.map((id) => String(id)),
+      },
+      ...(ctx.simulationClient !== undefined ? { simulationClient: ctx.simulationClient } : {}),
+      ...(payload.simulateViaRpc !== undefined ? { simulateViaRpc: payload.simulateViaRpc } : {}),
+    });
+    const plan = assembleDryRunPlan([opPreview]);
+
+    const reasonPrefix = payload.dryRun === true ? "Dry-run plan (unsigned)" : "No signer";
     return {
       bumpedTokens: 0,
       bumpedClaims: 0,
       bumpedTransfers: 0,
       dryRun: true,
-      detail: `No signer: ${tokens.length} tokens, ${claims.length} claims, ${transfers.length} transfers need maintenance.`,
+      detail: `${reasonPrefix}: ${String(tokens.length)} tokens, ${String(claims.length)} claims, ${String(transfers.length)} transfers need maintenance (estimated fee ${plan.totalEstimatedFeeStroops} stroops).`,
+      plan,
     };
-  const vector = (values: xdr.ScVal[]) => xdr.ScVal.scvVec(values);
-  const hash = await submitStellar(ctx.config, chain.routerContractId, "keep_alive", () => [
-    vector(tokens.map((token) => new Address(token).toScVal())),
-    vector([0, 1, 2, 3].map((route) => nativeToScVal(route, { type: "u32" }))),
-    vector(claims.map((id) => nativeToScVal(id, { type: "u64" }))),
-    vector(transfers.map((id) => nativeToScVal(id, { type: "u64" }))),
-  ]);
+  }
+
+  const hash = await submitStellar(ctx.config, chain.routerContractId, "keep_alive", buildArgs);
   ctx.logger.info({ hash }, "router keep_alive confirmed");
   return {
     bumpedTokens: tokens.length,

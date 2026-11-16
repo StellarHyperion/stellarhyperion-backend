@@ -10,6 +10,7 @@ import { Redis } from "ioredis";
 
 import { processClaimSettlement } from "./jobs/claims.js";
 import { processTtlBump } from "./jobs/ttl.js";
+import { sanitizePublicPreviewText } from "./stellar.js";
 import type { KeeperContext, KeeperJobName, KeeperJobResult } from "./types.js";
 
 export const KEEPER_QUEUE_NAME = "hyperion-keeper";
@@ -65,11 +66,26 @@ export async function startKeeperQueue(
   );
 
   worker.on("completed", (job, result) => {
-    logger.info({ jobName: job.name, jobId: job.id, kind: result.kind }, "keeper job completed");
+    logger.info(
+      {
+        jobName: job.name,
+        jobId: job.id,
+        kind: result.kind,
+        dryRun: result.result.dryRun,
+      },
+      "keeper job completed",
+    );
   });
 
   worker.on("failed", (job, error) => {
-    logger.error({ jobName: job?.name, jobId: job?.id, err: error }, "keeper job failed");
+    logger.error(
+      {
+        jobName: job?.name,
+        jobId: job?.id,
+        reason: sanitizePublicPreviewText(error.message),
+      },
+      "keeper job failed",
+    );
   });
 
   // Schedule repeatable jobs for the two Stellar tasks

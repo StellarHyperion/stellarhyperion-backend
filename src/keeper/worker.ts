@@ -1,15 +1,24 @@
 /**
  * Worker implementation for the keeper, integrating with the runner lifecycle.
  *
- * Exposes start, stop and readiness so `main.ts` and `runner.ts` treat the keeper identically
- * to chain watchers and rail pollers.
+ * Exposes start, stop, dry-run previewing, and readiness so `main.ts` and `runner.ts`
+ * treat the keeper identically to chain watchers and rail pollers.
  */
 import type { Logger } from "pino";
 
 import type { AppConfig } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
+import { processClaimSettlement } from "./jobs/claims.js";
+import { processTtlBump } from "./jobs/ttl.js";
 import { startKeeperQueue, type KeeperHandle } from "./queue.js";
+import { sanitizePublicPreviewText, type KeeperSimulationClient } from "./stellar.js";
+import type {
+  ClaimSettlementPayload,
+  KeeperJobName,
+  KeeperJobResult,
+  TtlBumpPayload,
+} from "./types.js";
 
 export class KeeperWorker implements ReadinessSource {
   readonly name = "keeper";
@@ -21,7 +30,26 @@ export class KeeperWorker implements ReadinessSource {
     private readonly config: AppConfig,
     private readonly db: Transactional,
     private readonly logger: Logger,
+    private readonly simulationClient?: KeeperSimulationClient,
   ) {}
+
+  async previewJob(
+    jobName: KeeperJobName,
+    payload: Omit<TtlBumpPayload & ClaimSettlementPayload, "dryRun"> = {},
+  ): Promise<KeeperJobResult> {
+    const ctx = {
+      db: this.db,
+      config: this.config,
+      logger: this.logger,
+      ...(this.simulationClient !== undefined ? { simulationClient: this.simulationClient } : {}),
+    };
+    if (jobName === "ttl-bump") {
+      const result = await processTtlBump(ctx, { ...payload, dryRun: true });
+      return { kind: "ttl-bump", result };
+    }
+    const result = await processClaimSettlement(ctx, { ...payload, dryRun: true });
+    return { kind: "claim-settlement", result };
+  }
 
   readiness(): ReadinessReport {
     if (!this.config.keeper.enabled) {
@@ -35,7 +63,7 @@ export class KeeperWorker implements ReadinessSource {
       return {
         name: this.name,
         state: "degraded",
-        detail: `redis connection failure: ${this.failedError}`,
+        detail: `redis connection failure: ${sanitizePublicPreviewText(this.failedError)}`,
       };
     }
     if (this.handle === null) {
@@ -48,7 +76,10 @@ export class KeeperWorker implements ReadinessSource {
     return {
       name: this.name,
       state: "ready",
-      detail: "active on BullMQ with 2 scheduled Stellar upkeep jobs",
+      detail:
+        this.config.keeper.stellarSecret === null
+          ? "active on BullMQ in unsigned dry-run mode"
+          : "active on BullMQ with 2 scheduled Stellar upkeep jobs",
     };
   }
 
@@ -57,7 +88,12 @@ export class KeeperWorker implements ReadinessSource {
     this.starting = true;
 
     startKeeperQueue(
-      { db: this.db, config: this.config, logger: this.logger },
+      {
+        db: this.db,
+        config: this.config,
+        logger: this.logger,
+        ...(this.simulationClient !== undefined ? { simulationClient: this.simulationClient } : {}),
+      },
       this.config.redisUrl,
     )
       .then((handle) => {
@@ -67,8 +103,9 @@ export class KeeperWorker implements ReadinessSource {
       })
       .catch((err: unknown) => {
         this.starting = false;
-        this.failedError = err instanceof Error ? err.message : String(err);
-        this.logger.error({ err }, "failed to start keeper queue");
+        const raw = err instanceof Error ? err.message : String(err);
+        this.failedError = sanitizePublicPreviewText(raw);
+        this.logger.error({ reason: this.failedError }, "failed to start keeper queue");
       });
   }
 
