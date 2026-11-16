@@ -25,6 +25,7 @@ async function getApp(): Promise<FastifyInstance> {
   const db = Database.open(config.databaseUrl, {
     applicationName: "hyperion-vercel-api",
     connectionTimeoutMs: 2000,
+    logger,
   });
 
   app = buildServer({

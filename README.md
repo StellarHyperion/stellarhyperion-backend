@@ -69,6 +69,8 @@ One process serializes its Stellar submissions to avoid sequence conflicts. Run 
 - `GET /v1/claims`, `GET /v1/claims/:chain/:claimId`
 - `GET /v1/routes/health`, `GET /v1/metrics`
 
+`GET /v1/metrics` and `GET /ready` expose parameter-free PostgreSQL pool saturation metrics (`utilizationRatio`, `activeConnections`, `waitingClients`, `saturationEvents`, `acquireWaitMaxMs`) alongside bounded query latency histograms keyed by fixed low-cardinality workloads (`api`, `ingestion`, `rails`, `keeper`, `health`, `maintenance`).
+
 `npm run check` runs formatting, lint, type checking and tests. Schema/API regressions execute repository migrations in embedded PostgreSQL (PGlite). The full PostgreSQL integration suite requires `TEST_DATABASE_URL`; it is skipped when unset. Use `npm run build` for emitted production code.
 
 RPC event retention is finite. A fresh deployment record may predate the public RPC's retained history; initialize `STELLAR_START_LEDGER` within retained history only if you accept that older events are unavailable, or use a historical provider. Check readiness and logs rather than treating an empty database as complete history.

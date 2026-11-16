@@ -12,8 +12,21 @@
  * not check the shape it returns against anything, so a generic there is a cast wearing a
  * costume. Narrowing happens once per table, in `rows.ts`, where it is visible.
  */
+import { performance } from "node:perf_hooks";
 import { Pool } from "pg";
-import type { PoolClient, PoolConfig } from "pg";
+import type { PoolConfig } from "pg";
+
+import {
+  DbTelemetryCollector,
+  createEmptyDbTelemetrySnapshot,
+  type DbTelemetrySnapshot,
+  type DbWorkload,
+  type PoolStatsSource,
+  type TelemetryWarnLogger,
+} from "./telemetry.js";
+
+export type { DbTelemetrySnapshot, DbWorkload } from "./telemetry.js";
+export { DB_WORKLOADS, createEmptyDbTelemetrySnapshot } from "./telemetry.js";
 
 export interface QueryResultRows {
   readonly rows: readonly Record<string, unknown>[];
@@ -38,23 +51,46 @@ export interface Transactional extends Queryable {
   transaction<T>(work: (tx: Queryable) => Promise<T>): Promise<T>;
 }
 
+export interface PoolClientLike {
+  query(text: string, values?: unknown[]): Promise<{ rows: unknown[]; rowCount: number | null }>;
+  release(): void;
+}
+
+export interface PoolLike extends PoolStatsSource {
+  query(text: string, values?: unknown[]): Promise<{ rows: unknown[]; rowCount: number | null }>;
+  connect(): Promise<PoolClientLike>;
+  end(): Promise<void>;
+}
+
 export interface OpenOptions {
   /** Low by default. Two watchers and an HTTP server do not need twenty connections. */
-  readonly maxConnections?: number;
-  readonly connectionTimeoutMs?: number;
-  readonly statementTimeoutMs?: number;
-  readonly applicationName?: string;
+  readonly maxConnections?: number | undefined;
+  readonly connectionTimeoutMs?: number | undefined;
+  readonly statementTimeoutMs?: number | undefined;
+  readonly applicationName?: string | undefined;
+  readonly saturationThresholdRatio?: number | undefined;
+  readonly acquireWarnMs?: number | undefined;
+  readonly warnCooldownMs?: number | undefined;
+  readonly logger?: TelemetryWarnLogger | undefined;
+}
+
+interface SharedPoolState {
+  closed: boolean;
 }
 
 export class Database implements Transactional {
-  private closed = false;
-
-  private constructor(private readonly pool: Pool) {}
+  private constructor(
+    private readonly pool: PoolLike,
+    private readonly telemetry: DbTelemetryCollector,
+    private readonly workload: DbWorkload,
+    private readonly state: SharedPoolState,
+  ) {}
 
   static open(connectionString: string, options: OpenOptions = {}): Database {
+    const maxConnections = options.maxConnections ?? 10;
     const config: PoolConfig = {
       connectionString,
-      max: options.maxConnections ?? 10,
+      max: maxConnections,
       connectionTimeoutMillis: options.connectionTimeoutMs ?? 10_000,
       // Named so `pg_stat_activity` says which process is holding a connection. During an
       // incident that is the difference between knowing and guessing.
@@ -63,12 +99,46 @@ export class Database implements Transactional {
       // the connection does not help it.
       statement_timeout: options.statementTimeoutMs ?? 30_000,
     };
-    return new Database(new Pool(config));
+    return Database.fromPool(new Pool(config), options);
+  }
+
+  static fromPool(pool: PoolLike, options: OpenOptions = {}): Database {
+    const telemetry = new DbTelemetryCollector(pool, {
+      maxConnections: options.maxConnections ?? 10,
+      saturationThresholdRatio: options.saturationThresholdRatio,
+      acquireWarnMs: options.acquireWarnMs,
+      warnCooldownMs: options.warnCooldownMs,
+      logger: options.logger,
+    });
+    return new Database(pool, telemetry, "api", { closed: false });
+  }
+
+  /**
+   * Return a lightweight view sharing the underlying connection pool and telemetry collector,
+   * attributing all queries and transactions executed through it to `workload`.
+   */
+  forWorkload(workload: DbWorkload): Database {
+    if (workload === this.workload) return this;
+    return new Database(this.pool, this.telemetry, workload, this.state);
+  }
+
+  telemetrySnapshot(): DbTelemetrySnapshot {
+    return this.telemetry.snapshot();
   }
 
   async query(text: string, params: readonly unknown[] = []): Promise<QueryResultRows> {
-    const result = await this.pool.query(text, params as unknown[]);
-    return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount ?? 0 };
+    this.telemetry.beginQuery(this.workload);
+    const started = performance.now();
+    let failed = false;
+    try {
+      const result = await this.pool.query(text, params as unknown[]);
+      return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount ?? 0 };
+    } catch (error) {
+      failed = true;
+      throw error;
+    } finally {
+      this.telemetry.endQuery(this.workload, performance.now() - started, failed);
+    }
   }
 
   /**
@@ -79,18 +149,31 @@ export class Database implements Transactional {
    * only as good as nobody being able to write one without the other.
    */
   async transaction<T>(work: (tx: Queryable) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
+    this.telemetry.beginAcquire(this.workload);
+    const acquireStarted = performance.now();
+    let client: PoolClientLike;
+    try {
+      client = await this.pool.connect();
+      this.telemetry.endAcquire(this.workload, performance.now() - acquireStarted, true);
+    } catch (error) {
+      this.telemetry.endAcquire(this.workload, performance.now() - acquireStarted, false);
+      throw error;
+    }
+
     try {
       await client.query("BEGIN");
-      const value = await work(wrapClient(client));
+      const value = await work(wrapClient(client, this.telemetry, this.workload));
       await client.query("COMMIT");
+      this.telemetry.recordTransactionOutcome(this.workload, true);
       return value;
     } catch (error) {
+      this.telemetry.recordTransactionOutcome(this.workload, false);
       // A rollback that itself fails means the connection is gone, in which case the server has
       // already rolled back and the original error is the one worth reporting.
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
+      this.telemetry.releaseCheckout();
       client.release();
     }
   }
@@ -105,7 +188,8 @@ export class Database implements Transactional {
    * Returns the count of deleted rows.
    */
   async pruneCompletedAttestations(olderThanDays = 30): Promise<number> {
-    const { rowCount } = await this.query(
+    const maintenanceDb = this.forWorkload("maintenance");
+    const { rowCount } = await maintenanceDb.query(
       `DELETE FROM rail_attestation
         WHERE status = 'delivered'
           AND updated_at < now() - ($1 * INTERVAL '1 day')`,
@@ -115,10 +199,34 @@ export class Database implements Transactional {
   }
 
   async close(): Promise<void> {
-    if (this.closed) return;
-    this.closed = true;
+    if (this.state.closed) return;
+    this.state.closed = true;
     await this.pool.end();
   }
+}
+
+export function withTransactionalWorkload(db: Transactional, workload: DbWorkload): Transactional {
+  const candidate = db as Partial<Database>;
+  if (typeof candidate.forWorkload === "function") {
+    return candidate.forWorkload(workload);
+  }
+  return db;
+}
+
+export function withDatabaseWorkload(db: Database, workload: DbWorkload): Database {
+  const candidate = db as Partial<Database>;
+  if (typeof candidate.forWorkload === "function") {
+    return candidate.forWorkload(workload);
+  }
+  return db;
+}
+
+export function getDatabaseTelemetry(db: unknown): DbTelemetrySnapshot {
+  const candidate = db as Partial<Database> | null | undefined;
+  if (candidate && typeof candidate.telemetrySnapshot === "function") {
+    return candidate.telemetrySnapshot();
+  }
+  return createEmptyDbTelemetrySnapshot();
 }
 
 export interface MaintenanceTaskOptions {
@@ -154,11 +262,24 @@ export function startMaintenanceTask(
   };
 }
 
-function wrapClient(client: PoolClient): Queryable {
+function wrapClient(
+  client: PoolClientLike,
+  telemetry: DbTelemetryCollector,
+  workload: DbWorkload,
+): Queryable {
   return {
     async query(text: string, params: readonly unknown[] = []): Promise<QueryResultRows> {
-      const result = await client.query(text, params as unknown[]);
-      return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount ?? 0 };
+      const started = performance.now();
+      let failed = false;
+      try {
+        const result = await client.query(text, params as unknown[]);
+        return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount ?? 0 };
+      } catch (error) {
+        failed = true;
+        throw error;
+      } finally {
+        telemetry.recordClientQuery(workload, performance.now() - started, failed);
+      }
     },
   };
 }

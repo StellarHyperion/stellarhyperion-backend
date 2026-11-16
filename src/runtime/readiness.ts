@@ -12,6 +12,8 @@
  * its own readiness and the HTTP layer only aggregates.
  */
 
+import type { PoolSaturationSnapshot } from "../db/telemetry.js";
+
 export type ReadinessState = "ready" | "degraded" | "down";
 
 export interface ReadinessReport {
@@ -196,4 +198,22 @@ export class ReadinessRegistry {
     }
     return { state: worstOf(checks), checks };
   }
+}
+
+export function checkDatabasePoolSaturation(pool: PoolSaturationSnapshot): ReadinessReport {
+  if (pool.saturated) {
+    return {
+      name: "postgres-pool",
+      state: "degraded",
+      detail:
+        `pool saturation at ${String(Math.round(pool.utilizationRatio * 100))}% ` +
+        `(${String(pool.activeConnections)}/${String(pool.maxConnections)} active, ` +
+        `${String(pool.waitingClients)} waiting)`,
+    };
+  }
+  return {
+    name: "postgres-pool",
+    state: "ready",
+    detail: `${String(pool.activeConnections)}/${String(pool.maxConnections)} active connections`,
+  };
 }

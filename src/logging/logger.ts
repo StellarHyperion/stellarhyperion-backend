@@ -40,6 +40,13 @@ const REDACTED_PATHS = [
   "err.connectionString",
   "config.databaseUrl",
   "config.redisUrl",
+  "queryParams",
+  "*.queryParams",
+  "sqlParams",
+  "*.sqlParams",
+  "authorization",
+  "*.authorization",
+  "headers.authorization",
 ];
 
 export function createLogger(config: AppConfig): Logger {

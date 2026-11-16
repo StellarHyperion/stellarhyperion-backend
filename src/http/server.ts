@@ -6,6 +6,7 @@ import rateLimit from "@fastify/rate-limit";
 
 import type { AppConfig } from "../config/config.js";
 import type { Database } from "../db/pool.js";
+import { withDatabaseWorkload } from "../db/pool.js";
 import type { BullMQWorkerState, RedisPingable, ReadinessSource } from "../runtime/readiness.js";
 import { registerClaimRoutes } from "./routes/claims.js";
 import { registerHealthRoutes } from "./routes/health.js";
@@ -67,11 +68,20 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }),
   });
 
-  registerHealthRoutes(app, deps);
-  registerTransferRoutes(app, deps);
-  registerClaimRoutes(app, deps);
-  registerRouteHealthRoutes(app, deps);
-  registerMetricsRoutes(app, deps);
+  const healthDeps: ServerDeps = {
+    ...deps,
+    db: withDatabaseWorkload(deps.db, "health"),
+  };
+  const apiDeps: ServerDeps = {
+    ...deps,
+    db: withDatabaseWorkload(deps.db, "api"),
+  };
+
+  registerHealthRoutes(app, healthDeps);
+  registerTransferRoutes(app, apiDeps);
+  registerClaimRoutes(app, apiDeps);
+  registerRouteHealthRoutes(app, apiDeps);
+  registerMetricsRoutes(app, apiDeps);
 
   app.setNotFoundHandler((request, reply) => {
     void reply.code(404).send({

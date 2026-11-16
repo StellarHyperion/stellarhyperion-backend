@@ -15,9 +15,10 @@
  */
 import type { FastifyInstance } from "fastify";
 
+import { getDatabaseTelemetry } from "../../db/pool.js";
 import type { ServerDeps } from "../server.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
-import { checkRedisHealth, worstOf } from "../../runtime/readiness.js";
+import { checkDatabasePoolSaturation, checkRedisHealth, worstOf } from "../../runtime/readiness.js";
 
 const LIVENESS_MEANING =
   "This process is running and answering. It says nothing about Postgres or the chains. Use /ready for that.";
@@ -37,7 +38,16 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
   }));
 
   app.get("/ready", async (_request, reply) => {
-    const checks: ReadinessReport[] = [await checkDatabase(deps), await checkRedis(deps)];
+    const dbCheck = await checkDatabase(deps);
+    const checks: ReadinessReport[] = [dbCheck, await checkRedis(deps)];
+
+    const dbTelemetry = getDatabaseTelemetry(deps.db);
+    if (dbCheck.state === "ready") {
+      const poolReport = checkDatabasePoolSaturation(dbTelemetry.pool);
+      if (poolReport.state === "degraded") {
+        checks.push(poolReport);
+      }
+    }
 
     for (const source of deps.readiness) {
       try {
@@ -65,6 +75,7 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
       network: deps.config.network,
       indexer: deps.config.indexer.enabled ? "enabled" : "disabled",
       checks,
+      databasePool: dbTelemetry.pool,
     });
   });
 }

@@ -21,6 +21,7 @@ import type {
   StellarWatchConfig,
 } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
+import { withTransactionalWorkload } from "../db/pool.js";
 import { Poller } from "../runtime/poller.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
 import { fixedReadiness } from "../runtime/readiness.js";
@@ -149,8 +150,12 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   const workers: Worker[] = [];
   const extra: ReadinessSource[] = [];
 
+  const ingestionDb = withTransactionalWorkload(db, "ingestion");
+  const railsDb = withTransactionalWorkload(db, "rails");
+  const keeperDb = withTransactionalWorkload(db, "keeper");
+
   if (config.indexer.stellar !== null) {
-    workers.push(stellarWorker(config.indexer.stellar, db, logger));
+    workers.push(stellarWorker(config.indexer.stellar, ingestionDb, logger));
   } else {
     logger.warn("the deployment record has no Stellar router, so nothing is watching Stellar");
   }
@@ -158,7 +163,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // One per chain in the record. Each carries its own confirmations from the registry, which is
   // the honest way to treat one block on Arc and twelve on Ethereum as the same kind of fact.
   for (const chain of config.indexer.evm) {
-    workers.push(evmWorker(chain, db, logger));
+    workers.push(evmWorker(chain, ingestionDb, logger));
   }
 
   // Counted before the rail pollers join the list, because the two questions are different. "Is
@@ -171,7 +176,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // They are not conditional on a router being watched: a transfer indexed by a previous run is
   // still waiting on its rail whether or not this replica is watching the chain it left.
   if (config.rails.enabled) {
-    for (const worker of railWorkers(config.rails, config.network, db, logger, config)) {
+    for (const worker of railWorkers(config.rails, config.network, railsDb, logger, config)) {
       workers.push(worker);
     }
   } else {
@@ -186,7 +191,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
 
   // The keeper submits Stellar TTL maintenance and claim settlement through BullMQ.
   if (config.keeper.enabled) {
-    workers.push(new KeeperWorker(config, db, logger));
+    workers.push(new KeeperWorker(config, keeperDb, logger));
   } else {
     extra.push(
       fixedReadiness(
