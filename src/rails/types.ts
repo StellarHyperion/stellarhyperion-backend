@@ -99,6 +99,12 @@ export interface PendingTransfer {
   readonly checkFailures: number;
   /** True when an inbound delivery already exists, which settles it without asking the rail. */
   readonly delivered: boolean;
+  /** Previously recorded provider status, preserved across circuit outages and probes. */
+  readonly railStatus?: string | null | undefined;
+  /** Previously recorded provider reference, preserved across circuit outages and probes. */
+  readonly railReference?: string | null | undefined;
+  /** Previously recorded provider attestation timestamp, preserved across circuit outages. */
+  readonly attestedAt?: Date | null | undefined;
 }
 
 /** What a rail client has to offer the pass that polls it. */

@@ -27,6 +27,7 @@ import { fixedReadiness } from "../runtime/readiness.js";
 import { RouteKind } from "@hyperion/protocol";
 
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
+import type { RailCircuitSnapshot } from "../rails/circuit-breaker.js";
 import { IrisClient } from "../rails/cctp/iris.js";
 import { RailPass } from "../rails/pass.js";
 import type { RailClient } from "../rails/types.js";
@@ -55,6 +56,8 @@ export interface Worker extends ReadinessSource {
 export interface IndexerHandle {
   readonly workers: readonly Worker[];
   readonly readiness: readonly ReadinessSource[];
+  /** Observable per-provider discovery circuit snapshots; never implies delivery. */
+  railCircuits(): readonly RailCircuitSnapshot[];
   /** Begin polling. Separate from building, the way `listen` is separate from `buildServer`. */
   start(): void;
   stop(): Promise<void>;
@@ -141,6 +144,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
           "disabled by configuration, so this replica answers questions and watches nothing",
         ),
       ],
+      railCircuits: () => [],
       start: () => undefined,
       stop: () => Promise.resolve(),
     };
@@ -148,6 +152,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
 
   const workers: Worker[] = [];
   const extra: ReadinessSource[] = [];
+  const passes: RailPass[] = [];
 
   if (config.indexer.stellar !== null) {
     workers.push(stellarWorker(config.indexer.stellar, db, logger));
@@ -171,8 +176,9 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // They are not conditional on a router being watched: a transfer indexed by a previous run is
   // still waiting on its rail whether or not this replica is watching the chain it left.
   if (config.rails.enabled) {
-    for (const worker of railWorkers(config.rails, config.network, db, logger, config)) {
-      workers.push(worker);
+    for (const entry of railWorkers(config.rails, config.network, db, logger, config)) {
+      passes.push(entry.pass);
+      workers.push(entry.worker);
     }
   } else {
     extra.push(
@@ -213,6 +219,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   return {
     workers,
     readiness: [...workers, ...extra],
+    railCircuits: () => passes.map((pass) => pass.circuitSnapshot()),
     start: () => {
       for (const worker of workers) worker.start();
       if (workers.length > 0) {
@@ -242,7 +249,7 @@ function railWorkers(
   db: Transactional,
   logger: Logger,
   appConfig: AppConfig,
-): readonly Worker[] {
+): readonly { readonly pass: RailPass; readonly worker: Worker }[] {
   const clients: readonly { readonly route: RouteKind; readonly client: RailClient }[] = [
     {
       route: RouteKind.Cctp,
@@ -273,7 +280,10 @@ function railWorkers(
       recheckAfterMs: config.recheckAfterMs,
       maxCheckFailures: config.maxCheckFailures,
     });
-    return new PolledWorker(pass, config.pollIntervalMs, child);
+    return {
+      pass,
+      worker: new PolledWorker(pass, config.pollIntervalMs, child),
+    };
   });
 }
 

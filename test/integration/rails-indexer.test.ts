@@ -11,7 +11,12 @@ import { writeOutbound, writeInbound } from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
 import { outstandingForRail, pendingForRail } from "../../src/rails/queue.js";
 import { RailPass } from "../../src/rails/pass.js";
-import type { PendingTransfer, RailClient, RailLookup } from "../../src/rails/types.js";
+import {
+  RailError,
+  type PendingTransfer,
+  type RailClient,
+  type RailLookup,
+} from "../../src/rails/types.js";
 import { capturingLogger } from "../stellar-fakes.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
@@ -214,5 +219,108 @@ suite("rail pollers against real Postgres", () => {
     // Outstanding should now be 0 for this transfer since delivered is terminal
     const outstanding = await outstandingForRail(db, 1);
     expect(outstanding).toBe(0);
+  });
+
+  it("opens per-provider circuit on repeated failures while settling inbound_delivery rows", async () => {
+    const { logger } = capturingLogger();
+
+    await db.transaction(async (tx) => {
+      await writeOutbound(
+        tx,
+        {
+          chainKey: ORIGIN_CHAIN,
+          block: 1020n,
+          txHash: "0xaaa401",
+          logIndex: 0,
+          observedAt: new Date(),
+        },
+        {
+          route: 0,
+          nonce: 401n,
+          sender: "0x1111111111111111111111111111111111111111",
+          token: "0x3333333333333333333333333333333333333333",
+          grossAmount: 1001000n,
+          fee: 1000n,
+          netAmount: 1000000n,
+          destinationChain: DESTINATION_CHAIN,
+          destination: "0x2222222222222222222222222222222222222222",
+          railRef: "0x0000",
+        },
+      );
+      await writeOutbound(
+        tx,
+        {
+          chainKey: ORIGIN_CHAIN,
+          block: 1021n,
+          txHash: "0xaaa402",
+          logIndex: 0,
+          observedAt: new Date(),
+        },
+        {
+          route: 0,
+          nonce: 402n,
+          sender: "0x1111111111111111111111111111111111111111",
+          token: "0x3333333333333333333333333333333333333333",
+          grossAmount: 1001000n,
+          fee: 1000n,
+          netAmount: 1000000n,
+          destinationChain: DESTINATION_CHAIN,
+          destination: "0x2222222222222222222222222222222222222222",
+          railRef: "0x0000",
+        },
+      );
+    });
+
+    const pass = new RailPass({
+      route: 0,
+      client: {
+        rail: "cctp",
+        look: (): Promise<RailLookup> =>
+          Promise.reject(new RailError("cctp", "transient", "provider unavailable")),
+      },
+      db,
+      logger,
+      batchSize: 10,
+      recheckAfterMs: 0,
+      maxCheckFailures: 5,
+      circuitBreaker: { failureThreshold: 1, openDurationMs: 60_000 },
+    });
+
+    await pass.tick(new AbortController().signal);
+    expect(pass.circuitSnapshot().state).toBe("open");
+    expect(pass.circuitSnapshot().deliveryImplied).toBe(false);
+
+    await db.transaction(async (tx) => {
+      await writeInbound(
+        tx,
+        {
+          chainKey: DESTINATION_CHAIN,
+          block: 2020n,
+          txHash: "0xdest402",
+          logIndex: 0,
+          observedAt: new Date(),
+        },
+        {
+          route: 0,
+          sourceChain: ORIGIN_CHAIN,
+          sourceNonce: 402n,
+          recipient: "0x2222222222222222222222222222222222222222",
+          token: "0x3333333333333333333333333333333333333333",
+          amount: 1000000n,
+          delivered: true,
+          claimId: null,
+          railMessageId: "0xmsg402",
+        },
+      );
+    });
+
+    await pass.tick(new AbortController().signal);
+    const settled = await db.query(
+      `SELECT a.status FROM rail_attestation a
+         JOIN outbound_transfer t ON t.id = a.transfer_id
+        WHERE t.origin_chain = $1 AND t.nonce = 402`,
+      [ORIGIN_CHAIN],
+    );
+    expect(settled.rows[0]?.status).toBe("delivered");
   });
 });

@@ -13,7 +13,7 @@
  * arrived is settled without spending a request on it, which on a busy day is most of them.
  */
 import type { Queryable } from "../db/pool.js";
-import { bigintOf, integer, text, textOrNull } from "../db/rows.js";
+import { bigintOf, integer, text, textOrNull, timestampOrNull, type Row } from "../db/rows.js";
 import type { AttestationStatus, PendingTransfer } from "./types.js";
 
 const STATUSES: readonly string[] = ["pending", "attested", "delivered", "failed", "expired"];
@@ -44,6 +44,9 @@ export async function pendingForRail(
             t.nonce,
             t.origin_tx,
             a.status,
+            a.rail_status,
+            a.rail_reference,
+            a.attested_at,
             COALESCE(a.check_failures, 0) AS check_failures,
             EXISTS (
               SELECT 1 FROM inbound_delivery d
@@ -63,7 +66,94 @@ export async function pendingForRail(
     [query.route, query.maxCheckFailures, query.notCheckedSince, query.limit],
   );
 
-  return rows.map((row) => ({
+  return rows.map((row) => mapPendingTransferRow(row));
+}
+
+/**
+ * Transfers on this rail that already have a confirmed `inbound_delivery` hop row and can settle
+ * immediately without touching the external rail discovery provider.
+ */
+export async function deliveredPendingForRail(
+  db: Queryable,
+  route: number,
+  limit: number,
+): Promise<readonly PendingTransfer[]> {
+  const { rows } = await db.query(
+    `SELECT t.id,
+            t.route,
+            t.origin_chain,
+            t.destination_chain,
+            t.nonce,
+            t.origin_tx,
+            a.status,
+            a.rail_status,
+            a.rail_reference,
+            a.attested_at,
+            COALESCE(a.check_failures, 0) AS check_failures,
+            true AS delivered
+       FROM outbound_transfer t
+       LEFT JOIN rail_attestation a ON a.transfer_id = t.id
+      WHERE t.route = $1
+        AND (a.transfer_id IS NULL OR a.status IN ('pending', 'attested'))
+        AND EXISTS (
+          SELECT 1 FROM inbound_delivery d
+           WHERE d.destination_chain = t.destination_chain
+             AND d.route = t.route
+             AND d.source_chain = t.origin_chain
+             AND d.source_nonce = t.nonce
+        )
+      ORDER BY t.id
+      LIMIT $2`,
+    [route, limit],
+  );
+
+  return rows.map((row) => mapPendingTransferRow(row));
+}
+
+/**
+ * Load non-terminal transfers by id so stored candidate execution references can be re-verified
+ * against destination chain RPCs even while the discovery provider circuit is open.
+ */
+export async function pendingTransfersByIds(
+  db: Queryable,
+  route: number,
+  transferIds: readonly bigint[],
+): Promise<readonly PendingTransfer[]> {
+  if (transferIds.length === 0) return [];
+  const placeholders = transferIds.map((_, idx) => `$${String(idx + 2)}`).join(", ");
+  const { rows } = await db.query(
+    `SELECT t.id,
+            t.route,
+            t.origin_chain,
+            t.destination_chain,
+            t.nonce,
+            t.origin_tx,
+            a.status,
+            a.rail_status,
+            a.rail_reference,
+            a.attested_at,
+            COALESCE(a.check_failures, 0) AS check_failures,
+            EXISTS (
+              SELECT 1 FROM inbound_delivery d
+               WHERE d.destination_chain = t.destination_chain
+                 AND d.route = t.route
+                 AND d.source_chain = t.origin_chain
+                 AND d.source_nonce = t.nonce
+            ) AS delivered
+       FROM outbound_transfer t
+       LEFT JOIN rail_attestation a ON a.transfer_id = t.id
+      WHERE t.route = $1
+        AND t.id IN (${placeholders})
+        AND (a.transfer_id IS NULL OR a.status IN ('pending', 'attested'))
+      ORDER BY t.id`,
+    [route, ...transferIds.map((id) => id.toString())],
+  );
+
+  return rows.map((row) => mapPendingTransferRow(row));
+}
+
+function mapPendingTransferRow(row: Row): PendingTransfer {
+  return {
     transferId: bigintOf(row, "id"),
     route: integer(row, "route"),
     originChain: text(row, "origin_chain"),
@@ -73,7 +163,10 @@ export async function pendingForRail(
     status: readStatus(row.status === undefined ? null : textOrNull(row, "status")),
     checkFailures: integer(row, "check_failures"),
     delivered: row.delivered === true,
-  }));
+    railStatus: row.rail_status === undefined ? null : textOrNull(row, "rail_status"),
+    railReference: row.rail_reference === undefined ? null : textOrNull(row, "rail_reference"),
+    attestedAt: row.attested_at === undefined ? null : timestampOrNull(row, "attested_at"),
+  };
 }
 
 /**
