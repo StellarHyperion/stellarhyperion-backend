@@ -20,6 +20,7 @@
     "migrate": "node-pg-migrate --envPath .env --migrations-dir migrations --migrations-table pgmigrations",
     "migrate:up": "npm run migrate -- up",
     "migrate:down": "npm run migrate -- down",
+    "db:rehearse": "node --experimental-strip-types src/db/rehearsal.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",

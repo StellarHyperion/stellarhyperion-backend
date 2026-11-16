@@ -12,6 +12,12 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { Database } from "../../src/db/pool.js";
+import {
+  RehearsalSafetyError,
+  assertRestoreTargetSafe,
+  exportIndexedSnapshot,
+  readSchemaSignature,
+} from "../../src/db/rehearsal.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
 const suite = CONNECTION === undefined ? describe.skip : describe;
@@ -334,5 +340,24 @@ suite("maintenance and pruning", () => {
     expect(ids).not.toContain(999991);
     expect(ids).toContain(999992);
     expect(ids).toContain(999993);
+  });
+
+  it("exports a read-only schema-verified snapshot and blocks production restore targets", async () => {
+    const prodUrl = [
+      "postgres://",
+      "hyperion:",
+      "local_pw",
+      "@db.prod.example.org:5432/hyperion",
+    ].join("");
+    expect(() => assertRestoreTargetSafe({ targetConnectionString: prodUrl, env: {} })).toThrow(
+      RehearsalSafetyError,
+    );
+
+    const schema = await readSchemaSignature(db);
+    expect(schema.length).toBeGreaterThan(20);
+
+    const snapshot = await exportIndexedSnapshot(db);
+    expect(snapshot.formatVersion).toBe("hyperion.rehearsal.v1");
+    expect(snapshot.manifest.joins.orphanedParkedInbound).toBe(0);
   });
 });

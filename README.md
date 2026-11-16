@@ -71,6 +71,8 @@ One process serializes its Stellar submissions to avoid sequence conflicts. Run 
 
 `npm run check` runs formatting, lint, type checking and tests. Schema/API regressions execute repository migrations in embedded PostgreSQL (PGlite). The full PostgreSQL integration suite requires `TEST_DATABASE_URL`; it is skipped when unset. Use `npm run build` for emitted production code.
 
+Run `npm run db:rehearse -- --target-url postgres://hyperion:hyperion-local-only@127.0.0.1:5433/hyperion_test --seed-representative` to export, restore, and verify a representative dataset in an isolated test or rehearsal database. Production and non-local targets are blocked unless `HYPERION_ALLOW_NON_TEST_RESTORE=true`, `--allow-non-test-target`, and a matching `--confirm-target-db` are all supplied explicitly.
+
 RPC event retention is finite. A fresh deployment record may predate the public RPC's retained history; initialize `STELLAR_START_LEDGER` within retained history only if you accept that older events are unavailable, or use a historical provider. Check readiness and logs rather than treating an empty database as complete history.
 
 ## Verified testnet status
