@@ -5,6 +5,7 @@ import type { Logger } from "pino";
 import rateLimit from "@fastify/rate-limit";
 
 import type { AppConfig } from "../config/config.js";
+import { isDatabaseTimeoutError, sanitizeDatabaseErrorMessage } from "../db/pool.js";
 import type { Database } from "../db/pool.js";
 import type { BullMQWorkerState, RedisPingable, ReadinessSource } from "../runtime/readiness.js";
 import { registerClaimRoutes } from "./routes/claims.js";
@@ -67,11 +68,17 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     }),
   });
 
-  registerHealthRoutes(app, deps);
-  registerTransferRoutes(app, deps);
-  registerClaimRoutes(app, deps);
-  registerRouteHealthRoutes(app, deps);
-  registerMetricsRoutes(app, deps);
+  const apiDbCandidate = deps.db as { withWorkload?: unknown };
+  const scopedDeps: ServerDeps =
+    typeof apiDbCandidate.withWorkload === "function"
+      ? { ...deps, db: deps.db.withWorkload("api") }
+      : deps;
+
+  registerHealthRoutes(app, scopedDeps);
+  registerTransferRoutes(app, scopedDeps);
+  registerClaimRoutes(app, scopedDeps);
+  registerRouteHealthRoutes(app, scopedDeps);
+  registerMetricsRoutes(app, scopedDeps);
 
   app.setNotFoundHandler((request, reply) => {
     void reply.code(404).send({
@@ -81,13 +88,34 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   app.setErrorHandler((error: FastifyError, request, reply) => {
+    if (isDatabaseTimeoutError(error)) {
+      request.log.warn(
+        {
+          code: error.code,
+          kind: error.kind,
+          workload: error.workload,
+          sqlState: error.sqlState,
+          timeoutMs: error.timeoutMs,
+          status: error.statusCode,
+        },
+        "database workload timeout",
+      );
+      void reply.code(error.statusCode).send({
+        error: error.code,
+        retryable: error.retryable,
+        message: "the database request timed out before completing",
+        requestId: request.id,
+      });
+      return;
+    }
+
     const status = error.statusCode ?? 500;
-    // The log gets the error, the response does not. An internal error message is the kind of
-    // thing that carries a table name, a file path or, on a bad day, a connection string.
-    request.log.error({ err: error, status }, "request failed");
+    // The log gets a credential-scrubbed error, the response does not.
+    const safeMessage = sanitizeDatabaseErrorMessage(error.message);
+    request.log.error({ code: error.code, status, errMessage: safeMessage }, "request failed");
     void reply.code(status).send({
       error: status >= 500 ? "internal_error" : "bad_request",
-      message: status >= 500 ? "the server could not complete that request" : error.message,
+      message: status >= 500 ? "the server could not complete that request" : safeMessage,
       requestId: request.id,
     });
   });

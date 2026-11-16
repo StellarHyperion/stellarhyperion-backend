@@ -332,7 +332,42 @@ suite("maintenance and pruning", () => {
     );
     const ids = rows.map((r) => Number(r.transfer_id));
     expect(ids).not.toContain(999991);
+    expect(ids).not.toBeUndefined();
     expect(ids).toContain(999992);
     expect(ids).toContain(999993);
+  });
+
+  it("applies isolated statement, lock, and read-only policies per workload", async () => {
+    const apiSettings = await db.transactionForWorkload("api", async (tx) => {
+      const st = await tx.query("SHOW statement_timeout");
+      const lt = await tx.query("SHOW lock_timeout");
+      const ro = await tx.query("SHOW transaction_read_only");
+      return {
+        statementTimeout: String(st.rows[0]?.statement_timeout),
+        lockTimeout: String(lt.rows[0]?.lock_timeout),
+        readOnly: String(ro.rows[0]?.transaction_read_only),
+      };
+    });
+    expect(apiSettings).toEqual({
+      statementTimeout: "5s",
+      lockTimeout: "1s",
+      readOnly: "on",
+    });
+
+    const ingestionSettings = await db.transactionForWorkload("ingestion", async (tx) => {
+      const st = await tx.query("SHOW statement_timeout");
+      const lt = await tx.query("SHOW lock_timeout");
+      const ro = await tx.query("SHOW transaction_read_only");
+      return {
+        statementTimeout: String(st.rows[0]?.statement_timeout),
+        lockTimeout: String(lt.rows[0]?.lock_timeout),
+        readOnly: String(ro.rows[0]?.transaction_read_only),
+      };
+    });
+    expect(ingestionSettings).toEqual({
+      statementTimeout: "30s",
+      lockTimeout: "5s",
+      readOnly: "off",
+    });
   });
 });

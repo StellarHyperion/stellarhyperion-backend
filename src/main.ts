@@ -45,8 +45,8 @@ async function main(): Promise<void> {
 
   // Registered between the pool and the server, because shutdown runs in reverse: the server
   // stops accepting requests, the watchers finish the page they are on, and only then does the
-  // pool close under them.
-  const indexer = buildIndexer({ config, logger, db });
+  // pool close under them. Watchers use the ingestion workload timeout policy.
+  const indexer = buildIndexer({ config, logger, db: db.forWorkload("ingestion") });
   shutdown.add("indexer", () => indexer.stop());
 
   const server = buildServer({
