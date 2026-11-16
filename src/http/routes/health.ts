@@ -15,9 +15,10 @@
  */
 import type { FastifyInstance } from "fastify";
 
+import { readCoverageGapMetrics } from "../../chains/coverage.js";
 import type { ServerDeps } from "../server.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
-import { checkRedisHealth, worstOf } from "../../runtime/readiness.js";
+import { checkRedisHealth, coverageStatusToState, worstOf } from "../../runtime/readiness.js";
 
 const LIVENESS_MEANING =
   "This process is running and answering. It says nothing about Postgres or the chains. Use /ready for that.";
@@ -37,7 +38,8 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
   }));
 
   app.get("/ready", async (_request, reply) => {
-    const checks: ReadinessReport[] = [await checkDatabase(deps), await checkRedis(deps)];
+    const dbCheck = await checkDatabase(deps);
+    const checks: ReadinessReport[] = [dbCheck, await checkRedis(deps)];
 
     for (const source of deps.readiness) {
       try {
@@ -55,6 +57,26 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
       }
     }
 
+    let historicalCoverage: {
+      readonly status: "complete" | "gapped" | "unknown";
+      readonly state: string;
+      readonly unresolvedGapCount: number;
+      readonly missingBlocksTotal: string;
+    } | null = null;
+    if (dbCheck.state === "ready") {
+      try {
+        const coverage = await readCoverageGapMetrics(deps.db, deps.config);
+        historicalCoverage = {
+          status: coverage.overallStatus,
+          state: coverageStatusToState(coverage.overallStatus),
+          unresolvedGapCount: coverage.unresolvedGapCount,
+          missingBlocksTotal: coverage.missingBlocksTotal,
+        };
+      } catch {
+        historicalCoverage = null;
+      }
+    }
+
     const state = worstOf(checks);
     // Degraded still serves. One stalled chain watcher is a reason to alert, not a reason to stop
     // answering questions about the three chains that are fine.
@@ -64,6 +86,7 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
       meaning: READINESS_MEANING,
       network: deps.config.network,
       indexer: deps.config.indexer.enabled ? "enabled" : "disabled",
+      historicalCoverage,
       checks,
     });
   });

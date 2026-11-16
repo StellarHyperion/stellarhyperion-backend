@@ -197,3 +197,7 @@ export class ReadinessRegistry {
     return { state: worstOf(checks), checks };
   }
 }
+
+export function coverageStatusToState(status: "complete" | "gapped" | "unknown"): ReadinessState {
+  return status === "complete" ? "ready" : "degraded";
+}

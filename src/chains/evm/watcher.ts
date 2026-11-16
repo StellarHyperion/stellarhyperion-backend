@@ -29,6 +29,7 @@ import type { Hex } from "viem";
 
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
+import type { CoverageTracker } from "../coverage.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
 import type { Position } from "../writers.js";
 import { ClaimPairing, applyRouterLog } from "./store.js";
@@ -61,6 +62,8 @@ export interface EvmWatcherOptions {
   readonly client: EvmClient;
   readonly db: Transactional;
   readonly logger: Logger;
+  readonly deployedBlock?: bigint | undefined;
+  readonly coverage?: CoverageTracker | undefined;
 }
 
 export interface EvmProgress {
@@ -226,6 +229,20 @@ export class EvmWatcher {
         // being handed a different history.
         hash: endHash,
       });
+
+      if (this.options.coverage !== undefined) {
+        const deployedStart = this.options.deployedBlock ?? this.options.startBlock;
+        await this.options.coverage.recordVerifiedRange(
+          {
+            chainKey,
+            family: "evm",
+            deployedStart,
+            fromHeight: from,
+            toHeight: to,
+          },
+          tx,
+        );
+      }
     });
 
     const behind = Number(confirmed - to);

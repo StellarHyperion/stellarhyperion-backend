@@ -5,6 +5,7 @@
  */
 import type { FastifyInstance, FastifyReply } from "fastify";
 
+import { readCoverageGapMetrics } from "../../chains/coverage.js";
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
 import type { ServerDeps } from "../server.js";
@@ -56,6 +57,9 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       updatedAt: new Date(row.updated_at as string | number | Date).toISOString(),
     }));
 
+    // 6. Historical coverage gaps, strictly separated from current cursor positions
+    const coverageGaps = await readCoverageGapMetrics(db, deps.config);
+
     return reply.send({
       service: "hyperion-backend",
       network: deps.config.network,
@@ -67,6 +71,7 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       claims,
       railAttestations: railStatusCounts,
       cursors,
+      coverageGaps,
     });
   });
 }

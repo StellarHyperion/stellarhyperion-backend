@@ -26,6 +26,7 @@ import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
+import type { CoverageTracker } from "../coverage.js";
 import { completeThrough, endOfLedgerCursor, parseEventCursor } from "./cursor.js";
 import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
 import type { EventSource, EventsQuery } from "./rpc.js";
@@ -77,6 +78,8 @@ export interface StellarWatcherOptions {
   readonly db: Transactional;
   readonly logger: Logger;
   readonly maxPagesPerTick?: number;
+  readonly deployedLedger?: number | undefined;
+  readonly coverage?: CoverageTracker | undefined;
 }
 
 export interface WatcherProgress {
@@ -215,6 +218,48 @@ export class StellarWatcher {
         // Nothing to record: a closed ledger cannot be replaced by a different one.
         hash: null,
       });
+
+      if (this.options.coverage !== undefined) {
+        const deployedStart = BigInt(this.options.deployedLedger ?? this.options.startLedger);
+        if (stored === null && BigInt(this.options.startLedger) > deployedStart) {
+          await this.options.coverage.recordGap(
+            {
+              chainKey,
+              family: "stellar",
+              fromHeight: deployedStart,
+              toHeight: BigInt(this.options.startLedger - 1),
+              reason: "start_override_skip",
+            },
+            tx,
+          );
+        }
+        if (scan.oldestLedger > base + 1 && stored !== null) {
+          await this.options.coverage.recordGap(
+            {
+              chainKey,
+              family: "stellar",
+              fromHeight: BigInt(base + 1),
+              toHeight: BigInt(scan.oldestLedger - 1),
+              reason: "rpc_retention_gap",
+            },
+            tx,
+          );
+        }
+        const verifiedStart =
+          stored !== null && scan.oldestLedger > base + 1 ? scan.oldestLedger : base + 1;
+        if (scan.through >= verifiedStart) {
+          await this.options.coverage.recordVerifiedRange(
+            {
+              chainKey,
+              family: "stellar",
+              deployedStart,
+              fromHeight: BigInt(verifiedStart),
+              toHeight: BigInt(scan.through),
+            },
+            tx,
+          );
+        }
+      }
     });
 
     const behind = Math.max(scan.latestLedger - scan.through, 0);

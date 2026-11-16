@@ -24,13 +24,14 @@ import type { Transactional } from "../db/pool.js";
 import { Poller } from "../runtime/poller.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
 import { fixedReadiness } from "../runtime/readiness.js";
-import { RouteKind } from "@hyperion/protocol";
+import { RouteKind, isEvmDeployment, isStellarDeployment } from "@hyperion/protocol";
 
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
 import { IrisClient } from "../rails/cctp/iris.js";
 import { RailPass } from "../rails/pass.js";
 import type { RailClient } from "../rails/types.js";
 import { KeeperWorker } from "../keeper/worker.js";
+import { CoverageTracker } from "./coverage.js";
 import { viemClient } from "./evm/client.js";
 import { EvmWatcher } from "./evm/watcher.js";
 import { StellarRpc } from "./stellar/rpc.js";
@@ -148,9 +149,13 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
 
   const workers: Worker[] = [];
   const extra: ReadinessSource[] = [];
+  const coverage = new CoverageTracker(db);
 
   if (config.indexer.stellar !== null) {
-    workers.push(stellarWorker(config.indexer.stellar, db, logger));
+    const dep = config.deployments.networks[config.indexer.stellar.chain];
+    const deployedLedger =
+      dep !== undefined && isStellarDeployment(dep) ? dep.deployedAt.ledger : undefined;
+    workers.push(stellarWorker(config.indexer.stellar, db, logger, coverage, deployedLedger));
   } else {
     logger.warn("the deployment record has no Stellar router, so nothing is watching Stellar");
   }
@@ -158,7 +163,10 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // One per chain in the record. Each carries its own confirmations from the registry, which is
   // the honest way to treat one block on Arc and twelve on Ethereum as the same kind of fact.
   for (const chain of config.indexer.evm) {
-    workers.push(evmWorker(chain, db, logger));
+    const dep = config.deployments.networks[chain.chain];
+    const deployedBlock =
+      dep !== undefined && isEvmDeployment(dep) ? BigInt(dep.deployedAt.blockNumber) : undefined;
+    workers.push(evmWorker(chain, db, logger, coverage, deployedBlock));
   }
 
   // Counted before the rail pollers join the list, because the two questions are different. "Is
@@ -277,7 +285,13 @@ function railWorkers(
   });
 }
 
-function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): Worker {
+function evmWorker(
+  config: EvmWatchConfig,
+  db: Transactional,
+  logger: Logger,
+  coverage: CoverageTracker,
+  deployedBlock: bigint | undefined,
+): Worker {
   const child = logger.child({ chain: config.chain, chainId: config.chainId });
   const watcher = new EvmWatcher({
     chainKey: config.chain,
@@ -290,11 +304,19 @@ function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): W
     client: viemClient(config.rpcUrls, { logger: child }),
     db,
     logger: child,
+    deployedBlock,
+    coverage,
   });
   return new PolledWorker(watcher, config.pollIntervalMs, child);
 }
 
-function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Logger): Worker {
+function stellarWorker(
+  config: StellarWatchConfig,
+  db: Transactional,
+  logger: Logger,
+  coverage: CoverageTracker,
+  deployedLedger: number | undefined,
+): Worker {
   const child = logger.child({ chain: config.chain });
   const watcher = new StellarWatcher({
     chainKey: config.chain,
@@ -304,6 +326,8 @@ function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Lo
     rpc: new StellarRpc(config.rpcUrl),
     db,
     logger: child,
+    deployedLedger,
+    coverage,
   });
   return new PolledWorker(watcher, config.pollIntervalMs, child);
 }
