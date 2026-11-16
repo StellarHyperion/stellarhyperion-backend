@@ -1,0 +1,193 @@
+{
+  "transferDetail": {
+    "id": "1",
+    "stage": "delivered",
+    "route": 0,
+    "origin": {
+      "chain": "stellar-testnet",
+      "nonce": "42",
+      "sender": "GDXRQQETEZHGRJTE3U7DYGIWGGYGMM6EAS5NWGPGN2WXFXZYZ6QZIANA",
+      "token": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+      "symbol": "USDC",
+      "decimals": 7,
+      "grossAmount": "10000000",
+      "fee": "30000",
+      "netAmount": "9970000",
+      "block": "5433900",
+      "txHash": "d2d112fdef5b381534eb10e92806bd0025f307ffb0b2da0d0d3194d3f7892ca2",
+      "observedAt": "2026-10-29T10:00:00.000Z"
+    },
+    "destination": {
+      "token": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+      "amount": "997000",
+      "symbol": "USDC",
+      "decimals": 6,
+      "chain": "sepolia",
+      "recipient": "0x6ef8032ffe4943f27388172549f6700f18bb8b38",
+      "delivered": true,
+      "block": "9413000",
+      "txHash": "0xb8a185a1e723443ab0b787225006fe56db80009fe796c69e8c4f6b8bf31db555",
+      "deliveredAt": "2026-10-29T10:02:00.000Z"
+    },
+    "rail": {
+      "status": "delivered",
+      "railStatus": "complete",
+      "reference": "iris-msg-42",
+      "attestedAt": "2026-10-29T10:01:00.000Z",
+      "lastError": null
+    },
+    "claim": null,
+    "schemaVersion": "2026-11-01",
+    "meta": {
+      "schemaVersion": "2026-11-01",
+      "deliveryFinalized": true,
+      "deliveryVerification": "inbound_delivery",
+      "sourceRouterIndexed": true
+    }
+  },
+  "transferList": {
+    "schemaVersion": "2026-11-01",
+    "transfers": [
+      {
+        "id": "1",
+        "stage": "delivered",
+        "route": 0,
+        "origin": {
+          "chain": "stellar-testnet",
+          "nonce": "42",
+          "sender": "GDXRQQETEZHGRJTE3U7DYGIWGGYGMM6EAS5NWGPGN2WXFXZYZ6QZIANA",
+          "token": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+          "symbol": "USDC",
+          "decimals": 7,
+          "grossAmount": "10000000",
+          "fee": "30000",
+          "netAmount": "9970000",
+          "block": "5433900",
+          "txHash": "d2d112fdef5b381534eb10e92806bd0025f307ffb0b2da0d0d3194d3f7892ca2",
+          "observedAt": "2026-10-29T10:00:00.000Z"
+        },
+        "destination": {
+          "token": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+          "amount": "997000",
+          "symbol": "USDC",
+          "decimals": 6,
+          "chain": "sepolia",
+          "recipient": "0x6ef8032ffe4943f27388172549f6700f18bb8b38",
+          "delivered": true,
+          "block": "9413000",
+          "txHash": "0xb8a185a1e723443ab0b787225006fe56db80009fe796c69e8c4f6b8bf31db555",
+          "deliveredAt": "2026-10-29T10:02:00.000Z"
+        },
+        "rail": {
+          "status": "delivered",
+          "railStatus": "complete",
+          "reference": "iris-msg-42",
+          "attestedAt": "2026-10-29T10:01:00.000Z",
+          "lastError": null
+        },
+        "claim": null,
+        "schemaVersion": "2026-11-01",
+        "meta": {
+          "schemaVersion": "2026-11-01",
+          "deliveryFinalized": true,
+          "deliveryVerification": "inbound_delivery",
+          "sourceRouterIndexed": true
+        }
+      }
+    ],
+    "limit": 20,
+    "offset": 0,
+    "count": 1,
+    "meta": {
+      "schemaVersion": "2026-11-01",
+      "historyState": "populated",
+      "pagination": {
+        "mode": "offset",
+        "limit": 20,
+        "offset": 0,
+        "count": 1
+      }
+    }
+  },
+  "claimDetail": {
+    "id": "stellar-testnet:7",
+    "chain": "stellar-testnet",
+    "claimId": "7",
+    "recipient": "GDXRQQETEZHGRJTE3U7DYGIWGGYGMM6EAS5NWGPGN2WXFXZYZ6QZIANA",
+    "token": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+    "amount": "9970000",
+    "route": 1,
+    "sourceChain": "sepolia",
+    "sourceNonce": "20",
+    "settled": false,
+    "createdAt": "2026-10-29T10:03:00.000Z",
+    "observedAt": "2026-10-29T10:03:05.000Z",
+    "schemaVersion": "2026-11-01",
+    "meta": {
+      "schemaVersion": "2026-11-01",
+      "settlementState": "unsettled"
+    }
+  },
+  "claimList": {
+    "schemaVersion": "2026-11-01",
+    "claims": [
+      {
+        "id": "stellar-testnet:7",
+        "chain": "stellar-testnet",
+        "claimId": "7",
+        "recipient": "GDXRQQETEZHGRJTE3U7DYGIWGGYGMM6EAS5NWGPGN2WXFXZYZ6QZIANA",
+        "token": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+        "amount": "9970000",
+        "route": 1,
+        "sourceChain": "sepolia",
+        "sourceNonce": "20",
+        "settled": false,
+        "createdAt": "2026-10-29T10:03:00.000Z",
+        "observedAt": "2026-10-29T10:03:05.000Z",
+        "schemaVersion": "2026-11-01",
+        "meta": {
+          "schemaVersion": "2026-11-01",
+          "settlementState": "unsettled"
+        }
+      }
+    ],
+    "limit": 20,
+    "offset": 0,
+    "count": 1,
+    "meta": {
+      "schemaVersion": "2026-11-01",
+      "historyState": "populated",
+      "pagination": {
+        "mode": "offset",
+        "limit": 20,
+        "offset": 0,
+        "count": 1
+      }
+    }
+  },
+  "routeHealth": {
+    "schemaVersion": "2026-11-01",
+    "routes": [
+      {
+        "originChain": "stellar-testnet",
+        "destinationChain": "sepolia",
+        "route": 0,
+        "token": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+        "available": true,
+        "blocker": {
+          "code": 0,
+          "label": "Ready",
+          "detail": "This rail can carry the transfer right now."
+        },
+        "flowAvailable": "90000000",
+        "observedAt": "2026-10-29T10:04:00.000Z"
+      }
+    ],
+    "count": 1,
+    "meta": {
+      "schemaVersion": "2026-11-01",
+      "historyState": "populated",
+      "activeEvmRouters": 0
+    }
+  }
+}

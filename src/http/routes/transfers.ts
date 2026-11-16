@@ -12,6 +12,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import { LATEST_API_SCHEMA_VERSION, type ApiSchemaVersion } from "../schema-version.js";
 import type { ServerDeps } from "../server.js";
 
 export type TransferLifecycleStage =
@@ -233,6 +234,51 @@ function isDeliveryFinalized(transfer: FormattedTransfer): boolean {
   );
 }
 
+export type DeliveryVerificationKind =
+  "inbound_delivery" | "parked_claim" | "settled_claim" | "unverified";
+
+export interface FormattedTransferV2 extends FormattedTransfer {
+  readonly schemaVersion: "2026-11-01";
+  readonly meta: {
+    readonly schemaVersion: "2026-11-01";
+    readonly deliveryFinalized: boolean;
+    readonly deliveryVerification: DeliveryVerificationKind;
+    readonly sourceRouterIndexed: boolean;
+  };
+}
+
+function projectTransferForVersion(
+  transfer: FormattedTransfer,
+  version: ApiSchemaVersion,
+  config: AppConfig,
+): FormattedTransfer | FormattedTransferV2 {
+  if (version !== LATEST_API_SCHEMA_VERSION) {
+    return transfer;
+  }
+
+  let deliveryVerification: DeliveryVerificationKind = "unverified";
+  if (transfer.claim !== null) {
+    deliveryVerification = transfer.claim.settled ? "settled_claim" : "parked_claim";
+  } else if (transfer.destination.delivered) {
+    deliveryVerification = "inbound_delivery";
+  }
+
+  const sourceRouterIndexed =
+    isChainKey(transfer.origin.chain) &&
+    config.deployments.networks[transfer.origin.chain] !== undefined;
+
+  return {
+    ...transfer,
+    schemaVersion: LATEST_API_SCHEMA_VERSION,
+    meta: {
+      schemaVersion: LATEST_API_SCHEMA_VERSION,
+      deliveryFinalized: isDeliveryFinalized(transfer),
+      deliveryVerification,
+      sourceRouterIndexed,
+    },
+  };
+}
+
 export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
 
@@ -263,7 +309,13 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         });
       }
 
-      return reply.send(formatRow(row, deps.config));
+      return reply.send(
+        projectTransferForVersion(
+          formatRow(row, deps.config),
+          request.apiSchemaVersion,
+          deps.config,
+        ),
+      );
     },
   );
 
@@ -285,7 +337,13 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         });
       }
 
-      return reply.send(formatRow(row, deps.config));
+      return reply.send(
+        projectTransferForVersion(
+          formatRow(row, deps.config),
+          request.apiSchemaVersion,
+          deps.config,
+        ),
+      );
     },
   );
 
@@ -327,15 +385,20 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       }
     };
 
-    safeWrite(`event: transfer_update\ndata: ${JSON.stringify(initial)}\n\n`);
+    const initialProjected = projectTransferForVersion(
+      initial,
+      request.apiSchemaVersion,
+      deps.config,
+    );
+    safeWrite(`event: transfer_update\ndata: ${JSON.stringify(initialProjected)}\n\n`);
 
     if (isDeliveryFinalized(initial)) {
-      safeWrite(`event: complete\ndata: ${JSON.stringify(initial)}\n\n`);
+      safeWrite(`event: complete\ndata: ${JSON.stringify(initialProjected)}\n\n`);
       safeEnd();
       return;
     }
 
-    let lastSerialized = JSON.stringify(initial);
+    let lastSerialized = JSON.stringify(initialProjected);
     let closed = false;
 
     const pollInterval = Math.max(Number(request.query.pollIntervalMs) || 1000, 1000);
@@ -370,13 +433,18 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
           const current = await queryTransferById(id);
           if (current === null) return;
 
-          const currentSerialized = JSON.stringify(current);
+          const currentProjected = projectTransferForVersion(
+            current,
+            request.apiSchemaVersion,
+            deps.config,
+          );
+          const currentSerialized = JSON.stringify(currentProjected);
           if (currentSerialized !== lastSerialized) {
             lastSerialized = currentSerialized;
-            safeWrite(`event: transfer_update\ndata: ${JSON.stringify(current)}\n\n`);
+            safeWrite(`event: transfer_update\ndata: ${currentSerialized}\n\n`);
 
             if (isDeliveryFinalized(current)) {
-              safeWrite(`event: complete\ndata: ${JSON.stringify(current)}\n\n`);
+              safeWrite(`event: complete\ndata: ${currentSerialized}\n\n`);
               safeEnd();
               cleanup();
             }
@@ -412,7 +480,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         message: `no transfer found with id ${id}`,
       });
     }
-    return reply.send(transfer);
+    return reply.send(projectTransferForVersion(transfer, request.apiSchemaVersion, deps.config));
   };
 
   app.get("/v1/transfers/:id", getTransferById);
@@ -485,8 +553,35 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         params,
       );
 
+      const formatted = rows.map((row) =>
+        projectTransferForVersion(
+          formatRow(row, deps.config),
+          request.apiSchemaVersion,
+          deps.config,
+        ),
+      );
+      if (request.apiSchemaVersion === LATEST_API_SCHEMA_VERSION) {
+        return reply.send({
+          schemaVersion: LATEST_API_SCHEMA_VERSION,
+          transfers: formatted,
+          limit: parsedLimit,
+          offset: parsedOffset,
+          count: rows.length,
+          meta: {
+            schemaVersion: LATEST_API_SCHEMA_VERSION,
+            historyState: rows.length > 0 ? "populated" : "empty",
+            pagination: {
+              mode: "offset",
+              limit: parsedLimit,
+              offset: parsedOffset,
+              count: rows.length,
+            },
+          },
+        });
+      }
+
       return reply.send({
-        transfers: rows.map((row) => formatRow(row, deps.config)),
+        transfers: formatted,
         limit: parsedLimit,
         offset: parsedOffset,
         count: rows.length,

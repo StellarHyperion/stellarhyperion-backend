@@ -9,6 +9,7 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import { LATEST_API_SCHEMA_VERSION, type ApiSchemaVersion } from "../schema-version.js";
 import type { ServerDeps } from "../server.js";
 
 export interface FormattedRouteHealth {
@@ -29,7 +30,7 @@ export interface FormattedRouteHealth {
 export function registerRouteHealthRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
 
-  app.get("/v1/routes/health", async (_request, reply: FastifyReply) => {
+  app.get("/v1/routes/health", async (request, reply: FastifyReply) => {
     // Return latest sample per (origin_chain, destination_chain, route, token)
     const { rows } = await db.query(
       `SELECT DISTINCT ON (origin_chain, destination_chain, route, token)
@@ -64,6 +65,20 @@ export function registerRouteHealthRoutes(app: FastifyInstance, deps: ServerDeps
         observedAt: new Date(row.observed_at as string | number | Date).toISOString(),
       };
     });
+
+    const version: ApiSchemaVersion = request.apiSchemaVersion;
+    if (version === LATEST_API_SCHEMA_VERSION) {
+      return reply.send({
+        schemaVersion: LATEST_API_SCHEMA_VERSION,
+        routes,
+        count: routes.length,
+        meta: {
+          schemaVersion: LATEST_API_SCHEMA_VERSION,
+          historyState: routes.length > 0 ? "populated" : "empty",
+          activeEvmRouters: deps.config.indexer.evm.length,
+        },
+      });
+    }
 
     return reply.send({ routes, count: routes.length });
   });

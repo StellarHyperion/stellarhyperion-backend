@@ -12,6 +12,7 @@ import { registerHealthRoutes } from "./routes/health.js";
 import { registerMetricsRoutes } from "./routes/metrics.js";
 import { registerRouteHealthRoutes } from "./routes/routes.js";
 import { registerTransferRoutes } from "./routes/transfers.js";
+import { registerSchemaVersionNegotiation } from "./schema-version.js";
 
 export interface ServerDeps {
   readonly config: AppConfig;
@@ -52,9 +53,15 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   app.addHook("onRequest", async (_request, reply) => {
     reply.header("Access-Control-Allow-Origin", "*");
     reply.header("Access-Control-Allow-Methods", "GET, OPTIONS");
-    reply.header("Access-Control-Allow-Headers", "Accept, Content-Type");
+    reply.header("Access-Control-Allow-Headers", "Accept, Content-Type, X-Hyperion-Schema-Version");
+    reply.header(
+      "Access-Control-Expose-Headers",
+      "X-Hyperion-Schema-Version, X-Hyperion-Supported-Versions, Vary",
+    );
   });
   app.options("/*", async (_request, reply) => reply.code(204).send());
+
+  registerSchemaVersionNegotiation(app);
 
   void app.register(rateLimit, {
     max: 120,

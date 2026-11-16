@@ -9,6 +9,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text } from "../../db/rows.js";
+import { LATEST_API_SCHEMA_VERSION, type ApiSchemaVersion } from "../schema-version.js";
 import type { ServerDeps } from "../server.js";
 
 export interface FormattedClaim {
@@ -43,6 +44,31 @@ function formatClaimRow(row: Record<string, unknown>): FormattedClaim {
   };
 }
 
+export interface FormattedClaimV2 extends FormattedClaim {
+  readonly schemaVersion: "2026-11-01";
+  readonly meta: {
+    readonly schemaVersion: "2026-11-01";
+    readonly settlementState: "settled" | "unsettled";
+  };
+}
+
+function projectClaimForVersion(
+  claim: FormattedClaim,
+  version: ApiSchemaVersion,
+): FormattedClaim | FormattedClaimV2 {
+  if (version !== LATEST_API_SCHEMA_VERSION) {
+    return claim;
+  }
+  return {
+    ...claim,
+    schemaVersion: LATEST_API_SCHEMA_VERSION,
+    meta: {
+      schemaVersion: LATEST_API_SCHEMA_VERSION,
+      settlementState: claim.settled ? "settled" : "unsettled",
+    },
+  };
+}
+
 export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
 
@@ -71,7 +97,7 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
         });
       }
 
-      return reply.send(formatClaimRow(row));
+      return reply.send(projectClaimForVersion(formatClaimRow(row), request.apiSchemaVersion));
     },
   );
 
@@ -128,8 +154,31 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
         params,
       );
 
+      const claims = rows.map((row) =>
+        projectClaimForVersion(formatClaimRow(row), request.apiSchemaVersion),
+      );
+      if (request.apiSchemaVersion === LATEST_API_SCHEMA_VERSION) {
+        return reply.send({
+          schemaVersion: LATEST_API_SCHEMA_VERSION,
+          claims,
+          limit: parsedLimit,
+          offset: parsedOffset,
+          count: rows.length,
+          meta: {
+            schemaVersion: LATEST_API_SCHEMA_VERSION,
+            historyState: rows.length > 0 ? "populated" : "empty",
+            pagination: {
+              mode: "offset",
+              limit: parsedLimit,
+              offset: parsedOffset,
+              count: rows.length,
+            },
+          },
+        });
+      }
+
       return reply.send({
-        claims: rows.map(formatClaimRow),
+        claims,
         limit: parsedLimit,
         offset: parsedOffset,
         count: rows.length,

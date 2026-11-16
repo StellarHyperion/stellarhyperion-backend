@@ -123,5 +123,23 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     expect(response.json().destination.decimals).toBe(6);
     expect(response.json().destination.symbol).toBe("USDC");
     expect(response.json().origin.netAmount).toBe("9970000");
+    expect(response.headers["x-hyperion-schema-version"]).toBe("2026-10-01");
+    expect(response.json().meta).toBeUndefined();
+
+    const negotiated = await app.inject({
+      method: "GET",
+      url: "/v1/transfers/by-tx/cctp-source",
+      headers: { "x-hyperion-schema-version": "2026-11-01" },
+    });
+    expect(negotiated.statusCode).toBe(200);
+    expect(negotiated.headers["x-hyperion-schema-version"]).toBe("2026-11-01");
+    expect(negotiated.json().destination.amount).toBe("897000");
+    expect(negotiated.json().origin.netAmount).toBe("9970000");
+    expect(negotiated.json().meta).toEqual({
+      schemaVersion: "2026-11-01",
+      deliveryFinalized: true,
+      deliveryVerification: "inbound_delivery",
+      sourceRouterIndexed: true,
+    });
   });
 });
