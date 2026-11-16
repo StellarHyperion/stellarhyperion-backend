@@ -13,6 +13,14 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
 import type { ServerDeps } from "../server.js";
+import {
+  BoundedSseWriter,
+  TransferStreamJournal,
+  extractRequestedCursor,
+  formatResyncEvent,
+  formatSseFrame,
+  type ResyncReason,
+} from "../sse-cursor.js";
 
 export type TransferLifecycleStage =
   | "initiated"
@@ -233,8 +241,30 @@ function isDeliveryFinalized(transfer: FormattedTransfer): boolean {
   );
 }
 
+function resyncInstructionsFor(reason: ResyncReason): string {
+  switch (reason) {
+    case "expired":
+      return "Resume cursor has expired outside the retention window. Fetch the current snapshot from snapshotUrl and reconnect to streamUrl without Last-Event-ID.";
+    case "evicted":
+      return "Resume cursor predates the bounded transition buffer. Fetch the current snapshot from snapshotUrl and reconnect to streamUrl without Last-Event-ID.";
+    case "transfer_mismatch":
+      return "Resume cursor belongs to a different transfer id. Reconnect using a cursor issued by this transfer stream or omit Last-Event-ID.";
+    case "conflicting_cursor":
+      return "Conflicting cursors were supplied in Last-Event-ID and cursor query parameter. Supply a single cursor or omit both to resync from snapshotUrl.";
+    case "malformed_cursor":
+    case "invalid_state":
+      return "Resume cursor is malformed or does not match transfer history. Fetch the current snapshot from snapshotUrl and reconnect to streamUrl without Last-Event-ID.";
+  }
+}
+
 export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
+  const sseOptions = deps.sse ?? {};
+  const journal = deps.streamJournal ?? new TransferStreamJournal(sseOptions);
+  const maxPendingFrames = sseOptions.maxPendingFrames ?? 16;
+  const maxBufferedBytes = sseOptions.maxBufferedBytes ?? 64 * 1024;
+  const drainTimeoutMs = sseOptions.drainTimeoutMs ?? 5_000;
+  const retryDelayMs = sseOptions.retryDelayMs ?? 1_000;
 
   const queryTransferById = async (id: string): Promise<FormattedTransfer | null> => {
     const { rows } = await db.query(`${TRANSFER_QUERY} WHERE t.id = $1 LIMIT 1`, [id]);
@@ -293,7 +323,11 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
   const handleStream = async (
     request: FastifyRequest<{
       Params: { id: string };
-      Querystring: { pollIntervalMs?: string; heartbeatIntervalMs?: string };
+      Querystring: {
+        pollIntervalMs?: string;
+        heartbeatIntervalMs?: string;
+        cursor?: string;
+      };
     }>,
     reply: FastifyReply,
   ) => {
@@ -306,93 +340,150 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       });
     }
 
+    const pathPrefix = request.url.startsWith("/api/") ? "/api/v1/transfers" : "/v1/transfers";
+    const snapshotUrl = `${pathPrefix}/${encodeURIComponent(id)}`;
+    const streamUrl = `${snapshotUrl}/stream`;
+
+    const extractedCursor = extractRequestedCursor(request.headers, request.query.cursor);
+    const resumeOutcome =
+      extractedCursor.kind === "none"
+        ? null
+        : extractedCursor.kind === "error"
+          ? { ok: false as const, reason: extractedCursor.reason, latestCursor: null }
+          : journal.resolveResume(id, extractedCursor.raw, initial);
+
+    const requiresResync = resumeOutcome !== null && !resumeOutcome.ok;
+
     reply.hijack();
     reply.raw.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
       "X-Accel-Buffering": "no",
+      ...(requiresResync ? { "X-Hyperion-Stream-Resync": "required" } : {}),
     });
-
-    const safeWrite = (chunk: string): boolean => {
-      if (reply.raw.writableEnded || reply.raw.destroyed) {
-        return false;
-      }
-      return reply.raw.write(chunk);
-    };
-
-    const safeEnd = (): void => {
-      if (!reply.raw.writableEnded && !reply.raw.destroyed) {
-        reply.raw.end();
-      }
-    };
-
-    safeWrite(`event: transfer_update\ndata: ${JSON.stringify(initial)}\n\n`);
-
-    if (isDeliveryFinalized(initial)) {
-      safeWrite(`event: complete\ndata: ${JSON.stringify(initial)}\n\n`);
-      safeEnd();
-      return;
-    }
-
-    let lastSerialized = JSON.stringify(initial);
-    let closed = false;
-
-    const pollInterval = Math.max(Number(request.query.pollIntervalMs) || 1000, 1000);
-    const heartbeatInterval = Math.max(Number(request.query.heartbeatIntervalMs) || 15000, 5000);
 
     let pollTimer: ReturnType<typeof setInterval> | null = null;
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+    let cleanedUp = false;
 
-    const cleanup = () => {
-      if (closed) return;
-      closed = true;
+    journal.onStreamOpen();
+
+    const cleanupTimersAndAccount = (): void => {
+      if (cleanedUp) return;
+      cleanedUp = true;
       if (pollTimer !== null) {
         clearInterval(pollTimer);
+        pollTimer = null;
       }
       if (heartbeatTimer !== null) {
         clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
       }
+      journal.onStreamClose();
     };
 
-    request.raw.on("close", cleanup);
-    reply.raw.on("close", cleanup);
-    reply.raw.on("error", cleanup);
+    const writer = new BoundedSseWriter({
+      requestRaw: request.raw,
+      responseRaw: reply.raw,
+      maxPendingFrames,
+      maxBufferedBytes,
+      drainTimeoutMs,
+      onClose: cleanupTimersAndAccount,
+    });
+
+    if (resumeOutcome !== null && !resumeOutcome.ok) {
+      writer.writeFrame(
+        formatResyncEvent({
+          error: "resync_required",
+          reason: resumeOutcome.reason,
+          transferId: id,
+          snapshotUrl,
+          streamUrl,
+          latestCursor: resumeOutcome.latestCursor,
+          instructions: resyncInstructionsFor(resumeOutcome.reason),
+        }),
+      );
+      writer.endStream();
+      return;
+    }
+
+    let lastStage: TransferLifecycleStage;
+    let lastDigest: string;
+
+    if (resumeOutcome === null) {
+      const recorded = journal.recordInitial(initial);
+      recorded.frames.forEach((frame, index) => {
+        writer.writeFrame(formatSseFrame(frame, index === 0 ? retryDelayMs : undefined));
+      });
+      if (isDeliveryFinalized(initial)) {
+        writer.endStream();
+        return;
+      }
+      lastStage = recorded.latestUpdateFrame.stage;
+      lastDigest = recorded.latestUpdateFrame.digest;
+    } else {
+      if (resumeOutcome.replayFrames.length === 0) {
+        writer.writeFrame(`retry: ${String(retryDelayMs)}\n: resumed\n\n`);
+      } else {
+        resumeOutcome.replayFrames.forEach((frame, index) => {
+          writer.writeFrame(formatSseFrame(frame, index === 0 ? retryDelayMs : undefined));
+        });
+      }
+      if (resumeOutcome.finalized) {
+        writer.endStream();
+        return;
+      }
+      lastStage = resumeOutcome.latestUpdateFrame.stage;
+      lastDigest = resumeOutcome.latestUpdateFrame.digest;
+    }
+
+    const pollInterval = Math.max(Number(request.query.pollIntervalMs) || 1000, 1000);
+    const heartbeatInterval = Math.max(Number(request.query.heartbeatIntervalMs) || 15000, 5000);
+    let pollInFlight = false;
 
     pollTimer = setInterval(() => {
-      void (async () => {
-        if (closed || reply.raw.writableEnded || reply.raw.destroyed) {
-          cleanup();
-          return;
-        }
+      if (writer.isClosed()) {
+        writer.close();
+        return;
+      }
+      if (pollInFlight || writer.isBackpressured()) {
+        return;
+      }
 
+      pollInFlight = true;
+      void (async () => {
         try {
           const current = await queryTransferById(id);
-          if (current === null) return;
+          if (current === null || writer.isClosed()) return;
 
-          const currentSerialized = JSON.stringify(current);
-          if (currentSerialized !== lastSerialized) {
-            lastSerialized = currentSerialized;
-            safeWrite(`event: transfer_update\ndata: ${JSON.stringify(current)}\n\n`);
+          const delta = journal.recordPolled(current, lastStage, lastDigest);
+          lastStage = delta.latestStage;
+          lastDigest = delta.latestDigest;
 
-            if (isDeliveryFinalized(current)) {
-              safeWrite(`event: complete\ndata: ${JSON.stringify(current)}\n\n`);
-              safeEnd();
-              cleanup();
+          for (const frame of delta.frames) {
+            if (!writer.writeFrame(formatSseFrame(frame))) {
+              return;
             }
+          }
+
+          if (delta.finalized) {
+            writer.endStream();
           }
         } catch (error) {
           request.log.warn({ err: error, id }, "transfer stream poll failed");
+        } finally {
+          pollInFlight = false;
         }
       })();
     }, pollInterval);
 
     heartbeatTimer = setInterval(() => {
-      if (closed || reply.raw.writableEnded || reply.raw.destroyed) {
-        cleanup();
+      if (writer.isClosed()) {
+        writer.close();
         return;
       }
-      safeWrite(": ping\n\n");
+      writer.writeHeartbeat(": ping\n\n");
     }, heartbeatInterval);
   };
 

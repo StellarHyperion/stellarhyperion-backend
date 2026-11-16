@@ -123,5 +123,10 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     expect(response.json().destination.decimals).toBe(6);
     expect(response.json().destination.symbol).toBe("USDC");
     expect(response.json().origin.netAmount).toBe("9970000");
+
+    const stream = await app.inject("/v1/transfers/2/stream");
+    expect(stream.statusCode).toBe(200);
+    expect(stream.payload).toMatch(/id: hyp1\.[A-Za-z0-9_-]+\nevent: transfer_update\ndata: /);
+    expect(stream.payload).toMatch(/id: hyp1\.[A-Za-z0-9_-]+\nevent: complete\ndata: /);
   });
 });
