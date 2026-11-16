@@ -43,6 +43,7 @@ beforeAll(async () => {
     "1790900000000_initial-schema.sql",
     "1791000000000_cursor-block-hash.sql",
     "1791100000000_cursor-autovacuum-tuning.sql",
+    "1791200000000_cctp-contract-diagnostics.sql",
   ]) {
     const sql = readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8").split(
       "-- Down Migration",
