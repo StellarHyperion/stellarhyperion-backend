@@ -8,6 +8,7 @@
 import { Queue, Worker } from "bullmq";
 import { Redis } from "ioredis";
 
+import { createRpcMaintenanceInspector } from "./adapters.js";
 import { processClaimSettlement } from "./jobs/claims.js";
 import { processTtlBump } from "./jobs/ttl.js";
 import type { KeeperContext, KeeperJobName, KeeperJobResult } from "./types.js";
@@ -34,6 +35,13 @@ export async function startKeeperQueue(
   redisUrl: string,
 ): Promise<KeeperHandle> {
   const { config, logger } = ctx;
+  const workerCtx: KeeperContext =
+    ctx.maintenanceInspector || !config.indexer.stellar
+      ? ctx
+      : {
+          ...ctx,
+          maintenanceInspector: createRpcMaintenanceInspector(config),
+        };
   const redis = createKeeperRedis(redisUrl);
   await redis.connect();
 
@@ -47,11 +55,11 @@ export async function startKeeperQueue(
       logger.info({ jobName: job.name, jobId: job.id }, "processing keeper job");
       switch (job.name as KeeperJobName) {
         case "ttl-bump": {
-          const result = await processTtlBump(ctx, job.data as object);
+          const result = await processTtlBump(workerCtx, job.data as object);
           return { kind: "ttl-bump", result };
         }
         case "claim-settlement": {
-          const result = await processClaimSettlement(ctx, job.data as object);
+          const result = await processClaimSettlement(workerCtx, job.data as object);
           return { kind: "claim-settlement", result };
         }
         default:

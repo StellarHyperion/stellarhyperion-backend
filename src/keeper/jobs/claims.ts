@@ -1,7 +1,9 @@
 import { Address, nativeToScVal } from "@stellar/stellar-sdk";
 import { bigintOf } from "../../db/rows.js";
+import { resolveResourceBounds, validateMeasuredResources } from "../adapters.js";
 import { submitStellar } from "../stellar.js";
 import type { ClaimSettlementPayload, ClaimSettlementResult, KeeperContext } from "../types.js";
+
 export async function processClaimSettlement(
   ctx: KeeperContext,
   payload: ClaimSettlementPayload = {},
@@ -27,15 +29,43 @@ export async function processClaimSettlement(
       dryRun: true,
       detail: "No signer configured; no settlement was attempted.",
     };
+  const bounds = resolveResourceBounds(payload.resourceBounds);
+  if (ctx.maintenanceInspector) {
+    const methods = await ctx.maintenanceInspector.getContractMethods(chain.routerContractId);
+    if (!methods.some((method) => method.name === "settle_claim" && method.inputs.length === 2)) {
+      throw new Error(
+        `Router contract ${chain.routerContractId} does not expose a callable settle_claim entrypoint.`,
+      );
+    }
+  }
   let settled = 0;
   for (const row of rows) {
     const id = bigintOf(row, "claim_id");
+    const buildArgs = (sender: string) => [
+      new Address(sender).toScVal(),
+      nativeToScVal(id, { type: "u64" }),
+    ];
     try {
+      if (ctx.maintenanceInspector) {
+        const measured = await ctx.maintenanceInspector.measureCall(
+          chain.routerContractId,
+          "settle_claim",
+          buildArgs,
+        );
+        const validation = validateMeasuredResources(measured, bounds);
+        if (!validation.ok) {
+          throw new Error(validation.detail);
+        }
+      }
       const hash = await submitStellar(
         ctx.config,
         chain.routerContractId,
         "settle_claim",
-        (sender) => [new Address(sender).toScVal(), nativeToScVal(id, { type: "u64" })],
+        buildArgs,
+        {
+          resourceBounds: payload.resourceBounds,
+          requireCallableMethod: true,
+        },
       );
       ctx.logger.info(
         { claimId: String(id), hash },
