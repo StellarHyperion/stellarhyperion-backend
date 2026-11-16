@@ -26,6 +26,7 @@
 import { CHAINS, IRIS_API, isChainKey, type NetworkMode } from "@hyperion/protocol";
 
 import type {
+  CctpProviderFeeHint,
   PendingTransfer,
   RailClient,
   RailLookup,
@@ -86,7 +87,12 @@ export interface IrisMessage {
   // Both levels nullable, because the reference says `decodedMessage` is null when decoding
   // fails and `decodedMessageBody` is itself nullable inside it.
   readonly decodedMessage?: {
-    readonly decodedMessageBody?: { readonly expirationBlock?: unknown } | null;
+    readonly decodedMessageBody?: {
+      readonly expirationBlock?: unknown;
+      readonly amount?: unknown;
+      readonly maxFee?: unknown;
+      readonly feeExecuted?: unknown;
+    } | null;
   } | null;
 }
 
@@ -418,6 +424,7 @@ export function reportFor(message: IrisMessage): RailReport {
 
   let railStatus = delay === null ? rawStatus : `${rawStatus}/${delay}`;
   railStatus = appendExpiry(railStatus, message);
+  const feeHint = extractFeeHint(message);
 
   return {
     ...(typeof message.forwardTxHash === "string" &&
@@ -434,7 +441,28 @@ export function reportFor(message: IrisMessage): RailReport {
     attestationSignature,
     attestationTimestamp,
     fastTransfer: isFast,
+    ...(feeHint !== null ? { feeHint } : {}),
   };
+}
+
+function parseExactIntegerString(value: unknown): string | null {
+  if (typeof value === "string" && /^\d+$/.test(value)) {
+    return BigInt(value).toString();
+  }
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+    return BigInt(value).toString();
+  }
+  return null;
+}
+
+function extractFeeHint(message: IrisMessage): CctpProviderFeeHint | null {
+  const body = message.decodedMessage?.decodedMessageBody;
+  if (!body || typeof body !== "object") return null;
+  const amount = parseExactIntegerString(body.amount);
+  const maxFee = parseExactIntegerString(body.maxFee);
+  const feeExecuted = parseExactIntegerString(body.feeExecuted);
+  if (amount === null && maxFee === null && feeExecuted === null) return null;
+  return { amount, maxFee, feeExecuted };
 }
 
 /**

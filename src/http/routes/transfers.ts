@@ -11,7 +11,7 @@ import type { AppConfig } from "../../config/config.js";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
-import { integer, text, textOrNull } from "../../db/rows.js";
+import { integer, integerOrNull, text, textOrNull } from "../../db/rows.js";
 import type { ServerDeps } from "../server.js";
 
 export type TransferLifecycleStage =
@@ -45,6 +45,8 @@ export interface FormattedTransfer {
   readonly destination: {
     readonly token: string | null;
     readonly amount: string | null;
+    readonly plannedMinAmount: string | null;
+    readonly actualAmount: string | null;
     readonly symbol: string | null;
     readonly decimals: number | null;
     readonly chain: string;
@@ -54,6 +56,18 @@ export interface FormattedTransfer {
     readonly txHash: string | null;
     readonly deliveredAt: string | null;
   };
+  readonly feeReconciliation: {
+    readonly status: string;
+    readonly sourceDecimals: number;
+    readonly destinationDecimals: number;
+    readonly sourceBurnedAmount: string;
+    readonly destinationBurnAmount: string;
+    readonly forwardingBudget: string;
+    readonly executedDeduction: string | null;
+    readonly plannedMinPayout: string;
+    readonly actualPayout: string | null;
+    readonly diagnosticCode: string | null;
+  } | null;
   readonly rail: {
     readonly status: string | null;
     readonly railStatus: string | null;
@@ -130,6 +144,27 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
   const railStatus = textOrNull(row, "attestation_status");
 
   const stage = deriveStage(delivered, hasClaim, claimSettled, railStatus);
+  const receivedAmount = textOrNull(row, "received_amount");
+  const feeStatus = textOrNull(row, "fee_reconciliation_status");
+  const plannedMinPayout = textOrNull(row, "fee_planned_min_payout");
+  const actualMintPayout = textOrNull(row, "fee_actual_mint_payout");
+
+  const feeReconciliation =
+    feeStatus !== null && plannedMinPayout !== null
+      ? {
+          status: feeStatus,
+          sourceDecimals: integerOrNull(row, "fee_source_decimals") ?? 7,
+          destinationDecimals: integerOrNull(row, "fee_destination_decimals") ?? 6,
+          sourceBurnedAmount:
+            textOrNull(row, "fee_source_burned_amount") ?? text(row, "net_amount"),
+          destinationBurnAmount: textOrNull(row, "fee_cctp_burn_amount") ?? "0",
+          forwardingBudget: textOrNull(row, "fee_forwarding_budget") ?? "0",
+          executedDeduction: textOrNull(row, "fee_executed_deduction"),
+          plannedMinPayout,
+          actualPayout: actualMintPayout,
+          diagnosticCode: textOrNull(row, "fee_diagnostic_code"),
+        }
+      : null;
 
   return {
     id: text(row, "id"),
@@ -151,7 +186,9 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
     },
     destination: {
       token: receivedToken,
-      amount: textOrNull(row, "received_amount"),
+      amount: receivedAmount,
+      plannedMinAmount: plannedMinPayout,
+      actualAmount: actualMintPayout ?? receivedAmount,
       symbol: receivedMetadata?.symbol ?? null,
       decimals: receivedMetadata?.decimals ?? null,
       chain: destinationChain,
@@ -163,6 +200,7 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
         ? new Date(row.delivered_at as string | number | Date).toISOString()
         : null,
     },
+    feeReconciliation,
     rail:
       railStatus === null
         ? null
@@ -212,9 +250,20 @@ const TRANSFER_QUERY = `
          d.amount AS received_amount,
          d.observed_at AS delivered_at,
          c.claim_id,
-         c.settled AS claim_settled
+         c.settled AS claim_settled,
+         f.status AS fee_reconciliation_status,
+         f.source_decimals AS fee_source_decimals,
+         f.destination_decimals AS fee_destination_decimals,
+         f.source_burned_amount AS fee_source_burned_amount,
+         f.cctp_burn_amount AS fee_cctp_burn_amount,
+         f.forwarding_budget_max_fee AS fee_forwarding_budget,
+         f.executed_fee_deduction AS fee_executed_deduction,
+         f.planned_min_payout AS fee_planned_min_payout,
+         f.actual_mint_payout AS fee_actual_mint_payout,
+         f.diagnostic_code AS fee_diagnostic_code
     FROM outbound_transfer t
     LEFT JOIN rail_attestation a ON a.transfer_id = t.id
+    LEFT JOIN cctp_fee_reconciliation f ON f.transfer_id = t.id
     LEFT JOIN inbound_delivery d
       ON d.destination_chain = t.destination_chain
      AND d.route = t.route

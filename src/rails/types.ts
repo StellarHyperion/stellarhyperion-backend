@@ -30,6 +30,12 @@ export function isTerminal(status: AttestationStatus): boolean {
   return TERMINAL.includes(status);
 }
 
+export interface CctpProviderFeeHint {
+  readonly amount?: string | null;
+  readonly maxFee?: string | null;
+  readonly feeExecuted?: string | null;
+}
+
 export interface RailReport {
   readonly forwardTxHash?: `0x${string}`;
   readonly execution?: { readonly txHash: `0x${string}`; readonly commandId: `0x${string}` };
@@ -52,6 +58,7 @@ export interface RailReport {
   readonly attestationSignature?: string | null;
   readonly attestationTimestamp?: Date | null;
   readonly fastTransfer?: boolean;
+  readonly feeHint?: CctpProviderFeeHint | null | undefined;
 }
 
 export type RailLookup =
