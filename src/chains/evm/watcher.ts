@@ -31,7 +31,7 @@ import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
 import type { Position } from "../writers.js";
-import { ClaimPairing, applyRouterLog } from "./store.js";
+import { ClaimPairing, applyRouterLog, recordRouterDeployment } from "./store.js";
 import { decodeRouterLog, signatureOf } from "./logs.js";
 import type { EvmClient, RawEvmLog } from "./client.js";
 
@@ -199,6 +199,15 @@ export class EvmWatcher {
     // One transaction for the range and the cursor advance past it. This is the restart guarantee,
     // and splitting it would turn every crash into either a lost range or a duplicated one.
     await db.transaction(async (tx: Queryable) => {
+      await recordRouterDeployment(tx, {
+        chainKey,
+        contract: router,
+        family: "evm",
+        startBlock: this.options.startBlock,
+        retiredAtBlock: null,
+        active: true,
+      });
+
       for (const log of logs) {
         if (log.removed) {
           // viem marks a log from an orphaned block. Indexing one would record a transfer that is
@@ -338,6 +347,7 @@ export class EvmWatcher {
       // Unlike Soroban, which orders events within a transaction instead.
       logIndex: log.logIndex,
       observedAt: new Date(Number(timestamp) * 1000),
+      routerAddress: this.options.router,
     };
 
     const applied = await applyRouterLog(tx, at, decoded, pairing);

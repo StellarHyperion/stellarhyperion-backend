@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 
 import { EvmWatcher } from "../../src/chains/evm/watcher.js";
 import { viemClient, type EvmClient } from "../../src/chains/evm/client.js";
+import { writeOutbound, type Position } from "../../src/chains/writers.js";
 import {
   ANVIL_HISTORY,
   ANVIL_CHAIN_ID,
@@ -545,5 +546,58 @@ describe("RPC endpoint failover", () => {
 
     // Cursor now advances properly from cursorRow(20n)
     expect(cursorWrites(db)).toEqual([{ block: 57n, family: "evm", hash: expect.any(String) }]);
+  });
+});
+
+describe("router activation and retirement boundaries", () => {
+  it("records router deployment metadata on indexing", async () => {
+    const { watcher, db } = harness({ head: 60n });
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    const deployments = db.matching("INSERT INTO router_deployment");
+    expect(deployments.length).toBeGreaterThan(0);
+    expect(deployments[0]?.params[0]).toBe(CHAIN);
+    expect(deployments[0]?.params[1]).toBe(ANVIL_ROUTER.toLowerCase());
+  });
+
+  it("prevents new router history from overwriting old router transfer identity", async () => {
+    const db = new RecordingDb();
+    const pos1: Position = {
+      chainKey: CHAIN,
+      block: 100n,
+      txHash: "0x1111",
+      logIndex: 0,
+      observedAt: new Date(),
+      routerAddress: "0x1111111111111111111111111111111111111111",
+    };
+    const pos2: Position = {
+      chainKey: CHAIN,
+      block: 200n,
+      txHash: "0x2222",
+      logIndex: 0,
+      observedAt: new Date(),
+      routerAddress: "0x2222222222222222222222222222222222222222",
+    };
+
+    const row = {
+      route: 0,
+      nonce: 1n,
+      sender: "0xaaaa",
+      token: "0xbbbb",
+      grossAmount: 1000n,
+      fee: 10n,
+      netAmount: 990n,
+      destinationChain: "stellar-testnet",
+      destination: "GCEXAMPLE",
+      railRef: null,
+    };
+
+    await writeOutbound(db, pos1, row);
+    await writeOutbound(db, pos2, row);
+
+    const inserts = db.matching("INSERT INTO outbound_transfer");
+    expect(inserts).toHaveLength(2);
+    expect(inserts[0]?.params[1]).toBe("0x1111111111111111111111111111111111111111");
+    expect(inserts[1]?.params[1]).toBe("0x2222222222222222222222222222222222222222");
   });
 });

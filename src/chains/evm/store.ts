@@ -10,6 +10,7 @@
 import { ROUTE_KINDS } from "@hyperion/protocol";
 
 import type { Queryable } from "../../db/pool.js";
+import { bigintOf, text } from "../../db/rows.js";
 import type { Position } from "../writers.js";
 import {
   settleAction,
@@ -249,4 +250,59 @@ export async function applyRouterLog(
     default:
       return { kind: "ignored" };
   }
+}
+
+export interface RouterDeploymentRecord {
+  readonly chainKey: string;
+  readonly contract: string;
+  readonly family: string;
+  readonly startBlock: bigint;
+  readonly retiredAtBlock: bigint | null;
+  readonly active: boolean;
+}
+
+export async function recordRouterDeployment(
+  db: Queryable,
+  record: RouterDeploymentRecord,
+): Promise<void> {
+  await db.query(
+    `INSERT INTO router_deployment
+       (chain_key, contract, family, start_block, retired_at_block, active)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (chain_key, contract) DO UPDATE
+       SET retired_at_block = EXCLUDED.retired_at_block,
+           active = EXCLUDED.active`,
+    [
+      record.chainKey,
+      record.contract.toLowerCase(),
+      record.family,
+      record.startBlock.toString(),
+      record.retiredAtBlock !== null ? record.retiredAtBlock.toString() : null,
+      record.active,
+    ],
+  );
+}
+
+export async function readRouterDeployments(
+  db: Queryable,
+  chainKey: string,
+): Promise<readonly RouterDeploymentRecord[]> {
+  const { rows } = await db.query(
+    `SELECT chain_key, contract, family, start_block, retired_at_block, active
+       FROM router_deployment
+      WHERE chain_key = $1
+      ORDER BY start_block ASC`,
+    [chainKey],
+  );
+  return rows.map((r) => ({
+    chainKey: text(r, "chain_key"),
+    contract: text(r, "contract"),
+    family: text(r, "family"),
+    startBlock: bigintOf(r, "start_block"),
+    retiredAtBlock:
+      r.retired_at_block !== null && r.retired_at_block !== undefined
+        ? bigintOf(r, "retired_at_block")
+        : null,
+    active: Boolean(r.active),
+  }));
 }

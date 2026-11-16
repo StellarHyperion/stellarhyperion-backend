@@ -31,6 +31,8 @@ export interface Position {
   readonly logIndex: number | null;
   /** The chain's own timestamp, never ours. Lag measured against our clock hides a stall. */
   readonly observedAt: Date;
+  /** The router contract address emitting the event. Used for scoped identity across redeployments. */
+  readonly routerAddress?: string | null;
 }
 
 export interface OutboundRow {
@@ -106,13 +108,14 @@ export interface HealthSample {
 }
 
 export async function writeOutbound(db: Queryable, at: Position, row: OutboundRow): Promise<void> {
+  const router = at.routerAddress ? at.routerAddress.toLowerCase() : "";
   await db.query(
     `INSERT INTO outbound_transfer
-       (origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
+       (origin_chain, router_address, route, nonce, sender, token, gross_amount, fee, net_amount,
         destination_chain, destination, rail_ref, origin_block, origin_tx, origin_log_index,
         observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-     ON CONFLICT (origin_chain, nonce) DO UPDATE
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+     ON CONFLICT (origin_chain, router_address, nonce) DO UPDATE
        SET route = EXCLUDED.route,
            sender = EXCLUDED.sender,
            token = EXCLUDED.token,
@@ -127,6 +130,7 @@ export async function writeOutbound(db: Queryable, at: Position, row: OutboundRo
            origin_log_index = EXCLUDED.origin_log_index`,
     [
       at.chainKey,
+      router,
       row.route,
       row.nonce.toString(),
       row.sender,
