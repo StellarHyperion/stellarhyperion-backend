@@ -58,11 +58,25 @@ export type RailLookup =
   /** The rail has not indexed this transfer yet. Normal, and not a failure. */
   { readonly kind: "missing" } | { readonly kind: "found"; readonly report: RailReport };
 
+export type CctpResourceLimitCode =
+  | "response_bytes_exceeded"
+  | "json_depth_exceeded"
+  | "json_tokens_exceeded"
+  | "message_count_exceeded"
+  | "message_bytes_exceeded"
+  | "attestation_bytes_exceeded"
+  | "receipt_logs_exceeded";
+
 export type RailErrorKind =
   /** Worth another go: a timeout, a 5xx, a body that did not parse. */
   | "transient"
   /** Will be wrong the same way next time: a malformed request, an unsupported domain. */
   | "permanent"
+  /**
+   * Provider payload or proof candidate exceeded configured memory or parsing bounds.
+   * Categorized separately from both transient network hiccups and invalid payment evidence.
+   */
+  | "resourceLimit"
   /**
    * The rail has asked us to stop for a while.
    *
@@ -74,15 +88,19 @@ export type RailErrorKind =
   | "rateLimited";
 
 export class RailError extends Error {
+  readonly limitCode: CctpResourceLimitCode | null;
+
   constructor(
     readonly rail: string,
     readonly kind: RailErrorKind,
     reason: string,
     /** How long the rail has asked us to wait, when it says. */
     readonly retryAfterMs: number | null = null,
+    limitCode: CctpResourceLimitCode | null = null,
   ) {
     super(`${rail}: ${reason}`);
     this.name = "RailError";
+    this.limitCode = limitCode;
   }
 }
 

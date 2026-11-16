@@ -232,8 +232,28 @@ export class RailPass {
 
   private async recordFailure(transfer: PendingTransfer, error: unknown): Promise<void> {
     const failures = transfer.checkFailures + 1;
-    const reason = error instanceof Error ? error.message : String(error);
+    const rawReason = error instanceof Error ? error.message : String(error);
     const permanent = error instanceof RailError && error.kind === "permanent";
+    const resourceLimited = error instanceof RailError && error.kind === "resourceLimit";
+    const reason =
+      resourceLimited && error.limitCode !== null
+        ? `[resource_limit:${error.limitCode}] ${rawReason}`
+        : resourceLimited
+          ? `[resource_limit] ${rawReason}`
+          : rawReason;
+
+    if (resourceLimited) {
+      this.options.logger.warn(
+        {
+          rail: this.options.client.rail,
+          transferId: transfer.transferId.toString(),
+          limitCode: error.limitCode,
+          failures,
+          reason: rawReason,
+        },
+        "provider response exceeded configured resource limits",
+      );
+    }
 
     if (permanent || failures >= this.options.maxCheckFailures) {
       // Said out loud, because the queue is about to stop offering this transfer and a transfer

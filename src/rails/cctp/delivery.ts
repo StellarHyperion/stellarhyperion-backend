@@ -12,16 +12,113 @@ import { createPublicClient, http, type Hex } from "viem";
 import type { AppConfig } from "../../config/config.js";
 import type { Transactional } from "../../db/pool.js";
 import { bigintOf, text } from "../../db/rows.js";
-import type { PendingTransfer, RailReport } from "../types.js";
+import {
+  RailError,
+  type CctpResourceLimitCode,
+  type PendingTransfer,
+  type RailReport,
+} from "../types.js";
 import type { VerifiedDelivery } from "../axelar/delivery.js";
-import { matchingCctpPayment, verifiedCctpMessage, type ExpectedCctpTransfer } from "./events.js";
+import type { DeliveryLog } from "../axelar/events.js";
+import {
+  assertCctpHexByteLimit,
+  assertCctpReceiptResourceLimits,
+  matchingCctpPayment,
+  resolveCctpResourceLimits,
+  verifiedCctpMessage,
+  type CctpResourceLimits,
+  type ExpectedCctpTransfer,
+} from "./events.js";
+
+export interface CctpReceipt {
+  readonly status: "success" | "reverted";
+  readonly blockNumber: bigint;
+  readonly blockHash: Hex;
+  readonly transactionHash: Hex;
+  readonly logs: readonly DeliveryLog[];
+}
+
+export interface CctpBlock {
+  readonly hash: Hex | null;
+  readonly timestamp: bigint;
+}
+
+export interface CctpEvmClient {
+  getChainId(): Promise<number>;
+  getBlockNumber(): Promise<bigint>;
+  getTransactionReceipt(args: { hash: Hex }): Promise<CctpReceipt>;
+  getBlock(args: { blockNumber: bigint }): Promise<CctpBlock>;
+}
+
+export interface VerifyCctpDeliveryOptions {
+  readonly evmClient?: CctpEvmClient;
+  readonly limits?: Partial<CctpResourceLimits>;
+}
+
+export type CctpDeliveryVerificationOutcome =
+  | { readonly outcome: "verified"; readonly delivery: VerifiedDelivery }
+  | { readonly outcome: "invalid_payment_evidence" }
+  | {
+      readonly outcome: "resource_limit";
+      readonly code: CctpResourceLimitCode;
+      readonly error: RailError;
+    };
+
+function createDefaultEvmClient(rpcUrl: string): CctpEvmClient {
+  const client = createPublicClient({
+    transport: http(rpcUrl, { timeout: 15_000, retryCount: 0 }),
+  });
+  return {
+    getChainId: () => client.getChainId(),
+    getBlockNumber: () => client.getBlockNumber(),
+    getTransactionReceipt: async ({ hash }) => {
+      const receipt = await client.getTransactionReceipt({ hash });
+      return {
+        status: receipt.status,
+        blockNumber: receipt.blockNumber,
+        blockHash: receipt.blockHash,
+        transactionHash: receipt.transactionHash,
+        logs: receipt.logs,
+      };
+    },
+    getBlock: async ({ blockNumber }) => {
+      const block = await client.getBlock({ blockNumber });
+      return { hash: block.hash, timestamp: block.timestamp };
+    },
+  };
+}
+
+export function assertReportResourceLimits(report: RailReport, limits: CctpResourceLimits): void {
+  const rawCandidate = report.messageBytes ?? report.message ?? null;
+  if (typeof rawCandidate === "string") {
+    assertCctpHexByteLimit(
+      rawCandidate,
+      limits.maxMessageHexBytes,
+      "message_bytes_exceeded",
+      "message",
+    );
+  }
+  const attCandidate = report.attestationSignature ?? report.attestation ?? null;
+  if (typeof attCandidate === "string" && attCandidate !== "PENDING") {
+    assertCctpHexByteLimit(
+      attCandidate,
+      limits.maxAttestationHexBytes,
+      "attestation_bytes_exceeded",
+      "attestation",
+    );
+  }
+}
 
 export async function verifyCctpDelivery(
   config: AppConfig,
   db: Transactional,
   transfer: PendingTransfer,
   report: RailReport,
+  options?: VerifyCctpDeliveryOptions,
 ): Promise<VerifiedDelivery | null> {
+  const limits = resolveCctpResourceLimits(options?.limits);
+  assertReportResourceLimits(report, limits);
+
   if (
     transfer.route !== RouteKind.Cctp ||
     transfer.originChain !== "stellar-testnet" ||
@@ -29,8 +126,9 @@ export async function verifyCctpDelivery(
     !report.messageBytes ||
     !/^0x[0-9a-fA-F]+$/.test(report.messageBytes) ||
     !isChainKey(transfer.destinationChain)
-  )
+  ) {
     return null;
+  }
   const source = config.deployments.networks["stellar-testnet"];
   const destination = CHAINS[transfer.destinationChain];
   const contracts = RAIL_CONTRACTS[transfer.destinationChain]?.cctp;
@@ -47,8 +145,9 @@ export async function verifyCctpDelivery(
     !contracts ||
     token?.family !== "evm" ||
     destination.cctpDomain === null
-  )
+  ) {
     return null;
+  }
   const { rows } = await db.query(
     "SELECT token, net_amount, destination FROM outbound_transfer WHERE id = $1",
     [String(transfer.transferId)],
@@ -67,21 +166,22 @@ export async function verifyCctpDelivery(
     sourceAmount: bigintOf(stored, "net_amount"),
   };
   const raw = report.messageBytes as Hex;
-  const message = verifiedCctpMessage(raw, expected);
+  const message = verifiedCctpMessage(raw, expected, limits);
   if (!message) return null;
-  const client = createPublicClient({
-    transport: http(destination.defaultRpcUrl, { timeout: 15000, retryCount: 0 }),
-  });
-  if ((await client.getChainId()) !== destination.chainId)
+
+  const client = options?.evmClient ?? createDefaultEvmClient(destination.defaultRpcUrl);
+  if ((await client.getChainId()) !== destination.chainId) {
     throw new Error("CCTP destination RPC chain mismatch.");
+  }
   const receipt = await client.getTransactionReceipt({ hash: report.forwardTxHash });
+  assertCctpReceiptResourceLimits(receipt.logs, limits);
   if (receipt.status !== "success") return null;
   const head = await client.getBlockNumber();
   if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations)) return null;
-  const payment = matchingCctpPayment(receipt.logs, raw, expected);
+  const payment = matchingCctpPayment(receipt.logs, raw, expected, limits);
   if (!payment) return null;
   const block = await client.getBlock({ blockNumber: receipt.blockNumber });
-  if (block.hash !== receipt.blockHash) return null;
+  if (block.hash?.toLowerCase() !== receipt.blockHash.toLowerCase()) return null;
   return {
     at: {
       chainKey: transfer.destinationChain,
@@ -102,4 +202,27 @@ export async function verifyCctpDelivery(
       claimId: null,
     },
   };
+}
+
+export async function verifyCctpDeliveryClassified(
+  config: AppConfig,
+  db: Transactional,
+  transfer: PendingTransfer,
+  report: RailReport,
+  options?: VerifyCctpDeliveryOptions,
+): Promise<CctpDeliveryVerificationOutcome> {
+  try {
+    const delivery = await verifyCctpDelivery(config, db, transfer, report, options);
+    if (!delivery) return { outcome: "invalid_payment_evidence" };
+    return { outcome: "verified", delivery };
+  } catch (error) {
+    if (error instanceof RailError && error.kind === "resourceLimit") {
+      return {
+        outcome: "resource_limit",
+        code: error.limitCode ?? "message_bytes_exceeded",
+        error,
+      };
+    }
+    throw error;
+  }
 }

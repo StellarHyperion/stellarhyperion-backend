@@ -33,6 +33,11 @@ import type {
   AttestationStatus,
 } from "../types.js";
 import { RailError } from "../types.js";
+import {
+  assertCctpHexByteLimit,
+  resolveCctpResourceLimits,
+  type CctpResourceLimits,
+} from "./events.js";
 
 /** Circle's own status values. */
 const PENDING = "pending_confirmations";
@@ -214,12 +219,176 @@ export interface IrisOptions {
   readonly fetch?: typeof globalThis.fetch;
   readonly page?: number;
   readonly pageSize?: number;
+  readonly limits?: Partial<CctpResourceLimits>;
+}
+
+/**
+ * Reads an HTTP body stream with a strict byte ceiling, cancelling the stream immediately as soon
+ * as `Content-Length` or cumulative chunk bytes exceed `maxBytes` so oversized envelopes cannot
+ * exhaust worker memory.
+ */
+export async function readBoundedResponseText(
+  response: Response,
+  maxBytes: number,
+): Promise<string> {
+  const declared = response.headers.get("content-length");
+  if (declared !== null && /^\d+$/.test(declared.trim())) {
+    const contentLength = Number(declared.trim());
+    if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new RailError(
+        "cctp",
+        "resourceLimit",
+        `provider response Content-Length ${String(contentLength)} bytes exceeds limit ${String(maxBytes)} bytes`,
+        null,
+        "response_bytes_exceeded",
+      );
+    }
+  }
+
+  if (response.body === null) {
+    return "";
+  }
+
+  const reader = response.body.getReader() as ReadableStreamDefaultReader<Uint8Array>;
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  try {
+    for (;;) {
+      const result = await reader.read();
+      if (result.done) break;
+      const chunk = result.value;
+      totalBytes += chunk.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new RailError(
+          "cctp",
+          "resourceLimit",
+          `provider response stream exceeded limit ${String(maxBytes)} bytes`,
+          null,
+          "response_bytes_exceeded",
+        );
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const merged = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder("utf-8", { fatal: false }).decode(merged);
+}
+
+/**
+ * Enforces structural JSON nesting depth and value count bounds in a single linear pass before
+ * invoking `JSON.parse`, bounding CPU and heap work on adversarial or corrupted payloads.
+ */
+export function enforceJsonComplexityLimits(
+  rawJson: string,
+  maxDepth: number,
+  maxValues: number,
+): void {
+  let inString = false;
+  let escaped = false;
+  let depth = 0;
+  let structuralCount = 0;
+
+  for (let i = 0; i < rawJson.length; i += 1) {
+    const code = rawJson.charCodeAt(i);
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (code === 0x5c /* \ */) {
+        escaped = true;
+      } else if (code === 0x22 /* " */) {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (code === 0x22 /* " */) {
+      inString = true;
+      continue;
+    }
+
+    if (code === 0x7b /* { */ || code === 0x5b /* [ */) {
+      depth += 1;
+      structuralCount += 1;
+      if (depth > maxDepth) {
+        throw new RailError(
+          "cctp",
+          "resourceLimit",
+          `provider JSON nesting depth ${String(depth)} exceeds limit ${String(maxDepth)}`,
+          null,
+          "json_depth_exceeded",
+        );
+      }
+      if (structuralCount > maxValues) {
+        throw new RailError(
+          "cctp",
+          "resourceLimit",
+          `provider JSON structural count exceeds limit ${String(maxValues)}`,
+          null,
+          "json_tokens_exceeded",
+        );
+      }
+    } else if (code === 0x7d /* } */ || code === 0x5d /* ] */) {
+      if (depth > 0) depth -= 1;
+    } else if (code === 0x2c /* , */ || code === 0x3a /* : */) {
+      structuralCount += 1;
+      if (structuralCount > maxValues) {
+        throw new RailError(
+          "cctp",
+          "resourceLimit",
+          `provider JSON structural count exceeds limit ${String(maxValues)}`,
+          null,
+          "json_tokens_exceeded",
+        );
+      }
+    }
+  }
+}
+
+export function enforceIrisMessageResourceLimits(
+  message: IrisMessage,
+  limits: CctpResourceLimits,
+): void {
+  for (const field of [message.message, message.messageBytes, message.rawMessage]) {
+    if (typeof field === "string") {
+      assertCctpHexByteLimit(field, limits.maxMessageHexBytes, "message_bytes_exceeded", "message");
+    }
+  }
+
+  const attestationFields: unknown[] = [
+    message.attestation,
+    message.signature,
+    message.attestationSignature,
+    message.fastAttestation?.signature,
+    message.fastAttestation?.attestation,
+  ];
+  for (const field of attestationFields) {
+    if (typeof field === "string" && field !== "PENDING") {
+      assertCctpHexByteLimit(
+        field,
+        limits.maxAttestationHexBytes,
+        "attestation_bytes_exceeded",
+        "attestation",
+      );
+    }
+  }
 }
 
 export class IrisClient implements RailClient {
   readonly rail = "cctp";
   private readonly baseUrl: string;
   private readonly request: typeof globalThis.fetch;
+  private readonly limits: CctpResourceLimits;
 
   constructor(
     network: NetworkMode,
@@ -229,6 +398,7 @@ export class IrisClient implements RailClient {
     // Circle lives and the backend is not allowed its own opinion about it.
     this.baseUrl = (options.baseUrl ?? IRIS_API[network]).replace(/\/+$/, "");
     this.request = options.fetch ?? globalThis.fetch;
+    this.limits = resolveCctpResourceLimits(options.limits);
   }
 
   async look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup> {
@@ -243,8 +413,12 @@ export class IrisClient implements RailClient {
 
     const response = await this.send(url, signal);
 
-    if (response.status === 404) return { kind: "missing" };
+    if (response.status === 404) {
+      await response.body?.cancel().catch(() => undefined);
+      return { kind: "missing" };
+    }
     if (response.status === 429) {
+      await response.body?.cancel().catch(() => undefined);
       throw new RailError(
         this.rail,
         "rateLimited",
@@ -253,15 +427,18 @@ export class IrisClient implements RailClient {
       );
     }
     if (!response.ok) {
-      const detail = await describeError(response);
+      const detail = await describeError(response, this.limits.maxErrorBodyBytes);
       // 5xx is worth another go. Any other 4xx was a bad request and will be bad the same way.
       const kind = response.status >= 500 ? "transient" : "permanent";
       throw new RailError(this.rail, kind, `http ${String(response.status)}: ${detail}`);
     }
 
+    const rawText = await readBoundedResponseText(response, this.limits.maxResponseBytes);
+    enforceJsonComplexityLimits(rawText, this.limits.maxJsonDepth, this.limits.maxJsonValues);
+
     let body: unknown;
     try {
-      body = await response.json();
+      body = JSON.parse(rawText);
     } catch (cause) {
       throw new RailError(this.rail, "transient", `response was not json: ${describe(cause)}`);
     }
@@ -287,16 +464,30 @@ export class IrisClient implements RailClient {
       }
     }
 
+    if (rawList.length > this.limits.maxMessages) {
+      throw new RailError(
+        this.rail,
+        "resourceLimit",
+        `provider candidate message count ${String(rawList.length)} exceeds limit ${String(this.limits.maxMessages)}`,
+        null,
+        "message_count_exceeded",
+      );
+    }
+
     const messages = rawList.filter(isIrisMessage);
     if (rawList.length > 0 && messages.length === 0) {
       throw new RailError(this.rail, "transient", "invalid iris message in response payload");
     }
+    for (const candidate of messages) {
+      enforceIrisMessageResourceLimits(candidate, this.limits);
+    }
+
     const message = messages[0];
     // A 200 with no messages is the same situation as a 404 and both happen. Reporting it as a
     // failure would be reporting the normal case.
     if (message === undefined) return { kind: "missing" };
 
-    return { kind: "found", report: reportFor(message) };
+    return { kind: "found", report: reportFor(message, this.limits) };
   }
 
   private async send(url: string, signal?: AbortSignal): Promise<Response> {
@@ -326,7 +517,10 @@ export class IrisClient implements RailClient {
  * Iris equivalent at all. `expired` is read from the burn's own `expirationBlock`, which is the
  * only thing Circle offers that means a transfer will not complete as it stands.
  */
-export function reportFor(message: IrisMessage): RailReport {
+export function reportFor(message: IrisMessage, limits?: Partial<CctpResourceLimits>): RailReport {
+  if (limits !== undefined) {
+    enforceIrisMessageResourceLimits(message, resolveCctpResourceLimits(limits));
+  }
   const rawStatus =
     typeof message.status === "string"
       ? message.status
@@ -439,16 +633,6 @@ export function reportFor(message: IrisMessage): RailReport {
 
 /**
  * Show a fast transfer's expiry block without claiming to have judged it.
- *
- * `expired` is one of our five states and this client cannot decide it. `expirationBlock` is a
- * block number on the source chain, and comparing it against anything needs that chain's current
- * height, which this client has no connection to and should not open one for. Guessing would be
- * worse than not knowing in a specific way: a transfer wrongly marked expired is terminal, so it
- * stops being polled and stops being chased.
- *
- * So the number goes into the rail's own status string, where an operator can see it, and the
- * comparison waits for whoever has both numbers. The EVM watcher already tracks the height per
- * chain, so the natural home is the pass once it is given that.
  */
 function appendExpiry(railStatus: string, message: IrisMessage): string {
   const raw =
@@ -495,21 +679,12 @@ export const CCTP_DOMAINS: Readonly<Record<string, number>> = {
   "stellar-testnet": 27,
 };
 
-/**
- * Which CCTP domain a chain is, read straight off the shared registry or updated domain mapping.
- *
- * Permanent rather than transient when there is none: a chain with no CCTP domain cannot have
- * burned through CCTP, so the transfer was filed under the wrong rail and retrying the lookup
- * will keep being wrong in the same way.
- */
 export function domainFor(chainKey: string): number {
   const normalized = chainKey.toLowerCase();
   if (normalized in CCTP_DOMAINS) {
     const domain = CCTP_DOMAINS[normalized];
     if (domain !== undefined) return domain;
   }
-  // Guarded rather than cast. The chain key arrives from a database column, so asserting it is a
-  // registry key would turn a renamed chain into an undefined read three lines later.
   const domain = isChainKey(chainKey) ? CHAINS[chainKey].cctpDomain : null;
   if (domain === null) {
     throw new RailError(
@@ -521,15 +696,17 @@ export function domainFor(chainKey: string): number {
   return domain;
 }
 
-async function describeError(response: Response): Promise<string> {
+async function describeError(response: Response, maxErrorBytes: number): Promise<string> {
   try {
-    const body = (await response.json()) as { error?: unknown; message?: unknown };
-    // Two shapes, both real: the reference documents `{code, message}` and the sandbox returns
-    // `{error}`.
+    const rawText = await readBoundedResponseText(response, maxErrorBytes);
+    const body = JSON.parse(rawText) as { error?: unknown; message?: unknown };
     if (typeof body.error === "string") return body.error;
     if (typeof body.message === "string") return body.message;
     return "no reason given";
-  } catch {
+  } catch (cause) {
+    if (cause instanceof RailError && cause.kind === "resourceLimit") {
+      return "error response exceeded size limit";
+    }
     return "no reason given";
   }
 }
