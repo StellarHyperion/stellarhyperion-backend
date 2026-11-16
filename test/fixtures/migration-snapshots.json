@@ -1,0 +1,25 @@
+{
+  "schemaSnapshots": [
+    {
+      "snapshotId": "v1-initial-schema",
+      "throughMigration": "1790900000000_initial-schema",
+      "description": "Initial seven-table bridge schema before EVM cursor block-hash tracking and autovacuum tuning.",
+      "hasCursorBlockHash": false,
+      "hasCursorAutovacuumOptions": false
+    },
+    {
+      "snapshotId": "v2-cursor-block-hash",
+      "throughMigration": "1791000000000_cursor-block-hash",
+      "description": "Adds nullable last_processed_hash column to indexer_cursor for EVM reorg detection.",
+      "hasCursorBlockHash": true,
+      "hasCursorAutovacuumOptions": false
+    },
+    {
+      "snapshotId": "v3-cursor-autovacuum-tuning",
+      "throughMigration": "1791100000000_cursor-autovacuum-tuning",
+      "description": "Current head migration adding aggressive autovacuum storage options on indexer_cursor.",
+      "hasCursorBlockHash": true,
+      "hasCursorAutovacuumOptions": true
+    }
+  ]
+}

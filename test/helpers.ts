@@ -36,3 +36,5 @@ export function completeEnv(
     ...overrides,
   };
 }
+
+export * from "./migration-upgrade-runner.js";
