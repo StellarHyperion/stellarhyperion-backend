@@ -23,11 +23,22 @@ import type { Transactional } from "../../db/pool.js";
 import { bigintOf, text } from "../../db/rows.js";
 import type { InboundRow, Position } from "../../chains/writers.js";
 import type { PendingTransfer, RailReport } from "../types.js";
+import { RailError } from "../types.js";
 
 import { ITS_ABI, matchingPayment } from "./events.js";
 export interface VerifiedDelivery {
   readonly at: Position;
   readonly row: InboundRow;
+}
+
+export interface ItsDeliveryVerifyOptions {
+  readonly signal?: AbortSignal;
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) {
+    throw new RailError("axelar", "cancelled", "cancelled");
+  }
 }
 
 // The rail API supplies a candidate receipt. Only matching confirmed chain events establish delivery.
@@ -36,7 +47,9 @@ export async function verifyItsDelivery(
   db: Transactional,
   transfer: PendingTransfer,
   report: RailReport,
+  options: ItsDeliveryVerifyOptions = {},
 ): Promise<VerifiedDelivery | null> {
+  throwIfAborted(options.signal);
   const execution = report.execution;
   const source = config.indexer.stellar;
   if (
@@ -85,14 +98,22 @@ export async function verifyItsDelivery(
   if (!(id instanceof Uint8Array) || id.length !== 32)
     throw new Error("Source token id is invalid.");
   const tokenId = toHex(id);
+  throwIfAborted(options.signal);
   const client = createPublicClient({
-    transport: http(destination.defaultRpcUrl, { timeout: 15_000, retryCount: 0 }),
+    transport: http(destination.defaultRpcUrl, {
+      timeout: 15_000,
+      retryCount: 0,
+      ...(options.signal !== undefined ? { fetchOptions: { signal: options.signal } } : {}),
+    }),
   });
   if ((await client.getChainId()) !== destination.chainId)
     throw new Error("Destination RPC chain mismatch.");
+  throwIfAborted(options.signal);
   const receipt = await client.getTransactionReceipt({ hash: execution.txHash });
+  throwIfAborted(options.signal);
   if (receipt.status !== "success") return null;
   const head = await client.getBlockNumber();
+  throwIfAborted(options.signal);
   if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations)) return null;
   const destinationToken = await client.readContract({
     address: its as `0x${string}`,
@@ -100,9 +121,11 @@ export async function verifyItsDelivery(
     functionName: "registeredTokenAddress",
     args: [tokenId],
   });
+  throwIfAborted(options.signal);
   const adapterConfig = (await view(adapter, "get_config")) as { its?: string };
   if (!adapterConfig.its) return null;
   const sourceName = await view(adapterConfig.its, "chain_name");
+  throwIfAborted(options.signal);
   if (typeof sourceName !== "string") return null;
   const payment = matchingPayment(receipt.logs, {
     its,
@@ -116,6 +139,7 @@ export async function verifyItsDelivery(
   });
   if (!payment) return null;
   const block = await client.getBlock({ blockNumber: receipt.blockNumber });
+  throwIfAborted(options.signal);
   if (block.hash !== receipt.blockHash) return null;
   return {
     at: {

@@ -6,7 +6,7 @@ import type {
   RailLookup,
   RailReport,
 } from "../types.js";
-import { RailError } from "../types.js";
+import { isSignalAborted, RailError } from "../types.js";
 
 /**
  * Axelar's statuses, mapped onto ours.
@@ -95,6 +95,9 @@ export class AxelarGmpClient implements RailClient {
   }
 
   async look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup> {
+    if (signal?.aborted === true) {
+      throw new RailError(this.rail, "cancelled", "cancelled");
+    }
     const rows = await this.rowsFor(transfer.originTx, signal);
     const hash = normalized(transfer.originTx);
     const matched = rows.filter((item) =>
@@ -116,6 +119,9 @@ export class AxelarGmpClient implements RailClient {
       const children = parent.executed?.childMessageIDs;
       if (typeof parentId !== "string" || !Array.isArray(children)) continue;
       for (const childId of children) {
+        if (isSignalAborted(signal)) {
+          throw new RailError(this.rail, "cancelled", "cancelled");
+        }
         if (remaining <= 0) break;
         if (typeof childId !== "string" || !/^0x[0-9a-fA-F]{64}-\d+$/.test(childId)) continue;
         remaining -= 1;
@@ -148,6 +154,9 @@ export class AxelarGmpClient implements RailClient {
     try {
       body = (await response.json()) as { readonly data?: unknown };
     } catch (cause) {
+      if (signal?.aborted === true) {
+        throw new RailError(this.rail, "cancelled", "cancelled");
+      }
       throw new RailError(this.rail, "transient", `response was not json: ${describe(cause)}`);
     }
     if (!Array.isArray(body.data))
@@ -210,7 +219,7 @@ export class AxelarGmpClient implements RailClient {
       const aborted = signal?.aborted === true;
       throw new RailError(
         this.rail,
-        aborted ? "permanent" : "transient",
+        aborted ? "cancelled" : "transient",
         aborted ? "cancelled" : describe(cause),
       );
     }

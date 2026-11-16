@@ -71,7 +71,9 @@ export type RailErrorKind =
    * minutes. A poller that backed off a second and tried again would spend those five minutes
    * refreshing the block.
    */
-  | "rateLimited";
+  | "rateLimited"
+  /** Aborted because the caller's shutdown or cancellation signal fired. */
+  | "cancelled";
 
 export class RailError extends Error {
   constructor(
@@ -84,6 +86,17 @@ export class RailError extends Error {
     super(`${rail}: ${reason}`);
     this.name = "RailError";
   }
+}
+
+export function isSignalAborted(signal?: AbortSignal): boolean {
+  return Boolean(signal?.aborted);
+}
+
+export function isRailCancellationError(error: unknown, signal?: AbortSignal): boolean {
+  if (error instanceof RailError && error.kind === "cancelled") return true;
+  if (isSignalAborted(signal)) return true;
+  if (error instanceof Error && error.name === "AbortError") return true;
+  return false;
 }
 
 /** One transfer waiting on a rail, as the queue hands it over. */

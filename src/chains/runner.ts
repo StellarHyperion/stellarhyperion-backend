@@ -272,6 +272,7 @@ function railWorkers(
       batchSize: config.batchSize,
       recheckAfterMs: config.recheckAfterMs,
       maxCheckFailures: config.maxCheckFailures,
+      shutdownBudgetMs: appConfig.shutdownTimeoutMs,
     });
     return new PolledWorker(pass, config.pollIntervalMs, child);
   });

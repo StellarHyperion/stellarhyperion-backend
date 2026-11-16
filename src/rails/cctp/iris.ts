@@ -32,7 +32,7 @@ import type {
   RailReport,
   AttestationStatus,
 } from "../types.js";
-import { RailError } from "../types.js";
+import { isSignalAborted, RailError } from "../types.js";
 
 /** Circle's own status values. */
 const PENDING = "pending_confirmations";
@@ -232,6 +232,9 @@ export class IrisClient implements RailClient {
   }
 
   async look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup> {
+    if (signal?.aborted === true) {
+      throw new RailError(this.rail, "cancelled", "cancelled");
+    }
     const domain = domainFor(transfer.originChain);
     let url = `${this.baseUrl}/v2/messages/${String(domain)}?transactionHash=${transfer.originTx}`;
     if (this.options.page !== undefined) {
@@ -263,6 +266,9 @@ export class IrisClient implements RailClient {
     try {
       body = await response.json();
     } catch (cause) {
+      if (isSignalAborted(signal)) {
+        throw new RailError(this.rail, "cancelled", "cancelled");
+      }
       throw new RailError(this.rail, "transient", `response was not json: ${describe(cause)}`);
     }
 
@@ -311,7 +317,7 @@ export class IrisClient implements RailClient {
       const aborted = signal?.aborted === true;
       throw new RailError(
         this.rail,
-        aborted ? "permanent" : "transient",
+        aborted ? "cancelled" : "transient",
         aborted ? "cancelled" : describe(cause),
       );
     }

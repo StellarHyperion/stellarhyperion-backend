@@ -19,14 +19,20 @@
  */
 import type { AppConfig } from "../config/config.js";
 import { verifyItsDelivery } from "./axelar/delivery.js";
-import { verifyCctpDelivery } from "./cctp/delivery.js";
+import { verifyCctpDelivery, type CctpReceiptRpcClient } from "./cctp/delivery.js";
 import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
 import { writeInbound, writeAttestation } from "../chains/writers.js";
 import { outstandingForRail, pendingForRail } from "./queue.js";
-import { RailError, isTerminal, type PendingTransfer, type RailClient } from "./types.js";
+import {
+  RailError,
+  isRailCancellationError,
+  isTerminal,
+  type PendingTransfer,
+  type RailClient,
+} from "./types.js";
 
 /**
  * How many outstanding transfers still counts as keeping up.
@@ -48,6 +54,9 @@ export interface RailPassOptions {
   readonly maxCheckFailures: number;
   readonly now?: () => Date;
   readonly config?: AppConfig;
+  /** Maximum grace window in milliseconds to finish aborting in-flight reads after signal fires. */
+  readonly shutdownBudgetMs?: number;
+  readonly evmClient?: CctpReceiptRpcClient;
 }
 
 export interface RailProgress {
@@ -56,6 +65,7 @@ export interface RailProgress {
   readonly failures: number;
   readonly outstanding: number;
   readonly at: Date;
+  readonly cancelled?: boolean;
 }
 
 export class RailPass {
@@ -109,7 +119,10 @@ export class RailPass {
 
   /** One pass. Returns true when it filled a batch, which means there is more behind it. */
   async tick(signal: AbortSignal): Promise<boolean> {
+    if (this.isAborted(signal)) return false;
+
     const { db, logger, batchSize, client } = this.options;
+    const shutdownBudgetMs = this.options.shutdownBudgetMs ?? 5_000;
 
     const cooldown = this.cooldownUntil;
     if (cooldown !== null && cooldown > this.now()) return false;
@@ -125,13 +138,31 @@ export class RailPass {
     let checked = 0;
     let settled = 0;
     let failures = 0;
+    let cancelled = false;
 
     for (const transfer of queue) {
-      if (signal.aborted) break;
+      if (this.isAborted(signal)) {
+        cancelled = true;
+        break;
+      }
       try {
-        if (await this.handle(transfer)) settled += 1;
+        const terminal = await awaitWithCancellationBudget(
+          this.handle(transfer, signal),
+          signal,
+          shutdownBudgetMs,
+          client.rail,
+        );
+        if (terminal) settled += 1;
         checked += 1;
       } catch (error) {
+        if (isRailCancellationError(error, signal)) {
+          cancelled = true;
+          logger.info(
+            { rail: client.rail, checked, settled, transferId: transfer.transferId.toString() },
+            "rail pass cancelled during graceful shutdown; preserving committed progress",
+          );
+          break;
+        }
         if (error instanceof RailError && error.kind === "rateLimited") {
           // The whole rail, not this transfer. Stop the pass and hold off.
           const waitMs = error.retryAfterMs ?? 60_000;
@@ -150,21 +181,24 @@ export class RailPass {
     }
 
     const outstanding = await outstandingForRail(db, this.options.route);
-    this.lastProgress = { checked, settled, failures, outstanding, at: this.now() };
+    this.lastProgress = { checked, settled, failures, outstanding, at: this.now(), cancelled };
 
     if (checked > 0 || failures > 0) {
       logger.info(
-        { rail: client.rail, checked, settled, failures, outstanding },
+        { rail: client.rail, checked, settled, failures, outstanding, cancelled },
         "rail statuses refreshed",
       );
     }
+
+    if (cancelled || this.isAborted(signal)) return false;
 
     // A full batch means the queue is longer than one pass, so come straight back.
     return queue.length >= batchSize;
   }
 
   /** Returns true when the transfer reached a terminal state on this pass. */
-  private async handle(transfer: PendingTransfer): Promise<boolean> {
+  private async handle(transfer: PendingTransfer, signal: AbortSignal): Promise<boolean> {
+    this.throwIfAborted(signal);
     const at = this.now();
 
     if (transfer.delivered) {
@@ -182,7 +216,9 @@ export class RailPass {
       return true;
     }
 
-    const lookup = await this.options.client.look(transfer);
+    const lookup = await this.options.client.look(transfer, signal);
+    this.throwIfAborted(signal);
+
     if (lookup.kind === "missing") {
       // Normal. The rail has not indexed the burn yet, which is where every transfer starts.
       await this.write(transfer, {
@@ -200,24 +236,34 @@ export class RailPass {
     const { report } = lookup;
     if (this.options.config && (report.execution || report.forwardTxHash)) {
       const verified =
-        (await verifyItsDelivery(this.options.config, this.options.db, transfer, report)) ??
-        (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report));
+        (await verifyItsDelivery(this.options.config, this.options.db, transfer, report, {
+          signal,
+        })) ??
+        (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report, {
+          signal,
+          ...(this.options.evmClient !== undefined ? { evmClient: this.options.evmClient } : {}),
+        }));
+      this.throwIfAborted(signal);
       if (verified) {
         await this.options.db.transaction(async (tx) => {
+          this.throwIfAborted(signal);
           await writeInbound(tx, verified.at, verified.row);
-        });
-        await this.write(transfer, {
-          status: "delivered",
-          railStatus: report.railStatus,
-          reference: report.reference,
-          attestedAt: report.attestedAt,
-          checkedAt: at,
-          failures: 0,
-          error: null,
+          await writeAttestation(tx, {
+            transferId: transfer.transferId,
+            route: transfer.route,
+            status: "delivered",
+            railStatus: report.railStatus,
+            railReference: report.reference,
+            attestedAt: report.attestedAt,
+            checkedAt: at,
+            checkFailures: 0,
+            lastError: null,
+          });
         });
         return true;
       }
     }
+    this.throwIfAborted(signal);
     await this.write(transfer, {
       status: report.status,
       railStatus: report.railStatus,
@@ -294,5 +340,54 @@ export class RailPass {
 
   private now(): Date {
     return this.options.now?.() ?? new Date();
+  }
+
+  private isAborted(signal: AbortSignal): boolean {
+    return signal.aborted;
+  }
+
+  private throwIfAborted(signal: AbortSignal): void {
+    if (this.isAborted(signal)) {
+      throw new RailError(this.options.client.rail, "cancelled", "cancelled");
+    }
+  }
+}
+
+async function awaitWithCancellationBudget<T>(
+  work: Promise<T>,
+  signal: AbortSignal,
+  budgetMs: number,
+  rail: string,
+): Promise<T> {
+  if (signal.aborted) {
+    void work.catch(() => undefined);
+    throw new RailError(rail, "cancelled", "cancelled");
+  }
+
+  let timer: NodeJS.Timeout | undefined;
+  let onAbort: (() => void) | undefined;
+
+  const budgetAbort = new Promise<never>((_resolve, reject) => {
+    onAbort = () => {
+      const boundedMs = Math.max(1, budgetMs);
+      timer = setTimeout(() => {
+        reject(new RailError(rail, "cancelled", `cancelled after ${String(boundedMs)}ms budget`));
+      }, boundedMs);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+
+  try {
+    return await Promise.race([work, budgetAbort]);
+  } catch (err) {
+    void work.catch(() => undefined);
+    throw err;
+  } finally {
+    if (onAbort !== undefined) {
+      signal.removeEventListener("abort", onAbort);
+    }
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
   }
 }
