@@ -36,6 +36,14 @@ import type {
   TokenRegisteredEvent,
 } from "./events.js";
 
+/** Error thrown when a concurrent update prevents compare-and-swap cursor advancement. */
+export class CursorConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CursorConflictError";
+  }
+}
+
 /** Where a watcher has read up to. */
 export interface ChainCursor {
   readonly position: bigint;
@@ -43,11 +51,13 @@ export interface ChainCursor {
   readonly observedAt: Date | null;
   /** EVM only. Null on Stellar, where a closed ledger cannot change. */
   readonly hash: string | null;
+  /** Monotonic revision number used for compare-and-swap concurrency checks. */
+  readonly revision?: bigint;
 }
 
 export async function readCursor(db: Queryable, chainKey: string): Promise<ChainCursor | null> {
   const { rows } = await db.query(
-    `SELECT last_processed, contract, last_processed_at, last_processed_hash
+    `SELECT last_processed, contract, last_processed_at, last_processed_hash, revision
        FROM indexer_cursor WHERE chain_key = $1`,
     [chainKey],
   );
@@ -58,15 +68,19 @@ export async function readCursor(db: Queryable, chainKey: string): Promise<Chain
     contract: text(row, "contract"),
     observedAt: timestampOrNull(row, "last_processed_at"),
     hash: textOrNull(row, "last_processed_hash"),
+    revision: row.revision !== undefined && row.revision !== null ? bigintOf(row, "revision") : 1n,
   };
 }
 
 /**
- * Advance the cursor, or create it.
+ * Advance the cursor, or create it using compare-and-swap semantics.
  *
  * The contract is part of the write rather than just the read. A redeployed router at a new address
  * shares no history with the old one, so a cursor carried across would skip everything the new one
  * has ever done, silently. Storing it means the watcher can notice.
+ *
+ * Preconditions ensure an older scan cannot overwrite a newer completed cursor position, and that
+ * concurrent updates with conflicting revisions abort and throw CursorConflictError.
  */
 export async function writeCursor(
   db: Queryable,
@@ -77,19 +91,29 @@ export async function writeCursor(
     readonly position: bigint;
     readonly observedAt: Date | null;
     readonly hash: string | null;
+    readonly expectedRevision?: bigint | null | undefined;
   },
-): Promise<void> {
-  await db.query(
+): Promise<bigint> {
+  const expectedRevParam =
+    entry.expectedRevision !== undefined && entry.expectedRevision !== null
+      ? entry.expectedRevision.toString()
+      : null;
+
+  const { rows } = await db.query(
     `INSERT INTO indexer_cursor
-       (chain_key, family, contract, last_processed, last_processed_at, last_processed_hash)
-     VALUES ($1, $2, $3, $4, $5, $6)
+       (chain_key, family, contract, last_processed, last_processed_at, last_processed_hash, revision)
+     VALUES ($1, $2, $3, $4, $5, $6, 1)
      ON CONFLICT (chain_key) DO UPDATE
        SET contract = EXCLUDED.contract,
            family = EXCLUDED.family,
            last_processed = EXCLUDED.last_processed,
            last_processed_at = EXCLUDED.last_processed_at,
            last_processed_hash = EXCLUDED.last_processed_hash,
-           updated_at = now()`,
+           revision = indexer_cursor.revision + 1,
+           updated_at = now()
+     WHERE indexer_cursor.last_processed <= EXCLUDED.last_processed
+       AND ($7::bigint IS NULL OR indexer_cursor.revision = $7::bigint)
+     RETURNING revision`,
     [
       entry.chainKey,
       entry.family,
@@ -97,8 +121,18 @@ export async function writeCursor(
       entry.position.toString(),
       entry.observedAt,
       entry.hash,
+      expectedRevParam,
     ],
   );
+
+  if (rows.length === 0) {
+    throw new CursorConflictError(
+      `cursor update conflict for ${entry.chainKey} at position ${entry.position.toString()}`,
+    );
+  }
+
+  const first = rows[0];
+  return first ? bigintOf(first, "revision") : 1n;
 }
 
 /** Context for one Soroban event, in the shape the shared writers take. */

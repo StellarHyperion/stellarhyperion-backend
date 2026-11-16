@@ -200,6 +200,57 @@ export class RecordingDb implements Transactional {
         rowCount: 1,
       });
     }
+    if (text.includes("INSERT INTO indexer_cursor")) {
+      const position = BigInt(typeof params[3] === "string" ? params[3] : String(params[3]));
+      const rawExpected = params[6];
+      const expectedRevision =
+        typeof rawExpected === "string"
+          ? BigInt(rawExpected)
+          : typeof rawExpected === "number" || typeof rawExpected === "bigint"
+            ? BigInt(rawExpected)
+            : null;
+
+      if (this.cursorRow !== null) {
+        const rawPos = this.cursorRow.last_processed;
+        const currentPos = BigInt(typeof rawPos === "string" ? rawPos : String(rawPos));
+        const rawRev = this.cursorRow.revision;
+        const currentRev =
+          typeof rawRev === "string"
+            ? BigInt(rawRev)
+            : typeof rawRev === "number" || typeof rawRev === "bigint"
+              ? BigInt(rawRev)
+              : 1n;
+
+        if (
+          currentPos > position ||
+          (expectedRevision !== null && expectedRevision !== currentRev)
+        ) {
+          return Promise.resolve({ rows: [], rowCount: 0 });
+        }
+
+        const nextRev = (currentRev + 1n).toString();
+        this.cursorRow = {
+          ...this.cursorRow,
+          last_processed: position.toString(),
+          last_processed_at: params[4] as Date | null,
+          last_processed_hash:
+            params[5] === null || typeof params[5] === "string" ? params[5] : null,
+          revision: nextRev,
+        };
+        return Promise.resolve({ rows: [{ revision: nextRev }], rowCount: 1 });
+      }
+
+      this.cursorRow = {
+        chain_key: String(params[0]),
+        family: String(params[1]),
+        contract: String(params[2]),
+        last_processed: position.toString(),
+        last_processed_at: params[4] as Date | null,
+        last_processed_hash: params[5] === null || typeof params[5] === "string" ? params[5] : null,
+        revision: "1",
+      };
+      return Promise.resolve({ rows: [{ revision: "1" }], rowCount: 1 });
+    }
     // Zero rows affected, which is what makes `recordClaimSettled` report an unmatched settlement.
     return Promise.resolve({ rows: [], rowCount: 0 });
   }

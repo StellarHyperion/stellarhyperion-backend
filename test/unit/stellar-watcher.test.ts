@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 
 import { endOfLedgerCursor } from "../../src/chains/stellar/cursor.js";
 import type { RawStellarEvent } from "../../src/chains/stellar/events.js";
+import { CursorConflictError, writeCursor } from "../../src/chains/stellar/store.js";
 import { StellarWatcher } from "../../src/chains/stellar/watcher.js";
 import {
   FakeRpc,
@@ -66,11 +67,12 @@ function harness(
 }
 
 /** The cursor row `readCursor` expects, as pg would hand it back. */
-function cursorRow(ledger: number, contract = LIVE_ROUTER): Record<string, unknown> {
+function cursorRow(ledger: number, contract = LIVE_ROUTER, revision = 1): Record<string, unknown> {
   return {
     last_processed: String(ledger),
     contract,
     last_processed_at: new Date("2026-10-01T12:00:00.000Z"),
+    revision: String(revision),
   };
 }
 
@@ -342,5 +344,85 @@ describe("gaps it cannot close", () => {
 
     const warnings = lines.filter((line) => line.message.includes("running ahead of the indexer"));
     expect(warnings).toHaveLength(1);
+  });
+});
+
+describe("compare-and-swap cursor advancement", () => {
+  it("advances cursor revision monotonically on successful commit", async () => {
+    const { watcher, db } = harness({ events: ROUTER_HISTORY, startLedger: FIRST_EVENT_LEDGER });
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    expect(db.cursorRow?.revision).toBe("1");
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+    expect(db.cursorRow?.revision).toBe("2");
+  });
+
+  it("rejects an older scan attempting to overwrite a newer completed cursor", async () => {
+    const { db } = harness({ events: ROUTER_HISTORY, startLedger: FIRST_EVENT_LEDGER });
+    db.cursorRow = cursorRow(5_000_000, LIVE_ROUTER, 5);
+
+    await expect(
+      writeCursor(db, {
+        chainKey: CHAIN,
+        family: "stellar",
+        contract: LIVE_ROUTER,
+        position: 4_900_000n,
+        observedAt: new Date(),
+        hash: null,
+        expectedRevision: 5n,
+      }),
+    ).rejects.toThrow(CursorConflictError);
+
+    expect(db.cursorRow.last_processed).toBe("5000000");
+    expect(db.cursorRow.revision).toBe("5");
+  });
+
+  it("rolls back staged event mutations atomically when a cursor write conflicts", async () => {
+    const { db } = harness({ events: ROUTER_HISTORY, startLedger: FIRST_EVENT_LEDGER });
+    db.cursorRow = cursorRow(4_966_000, LIVE_ROUTER, 2);
+
+    await expect(
+      db.transaction(async (tx) => {
+        await tx.query("INSERT INTO outbound_transfer (id) VALUES ('staged-mutation')");
+        await writeCursor(tx, {
+          chainKey: CHAIN,
+          family: "stellar",
+          contract: LIVE_ROUTER,
+          position: 4_967_000n,
+          observedAt: new Date(),
+          hash: null,
+          expectedRevision: 1n,
+        });
+      }),
+    ).rejects.toThrow(CursorConflictError);
+
+    expect(db.rollbacks).toHaveLength(1);
+    expect(db.commits).toHaveLength(0);
+    expect(db.cursorRow.revision).toBe("2");
+  });
+
+  it("rereads committed cursor and replays when a race triggers a conflict retry", async () => {
+    const { watcher, db, lines } = harness({
+      events: ROUTER_HISTORY,
+      startLedger: FIRST_EVENT_LEDGER,
+    });
+    db.cursorRow = cursorRow(FIRST_EVENT_LEDGER, LIVE_ROUTER, 1);
+
+    let firstAttempt = true;
+    const originalQuery = db.query.bind(db);
+    db.query = function (text: string, params?: readonly unknown[]) {
+      if (text.includes("INSERT INTO indexer_cursor") && firstAttempt) {
+        firstAttempt = false;
+        if (db.cursorRow) {
+          db.cursorRow.revision = "2";
+        }
+      }
+      return originalQuery(text, params ?? []);
+    };
+
+    const progressed = await watcher.tick(AbortSignal.timeout(5_000));
+    expect(progressed).toBe(true);
+    expect(lines.some((l) => l.message.includes("rereading committed cursor"))).toBe(true);
   });
 });

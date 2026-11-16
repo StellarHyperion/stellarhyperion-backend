@@ -31,6 +31,7 @@ import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
 import type { EventSource, EventsQuery } from "./rpc.js";
 import { StellarRpcError } from "./rpc.js";
 import {
+  CursorConflictError,
   readCursor,
   recordActionQueued,
   recordActionSettled,
@@ -136,10 +137,30 @@ export class StellarWatcher {
   }
 
   /**
-   * One pass. Returns true when it made progress and should be run again immediately, which is how
-   * a watcher starting thousands of ledgers back catches up without sleeping between windows.
+   * One pass with compare-and-swap retry protection. Returns true when it made progress and should
+   * be run again immediately, which is how a watcher starting thousands of ledgers back catches up
+   * without sleeping between windows.
    */
   async tick(signal: AbortSignal): Promise<boolean> {
+    const maxRetries = 3;
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        return await this.pass(signal);
+      } catch (error) {
+        if (error instanceof CursorConflictError && attempt < maxRetries - 1) {
+          this.options.logger.warn(
+            { chain: this.options.chainKey, attempt: attempt + 1 },
+            "cursor update conflicted with concurrent writer; rereading committed cursor before replay",
+          );
+          continue;
+        }
+        throw error;
+      }
+    }
+    return false;
+  }
+
+  private async pass(signal: AbortSignal): Promise<boolean> {
     const { chainKey, router, db, logger } = this.options;
 
     const stored = await readCursor(db, chainKey);
@@ -214,6 +235,7 @@ export class StellarWatcher {
         observedAt: closedAt,
         // Nothing to record: a closed ledger cannot be replaced by a different one.
         hash: null,
+        expectedRevision: stored?.revision ?? null,
       });
     });
 
