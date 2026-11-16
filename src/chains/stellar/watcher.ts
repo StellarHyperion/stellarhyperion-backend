@@ -26,6 +26,7 @@ import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
+import { reconcileRejectedEvents, writeRejectedEvent } from "../writers.js";
 import { completeThrough, endOfLedgerCursor, parseEventCursor } from "./cursor.js";
 import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
 import type { EventSource, EventsQuery } from "./rpc.js";
@@ -187,35 +188,76 @@ export class StellarWatcher {
 
     // One transaction for the page and the cursor. This is the restart guarantee, and splitting it
     // would turn every crash into either a lost page or a duplicated one.
-    await db.transaction(async (tx: Queryable) => {
-      for (const raw of scan.events) {
-        if (raw.type !== "contract" || raw.inSuccessfulContractCall === false) {
-          // getEvents no longer returns the deprecated success flag (RPC30).
-          // Diagnostic events are excluded by current RPC; retain legacy explicit-failure checks.
-          // https://github.com/stellar/stellar-rpc/releases/tag/v30.0.0
-          skipped += 1;
-          continue;
+    const failure: { raw: RawStellarEvent | null } = { raw: null };
+    try {
+      await db.transaction(async (tx: Queryable) => {
+        const appliedRefs: string[] = [];
+        for (const raw of scan.events) {
+          if (raw.type !== "contract" || raw.inSuccessfulContractCall === false) {
+            // getEvents no longer returns the deprecated success flag (RPC30).
+            // Diagnostic events are excluded by current RPC; retain legacy explicit-failure checks.
+            // https://github.com/stellar/stellar-rpc/releases/tag/v30.0.0
+            skipped += 1;
+            continue;
+          }
+          try {
+            const context: EventContext = {
+              chainKey,
+              ledger: raw.ledger,
+              txHash: raw.txHash,
+              closedAt: new Date(raw.ledgerClosedAt),
+            };
+            if (await this.apply(tx, context, raw)) decoded += 1;
+            else skipped += 1;
+            appliedRefs.push(raw.id);
+          } catch (error) {
+            failure.raw = raw;
+            throw error;
+          }
         }
-        const context: EventContext = {
-          chainKey,
-          ledger: raw.ledger,
-          txHash: raw.txHash,
-          closedAt: new Date(raw.ledgerClosedAt),
-        };
-        if (await this.apply(tx, context, raw)) decoded += 1;
-        else skipped += 1;
-      }
 
-      await writeCursor(tx, {
-        chainKey,
-        family: "stellar",
-        contract: router,
-        position: BigInt(scan.through),
-        observedAt: closedAt,
-        // Nothing to record: a closed ledger cannot be replaced by a different one.
-        hash: null,
+        if (appliedRefs.length > 0) {
+          await reconcileRejectedEvents(tx, {
+            chainKey,
+            contract: router,
+            eventRefs: appliedRefs,
+            reconciledAt: closedAt ?? new Date(),
+          });
+        }
+
+        await writeCursor(tx, {
+          chainKey,
+          family: "stellar",
+          contract: router,
+          position: BigInt(scan.through),
+          observedAt: closedAt,
+          // Nothing to record: a closed ledger cannot be replaced by a different one.
+          hash: null,
+        });
       });
-    });
+    } catch (error) {
+      const captured = failure.raw;
+      if (captured !== null) {
+        await writeRejectedEvent(db, {
+          chainKey,
+          family: "stellar",
+          contract: router,
+          blockNumber: BigInt(captured.ledger),
+          txHash: captured.txHash,
+          eventRef: captured.id,
+          logIndex: null,
+          eventTag: stellarEventTag(captured),
+          error,
+          payload: captured,
+        }).catch((recordError: unknown) => {
+          logger.warn(
+            { err: recordError, chain: chainKey, eventRef: captured.id },
+            "failed to persist rejected stellar event record",
+          );
+        });
+      }
+      throw error;
+    }
 
     const behind = Math.max(scan.latestLedger - scan.through, 0);
     this.lastProgress = { ledger: scan.through, decoded, skipped, behind, at: new Date() };
@@ -391,4 +433,11 @@ export class StellarWatcher {
 /** A compile time exhaustiveness check. The runtime throw is a formality. */
 function assertNever(value: never): never {
   throw new Error(`unhandled event kind: ${JSON.stringify(value)}`);
+}
+
+function stellarEventTag(raw: RawStellarEvent): string | null {
+  const parts = raw.topicJson
+    .map((topic) => ("symbol" in topic && typeof topic.symbol === "string" ? topic.symbol : ""))
+    .filter((part) => part.length > 0);
+  return parts.length > 0 ? parts.join(":") : null;
 }

@@ -30,7 +30,7 @@ import type { Hex } from "viem";
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
-import type { Position } from "../writers.js";
+import { reconcileRejectedEvents, writeRejectedEvent, type Position } from "../writers.js";
 import { ClaimPairing, applyRouterLog } from "./store.js";
 import { decodeRouterLog, signatureOf } from "./logs.js";
 import type { EvmClient, RawEvmLog } from "./client.js";
@@ -198,35 +198,84 @@ export class EvmWatcher {
 
     // One transaction for the range and the cursor advance past it. This is the restart guarantee,
     // and splitting it would turn every crash into either a lost range or a duplicated one.
-    await db.transaction(async (tx: Queryable) => {
-      for (const log of logs) {
-        if (log.removed) {
-          // viem marks a log from an orphaned block. Indexing one would record a transfer that is
-          // no longer on the chain.
-          ignored += 1;
-          continue;
+    const normalizedRouter = router.toLowerCase();
+    const failure: { log: RawEvmLog | null } = { log: null };
+    try {
+      await db.transaction(async (tx: Queryable) => {
+        const appliedRefs: string[] = [];
+        for (const log of logs) {
+          if (log.removed) {
+            // viem marks a log from an orphaned block. Indexing one would record a transfer that is
+            // no longer on the chain.
+            ignored += 1;
+            continue;
+          }
+          try {
+            const timestamp = blocks.get(log.blockNumber)?.timestamp;
+            if (timestamp === undefined) {
+              throw new Error(
+                `no timestamp for block ${log.blockNumber.toString()} on ${chainKey}, which three columns need`,
+              );
+            }
+            if (await this.apply(tx, log, timestamp, pairing)) written += 1;
+            else ignored += 1;
+            appliedRefs.push(evmEventRef(log));
+          } catch (error) {
+            failure.log = log;
+            throw error;
+          }
         }
-        const timestamp = blocks.get(log.blockNumber)?.timestamp;
-        if (timestamp === undefined) {
-          throw new Error(
-            `no timestamp for block ${log.blockNumber.toString()} on ${chainKey}, which three columns need`,
-          );
-        }
-        if (await this.apply(tx, log, timestamp, pairing)) written += 1;
-        else ignored += 1;
-      }
 
-      await writeCursor(tx, {
-        chainKey,
-        family: "evm",
-        contract: router,
-        position: to,
-        observedAt: timestampOf(blocks.get(to)?.timestamp ?? null),
-        // The whole reason the column exists. Without it the next pass cannot tell advancing from
-        // being handed a different history.
-        hash: endHash,
+        if (appliedRefs.length > 0) {
+          await reconcileRejectedEvents(tx, {
+            chainKey,
+            contract: normalizedRouter,
+            eventRefs: appliedRefs,
+            reconciledAt: timestampOf(blocks.get(to)?.timestamp ?? null) ?? new Date(),
+          });
+        }
+
+        await writeCursor(tx, {
+          chainKey,
+          family: "evm",
+          contract: router,
+          position: to,
+          observedAt: timestampOf(blocks.get(to)?.timestamp ?? null),
+          // The whole reason the column exists. Without it the next pass cannot tell advancing from
+          // being handed a different history.
+          hash: endHash,
+        });
       });
-    });
+    } catch (error) {
+      const captured = failure.log;
+      if (captured !== null) {
+        await writeRejectedEvent(db, {
+          chainKey,
+          family: "evm",
+          contract: normalizedRouter,
+          blockNumber: captured.blockNumber,
+          txHash: captured.transactionHash.toLowerCase(),
+          eventRef: evmEventRef(captured),
+          logIndex: captured.logIndex,
+          eventTag: signatureOf(captured),
+          error,
+          payload: {
+            address: captured.address,
+            blockNumber: captured.blockNumber.toString(),
+            transactionHash: captured.transactionHash,
+            logIndex: captured.logIndex,
+            topics: captured.topics,
+            data: captured.data,
+          },
+        }).catch((recordError: unknown) => {
+          logger.warn(
+            { err: recordError, chain: chainKey, eventRef: evmEventRef(captured) },
+            "failed to persist rejected evm log record",
+          );
+        });
+      }
+      throw error;
+    }
 
     const behind = Number(confirmed - to);
     this.lastProgress = {
@@ -361,4 +410,8 @@ function min(a: bigint, b: bigint): bigint {
 
 function timestampOf(seconds: bigint | null): Date | null {
   return seconds === null ? null : new Date(Number(seconds) * 1000);
+}
+
+export function evmEventRef(log: Pick<RawEvmLog, "transactionHash" | "logIndex">): string {
+  return `${log.transactionHash.toLowerCase()}:${String(log.logIndex)}`;
 }

@@ -60,6 +60,7 @@ suite("the schema", () => {
       "outbound_transfer",
       "pending_claim",
       "rail_attestation",
+      "rejected_event",
       "route_health",
     ]) {
       expect(names, `${table} is missing; has the migration run`).toContain(table);
@@ -334,5 +335,64 @@ suite("maintenance and pruning", () => {
     expect(ids).not.toContain(999991);
     expect(ids).toContain(999992);
     expect(ids).toContain(999993);
+  });
+});
+
+suite("rejected_event", () => {
+  let db: Database;
+
+  beforeAll(() => {
+    db = Database.open(CONNECTION ?? "", { applicationName: "hyperion-schema-test" });
+  });
+
+  afterAll(async () => {
+    await db.query("DELETE FROM public.rejected_event WHERE chain_key = 'rejected-schema-test'");
+    await db.close();
+  });
+
+  it("enforces normalized error classes, reconciliation state pairing, and bounded payloads", async () => {
+    await expect(
+      db.query(
+        `INSERT INTO public.rejected_event
+           (chain_key, family, contract, block_number, tx_hash, event_ref,
+            error_class, error_message, replay_eligible)
+         VALUES ('rejected-schema-test', 'stellar', 'CROUTER', $1, '0xtx-1', 'evt-1',
+                 'not_a_class', 'bad class', true)`,
+        [U64_MAX],
+      ),
+    ).rejects.toSatisfy((error: unknown) => codeOf(error) === CHECK_VIOLATION);
+
+    await expect(
+      db.query(
+        `INSERT INTO public.rejected_event
+           (chain_key, family, contract, block_number, tx_hash, event_ref,
+            error_class, error_message, replay_eligible, status, reconciled_at)
+         VALUES ('rejected-schema-test', 'stellar', 'CROUTER', $1, '0xtx-2', 'evt-2',
+                 'decode_error', 'reconciled without timestamp', true, 'reconciled', NULL)`,
+        [U64_MAX],
+      ),
+    ).rejects.toSatisfy((error: unknown) => codeOf(error) === CHECK_VIOLATION);
+
+    await expect(
+      db.query(
+        `INSERT INTO public.rejected_event
+           (chain_key, family, contract, block_number, tx_hash, event_ref,
+            error_class, error_message, replay_eligible, payload_preview)
+         VALUES ('rejected-schema-test', 'stellar', 'CROUTER', $1, '0xtx-3', 'evt-3',
+                 'decode_error', 'oversized preview', true, $2)`,
+        [U64_MAX, "x".repeat(4097)],
+      ),
+    ).rejects.toSatisfy((error: unknown) => codeOf(error) === CHECK_VIOLATION);
+
+    await expect(
+      db.query(
+        `INSERT INTO public.rejected_event
+           (chain_key, family, contract, block_number, tx_hash, event_ref,
+            error_class, error_message, replay_eligible)
+         VALUES ('rejected-schema-test', 'stellar', 'CROUTER', $1, '0xtx-4', 'evt-4',
+                 'decode_error', 'valid durable failure', true)`,
+        [U64_MAX],
+      ),
+    ).resolves.toBeDefined();
   });
 });

@@ -19,7 +19,19 @@
  * had handled the case. `observed_at` is deliberately left out of every update: it records when
  * this indexer first saw the row, and a reorg does not change that.
  */
-import type { Queryable } from "../db/pool.js";
+import type { Queryable, Transactional } from "../db/pool.js";
+import {
+  bigintOf,
+  boolean,
+  enumText,
+  integer,
+  integerOrNull,
+  maybeOne,
+  text,
+  textOrNull,
+  timestamp,
+  timestampOrNull,
+} from "../db/rows.js";
 
 /** Where on a chain a row was observed. One shape for a ledger and for a block. */
 export interface Position {
@@ -371,4 +383,500 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
       row.lastError,
     ],
   );
+}
+
+export const REJECTED_ERROR_CLASSES = [
+  "decode_error",
+  "shape_error",
+  "constraint_violation",
+  "state_mismatch",
+  "transient_db_error",
+  "unknown_error",
+] as const;
+
+export type RejectedErrorClass = (typeof REJECTED_ERROR_CLASSES)[number];
+
+export const REJECTED_EVENT_STATUSES = ["rejected", "reconciled"] as const;
+export type RejectedEventStatus = (typeof REJECTED_EVENT_STATUSES)[number];
+
+export const REJECTED_FAMILIES = ["stellar", "evm"] as const;
+export type RejectedChainFamily = (typeof REJECTED_FAMILIES)[number];
+
+export const MAX_REJECTED_REF_LENGTH = 256;
+export const MAX_REJECTED_TAG_LENGTH = 256;
+export const MAX_REJECTED_CODE_LENGTH = 64;
+export const MAX_REJECTED_ERROR_MESSAGE_LENGTH = 1_024;
+export const MAX_REJECTED_PAYLOAD_PREVIEW_LENGTH = 4_096;
+export const MAX_REJECTED_FAILURE_COUNT = 1_000_000;
+export const DEFAULT_MAX_REPLAY_FAILURES = 25;
+
+export interface NormalizedIngestionError {
+  readonly errorClass: RejectedErrorClass;
+  readonly errorCode: string | null;
+  readonly errorMessage: string;
+  readonly replayEligible: boolean;
+}
+
+export interface RejectedEventInput {
+  readonly chainKey: string;
+  readonly family: RejectedChainFamily;
+  readonly contract: string;
+  readonly blockNumber: bigint;
+  readonly txHash: string;
+  readonly eventRef: string;
+  readonly logIndex: number | null;
+  readonly eventTag: string | null;
+  readonly error: unknown;
+  readonly payload?: unknown;
+  readonly replayEligible?: boolean;
+  readonly maxReplayFailures?: number;
+  readonly failedAt?: Date;
+}
+
+export interface RejectedEventRecord {
+  readonly id: bigint;
+  readonly chainKey: string;
+  readonly family: RejectedChainFamily;
+  readonly contract: string;
+  readonly blockNumber: bigint;
+  readonly txHash: string;
+  readonly eventRef: string;
+  readonly logIndex: number | null;
+  readonly eventTag: string | null;
+  readonly errorClass: RejectedErrorClass;
+  readonly errorCode: string | null;
+  readonly errorMessage: string;
+  readonly replayEligible: boolean;
+  readonly status: RejectedEventStatus;
+  readonly payloadPreview: string | null;
+  readonly payloadTruncated: boolean;
+  readonly failureCount: number;
+  readonly firstFailedAt: Date;
+  readonly lastFailedAt: Date;
+  readonly lastReplayAt: Date | null;
+  readonly reconciledAt: Date | null;
+  readonly reconciledTx: string | null;
+}
+
+const URL_CREDENTIALS_RE = /\b((?:postgres(?:ql)?|redis(?:s)?|https?|wss?):\/\/)([^/\s@]+@)/gi;
+const QUERY_SECRET_RE =
+  /([?&](?:api[_-]?key|apikey|token|access[_-]?token|secret|password|key|auth|signature)=)([^&\s"']+)/gi;
+const AUTH_HEADER_RE = /(\bauthorization\s*[:=]\s*(?:bearer|basic)\s+)([^\s"',;}]+)/gi;
+const KV_SECRET_RE =
+  /(\b(?:x-api-key|api[_-]?key|secret|password|private[_-]?key|client[_-]?secret)\s*[:=]\s*["']?)([^\s"',;}]+)/gi;
+const STELLAR_SECRET_SEED_RE = /\bS[A-Z2-7]{55}\b/g;
+
+export function sanitizeRejectedDiagnostic(
+  raw: string,
+  maxLength: number,
+): { readonly value: string; readonly truncated: boolean } {
+  const scrubbed = raw
+    .replace(URL_CREDENTIALS_RE, "$1[REDACTED]@")
+    .replace(QUERY_SECRET_RE, "$1[REDACTED]")
+    .replace(AUTH_HEADER_RE, "$1[REDACTED]")
+    .replace(KV_SECRET_RE, "$1[REDACTED]")
+    .replace(STELLAR_SECRET_SEED_RE, "[REDACTED_SEED]");
+
+  if (scrubbed.length <= maxLength) {
+    return { value: scrubbed, truncated: false };
+  }
+  const suffix = "...[truncated]";
+  const budget = Math.max(0, maxLength - suffix.length);
+  return {
+    value: `${scrubbed.slice(0, budget)}${suffix}`.slice(0, maxLength),
+    truncated: true,
+  };
+}
+
+export function serializeRejectedPayload(payload: unknown): {
+  readonly preview: string | null;
+  readonly truncated: boolean;
+} {
+  if (payload === undefined || payload === null) {
+    return { preview: null, truncated: false };
+  }
+
+  let serialized: string;
+  try {
+    serialized =
+      typeof payload === "string"
+        ? payload
+        : JSON.stringify(payload, (_key, value: unknown) =>
+            typeof value === "bigint" ? value.toString() : value,
+          );
+  } catch {
+    serialized = "[unserializable_payload]";
+  }
+
+  const sanitized = sanitizeRejectedDiagnostic(serialized, MAX_REJECTED_PAYLOAD_PREVIEW_LENGTH);
+  return { preview: sanitized.value, truncated: sanitized.truncated };
+}
+
+export function classifyIngestionError(error: unknown): NormalizedIngestionError {
+  const rawMessage =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : "unknown ingestion error";
+  const sanitizedMessage =
+    sanitizeRejectedDiagnostic(
+      rawMessage || "unknown ingestion error",
+      MAX_REJECTED_ERROR_MESSAGE_LENGTH,
+    ).value || "unknown ingestion error";
+
+  const name =
+    typeof error === "object" && error !== null && "name" in error && typeof error.name === "string"
+      ? error.name
+      : null;
+  const rawCode =
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (typeof error.code === "string" || typeof error.code === "number")
+      ? String(error.code)
+      : null;
+  const boundedCode =
+    rawCode !== null
+      ? sanitizeRejectedDiagnostic(rawCode, MAX_REJECTED_CODE_LENGTH).value
+      : name !== null && name !== "Error"
+        ? sanitizeRejectedDiagnostic(name, MAX_REJECTED_CODE_LENGTH).value
+        : null;
+
+  if (
+    name === "ScValError" ||
+    name === "StellarEventError" ||
+    name === "AbiEncodingLengthMismatchError"
+  ) {
+    return {
+      errorClass: "decode_error",
+      errorCode: boundedCode,
+      errorMessage: sanitizedMessage,
+      replayEligible: true,
+    };
+  }
+
+  if (
+    name === "LogShapeError" ||
+    name === "TypeError" ||
+    name === "SyntaxError" ||
+    name === "RangeError"
+  ) {
+    return {
+      errorClass: "shape_error",
+      errorCode: boundedCode,
+      errorMessage: sanitizedMessage,
+      replayEligible: true,
+    };
+  }
+
+  if (name === "RowError") {
+    return {
+      errorClass: "state_mismatch",
+      errorCode: boundedCode,
+      errorMessage: sanitizedMessage,
+      replayEligible: true,
+    };
+  }
+
+  if (rawCode !== null) {
+    if (
+      rawCode === "40001" ||
+      rawCode === "40P01" ||
+      rawCode === "55P03" ||
+      rawCode === "57014" ||
+      rawCode.startsWith("08") ||
+      rawCode.startsWith("53")
+    ) {
+      return {
+        errorClass: "transient_db_error",
+        errorCode: boundedCode,
+        errorMessage: sanitizedMessage,
+        replayEligible: true,
+      };
+    }
+
+    if (rawCode.startsWith("22") || rawCode.startsWith("23")) {
+      return {
+        errorClass: "constraint_violation",
+        errorCode: boundedCode,
+        errorMessage: sanitizedMessage,
+        replayEligible: false,
+      };
+    }
+  }
+
+  if (/deadlock|timeout|connection terminated|serialization failure/i.test(sanitizedMessage)) {
+    return {
+      errorClass: "transient_db_error",
+      errorCode: boundedCode,
+      errorMessage: sanitizedMessage,
+      replayEligible: true,
+    };
+  }
+
+  return {
+    errorClass: "unknown_error",
+    errorCode: boundedCode,
+    errorMessage: sanitizedMessage,
+    replayEligible: true,
+  };
+}
+
+function parseRejectedEventRow(row: Record<string, unknown>): RejectedEventRecord {
+  return {
+    id: bigintOf(row, "id"),
+    chainKey: text(row, "chain_key"),
+    family: enumText(row, "family", REJECTED_FAMILIES),
+    contract: text(row, "contract"),
+    blockNumber: bigintOf(row, "block_number"),
+    txHash: text(row, "tx_hash"),
+    eventRef: text(row, "event_ref"),
+    logIndex: integerOrNull(row, "log_index"),
+    eventTag: textOrNull(row, "event_tag"),
+    errorClass: enumText(row, "error_class", REJECTED_ERROR_CLASSES),
+    errorCode: textOrNull(row, "error_code"),
+    errorMessage: text(row, "error_message"),
+    replayEligible: boolean(row, "replay_eligible"),
+    status: enumText(row, "status", REJECTED_EVENT_STATUSES),
+    payloadPreview: textOrNull(row, "payload_preview"),
+    payloadTruncated: boolean(row, "payload_truncated"),
+    failureCount: integer(row, "failure_count"),
+    firstFailedAt: timestamp(row, "first_failed_at"),
+    lastFailedAt: timestamp(row, "last_failed_at"),
+    lastReplayAt: timestampOrNull(row, "last_replay_at"),
+    reconciledAt: timestampOrNull(row, "reconciled_at"),
+    reconciledTx: textOrNull(row, "reconciled_tx"),
+  };
+}
+
+export async function writeRejectedEvent(db: Queryable, input: RejectedEventInput): Promise<void> {
+  const classified = classifyIngestionError(input.error);
+  const replayEligible = input.replayEligible ?? classified.replayEligible;
+  const maxReplayFailures = Math.min(
+    Math.max(input.maxReplayFailures ?? DEFAULT_MAX_REPLAY_FAILURES, 1),
+    MAX_REJECTED_FAILURE_COUNT,
+  );
+  const payload = serializeRejectedPayload(input.payload);
+  const boundedRef = sanitizeRejectedDiagnostic(input.eventRef, MAX_REJECTED_REF_LENGTH).value;
+  if (boundedRef.length === 0) {
+    throw new Error("rejected event reference must not be empty");
+  }
+  const boundedTag =
+    input.eventTag !== null && input.eventTag.length > 0
+      ? sanitizeRejectedDiagnostic(input.eventTag, MAX_REJECTED_TAG_LENGTH).value
+      : null;
+  const failedAt = input.failedAt ?? new Date();
+
+  await db.query(
+    `INSERT INTO rejected_event
+       (chain_key, family, contract, block_number, tx_hash, event_ref, log_index, event_tag,
+        error_class, error_code, error_message, replay_eligible, status, payload_preview,
+        payload_truncated, failure_count, first_failed_at, last_failed_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'rejected', $13, $14, 1, $15, $15)
+     ON CONFLICT (chain_key, contract, event_ref) DO UPDATE
+       SET family = EXCLUDED.family,
+           block_number = EXCLUDED.block_number,
+           tx_hash = EXCLUDED.tx_hash,
+           log_index = EXCLUDED.log_index,
+           event_tag = COALESCE(EXCLUDED.event_tag, rejected_event.event_tag),
+           error_class = EXCLUDED.error_class,
+           error_code = EXCLUDED.error_code,
+           error_message = EXCLUDED.error_message,
+           replay_eligible = CASE
+             WHEN LEAST(rejected_event.failure_count + 1, ${String(MAX_REJECTED_FAILURE_COUNT)}) >= $16
+               THEN false
+             ELSE EXCLUDED.replay_eligible
+           END,
+           status = 'rejected',
+           payload_preview = COALESCE(EXCLUDED.payload_preview, rejected_event.payload_preview),
+           payload_truncated = EXCLUDED.payload_truncated OR rejected_event.payload_truncated,
+           failure_count = LEAST(rejected_event.failure_count + 1, ${String(MAX_REJECTED_FAILURE_COUNT)}),
+           last_failed_at = EXCLUDED.last_failed_at,
+           reconciled_at = NULL,
+           reconciled_tx = NULL`,
+    [
+      input.chainKey,
+      input.family,
+      input.contract,
+      input.blockNumber.toString(),
+      sanitizeRejectedDiagnostic(input.txHash, MAX_REJECTED_REF_LENGTH).value,
+      boundedRef,
+      input.logIndex,
+      boundedTag,
+      classified.errorClass,
+      classified.errorCode,
+      classified.errorMessage,
+      replayEligible,
+      payload.preview,
+      payload.truncated,
+      failedAt,
+      maxReplayFailures,
+    ],
+  );
+}
+
+export async function reconcileRejectedEvents(
+  db: Queryable,
+  input: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly eventRefs: readonly string[];
+    readonly reconciledAt?: Date;
+    readonly reconciledTx?: string | null;
+  },
+): Promise<number> {
+  if (input.eventRefs.length === 0) return 0;
+  const boundedRefs = input.eventRefs.map(
+    (ref) => sanitizeRejectedDiagnostic(ref, MAX_REJECTED_REF_LENGTH).value,
+  );
+  const reconciledAt = input.reconciledAt ?? new Date();
+  const reconciledTx =
+    input.reconciledTx !== undefined && input.reconciledTx !== null
+      ? sanitizeRejectedDiagnostic(input.reconciledTx, MAX_REJECTED_REF_LENGTH).value
+      : null;
+
+  const { rowCount } = await db.query(
+    `UPDATE rejected_event
+        SET status = 'reconciled',
+            reconciled_at = $4,
+            reconciled_tx = COALESCE($5, tx_hash),
+            last_replay_at = $4
+      WHERE chain_key = $1
+        AND contract = $2
+        AND event_ref = ANY($3::text[])
+        AND status = 'rejected'`,
+    [input.chainKey, input.contract, boundedRefs, reconciledAt, reconciledTx],
+  );
+  return rowCount;
+}
+
+export async function readRejectedEvent(
+  db: Queryable,
+  chainKey: string,
+  contract: string,
+  eventRef: string,
+): Promise<RejectedEventRecord | null> {
+  const { rows } = await db.query(
+    `SELECT * FROM rejected_event
+      WHERE chain_key = $1 AND contract = $2 AND event_ref = $3`,
+    [chainKey, contract, eventRef],
+  );
+  const row = maybeOne(rows, `rejected_event for ${chainKey}:${eventRef}`);
+  return row === null ? null : parseRejectedEventRow(row);
+}
+
+export async function listRejectedEvents(
+  db: Queryable,
+  options: {
+    readonly chainKey?: string;
+    readonly contract?: string;
+    readonly status?: RejectedEventStatus;
+    readonly replayEligible?: boolean;
+    readonly limit?: number;
+  } = {},
+): Promise<readonly RejectedEventRecord[]> {
+  const limit = Math.min(Math.max(options.limit ?? 100, 1), 500);
+  const { rows } = await db.query(
+    `SELECT * FROM rejected_event
+      WHERE ($1::text IS NULL OR chain_key = $1)
+        AND ($2::text IS NULL OR contract = $2)
+        AND ($3::text IS NULL OR status = $3)
+        AND ($4::boolean IS NULL OR replay_eligible = $4)
+      ORDER BY block_number ASC, id ASC
+      LIMIT $5`,
+    [
+      options.chainKey ?? null,
+      options.contract ?? null,
+      options.status ?? null,
+      options.replayEligible ?? null,
+      limit,
+    ],
+  );
+  return rows.map(parseRejectedEventRow);
+}
+
+export interface ReplayRejectedEventsResult {
+  readonly attempted: number;
+  readonly reconciled: number;
+  readonly failed: number;
+}
+
+export async function replayRejectedEvents(
+  db: Transactional,
+  options: {
+    readonly chainKey: string;
+    readonly contract?: string;
+    readonly limit?: number;
+    readonly maxReplayFailures?: number;
+    readonly now?: () => Date;
+    readonly apply: (
+      tx: Queryable,
+      record: RejectedEventRecord,
+    ) => Promise<{ readonly reconciledTx?: string | null } | undefined>;
+  },
+): Promise<ReplayRejectedEventsResult> {
+  const candidates = await listRejectedEvents(db, {
+    chainKey: options.chainKey,
+    ...(options.contract === undefined ? {} : { contract: options.contract }),
+    status: "rejected",
+    replayEligible: true,
+    limit: options.limit ?? 50,
+  });
+
+  const maxReplayFailures = Math.min(
+    Math.max(options.maxReplayFailures ?? DEFAULT_MAX_REPLAY_FAILURES, 1),
+    MAX_REJECTED_FAILURE_COUNT,
+  );
+
+  let attempted = 0;
+  let reconciled = 0;
+  let failed = 0;
+
+  for (const record of candidates) {
+    attempted += 1;
+    const replayTime = options.now ? options.now() : new Date();
+    try {
+      await db.transaction(async (tx) => {
+        const outcome = await options.apply(tx, record);
+        await reconcileRejectedEvents(tx, {
+          chainKey: record.chainKey,
+          contract: record.contract,
+          eventRefs: [record.eventRef],
+          reconciledAt: replayTime,
+          reconciledTx: outcome?.reconciledTx ?? record.txHash,
+        });
+      });
+      reconciled += 1;
+    } catch (error) {
+      failed += 1;
+      const classified = classifyIngestionError(error);
+      await db.query(
+        `UPDATE rejected_event
+            SET error_class = $2,
+                error_code = $3,
+                error_message = $4,
+                failure_count = LEAST(failure_count + 1, ${String(MAX_REJECTED_FAILURE_COUNT)}),
+                replay_eligible = CASE
+                  WHEN LEAST(failure_count + 1, ${String(MAX_REJECTED_FAILURE_COUNT)}) >= $6
+                    THEN false
+                  ELSE $5
+                END,
+                last_failed_at = $7,
+                last_replay_at = $7
+          WHERE id = $1`,
+        [
+          record.id.toString(),
+          classified.errorClass,
+          classified.errorCode,
+          classified.errorMessage,
+          classified.replayEligible,
+          maxReplayFailures,
+          replayTime,
+        ],
+      );
+    }
+  }
+
+  return { attempted, reconciled, failed };
 }

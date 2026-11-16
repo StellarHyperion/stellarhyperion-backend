@@ -114,6 +114,21 @@ export class Database implements Transactional {
     return rowCount;
   }
 
+  /**
+   * Bounded retention cleanup for reconciled rejected-event audit rows older than `olderThanDays`.
+   * Unresolved `rejected` rows are never pruned automatically.
+   */
+  async pruneReconciledRejectedEvents(olderThanDays = 30): Promise<number> {
+    const { rowCount } = await this.query(
+      `DELETE FROM rejected_event
+        WHERE status = 'reconciled'
+          AND reconciled_at IS NOT NULL
+          AND reconciled_at < now() - ($1 * INTERVAL '1 day')`,
+      [olderThanDays],
+    );
+    return rowCount;
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
@@ -145,6 +160,9 @@ export function startMaintenanceTask(
   const timer = setInterval(() => {
     void db.pruneCompletedAttestations(olderThanDays).catch((error: unknown) => {
       options.logger?.warn?.({ err: error }, "maintenance attestation pruning failed");
+    });
+    void db.pruneReconciledRejectedEvents(olderThanDays).catch((error: unknown) => {
+      options.logger?.warn?.({ err: error }, "maintenance rejected-event pruning failed");
     });
   }, intervalMs);
 
