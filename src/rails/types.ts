@@ -26,8 +26,16 @@ export type AttestationStatus = "pending" | "attested" | "delivered" | "failed" 
 /** Terminal states. Nothing polls a transfer again once it reaches one. */
 export const TERMINAL: readonly AttestationStatus[] = ["delivered", "failed", "expired"];
 
+export type RecoverableTerminalStatus = "failed" | "expired";
+
 export function isTerminal(status: AttestationStatus): boolean {
   return TERMINAL.includes(status);
+}
+
+export function isRecoverableTerminalStatus(
+  status: AttestationStatus,
+): status is RecoverableTerminalStatus {
+  return status === "failed" || status === "expired";
 }
 
 export interface RailReport {
@@ -107,3 +115,66 @@ export interface RailClient {
   /** Throws `RailError`; returns `missing` rather than throwing for a transfer not yet indexed. */
   look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup>;
 }
+
+export type RequeueSelector =
+  { readonly transferId: bigint } | { readonly originChain: string; readonly nonce: bigint };
+
+export interface RequeueTransferRequest {
+  readonly selector: RequeueSelector;
+  readonly reviewedBy: string;
+  readonly reason: string;
+  readonly evidenceReference?: string | null | undefined;
+  readonly at?: Date | undefined;
+}
+
+export interface PreservedTransferIdentity {
+  readonly transferId: bigint;
+  readonly originChain: string;
+  readonly route: number;
+  readonly nonce: bigint;
+  readonly sender: string;
+  readonly token: string;
+  readonly grossAmount: bigint;
+  readonly fee: bigint;
+  readonly netAmount: bigint;
+  readonly destinationChain: string;
+  readonly destination: string;
+  readonly railRef: string | null;
+  readonly originBlock: bigint;
+  readonly originTx: string;
+  readonly originLogIndex: number | null;
+}
+
+export interface RequeueAuditEntry {
+  readonly id: bigint;
+  readonly transferId: bigint;
+  readonly route: number;
+  readonly originChain: string;
+  readonly nonce: bigint;
+  readonly priorStatus: RecoverableTerminalStatus;
+  readonly newStatus: "pending";
+  readonly priorRailStatus: string | null;
+  readonly priorRailReference: string | null;
+  readonly priorCheckFailures: number;
+  readonly reviewedBy: string;
+  readonly reviewedReason: string;
+  readonly evidenceReference: string | null;
+  readonly requeuedAt: Date;
+}
+
+export type RequeueRefusalCode =
+  "not_found" | "missing_attestation" | "already_delivered" | "not_terminal";
+
+export type RequeueTransferOutcome =
+  | {
+      readonly kind: "requeued";
+      readonly audit: RequeueAuditEntry;
+      readonly transfer: PreservedTransferIdentity;
+    }
+  | {
+      readonly kind: "refused";
+      readonly code: RequeueRefusalCode;
+      readonly detail: string;
+      readonly currentStatus: AttestationStatus | null;
+      readonly transfer?: PreservedTransferIdentity | undefined;
+    };

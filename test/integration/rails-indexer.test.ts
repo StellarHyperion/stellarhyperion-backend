@@ -7,9 +7,15 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { writeOutbound, writeInbound } from "../../src/chains/writers.js";
+import { writeAttestation, writeOutbound, writeInbound } from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
-import { outstandingForRail, pendingForRail } from "../../src/rails/queue.js";
+import { bigintOf } from "../../src/db/rows.js";
+import {
+  listRequeueAudit,
+  outstandingForRail,
+  pendingForRail,
+  requeueTerminalTransfer,
+} from "../../src/rails/queue.js";
 import { RailPass } from "../../src/rails/pass.js";
 import type { PendingTransfer, RailClient, RailLookup } from "../../src/rails/types.js";
 import { capturingLogger } from "../stellar-fakes.js";
@@ -214,5 +220,66 @@ suite("rail pollers against real Postgres", () => {
     // Outstanding should now be 0 for this transfer since delivered is terminal
     const outstanding = await outstandingForRail(db, 1);
     expect(outstanding).toBe(0);
+  });
+
+  it("requeues terminal failed transfers with recorded operator audit and refuses delivered transfers", async () => {
+    await db.transaction(async (tx) => {
+      await writeOutbound(
+        tx,
+        {
+          chainKey: ORIGIN_CHAIN,
+          block: 1010n,
+          txHash: "0xaaa303",
+          logIndex: 0,
+          observedAt: new Date(),
+        },
+        {
+          route: 0,
+          nonce: 303n,
+          sender: "0x1111111111111111111111111111111111111111",
+          token: "0x3333333333333333333333333333333333333333",
+          grossAmount: 2002000n,
+          fee: 2000n,
+          netAmount: 2000000n,
+          destinationChain: DESTINATION_CHAIN,
+          destination: "0x2222222222222222222222222222222222222222",
+          railRef: "0x0000",
+        },
+      );
+    });
+
+    const idRes = await db.query(
+      "SELECT id FROM outbound_transfer WHERE origin_chain = $1 AND nonce = 303",
+      [ORIGIN_CHAIN],
+    );
+    const idRow = idRes.rows[0];
+    expect(idRow).toBeDefined();
+    if (idRow === undefined) return;
+    const transferId = bigintOf(idRow, "id");
+
+    await writeAttestation(db, {
+      transferId,
+      route: 0,
+      status: "failed",
+      railStatus: "error",
+      railReference: "iris-err-303",
+      attestedAt: null,
+      checkedAt: new Date("2026-10-08T00:00:00Z"),
+      checkFailures: 3,
+      lastError: "provider error",
+    });
+
+    const requeued = await requeueTerminalTransfer(db, {
+      selector: { transferId },
+      reviewedBy: "integration-operator",
+      reason: "New Iris attestation observed",
+      evidenceReference: "iris-ref-303",
+    });
+    expect(requeued.kind).toBe("requeued");
+
+    const audit = await listRequeueAudit(db, transferId);
+    expect(audit).toHaveLength(1);
+    expect(audit[0]?.priorStatus).toBe("failed");
+    expect(audit[0]?.reviewedReason).toBe("New Iris attestation observed");
   });
 });

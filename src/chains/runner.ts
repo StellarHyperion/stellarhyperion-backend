@@ -29,7 +29,8 @@ import { RouteKind } from "@hyperion/protocol";
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
 import { IrisClient } from "../rails/cctp/iris.js";
 import { RailPass } from "../rails/pass.js";
-import type { RailClient } from "../rails/types.js";
+import { requeueTerminalTransfer } from "../rails/requeue.js";
+import type { RailClient, RequeueTransferOutcome, RequeueTransferRequest } from "../rails/types.js";
 import { KeeperWorker } from "../keeper/worker.js";
 import { viemClient } from "./evm/client.js";
 import { EvmWatcher } from "./evm/watcher.js";
@@ -58,6 +59,13 @@ export interface IndexerHandle {
   /** Begin polling. Separate from building, the way `listen` is separate from `buildServer`. */
   start(): void;
   stop(): Promise<void>;
+  requeueTransfer(
+    request: RequeueTransferRequest,
+    options?: {
+      readonly evaluateNow?: boolean | undefined;
+      readonly signal?: AbortSignal | undefined;
+    },
+  ): Promise<RequeueTransferOutcome>;
 }
 
 /** One pass is one `tick`, and the component reports its own health. */
@@ -130,6 +138,18 @@ export interface BuildIndexerDeps {
  */
 export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   const { config, logger, db } = deps;
+  const passes = buildRailPasses(config.rails, config.network, db, logger, config);
+
+  const requeueTransfer: IndexerHandle["requeueTransfer"] = async (request, options) => {
+    const outcome = await requeueTerminalTransfer(db, request);
+    if (outcome.kind === "requeued" && options?.evaluateNow === true) {
+      const pass = passes.find((candidate) => candidate.route === outcome.transfer.route);
+      if (pass !== undefined) {
+        await pass.evaluateTransfer(outcome.transfer.transferId, options.signal);
+      }
+    }
+    return outcome;
+  };
 
   if (!config.indexer.enabled) {
     return {
@@ -143,6 +163,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
       ],
       start: () => undefined,
       stop: () => Promise.resolve(),
+      requeueTransfer,
     };
   }
 
@@ -171,7 +192,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // They are not conditional on a router being watched: a transfer indexed by a previous run is
   // still waiting on its rail whether or not this replica is watching the chain it left.
   if (config.rails.enabled) {
-    for (const worker of railWorkers(config.rails, config.network, db, logger, config)) {
+    for (const worker of railWorkersFromPasses(passes, config.rails, logger)) {
       workers.push(worker);
     }
   } else {
@@ -225,24 +246,25 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
       // number of chains.
       await Promise.all(workers.map((worker) => worker.stop()));
     },
+    requeueTransfer,
   };
 }
 
 /**
- * One worker per rail that has a status API to ask.
+ * Build `RailPass` instances for each rail that exposes a status API.
  *
  * Allbridge is absent on purpose rather than by omission. It is outbound only by construction and
  * exposes no attestation to poll, so a transfer on it is pending until an inbound delivery appears,
  * which the queue already settles without a request. A poller for it would make a request a tick
  * for an answer that does not exist.
  */
-function railWorkers(
+export function buildRailPasses(
   config: RailsConfig,
   network: AppConfig["network"],
   db: Transactional,
   logger: Logger,
   appConfig: AppConfig,
-): readonly Worker[] {
+): readonly RailPass[] {
   const clients: readonly { readonly route: RouteKind; readonly client: RailClient }[] = [
     {
       route: RouteKind.Cctp,
@@ -263,7 +285,7 @@ function railWorkers(
 
   return clients.map(({ route, client }) => {
     const child = logger.child({ rail: client.rail, route });
-    const pass = new RailPass({
+    return new RailPass({
       route,
       config: appConfig,
       client,
@@ -273,6 +295,16 @@ function railWorkers(
       recheckAfterMs: config.recheckAfterMs,
       maxCheckFailures: config.maxCheckFailures,
     });
+  });
+}
+
+function railWorkersFromPasses(
+  passes: readonly RailPass[],
+  config: RailsConfig,
+  logger: Logger,
+): readonly Worker[] {
+  return passes.map((pass) => {
+    const child = logger.child({ worker: pass.name, route: pass.route });
     return new PolledWorker(pass, config.pollIntervalMs, child);
   });
 }
