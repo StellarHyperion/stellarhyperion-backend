@@ -1,7 +1,9 @@
 import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 import { bigintOf } from "../../db/rows.js";
+import { KeeperBudgetExceededError, KeeperBudgetTracker } from "../budgets.js";
 import { submitStellar } from "../stellar.js";
 import type { KeeperContext, TtlBumpPayload, TtlBumpResult } from "../types.js";
+
 export async function processTtlBump(
   ctx: KeeperContext,
   payload: TtlBumpPayload = {},
@@ -40,19 +42,43 @@ export async function processTtlBump(
       dryRun: true,
       detail: `No signer: ${tokens.length} tokens, ${claims.length} claims, ${transfers.length} transfers need maintenance.`,
     };
+
+  const tracker = ctx.budgetTracker ?? new KeeperBudgetTracker(ctx.config.keeper.budgets);
+  const session = tracker.createJobSession(payload.budgetOverrides);
   const vector = (values: xdr.ScVal[]) => xdr.ScVal.scvVec(values);
-  const hash = await submitStellar(ctx.config, chain.routerContractId, "keep_alive", () => [
-    vector(tokens.map((token) => new Address(token).toScVal())),
-    vector([0, 1, 2, 3].map((route) => nativeToScVal(route, { type: "u32" }))),
-    vector(claims.map((id) => nativeToScVal(id, { type: "u64" }))),
-    vector(transfers.map((id) => nativeToScVal(id, { type: "u64" }))),
-  ]);
-  ctx.logger.info({ hash }, "router keep_alive confirmed");
-  return {
-    bumpedTokens: tokens.length,
-    bumpedClaims: claims.length,
-    bumpedTransfers: transfers.length,
-    dryRun: false,
-    detail: `Confirmed router maintenance: ${hash}`,
-  };
+
+  try {
+    const hash = await submitStellar(
+      ctx.config,
+      chain.routerContractId,
+      "keep_alive",
+      () => [
+        vector(tokens.map((token) => new Address(token).toScVal())),
+        vector([0, 1, 2, 3].map((route) => nativeToScVal(route, { type: "u32" }))),
+        vector(claims.map((id) => nativeToScVal(id, { type: "u64" }))),
+        vector(transfers.map((id) => nativeToScVal(id, { type: "u64" }))),
+      ],
+      {
+        budgetSession: session,
+        pollIntervalMs: ctx.pollIntervalMs,
+      },
+    );
+    ctx.logger.info({ hash }, "router keep_alive confirmed");
+    return {
+      bumpedTokens: tokens.length,
+      bumpedClaims: claims.length,
+      bumpedTransfers: transfers.length,
+      dryRun: false,
+      detail: `Confirmed router maintenance: ${hash}`,
+      budgetAccounting: session.snapshot(),
+    };
+  } catch (error) {
+    if (error instanceof KeeperBudgetExceededError) {
+      ctx.logger.warn(
+        { diagnostic: error.diagnostic },
+        "router keep_alive blocked before signing due to budget or simulation resource limits",
+      );
+    }
+    throw error;
+  }
 }

@@ -1,11 +1,19 @@
 import { Address, nativeToScVal } from "@stellar/stellar-sdk";
 import { bigintOf } from "../../db/rows.js";
+import {
+  assertNoClaimRecipientOverride,
+  KeeperBudgetExceededError,
+  KeeperBudgetTracker,
+} from "../budgets.js";
 import { submitStellar } from "../stellar.js";
 import type { ClaimSettlementPayload, ClaimSettlementResult, KeeperContext } from "../types.js";
+
 export async function processClaimSettlement(
   ctx: KeeperContext,
   payload: ClaimSettlementPayload = {},
 ): Promise<ClaimSettlementResult> {
+  assertNoClaimRecipientOverride(payload);
+
   const chain = ctx.config.indexer.stellar;
   if (!chain)
     return {
@@ -27,15 +35,24 @@ export async function processClaimSettlement(
       dryRun: true,
       detail: "No signer configured; no settlement was attempted.",
     };
+
+  const tracker = ctx.budgetTracker ?? new KeeperBudgetTracker(ctx.config.keeper.budgets);
+  const session = tracker.createJobSession(payload.budgetOverrides);
+
   let settled = 0;
   for (const row of rows) {
     const id = bigintOf(row, "claim_id");
     try {
+      // Recipient is never passed by keeper; router reads immutable payout target from storage.
       const hash = await submitStellar(
         ctx.config,
         chain.routerContractId,
         "settle_claim",
         (sender) => [new Address(sender).toScVal(), nativeToScVal(id, { type: "u64" })],
+        {
+          budgetSession: session,
+          pollIntervalMs: ctx.pollIntervalMs,
+        },
       );
       ctx.logger.info(
         { claimId: String(id), hash },
@@ -43,6 +60,13 @@ export async function processClaimSettlement(
       );
       settled += 1;
     } catch (error) {
+      if (error instanceof KeeperBudgetExceededError) {
+        ctx.logger.warn(
+          { claimId: String(id), diagnostic: error.diagnostic },
+          "claim settlement blocked before signing due to fee or simulation resource budget",
+        );
+        continue;
+      }
       ctx.logger.warn({ err: error, claimId: String(id) }, "claim is not ready for settlement");
     }
   }
@@ -52,5 +76,6 @@ export async function processClaimSettlement(
     pending: rows.length - settled,
     dryRun: false,
     detail: `${settled} confirmed settlements of ${rows.length} attempts.`,
+    budgetAccounting: session.snapshot(),
   };
 }

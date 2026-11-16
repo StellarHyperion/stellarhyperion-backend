@@ -8,9 +8,10 @@
 import { Queue, Worker } from "bullmq";
 import { Redis } from "ioredis";
 
+import { KeeperBudgetTracker } from "./budgets.js";
 import { processClaimSettlement } from "./jobs/claims.js";
 import { processTtlBump } from "./jobs/ttl.js";
-import type { KeeperContext, KeeperJobName, KeeperJobResult } from "./types.js";
+import type { BudgetTrackerPort, KeeperContext, KeeperJobName, KeeperJobResult } from "./types.js";
 
 export const KEEPER_QUEUE_NAME = "hyperion-keeper";
 
@@ -18,6 +19,7 @@ export interface KeeperHandle {
   readonly queue: Queue;
   readonly worker: Worker<unknown, KeeperJobResult>;
   readonly redis: Redis;
+  readonly budgetTracker: BudgetTrackerPort;
   close(): Promise<void>;
 }
 
@@ -34,6 +36,11 @@ export async function startKeeperQueue(
   redisUrl: string,
 ): Promise<KeeperHandle> {
   const { config, logger } = ctx;
+  const budgetTracker = ctx.budgetTracker ?? new KeeperBudgetTracker(config.keeper.budgets);
+  const workerCtx: KeeperContext = {
+    ...ctx,
+    budgetTracker,
+  };
   const redis = createKeeperRedis(redisUrl);
   await redis.connect();
 
@@ -47,11 +54,11 @@ export async function startKeeperQueue(
       logger.info({ jobName: job.name, jobId: job.id }, "processing keeper job");
       switch (job.name as KeeperJobName) {
         case "ttl-bump": {
-          const result = await processTtlBump(ctx, job.data as object);
+          const result = await processTtlBump(workerCtx, job.data as object);
           return { kind: "ttl-bump", result };
         }
         case "claim-settlement": {
-          const result = await processClaimSettlement(ctx, job.data as object);
+          const result = await processClaimSettlement(workerCtx, job.data as object);
           return { kind: "claim-settlement", result };
         }
         default:
@@ -87,6 +94,7 @@ export async function startKeeperQueue(
     queue,
     worker,
     redis,
+    budgetTracker,
     close: async () => {
       await worker.close();
       await queue.close();

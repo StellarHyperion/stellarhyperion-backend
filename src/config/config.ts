@@ -93,11 +93,23 @@ export interface IndexerConfig {
   readonly evm: readonly EvmWatchConfig[];
 }
 
+export interface KeeperBudgetConfig {
+  readonly maxTxFeeStroops: bigint;
+  readonly maxJobFeeStroops: bigint;
+  readonly maxIntervalFeeStroops: bigint;
+  readonly intervalMs: number;
+  readonly maxCpuInstructions: number;
+  readonly maxReadBytes: number;
+  readonly maxWriteBytes: number;
+  readonly maxFootprintKeys: number;
+}
+
 export interface KeeperConfig {
   readonly enabled: boolean;
   readonly pollIntervalMs: number;
   readonly concurrency: number;
   readonly stellarSecret: string | null;
+  readonly budgets: KeeperBudgetConfig;
 }
 
 export interface AppConfig {
@@ -323,6 +335,100 @@ const KEEPER_STELLAR_SECRET: VarSpec = {
     "Secret key for submitting Stellar keep_alive and claim transactions. Optional; runs dry-run when absent.",
 };
 
+const KEEPER_MAX_TX_FEE_STROOPS: VarSpec = {
+  name: "KEEPER_MAX_TX_FEE_STROOPS",
+  kind: "string",
+  required: false,
+  fallback: "5000000",
+  printable: true,
+  purpose: "Maximum total Stellar fee in stroops permitted for a single keeper transaction.",
+};
+
+const KEEPER_MAX_JOB_FEE_STROOPS: VarSpec = {
+  name: "KEEPER_MAX_JOB_FEE_STROOPS",
+  kind: "string",
+  required: false,
+  fallback: "25000000",
+  printable: true,
+  purpose: "Maximum total Stellar fee in stroops permitted across a single keeper job execution.",
+};
+
+const KEEPER_MAX_INTERVAL_FEE_STROOPS: VarSpec = {
+  name: "KEEPER_MAX_INTERVAL_FEE_STROOPS",
+  kind: "string",
+  required: false,
+  fallback: "100000000",
+  printable: true,
+  purpose:
+    "Maximum submitted Stellar fee in stroops permitted within one operational budget interval.",
+};
+
+const KEEPER_BUDGET_INTERVAL_MS: VarSpec = {
+  name: "KEEPER_BUDGET_INTERVAL_MS",
+  kind: "integer",
+  required: false,
+  fallback: "3600000",
+  min: 1000,
+  printable: true,
+  purpose: "Duration in milliseconds of each keeper operational fee and resource budget interval.",
+};
+
+const KEEPER_MAX_CPU_INSTRUCTIONS: VarSpec = {
+  name: "KEEPER_MAX_CPU_INSTRUCTIONS",
+  kind: "integer",
+  required: false,
+  fallback: "100000000",
+  min: 1,
+  printable: true,
+  purpose: "Maximum Soroban simulation CPU instructions permitted per keeper transaction.",
+};
+
+const KEEPER_MAX_READ_BYTES: VarSpec = {
+  name: "KEEPER_MAX_READ_BYTES",
+  kind: "integer",
+  required: false,
+  fallback: "200000",
+  min: 1,
+  printable: true,
+  purpose: "Maximum Soroban simulation disk read bytes permitted per keeper transaction.",
+};
+
+const KEEPER_MAX_WRITE_BYTES: VarSpec = {
+  name: "KEEPER_MAX_WRITE_BYTES",
+  kind: "integer",
+  required: false,
+  fallback: "131072",
+  min: 1,
+  printable: true,
+  purpose: "Maximum Soroban simulation write bytes permitted per keeper transaction.",
+};
+
+const KEEPER_MAX_FOOTPRINT_KEYS: VarSpec = {
+  name: "KEEPER_MAX_FOOTPRINT_KEYS",
+  kind: "integer",
+  required: false,
+  fallback: "128",
+  min: 1,
+  printable: true,
+  purpose: "Maximum Soroban ledger footprint keys permitted per keeper transaction.",
+};
+
+const FORBIDDEN_CLAIM_RECIPIENT_VARS = [
+  "KEEPER_CLAIM_RECIPIENT",
+  "KEEPER_PAYOUT_RECIPIENT",
+  "KEEPER_RECIPIENT_OVERRIDE",
+  "CLAIM_RECIPIENT_OVERRIDE",
+] as const;
+
+function readPositiveStroops(reader: EnvReader, spec: VarSpec): bigint {
+  const raw = reader.string(spec);
+  if (!/^[1-9]\d*$/.test(raw)) {
+    reader.reject(spec, `expected a positive whole number of stroops, found "${raw}"`);
+    return 0n;
+  }
+  return BigInt(raw);
+}
+
 const SHUTDOWN_TIMEOUT_MS: VarSpec = {
   name: "SHUTDOWN_TIMEOUT_MS",
   kind: "integer",
@@ -471,6 +577,37 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const keeperStellarSecret = reader.has(KEEPER_STELLAR_SECRET.name)
     ? reader.string(KEEPER_STELLAR_SECRET)
     : null;
+  const keeperMaxTxFeeStroops = readPositiveStroops(reader, KEEPER_MAX_TX_FEE_STROOPS);
+  const keeperMaxJobFeeStroops = readPositiveStroops(reader, KEEPER_MAX_JOB_FEE_STROOPS);
+  const keeperMaxIntervalFeeStroops = readPositiveStroops(reader, KEEPER_MAX_INTERVAL_FEE_STROOPS);
+  const keeperBudgetIntervalMs = reader.integer(KEEPER_BUDGET_INTERVAL_MS);
+  const keeperMaxCpuInstructions = reader.integer(KEEPER_MAX_CPU_INSTRUCTIONS);
+  const keeperMaxReadBytes = reader.integer(KEEPER_MAX_READ_BYTES);
+  const keeperMaxWriteBytes = reader.integer(KEEPER_MAX_WRITE_BYTES);
+  const keeperMaxFootprintKeys = reader.integer(KEEPER_MAX_FOOTPRINT_KEYS);
+
+  for (const forbiddenName of Object.keys(env)) {
+    const upper = forbiddenName.toUpperCase();
+    const isForbiddenExplicit = (FORBIDDEN_CLAIM_RECIPIENT_VARS as readonly string[]).includes(
+      upper,
+    );
+    const isForbiddenPattern =
+      upper.startsWith("KEEPER_") &&
+      (upper.includes("RECIPIENT") || upper.includes("PAYOUT") || upper.includes("REDIRECT"));
+    if ((isForbiddenExplicit || isForbiddenPattern) && reader.has(forbiddenName)) {
+      reader.reject(
+        {
+          name: forbiddenName,
+          kind: "string",
+          required: false,
+          printable: false,
+          purpose:
+            "Claim payout recipients are immutable on-chain in router storage and cannot be configured manually.",
+        },
+        "is forbidden because keeper configuration cannot redirect router claim recipients",
+      );
+    }
+  }
   const stellarRpcOverride = reader.url(STELLAR_RPC_URL);
   const startLedgerOverride = reader.has(STELLAR_START_LEDGER.name)
     ? reader.integer(STELLAR_START_LEDGER)
@@ -526,6 +663,16 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       pollIntervalMs: keeperPollIntervalMs,
       concurrency: keeperConcurrency,
       stellarSecret: keeperStellarSecret,
+      budgets: {
+        maxTxFeeStroops: keeperMaxTxFeeStroops,
+        maxJobFeeStroops: keeperMaxJobFeeStroops,
+        maxIntervalFeeStroops: keeperMaxIntervalFeeStroops,
+        intervalMs: keeperBudgetIntervalMs,
+        maxCpuInstructions: keeperMaxCpuInstructions,
+        maxReadBytes: keeperMaxReadBytes,
+        maxWriteBytes: keeperMaxWriteBytes,
+        maxFootprintKeys: keeperMaxFootprintKeys,
+      },
     },
     shutdownTimeoutMs,
   };

@@ -9,19 +9,25 @@ import type { Logger } from "pino";
 import type { AppConfig } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
+import { KeeperBudgetTracker } from "./budgets.js";
 import { startKeeperQueue, type KeeperHandle } from "./queue.js";
+import type { BudgetTrackerPort } from "./types.js";
 
 export class KeeperWorker implements ReadinessSource {
   readonly name = "keeper";
   private handle: KeeperHandle | null = null;
   private starting = false;
   private failedError: string | null = null;
+  readonly budgetTracker: BudgetTrackerPort;
 
   constructor(
     private readonly config: AppConfig,
     private readonly db: Transactional,
     private readonly logger: Logger,
-  ) {}
+    budgetTracker?: BudgetTrackerPort,
+  ) {
+    this.budgetTracker = budgetTracker ?? new KeeperBudgetTracker(config.keeper.budgets);
+  }
 
   readiness(): ReadinessReport {
     if (!this.config.keeper.enabled) {
@@ -38,6 +44,14 @@ export class KeeperWorker implements ReadinessSource {
         detail: `redis connection failure: ${this.failedError}`,
       };
     }
+    const budget = this.budgetTracker.snapshot();
+    if (budget.exhausted) {
+      return {
+        name: this.name,
+        state: "degraded",
+        detail: `operational fee budget exhausted for current interval (submitted=${budget.submittedStroops}, confirmed=${budget.confirmedStroops}, cap=${budget.maxIntervalFeeStroops} stroops)`,
+      };
+    }
     if (this.handle === null) {
       return {
         name: this.name,
@@ -48,7 +62,7 @@ export class KeeperWorker implements ReadinessSource {
     return {
       name: this.name,
       state: "ready",
-      detail: "active on BullMQ with 2 scheduled Stellar upkeep jobs",
+      detail: `active on BullMQ with 2 scheduled Stellar upkeep jobs (submitted=${budget.submittedStroops}, confirmed=${budget.confirmedStroops} stroops)`,
     };
   }
 
@@ -57,7 +71,12 @@ export class KeeperWorker implements ReadinessSource {
     this.starting = true;
 
     startKeeperQueue(
-      { db: this.db, config: this.config, logger: this.logger },
+      {
+        db: this.db,
+        config: this.config,
+        logger: this.logger,
+        budgetTracker: this.budgetTracker,
+      },
       this.config.redisUrl,
     )
       .then((handle) => {
