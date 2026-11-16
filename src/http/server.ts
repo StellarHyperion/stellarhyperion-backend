@@ -7,6 +7,7 @@ import rateLimit from "@fastify/rate-limit";
 import type { AppConfig } from "../config/config.js";
 import type { Database } from "../db/pool.js";
 import type { BullMQWorkerState, RedisPingable, ReadinessSource } from "../runtime/readiness.js";
+import { KeysetValidationError } from "./keyset.js";
 import { registerClaimRoutes } from "./routes/claims.js";
 import { registerHealthRoutes } from "./routes/health.js";
 import { registerMetricsRoutes } from "./routes/metrics.js";
@@ -81,6 +82,16 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   app.setErrorHandler((error: FastifyError, request, reply) => {
+    if (error instanceof KeysetValidationError) {
+      void reply.code(error.statusCode).send({
+        error: "bad_request",
+        code: error.code,
+        message: error.message,
+        requestId: request.id,
+      });
+      return;
+    }
+
     const status = error.statusCode ?? 500;
     // The log gets the error, the response does not. An internal error message is the kind of
     // thing that carries a table name, a file path or, on a bad day, a connection string.

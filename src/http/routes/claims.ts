@@ -9,6 +9,13 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text } from "../../db/rows.js";
+import {
+  assertPaginationCompatibility,
+  computeClaimFilterHash,
+  decodeClaimCursor,
+  encodeClaimCursor,
+  parseSortDirection,
+} from "../keyset.js";
 import type { ServerDeps } from "../server.js";
 
 export interface FormattedClaim {
@@ -86,11 +93,24 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
           settled?: string;
           limit?: string;
           offset?: string;
+          cursor?: string;
+          sort?: string;
         };
       }>,
       reply: FastifyReply,
     ) => {
-      const { chain, recipient, settled, limit, offset } = request.query;
+      const { chain, recipient, settled, limit, offset, cursor, sort } = request.query;
+
+      assertPaginationCompatibility(cursor, offset);
+      const sortDirection = parseSortDirection(sort);
+      const parsedSettled = settled !== undefined ? settled === "true" : null;
+      const filterHash = computeClaimFilterHash({
+        chain,
+        recipient,
+        settled: parsedSettled,
+      });
+      const decodedCursor =
+        cursor !== undefined ? decodeClaimCursor(cursor, sortDirection, filterHash) : null;
 
       const conditions: string[] = [];
       const params: unknown[] = [];
@@ -103,36 +123,76 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
         params.push(recipient);
         conditions.push(`recipient = $${String(params.length)}`);
       }
-      if (settled !== undefined) {
-        params.push(settled === "true");
+      if (parsedSettled !== null) {
+        params.push(parsedSettled);
         conditions.push(`settled = $${String(params.length)}`);
       }
 
+      if (decodedCursor !== null) {
+        params.push(decodedCursor.lastChain);
+        const chainParam = `$${String(params.length)}`;
+        params.push(decodedCursor.lastClaimId.toString());
+        const idParam = `$${String(params.length)}`;
+        conditions.push(
+          sortDirection === "desc"
+            ? `(chain > ${chainParam} OR (chain = ${chainParam} AND claim_id < ${idParam}::numeric))`
+            : `(chain > ${chainParam} OR (chain = ${chainParam} AND claim_id > ${idParam}::numeric))`,
+        );
+      }
+
       const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+      const orderClause =
+        sortDirection === "desc"
+          ? "ORDER BY chain ASC, claim_id DESC"
+          : "ORDER BY chain ASC, claim_id ASC";
       const parsedLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
       const parsedOffset = Math.max(Number(offset) || 0, 0);
 
-      params.push(parsedLimit);
+      params.push(parsedLimit + 1);
       const limitClause = `LIMIT $${String(params.length)}`;
-      params.push(parsedOffset);
-      const offsetClause = `OFFSET $${String(params.length)}`;
+
+      let offsetClause = "";
+      if (decodedCursor === null) {
+        params.push(parsedOffset);
+        offsetClause = `OFFSET $${String(params.length)}`;
+      }
 
       const { rows } = await db.query(
         `SELECT chain || ':' || claim_id::text AS id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
                 created_at, settled, observed_at
            FROM pending_claim
           ${whereClause}
-          ORDER BY chain ASC, claim_id DESC
+          ${orderClause}
           ${limitClause}
           ${offsetClause}`,
         params,
       );
 
+      const hasMore = rows.length > parsedLimit;
+      const pageRows = hasMore ? rows.slice(0, parsedLimit) : rows;
+      const claims = pageRows.map(formatClaimRow);
+      const lastClaim = claims.at(-1);
+      const nextCursor =
+        hasMore && lastClaim !== undefined
+          ? encodeClaimCursor({
+              lastChain: lastClaim.chain,
+              lastClaimId: lastClaim.claimId,
+              sort: sortDirection,
+              filterHash,
+            })
+          : null;
+
       return reply.send({
-        claims: rows.map(formatClaimRow),
+        claims,
         limit: parsedLimit,
-        offset: parsedOffset,
-        count: rows.length,
+        offset: decodedCursor !== null ? null : parsedOffset,
+        count: claims.length,
+        pageInfo: {
+          mode: decodedCursor !== null ? "keyset" : "offset",
+          sort: sortDirection,
+          hasMore,
+          nextCursor,
+        },
       });
     },
   );

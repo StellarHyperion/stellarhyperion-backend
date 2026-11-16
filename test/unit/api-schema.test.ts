@@ -124,4 +124,25 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     expect(response.json().destination.symbol).toBe("USDC");
     expect(response.json().origin.netAmount).toBe("9970000");
   });
+
+  it("paginates real PostgreSQL transfers via keyset cursors while preserving offset reads", async () => {
+    const firstPage = await app.inject("/v1/transfers?originChain=stellar-testnet&limit=1");
+    expect(firstPage.statusCode).toBe(200);
+    const firstBody = firstPage.json();
+    expect(firstBody.transfers).toHaveLength(1);
+    expect(firstBody.offset).toBe(0);
+    expect(firstBody.pageInfo.mode).toBe("offset");
+    expect(firstBody.pageInfo.hasMore).toBe(true);
+    expect(typeof firstBody.pageInfo.nextCursor).toBe("string");
+
+    const secondPage = await app.inject(
+      `/v1/transfers?originChain=stellar-testnet&limit=1&cursor=${encodeURIComponent(firstBody.pageInfo.nextCursor)}`,
+    );
+    expect(secondPage.statusCode).toBe(200);
+    const secondBody = secondPage.json();
+    expect(secondBody.transfers).toHaveLength(1);
+    expect(secondBody.offset).toBeNull();
+    expect(secondBody.pageInfo.mode).toBe("keyset");
+    expect(secondBody.transfers[0].id).not.toBe(firstBody.transfers[0].id);
+  });
 });

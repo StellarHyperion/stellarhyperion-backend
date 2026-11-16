@@ -12,6 +12,14 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import {
+  assertPaginationCompatibility,
+  computeTransferFilterHash,
+  decodeTransferCursor,
+  encodeTransferCursor,
+  KeysetValidationError,
+  parseSortDirection,
+} from "../keyset.js";
 import type { ServerDeps } from "../server.js";
 
 export type TransferLifecycleStage =
@@ -418,7 +426,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
   app.get("/v1/transfers/:id", getTransferById);
   app.get("/api/v1/transfers/:id", getTransferById);
 
-  // 3. List transfers with filtering
+  // 3. List transfers with filtering and offset or keyset pagination
   app.get(
     "/v1/transfers",
     async (
@@ -432,12 +440,51 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
           search?: string;
           limit?: string;
           offset?: string;
+          cursor?: string;
+          sort?: string;
         };
       }>,
       reply: FastifyReply,
     ) => {
-      const { originChain, destinationChain, route, sender, recipient, search, limit, offset } =
-        request.query;
+      const {
+        originChain,
+        destinationChain,
+        route,
+        sender,
+        recipient,
+        search,
+        limit,
+        offset,
+        cursor,
+        sort,
+      } = request.query;
+
+      assertPaginationCompatibility(cursor, offset);
+      const sortDirection = parseSortDirection(sort);
+
+      let parsedRoute: number | null = null;
+      if (route !== undefined) {
+        const trimmedRoute = route.trim();
+        if (!/^\d+$/.test(trimmedRoute)) {
+          throw new KeysetValidationError("invalid_cursor", "route filter must be an integer");
+        }
+        parsedRoute = Number(trimmedRoute);
+        if (!Number.isSafeInteger(parsedRoute)) {
+          throw new KeysetValidationError("invalid_cursor", "route filter is out of range");
+        }
+      }
+
+      const filterHash = computeTransferFilterHash({
+        originChain,
+        destinationChain,
+        route: parsedRoute,
+        sender,
+        recipient,
+        search,
+      });
+
+      const decodedCursor =
+        cursor !== undefined ? decodeTransferCursor(cursor, sortDirection, filterHash) : null;
 
       const conditions: string[] = [];
       const params: unknown[] = [];
@@ -450,8 +497,8 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         params.push(destinationChain);
         conditions.push(`t.destination_chain = $${String(params.length)}`);
       }
-      if (route !== undefined) {
-        params.push(Number(route));
+      if (parsedRoute !== null) {
+        params.push(parsedRoute);
         conditions.push(`t.route = $${String(params.length)}`);
       }
       if (sender) {
@@ -471,25 +518,59 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         );
       }
 
+      if (decodedCursor !== null) {
+        params.push(decodedCursor.lastId.toString());
+        const cursorParam = `$${String(params.length)}`;
+        conditions.push(
+          sortDirection === "desc"
+            ? `t.id < ${cursorParam}::bigint`
+            : `t.id > ${cursorParam}::bigint`,
+        );
+      }
+
       const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+      const orderClause = sortDirection === "desc" ? "ORDER BY t.id DESC" : "ORDER BY t.id ASC";
       const parsedLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
       const parsedOffset = Math.max(Number(offset) || 0, 0);
 
-      params.push(parsedLimit);
+      params.push(parsedLimit + 1);
       const limitClause = `LIMIT $${String(params.length)}`;
-      params.push(parsedOffset);
-      const offsetClause = `OFFSET $${String(params.length)}`;
+
+      let offsetClause = "";
+      if (decodedCursor === null) {
+        params.push(parsedOffset);
+        offsetClause = `OFFSET $${String(params.length)}`;
+      }
 
       const { rows } = await db.query(
-        `${TRANSFER_QUERY} ${whereClause} ORDER BY t.id DESC ${limitClause} ${offsetClause}`,
+        `${TRANSFER_QUERY} ${whereClause} ${orderClause} ${limitClause} ${offsetClause}`,
         params,
       );
 
+      const hasMore = rows.length > parsedLimit;
+      const pageRows = hasMore ? rows.slice(0, parsedLimit) : rows;
+      const transfers = pageRows.map((row) => formatRow(row, deps.config));
+      const lastTransfer = transfers.at(-1);
+      const nextCursor =
+        hasMore && lastTransfer !== undefined
+          ? encodeTransferCursor({
+              lastId: lastTransfer.id,
+              sort: sortDirection,
+              filterHash,
+            })
+          : null;
+
       return reply.send({
-        transfers: rows.map((row) => formatRow(row, deps.config)),
+        transfers,
         limit: parsedLimit,
-        offset: parsedOffset,
-        count: rows.length,
+        offset: decodedCursor !== null ? null : parsedOffset,
+        count: transfers.length,
+        pageInfo: {
+          mode: decodedCursor !== null ? "keyset" : "offset",
+          sort: sortDirection,
+          hasMore,
+          nextCursor,
+        },
       });
     },
   );
