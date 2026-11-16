@@ -31,6 +31,7 @@ import { IrisClient } from "../rails/cctp/iris.js";
 import { RailPass } from "../rails/pass.js";
 import type { RailClient } from "../rails/types.js";
 import { KeeperWorker } from "../keeper/worker.js";
+import { syncWatcherRuntimeState } from "../observability/slo.js";
 import { viemClient } from "./evm/client.js";
 import { EvmWatcher } from "./evm/watcher.js";
 import { StellarRpc } from "./stellar/rpc.js";
@@ -214,6 +215,9 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
     workers,
     readiness: [...workers, ...extra],
     start: () => {
+      void syncWatcherRuntimeState(db, config).catch((err: unknown) => {
+        logger.warn({ err }, "failed to persist watcher runtime state");
+      });
       for (const worker of workers) worker.start();
       if (workers.length > 0) {
         logger.info({ workers: workers.map((worker) => worker.name) }, "watchers started");

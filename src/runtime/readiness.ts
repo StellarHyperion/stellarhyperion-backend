@@ -12,6 +12,8 @@
  * its own readiness and the HTTP layer only aggregates.
  */
 
+import type { FreshnessSloReport } from "../observability/slo.js";
+
 export type ReadinessState = "ready" | "degraded" | "down";
 
 export interface ReadinessReport {
@@ -54,6 +56,40 @@ export function fixedReadiness(
   detail: string,
 ): ReadinessSource {
   return { readiness: () => ({ name, state, detail }) };
+}
+
+/**
+ * Convert a persisted freshness SLO evaluation into a `/ready` check report.
+ *
+ * Breaches report `degraded` rather than `down`, so the API keeps answering queries while
+ * surfacing the exact breached lane and missing progress stage to monitors.
+ */
+export function freshnessSloToReadinessReport(report: FreshnessSloReport): ReadinessReport {
+  if (report.status === "disabled") {
+    return {
+      name: "freshness-slo",
+      state: "ready",
+      detail: "disabled or all configured watchers intentionally switched off",
+    };
+  }
+  if (report.status === "breached") {
+    const summary = report.breaches
+      .map((breach) => `${breach.laneKey} (${breach.missingStage})`)
+      .join(", ");
+    return {
+      name: "freshness-slo",
+      state: "degraded",
+      detail: `freshness SLO breached on ${summary}`,
+    };
+  }
+  return {
+    name: "freshness-slo",
+    state: "ready",
+    detail:
+      report.lanes.length === 0
+        ? "no configured lanes to evaluate"
+        : `all ${String(report.lanes.length)} configured lanes are within freshness and backlog targets`,
+  };
 }
 
 export interface RedisPingable {

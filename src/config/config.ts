@@ -20,11 +20,13 @@ import {
   DeploymentFormatError,
   IRIS_API,
   chainsFor,
+  isChainKey,
   isEvmChain,
   isEvmDeployment,
   isStellarChain,
   isStellarDeployment,
   parseDeploymentSet,
+  tryRouteFromSlug,
 } from "@hyperion/protocol";
 
 import type { EnumSpec, VarSpec } from "./env.js";
@@ -100,6 +102,20 @@ export interface KeeperConfig {
   readonly stellarSecret: string | null;
 }
 
+export interface LaneSloTargets {
+  readonly maxSourceScanLagSeconds: number;
+  readonly maxAttestationPollLagSeconds: number;
+  readonly maxDestinationProofLagSeconds: number;
+  readonly maxProofBacklog: number;
+}
+
+export interface FreshnessSloConfig {
+  readonly enabled: boolean;
+  readonly defaults: LaneSloTargets;
+  readonly laneOverrides: Readonly<Record<string, Partial<LaneSloTargets>>>;
+  readonly disabledWatchers: readonly string[];
+}
+
 export interface AppConfig {
   readonly nodeEnv: NodeEnv;
   readonly logLevel: LogLevel;
@@ -112,6 +128,7 @@ export interface AppConfig {
   readonly indexer: IndexerConfig;
   readonly rails: RailsConfig;
   readonly keeper: KeeperConfig;
+  readonly slo: FreshnessSloConfig;
   readonly shutdownTimeoutMs: number;
 }
 
@@ -404,6 +421,78 @@ const EVM_REORG_DEPTH: VarSpec = {
     "How far back the cursor winds when a reorg is found below the confirmation depth. Not a re-read on every pass: ordinary passes trust the cursor, because nothing past the confirmation line is indexed in the first place. Defaults per chain to that chain's own confirmations from the registry.",
 };
 
+const SLO_EVALUATION_ENABLED: VarSpec = {
+  name: "SLO_EVALUATION_ENABLED",
+  kind: "boolean",
+  required: false,
+  fallback: "true",
+  printable: true,
+  purpose: "Enables persisted per-lane freshness and destination proof backlog SLO evaluation.",
+};
+
+const SLO_SOURCE_SCAN_LAG_SECONDS: VarSpec = {
+  name: "SLO_SOURCE_SCAN_LAG_SECONDS",
+  kind: "integer",
+  required: false,
+  fallback: "600",
+  min: 1,
+  printable: true,
+  purpose: "Default maximum source cursor age in seconds before source_scan breaches.",
+};
+
+const SLO_ATTESTATION_POLL_LAG_SECONDS: VarSpec = {
+  name: "SLO_ATTESTATION_POLL_LAG_SECONDS",
+  kind: "integer",
+  required: false,
+  fallback: "600",
+  min: 1,
+  printable: true,
+  purpose:
+    "Default maximum seconds an undelivered transfer may go without a rail attestation check.",
+};
+
+const SLO_DESTINATION_PROOF_LAG_SECONDS: VarSpec = {
+  name: "SLO_DESTINATION_PROOF_LAG_SECONDS",
+  kind: "integer",
+  required: false,
+  fallback: "1800",
+  min: 1,
+  printable: true,
+  purpose:
+    "Default maximum age in seconds for an undelivered transfer awaiting canonical destination proof.",
+};
+
+const SLO_MAX_PROOF_BACKLOG: VarSpec = {
+  name: "SLO_MAX_PROOF_BACKLOG",
+  kind: "integer",
+  required: false,
+  fallback: "25",
+  min: 1,
+  printable: true,
+  purpose:
+    "Default maximum count of undelivered transfers on a lane before destination_proof breaches.",
+};
+
+const SLO_DISABLED_WATCHERS: VarSpec = {
+  name: "SLO_DISABLED_WATCHERS",
+  kind: "string",
+  required: false,
+  fallback: "",
+  printable: true,
+  purpose:
+    "Comma-separated chain keys or rail names intentionally disabled for maintenance so SLO evaluation marks them disabled rather than breached.",
+};
+
+const SLO_LANE_TARGETS_JSON: VarSpec = {
+  name: "SLO_LANE_TARGETS_JSON",
+  kind: "string",
+  required: false,
+  fallback: "",
+  printable: true,
+  purpose:
+    "Optional JSON object mapping '<originChain>-><destinationChain>:<routeSlug>' to per-lane freshness and backlog target overrides.",
+};
+
 /** `base-sepolia` becomes `BASE_SEPOLIA`, which is what an override variable is named after. */
 export function envSuffixFor(chain: ChainKey): string {
   return chain.toUpperCase().replaceAll("-", "_");
@@ -483,6 +572,16 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     ? reader.integer(EVM_REORG_DEPTH)
     : null;
 
+  const sloEnabled = reader.boolean(SLO_EVALUATION_ENABLED);
+  const sloSourceScanLagSeconds = reader.integer(SLO_SOURCE_SCAN_LAG_SECONDS);
+  const sloAttestationPollLagSeconds = reader.integer(SLO_ATTESTATION_POLL_LAG_SECONDS);
+  const sloDestinationProofLagSeconds = reader.integer(SLO_DESTINATION_PROOF_LAG_SECONDS);
+  const sloMaxProofBacklog = reader.integer(SLO_MAX_PROOF_BACKLOG);
+  const sloDisabledWatchersRaw = reader.string(SLO_DISABLED_WATCHERS);
+  const sloLaneTargetsRaw = reader.string(SLO_LANE_TARGETS_JSON);
+  const sloDisabledWatchers = parseDisabledWatchers(reader, sloDisabledWatchersRaw);
+  const sloLaneOverrides = parseLaneTargetsJson(reader, sloLaneTargetsRaw);
+
   const absoluteDeployments = deploymentsPath === "" ? "" : resolvePath(cwd, deploymentsPath);
   const deployments = readDeployments(reader, read, absoluteDeployments);
   const indexer = planIndexer(reader, {
@@ -526,6 +625,17 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       pollIntervalMs: keeperPollIntervalMs,
       concurrency: keeperConcurrency,
       stellarSecret: keeperStellarSecret,
+    },
+    slo: {
+      enabled: sloEnabled,
+      defaults: {
+        maxSourceScanLagSeconds: sloSourceScanLagSeconds,
+        maxAttestationPollLagSeconds: sloAttestationPollLagSeconds,
+        maxDestinationProofLagSeconds: sloDestinationProofLagSeconds,
+        maxProofBacklog: sloMaxProofBacklog,
+      },
+      laneOverrides: sloLaneOverrides,
+      disabledWatchers: sloDisabledWatchers,
     },
     shutdownTimeoutMs,
   };
@@ -696,6 +806,100 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
   // Stable order so logs and the ready check read the same way on every boot.
   evm.sort((a, b) => a.chain.localeCompare(b.chain));
   return { enabled: input.enabled, stellar, evm };
+}
+
+function parseDisabledWatchers(reader: EnvReader, raw: string): readonly string[] {
+  if (raw.trim() === "") return [];
+  const items = raw
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+  for (const item of items) {
+    if (item === "indexer" || item === "rails") continue;
+    if (item.startsWith("rail:")) {
+      const slug = item.slice("rail:".length);
+      if (slug === "axelar" || tryRouteFromSlug(slug) !== null) continue;
+      reader.reject(SLO_DISABLED_WATCHERS, `unknown rail identifier "${item}"`);
+      return [];
+    }
+    if (!isChainKey(item)) {
+      reader.reject(SLO_DISABLED_WATCHERS, `unknown chain key "${item}"`);
+      return [];
+    }
+  }
+  return items;
+}
+
+function parseLaneTargetsJson(
+  reader: EnvReader,
+  raw: string,
+): Readonly<Record<string, Partial<LaneSloTargets>>> {
+  if (raw.trim() === "") return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    reader.reject(SLO_LANE_TARGETS_JSON, `is not valid JSON: ${messageOf(error)}`);
+    return {};
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    reader.reject(SLO_LANE_TARGETS_JSON, "must be a JSON object keyed by lane identifier");
+    return {};
+  }
+
+  const out: Record<string, Partial<LaneSloTargets>> = {};
+  const allowedFields = new Set([
+    "maxSourceScanLagSeconds",
+    "maxAttestationPollLagSeconds",
+    "maxDestinationProofLagSeconds",
+    "maxProofBacklog",
+  ]);
+
+  for (const [laneKey, specRaw] of Object.entries(parsed as Record<string, unknown>)) {
+    const match = /^([a-z0-9-]+)->([a-z0-9-]+):([a-z0-9-]+)$/.exec(laneKey);
+    if (!match) {
+      reader.reject(
+        SLO_LANE_TARGETS_JSON,
+        `lane key "${laneKey}" must match "<originChain>-><destinationChain>:<routeSlug>"`,
+      );
+      return {};
+    }
+    const [, origin, destination, slug] = match;
+    if (!origin || !destination || !slug || !isChainKey(origin) || !isChainKey(destination)) {
+      reader.reject(SLO_LANE_TARGETS_JSON, `lane key "${laneKey}" names an unknown chain`);
+      return {};
+    }
+    if (tryRouteFromSlug(slug) === null) {
+      reader.reject(
+        SLO_LANE_TARGETS_JSON,
+        `lane key "${laneKey}" names an unknown route "${slug}"`,
+      );
+      return {};
+    }
+    if (typeof specRaw !== "object" || specRaw === null || Array.isArray(specRaw)) {
+      reader.reject(SLO_LANE_TARGETS_JSON, `target entry for "${laneKey}" must be an object`);
+      return {};
+    }
+
+    const partial: Record<string, number> = {};
+    for (const [field, val] of Object.entries(specRaw as Record<string, unknown>)) {
+      if (!allowedFields.has(field)) {
+        reader.reject(SLO_LANE_TARGETS_JSON, `unknown field "${field}" on lane "${laneKey}"`);
+        return {};
+      }
+      if (typeof val !== "number" || !Number.isInteger(val) || val < 1) {
+        reader.reject(
+          SLO_LANE_TARGETS_JSON,
+          `field "${field}" on lane "${laneKey}" must be a positive whole number`,
+        );
+        return {};
+      }
+      partial[field] = val;
+    }
+    out[laneKey] = partial;
+  }
+
+  return out;
 }
 
 function messageOf(error: unknown): string {

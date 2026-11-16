@@ -69,6 +69,8 @@ One process serializes its Stellar submissions to avoid sequence conflicts. Run 
 - `GET /v1/claims`, `GET /v1/claims/:chain/:claimId`
 - `GET /v1/routes/health`, `GET /v1/metrics`
 
+`/ready` and `/v1/metrics` evaluate configurable per-lane freshness and destination-proof backlog SLOs (`SLO_EVALUATION_ENABLED`, `SLO_SOURCE_SCAN_LAG_SECONDS`, `SLO_ATTESTATION_POLL_LAG_SECONDS`, `SLO_DESTINATION_PROOF_LAG_SECONDS`, `SLO_MAX_PROOF_BACKLOG`, `SLO_DISABLED_WATCHERS`, and `SLO_LANE_TARGETS_JSON`) directly from persisted PostgreSQL cursor, transfer, attestation, canonical `inbound_delivery` and `watcher_runtime_state` records so API-only deployments and separate worker processes report the same lane status and missing progress stage (`source_scan`, `attestation_poll`, or `destination_proof`).
+
 `npm run check` runs formatting, lint, type checking and tests. Schema/API regressions execute repository migrations in embedded PostgreSQL (PGlite). The full PostgreSQL integration suite requires `TEST_DATABASE_URL`; it is skipped when unset. Use `npm run build` for emitted production code.
 
 RPC event retention is finite. A fresh deployment record may predate the public RPC's retained history; initialize `STELLAR_START_LEDGER` within retained history only if you accept that older events are unavailable, or use a historical provider. Check readiness and logs rather than treating an empty database as complete history.
