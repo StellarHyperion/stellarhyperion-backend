@@ -74,6 +74,11 @@ export interface EvmWatchConfig {
   readonly pollIntervalMs: number;
 }
 
+export interface CctpRetentionConfig {
+  readonly rawProofRetentionDays: number;
+  readonly unconfirmedProofRetentionDays: number;
+}
+
 /** Everything the rail status pollers need. One per rail that has a status API. */
 export interface RailsConfig {
   readonly enabled: boolean;
@@ -84,6 +89,7 @@ export interface RailsConfig {
   readonly batchSize: number;
   readonly recheckAfterMs: number;
   readonly maxCheckFailures: number;
+  readonly cctpRetention: CctpRetentionConfig;
 }
 
 export interface IndexerConfig {
@@ -284,6 +290,30 @@ const RAIL_MAX_CHECK_FAILURES: VarSpec = {
     "Consecutive failures before the queue stops offering a transfer. Per transfer, not per rail: one unanswerable transfer must not back off the whole rail.",
 };
 
+const CCTP_RAW_PROOF_RETENTION_DAYS: VarSpec = {
+  name: "CCTP_RAW_PROOF_RETENTION_DAYS",
+  kind: "integer",
+  required: false,
+  fallback: "90",
+  min: 1,
+  max: 3650,
+  printable: true,
+  purpose:
+    "Days to keep full raw CCTP message and attestation hex payloads on confirmed audit rows before compacting to canonical summary evidence.",
+};
+
+const CCTP_UNCONFIRMED_PROOF_RETENTION_DAYS: VarSpec = {
+  name: "CCTP_UNCONFIRMED_PROOF_RETENTION_DAYS",
+  kind: "integer",
+  required: false,
+  fallback: "30",
+  min: 1,
+  max: 3650,
+  printable: true,
+  purpose:
+    "Days to keep terminal unconfirmed CCTP candidate audit rows that never established an inbound payout.",
+};
+
 const KEEPER_ENABLED: VarSpec = {
   name: "KEEPER_ENABLED",
   kind: "boolean",
@@ -465,6 +495,8 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const railBatchSize = reader.integer(RAIL_BATCH_SIZE);
   const railRecheckAfterMs = reader.integer(RAIL_RECHECK_AFTER_MS);
   const railMaxCheckFailures = reader.integer(RAIL_MAX_CHECK_FAILURES);
+  const cctpRawProofRetentionDays = reader.integer(CCTP_RAW_PROOF_RETENTION_DAYS);
+  const cctpUnconfirmedProofRetentionDays = reader.integer(CCTP_UNCONFIRMED_PROOF_RETENTION_DAYS);
 
   const keeperPollIntervalMs = reader.integer(KEEPER_POLL_INTERVAL_MS);
   const keeperConcurrency = reader.integer(KEEPER_CONCURRENCY);
@@ -520,6 +552,10 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       batchSize: railBatchSize,
       recheckAfterMs: railRecheckAfterMs,
       maxCheckFailures: railMaxCheckFailures,
+      cctpRetention: {
+        rawProofRetentionDays: cctpRawProofRetentionDays,
+        unconfirmedProofRetentionDays: cctpUnconfirmedProofRetentionDays,
+      },
     },
     keeper: {
       enabled: keeperEnabled,

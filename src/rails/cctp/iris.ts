@@ -538,4 +538,11 @@ function describe(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
 
+export function sanitizePublicHexArtifact(value: string | null | undefined): `0x${string}` | null {
+  if (typeof value !== "string" || !/^0x[0-9a-fA-F]+$/.test(value) || value.length % 2 !== 0) {
+    return null;
+  }
+  return value.toLowerCase() as `0x${string}`;
+}
+
 export { PENDING as IRIS_PENDING, COMPLETE as IRIS_COMPLETE, RATE_LIMIT_COOLDOWN_MS };
