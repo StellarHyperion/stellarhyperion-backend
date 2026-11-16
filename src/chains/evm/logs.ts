@@ -25,6 +25,13 @@ import { hyperionRouterAbi } from "@hyperion/protocol/abi";
 import { decodeEventLog } from "viem";
 import type { Hex } from "viem";
 
+import {
+  UnresolvedLogRangeError,
+  isProviderLogRangeLimitError,
+  type EvmClient,
+  type RawEvmLog,
+} from "./client.js";
+
 /** A 32 byte word of zeroes, which is how the router spells "no rail reference yet". */
 const ZERO_WORD = `0x${"0".repeat(64)}` as const;
 
@@ -150,6 +157,184 @@ export class LogShapeError extends Error {
 /** The first topic, which is the event signature and the only thing to name an unknown log by. */
 export function signatureOf(log: Pick<RouterLogInput, "topics">): Hex {
   return log.topics[0] ?? "0x";
+}
+
+export interface AdaptiveLogFetchResult {
+  readonly logs: readonly RawEvmLog[];
+  readonly requests: number;
+  readonly splits: number;
+  readonly duplicatesRemoved: number;
+}
+
+export interface AdaptiveLogFetchInput {
+  readonly chainKey: string;
+  readonly address: Hex;
+  readonly fromBlock: bigint;
+  readonly toBlock: bigint;
+  readonly minLogRange?: number;
+  readonly client: Pick<EvmClient, "logs">;
+  readonly signal?: AbortSignal;
+  readonly onSplit?: (event: {
+    readonly fromBlock: bigint;
+    readonly toBlock: bigint;
+    readonly leftTo: bigint;
+    readonly rightFrom: bigint;
+  }) => void;
+}
+
+/**
+ * Fetch router logs over `[fromBlock, toBlock]`, bisecting rejected intervals on provider block-range
+ * or result-size limits without skipping any sub-interval, then deduplicating boundary duplicates and
+ * sorting deterministically by `(blockNumber, logIndex)`.
+ */
+export async function fetchLogsAdaptive(
+  input: AdaptiveLogFetchInput,
+): Promise<AdaptiveLogFetchResult> {
+  const minLogRange = input.minLogRange ?? 1;
+  if (!Number.isInteger(minLogRange) || minLogRange < 1) {
+    throw new Error(
+      `minLogRange must be a positive integer, received ${String(input.minLogRange)}`,
+    );
+  }
+  if (input.fromBlock > input.toBlock) {
+    return { logs: [], requests: 0, splits: 0, duplicatesRemoved: 0 };
+  }
+
+  const stack: { readonly from: bigint; readonly to: bigint }[] = [
+    { from: input.fromBlock, to: input.toBlock },
+  ];
+  const completed: { readonly from: bigint; readonly to: bigint }[] = [];
+  const collected: RawEvmLog[] = [];
+  let requests = 0;
+  let splits = 0;
+
+  while (stack.length > 0) {
+    input.signal?.throwIfAborted();
+    const current = stack.pop();
+    if (current === undefined) break;
+
+    try {
+      requests += 1;
+      const chunk = await input.client.logs(
+        { address: input.address, fromBlock: current.from, toBlock: current.to },
+        input.signal,
+      );
+      completed.push(current);
+      for (const entry of chunk) {
+        if (entry.blockNumber >= current.from && entry.blockNumber <= current.to) {
+          collected.push(entry);
+        } else if (entry.blockNumber >= input.fromBlock && entry.blockNumber <= input.toBlock) {
+          // Some providers echo boundary logs slightly outside a sub-window; retain within overall
+          // scan bounds and let canonical deduplication collapse duplicates once.
+          collected.push(entry);
+        }
+      }
+    } catch (error) {
+      if (!isProviderLogRangeLimitError(error)) {
+        throw error;
+      }
+      const span = current.to - current.from + 1n;
+      if (span <= BigInt(minLogRange)) {
+        throw new UnresolvedLogRangeError({
+          chainKey: input.chainKey,
+          unresolvedFrom: current.from,
+          unresolvedTo: current.to,
+          requestedFrom: input.fromBlock,
+          requestedTo: input.toBlock,
+          minLogRange,
+          cause: error,
+        });
+      }
+      const mid = current.from + (current.to - current.from) / 2n;
+      const rightFrom = mid + 1n;
+      splits += 1;
+      input.onSplit?.({
+        fromBlock: current.from,
+        toBlock: current.to,
+        leftTo: mid,
+        rightFrom,
+      });
+      // Push right interval first so LIFO pops the lower `[from, mid]` interval first.
+      stack.push({ from: rightFrom, to: current.to });
+      stack.push({ from: current.from, to: mid });
+    }
+  }
+
+  assertContiguousCoverage(input.fromBlock, input.toBlock, completed);
+  const { logs, duplicatesRemoved } = dedupeAndOrderRouterLogs(collected);
+  return { logs, requests, splits, duplicatesRemoved };
+}
+
+function assertContiguousCoverage(
+  fromBlock: bigint,
+  toBlock: bigint,
+  completed: readonly { readonly from: bigint; readonly to: bigint }[],
+): void {
+  let expected = fromBlock;
+  for (const segment of completed) {
+    if (segment.from !== expected) {
+      throw new Error(
+        `adaptive EVM log scan skipped interval ${expected.toString()}..${(segment.from - 1n).toString()}`,
+      );
+    }
+    expected = segment.to + 1n;
+  }
+  if (expected !== toBlock + 1n) {
+    throw new Error(
+      `adaptive EVM log scan ended at ${(expected - 1n).toString()} instead of ${toBlock.toString()}`,
+    );
+  }
+}
+
+export function dedupeAndOrderRouterLogs(logs: readonly RawEvmLog[]): {
+  readonly logs: readonly RawEvmLog[];
+  readonly duplicatesRemoved: number;
+} {
+  const byIdentity = new Map<string, RawEvmLog>();
+  let duplicatesRemoved = 0;
+
+  for (const log of logs) {
+    const key = `${log.blockNumber.toString()}|${log.transactionHash.toLowerCase()}|${String(log.logIndex)}`;
+    const existing = byIdentity.get(key);
+    if (existing === undefined) {
+      byIdentity.set(key, log);
+      continue;
+    }
+    if (
+      existing.address.toLowerCase() !== log.address.toLowerCase() ||
+      existing.data.toLowerCase() !== log.data.toLowerCase() ||
+      !sameTopics(existing.topics, log.topics)
+    ) {
+      throw new Error(
+        `conflicting duplicate EVM log payload for block ${log.blockNumber.toString()} tx ${log.transactionHash} logIndex ${String(log.logIndex)}`,
+      );
+    }
+    // If one duplicate across a split boundary was marked removed, keep the removed marker conservative.
+    if (log.removed && !existing.removed) {
+      byIdentity.set(key, log);
+    }
+    duplicatesRemoved += 1;
+  }
+
+  const ordered = [...byIdentity.values()].sort((left, right) => {
+    if (left.blockNumber !== right.blockNumber) {
+      return left.blockNumber < right.blockNumber ? -1 : 1;
+    }
+    if (left.logIndex !== right.logIndex) {
+      return left.logIndex - right.logIndex;
+    }
+    return left.transactionHash.toLowerCase().localeCompare(right.transactionHash.toLowerCase());
+  });
+
+  return { logs: ordered, duplicatesRemoved };
+}
+
+function sameTopics(left: readonly Hex[], right: readonly Hex[]): boolean {
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i += 1) {
+    if (left[i]?.toLowerCase() !== right[i]?.toLowerCase()) return false;
+  }
+  return true;
 }
 
 function describe(value: unknown): string {

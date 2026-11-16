@@ -185,3 +185,94 @@ export function viemClient(
     },
   };
 }
+
+export class UnresolvedLogRangeError extends Error {
+  readonly chainKey: string;
+  readonly unresolvedFrom: bigint;
+  readonly unresolvedTo: bigint;
+  readonly requestedFrom: bigint;
+  readonly requestedTo: bigint;
+  readonly minLogRange: number;
+
+  constructor(input: {
+    readonly chainKey: string;
+    readonly unresolvedFrom: bigint;
+    readonly unresolvedTo: bigint;
+    readonly requestedFrom: bigint;
+    readonly requestedTo: bigint;
+    readonly minLogRange: number;
+    readonly cause: unknown;
+  }) {
+    const detail = scrubProviderError(
+      input.cause instanceof Error ? input.cause.message : String(input.cause),
+    );
+    super(
+      `provider rejected minimum EVM log window ${input.unresolvedFrom.toString()}..${input.unresolvedTo.toString()} ` +
+        `(minLogRange=${String(input.minLogRange)}) while scanning ${input.requestedFrom.toString()}..${input.requestedTo.toString()} ` +
+        `on ${input.chainKey}: ${detail}`,
+    );
+    this.name = "UnresolvedLogRangeError";
+    this.chainKey = input.chainKey;
+    this.unresolvedFrom = input.unresolvedFrom;
+    this.unresolvedTo = input.unresolvedTo;
+    this.requestedFrom = input.requestedFrom;
+    this.requestedTo = input.requestedTo;
+    this.minLogRange = input.minLogRange;
+  }
+}
+
+export function isProviderLogRangeLimitError(error: unknown): boolean {
+  let cursor: unknown = error;
+  for (let depth = 0; depth < 5 && typeof cursor === "object" && cursor !== null; depth += 1) {
+    const record = cursor as Record<string, unknown>;
+    const name = typeof record.name === "string" ? record.name : "";
+    if (name === "LimitExceededRpcError") {
+      return true;
+    }
+    const status = typeof record.status === "number" ? record.status : null;
+    if (status === 413) {
+      return true;
+    }
+    const code = typeof record.code === "number" ? record.code : null;
+    if (code === -32005) {
+      return true;
+    }
+    const parts = [record.message, record.shortMessage, record.details]
+      .filter((item): item is string => typeof item === "string")
+      .join(" ")
+      .toLowerCase();
+    if (
+      parts.includes("query returned more than") ||
+      parts.includes("exceeds max results") ||
+      parts.includes("max results") ||
+      parts.includes("too many results") ||
+      parts.includes("too many logs") ||
+      parts.includes("log response size exceeded") ||
+      parts.includes("response size is too large") ||
+      parts.includes("response size should not") ||
+      parts.includes("payload too large") ||
+      parts.includes("request entity too large") ||
+      parts.includes("block range") ||
+      parts.includes("range is too large") ||
+      parts.includes("eth_getlogs is limited")
+    ) {
+      return true;
+    }
+    cursor = record.cause;
+  }
+  return false;
+}
+
+function scrubProviderError(input: string): string {
+  return input
+    .replace(/https?:\/\/[^\s"'<>]+/gi, (rawUrl) => {
+      try {
+        const parsed = new URL(rawUrl);
+        return `${parsed.protocol}//${parsed.host}`;
+      } catch {
+        return "[redacted-url]";
+      }
+    })
+    .replace(/(bearer\s+)[a-z0-9._~+/-]+=*/gi, "$1[redacted]")
+    .replace(/([?&](?:api[_-]?key|key|token|secret|auth)=)[^&\s"'<>]+/gi, "$1[redacted]");
+}

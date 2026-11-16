@@ -32,7 +32,7 @@ import type { ReadinessReport } from "../../runtime/readiness.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
 import type { Position } from "../writers.js";
 import { ClaimPairing, applyRouterLog } from "./store.js";
-import { decodeRouterLog, signatureOf } from "./logs.js";
+import { decodeRouterLog, fetchLogsAdaptive, signatureOf } from "./logs.js";
 import type { EvmClient, RawEvmLog } from "./client.js";
 
 /**
@@ -58,6 +58,8 @@ export interface EvmWatcherOptions {
   readonly reorgDepth: number;
   /** Blocks per `getLogs` call. Public endpoints reject wide ranges. */
   readonly logRange: number;
+  /** Smallest block span allowed when bisecting provider-rejected `getLogs` ranges. Defaults to 1. */
+  readonly minLogRange?: number;
   readonly client: EvmClient;
   readonly db: Transactional;
   readonly logger: Logger;
@@ -72,6 +74,7 @@ export interface EvmProgress {
   /** Blocks between the cursor and the deepest block this watcher will read. */
   readonly behind: number;
   readonly reorgs: number;
+  readonly rangeSplits?: number;
   readonly at: Date;
 }
 
@@ -173,7 +176,28 @@ export class EvmWatcher {
     }
 
     const to = min(from + BigInt(this.options.logRange) - 1n, confirmed);
-    const logs = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
+    const adaptive = await fetchLogsAdaptive({
+      chainKey,
+      address: router,
+      fromBlock: from,
+      toBlock: to,
+      ...(this.options.minLogRange === undefined ? {} : { minLogRange: this.options.minLogRange }),
+      client,
+      signal,
+      onSplit: ({ fromBlock, toBlock, leftTo, rightFrom }) => {
+        logger.warn(
+          {
+            chain: chainKey,
+            rejectedFrom: fromBlock.toString(),
+            rejectedTo: toBlock.toString(),
+            leftRange: `${fromBlock.toString()}..${leftTo.toString()}`,
+            rightRange: `${rightFrom.toString()}..${toBlock.toString()}`,
+          },
+          "provider rejected evm log range; splitting request window",
+        );
+      },
+    });
+    const logs = adaptive.logs;
 
     // Block timestamps, which `getLogs` does not return and three columns need. One call per block
     // that actually has logs, plus the range end for its hash, rather than one per block in range.
@@ -236,6 +260,7 @@ export class EvmWatcher {
       head,
       behind,
       reorgs: this.reorgs,
+      rangeSplits: adaptive.splits,
       at: new Date(),
     };
     logger.info(
@@ -246,6 +271,8 @@ export class EvmWatcher {
         written,
         ignored,
         behind,
+        rangeSplits: adaptive.splits,
+        duplicatesRemoved: adaptive.duplicatesRemoved,
       },
       "evm range indexed",
     );

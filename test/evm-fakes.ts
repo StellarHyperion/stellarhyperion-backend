@@ -77,6 +77,14 @@ export interface FakeEvmClientOptions {
   readonly chainId?: number;
   /** Blocks the node no longer has, which is how a vanished block is expressed. */
   readonly missing?: readonly bigint[];
+  /** Reject `getLogs` requests spanning more than this many blocks with a provider limit error. */
+  readonly maxBlockSpan?: number;
+  /** Reject `getLogs` requests whose result count exceeds this ceiling. */
+  readonly maxLogsPerResponse?: number;
+  /** Echo logs at `fromBlock - 1n` and `toBlock + 1n` to simulate provider boundary duplication. */
+  readonly duplicateBoundaryLogs?: boolean;
+  /** Specific block that always triggers a provider result-limit error even on a 1-block window. */
+  readonly overloadedBlock?: bigint;
 }
 
 export class FakeEvmClient implements EvmClient {
@@ -88,6 +96,10 @@ export class FakeEvmClient implements EvmClient {
   private log: RawEvmLog[];
   private head: bigint;
   private readonly missing = new Set<bigint>();
+  private readonly maxBlockSpan: number | null;
+  private readonly maxLogsPerResponse: number | null;
+  private readonly duplicateBoundaryLogs: boolean;
+  private readonly overloadedBlock: bigint | null;
   /** Bumped for a block range that has been rewritten, which changes every hash at or above it. */
   private reorgFrom: bigint | null = null;
   private epoch = 0;
@@ -100,6 +112,10 @@ export class FakeEvmClient implements EvmClient {
       options.head ??
       this.log.reduce((max, entry) => (entry.blockNumber > max ? entry.blockNumber : max), 0n) + 1n;
     for (const block of options.missing ?? []) this.missing.add(block);
+    this.maxBlockSpan = options.maxBlockSpan ?? null;
+    this.maxLogsPerResponse = options.maxLogsPerResponse ?? null;
+    this.duplicateBoundaryLogs = options.duplicateBoundaryLogs ?? false;
+    this.overloadedBlock = options.overloadedBlock ?? null;
   }
 
   get latest(): bigint {
@@ -141,14 +157,47 @@ export class FakeEvmClient implements EvmClient {
 
   logs(query: LogQuery): Promise<readonly RawEvmLog[]> {
     this.logQueries.push(query);
+    const span = query.toBlock - query.fromBlock + 1n;
+    if (this.maxBlockSpan !== null && span > BigInt(this.maxBlockSpan)) {
+      const err = Object.assign(
+        new Error(`eth_getLogs block range is too large (max ${String(this.maxBlockSpan)} blocks)`),
+        { code: -32005 },
+      );
+      return Promise.reject(err);
+    }
+    if (
+      this.overloadedBlock !== null &&
+      query.fromBlock <= this.overloadedBlock &&
+      query.toBlock >= this.overloadedBlock
+    ) {
+      const err = Object.assign(
+        new Error(
+          `query returned more than 10000 results at https://user:secret@rpc.example.invalid/v1?api_key=leak`,
+        ),
+        { code: -32005 },
+      );
+      return Promise.reject(err);
+    }
+
+    const low = this.duplicateBoundaryLogs ? query.fromBlock - 1n : query.fromBlock;
+    const high = this.duplicateBoundaryLogs ? query.toBlock + 1n : query.toBlock;
+    const matched = this.log.filter(
+      (entry) =>
+        entry.address.toLowerCase() === query.address.toLowerCase() &&
+        entry.blockNumber >= low &&
+        entry.blockNumber <= high,
+    );
+
+    if (this.maxLogsPerResponse !== null && matched.length > this.maxLogsPerResponse) {
+      const err = Object.assign(
+        new Error(`query returned more than ${String(this.maxLogsPerResponse)} results`),
+        { code: -32005 },
+      );
+      return Promise.reject(err);
+    }
+
     return Promise.resolve(
-      this.log
-        .filter(
-          (entry) =>
-            entry.address.toLowerCase() === query.address.toLowerCase() &&
-            entry.blockNumber >= query.fromBlock &&
-            entry.blockNumber <= query.toBlock,
-        )
+      matched
         // Ascending by block then log index, which is the order a node returns them in and the
         // order the claim pairing depends on.
         .sort((a, b) =>

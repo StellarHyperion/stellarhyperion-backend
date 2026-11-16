@@ -197,6 +197,38 @@ suite("replaying the anvil deployment's logs", () => {
     await clean();
     await drain();
   });
+
+  it("produces the exact same database state when splitting rejected wide log ranges", async () => {
+    const baseline = await snapshot(db);
+
+    await clean();
+    const { logger } = capturingLogger();
+    const limitedClient = new FakeEvmClient({
+      head: ANVIL_HEAD,
+      maxBlockSpan: 14,
+      maxLogsPerResponse: 20,
+      duplicateBoundaryLogs: true,
+    });
+    const watcher = new EvmWatcher({
+      chainKey: CHAIN,
+      router: ANVIL_ROUTER,
+      chainId: ANVIL_CHAIN_ID,
+      startBlock: ANVIL_START_BLOCK,
+      confirmations: 0,
+      reorgDepth: 5,
+      logRange: 2_000,
+      client: limitedClient,
+      db,
+      logger,
+    });
+    await watcher.tick(AbortSignal.timeout(20_000));
+
+    expect(watcher.progress?.rangeSplits).toBeGreaterThan(0);
+    expect(await snapshot(db)).toEqual(baseline);
+
+    await clean();
+    await drain();
+  });
 });
 
 /** Everything keyed, in a comparable shape. route_health is append only and deliberately absent. */

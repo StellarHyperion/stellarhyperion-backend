@@ -10,7 +10,11 @@
 import { describe, expect, it } from "vitest";
 
 import { EvmWatcher } from "../../src/chains/evm/watcher.js";
-import { viemClient, type EvmClient } from "../../src/chains/evm/client.js";
+import {
+  UnresolvedLogRangeError,
+  viemClient,
+  type EvmClient,
+} from "../../src/chains/evm/client.js";
 import {
   ANVIL_HISTORY,
   ANVIL_CHAIN_ID,
@@ -545,5 +549,164 @@ describe("RPC endpoint failover", () => {
 
     // Cursor now advances properly from cursorRow(20n)
     expect(cursorWrites(db)).toEqual([{ block: 57n, family: "evm", hash: expect.any(String) }]);
+  });
+});
+
+describe("adaptive EVM log range splitting", () => {
+  const RECIPIENT = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8";
+  const TOKEN = "0x5fbdb2315678afecb367f032d93f642f64180aa3";
+
+  it("splits rejected large requests without skipping any sub-interval", async () => {
+    const client = new FakeEvmClient({
+      head: ANVIL_START_BLOCK + 39n,
+      maxBlockSpan: 14,
+      maxLogsPerResponse: 20,
+    });
+    const { watcher, db, lines } = harness({
+      client,
+      confirmations: 0,
+      logRange: 40,
+    });
+
+    const baselineDb = new RecordingDb();
+    const baselineWatcher = new EvmWatcher({
+      chainKey: CHAIN,
+      router: ANVIL_ROUTER,
+      chainId: ANVIL_CHAIN_ID,
+      startBlock: ANVIL_START_BLOCK,
+      confirmations: 0,
+      reorgDepth: 5,
+      logRange: 40,
+      client: new FakeEvmClient({ head: ANVIL_START_BLOCK + 39n }),
+      db: baselineDb,
+      logger: capturingLogger().logger,
+    });
+
+    await baselineWatcher.tick(AbortSignal.timeout(5_000));
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    expect(watcher.progress?.rangeSplits).toBeGreaterThan(0);
+    expect(watcher.progress?.written).toBe(baselineWatcher.progress?.written);
+    expect(cursorWrites(db)).toEqual(cursorWrites(baselineDb));
+    expect(
+      lines.some((line) => line.message.includes("provider rejected evm log range; splitting")),
+    ).toBe(true);
+  });
+
+  it("deduplicates boundary logs and preserves deterministic ordering across splits", async () => {
+    const txHash = `0x${"77".repeat(32)}` as const;
+    const boundaryBlock = ANVIL_START_BLOCK + 9n;
+    const parked = encodedLog(
+      "ClaimParked",
+      {
+        id: 15n,
+        recipient: RECIPIENT,
+        token: TOKEN,
+        amount: 300_000n,
+        route: 0,
+        sourceChain: "stellar-testnet",
+        sourceNonce: 501n,
+      },
+      { blockNumber: boundaryBlock, logIndex: 0, txHash },
+    );
+    const bridgeIn = encodedLog(
+      "BridgeIn",
+      {
+        route: 0,
+        recipient: RECIPIENT,
+        token: TOKEN,
+        amount: 300_000n,
+        sourceChain: "stellar-testnet",
+        sourceNonce: 501n,
+        messageId: `0x${"88".repeat(32)}`,
+      },
+      { blockNumber: boundaryBlock, logIndex: 1, txHash },
+    );
+    const secondHop = encodedLog(
+      "BridgeIn",
+      {
+        route: 0,
+        recipient: RECIPIENT,
+        token: TOKEN,
+        amount: 400_000n,
+        sourceChain: "stellar-testnet",
+        sourceNonce: 502n,
+        messageId: `0x${"99".repeat(32)}`,
+      },
+      { blockNumber: boundaryBlock + 1n, logIndex: 0, txHash: `0x${"aa".repeat(32)}` },
+    );
+
+    const inner = new FakeEvmClient({
+      logs: [secondHop, bridgeIn, parked],
+      head: ANVIL_START_BLOCK + 19n,
+      maxBlockSpan: 10,
+      duplicateBoundaryLogs: true,
+    });
+    // Return logs in reverse order from the underlying client to prove deterministic sorting.
+    const reversedClient: EvmClient = {
+      chainId: () => inner.chainId(),
+      blockNumber: () => inner.blockNumber(),
+      logs: async (q) => [...(await inner.logs(q))].reverse(),
+      blocks: (n) => inner.blocks(n),
+    };
+
+    const db = new RecordingDb();
+    const { logger } = capturingLogger();
+    const watcher = new EvmWatcher({
+      chainKey: CHAIN,
+      router: ANVIL_ROUTER,
+      chainId: ANVIL_CHAIN_ID,
+      startBlock: ANVIL_START_BLOCK,
+      confirmations: 0,
+      reorgDepth: 5,
+      logRange: 20,
+      client: reversedClient,
+      db,
+      logger,
+    });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    // Three unique logs (ClaimParked + BridgeIn on boundaryBlock, BridgeIn on boundaryBlock+1)
+    // must each apply once even though boundary logs were echoed by both split halves.
+    expect(watcher.progress?.written).toBe(3);
+    expect(db.matching("INSERT INTO pending_claim")).toHaveLength(1);
+    const inboundRows = db.matching("INSERT INTO inbound_delivery");
+    expect(inboundRows).toHaveLength(2);
+    // First arrival was properly paired with ClaimParked (delivered = false, claimId = "15").
+    expect(inboundRows[0]?.params[8]).toBe(false);
+    expect(inboundRows[0]?.params[9]).toBe("15");
+    // Second arrival landed directly (delivered = true, claimId = null).
+    expect(inboundRows[1]?.params[8]).toBe(true);
+    expect(inboundRows[1]?.params[9]).toBeNull();
+  });
+
+  it("reports the unresolved block range clearly when a minimum window still fails", async () => {
+    const failingBlock = ANVIL_START_BLOCK + 5n;
+    const client = new FakeEvmClient({
+      head: ANVIL_START_BLOCK + 15n,
+      overloadedBlock: failingBlock,
+    });
+    const { watcher, db } = harness({
+      client,
+      confirmations: 0,
+      logRange: 16,
+    });
+
+    let caught: unknown;
+    try {
+      await watcher.tick(AbortSignal.timeout(5_000));
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(UnresolvedLogRangeError);
+    const rangeErr = caught as UnresolvedLogRangeError;
+    expect(rangeErr.unresolvedFrom).toBe(failingBlock);
+    expect(rangeErr.unresolvedTo).toBe(failingBlock);
+    expect(rangeErr.message).toContain(`${failingBlock.toString()}..${failingBlock.toString()}`);
+    expect(rangeErr.message).not.toContain("secret");
+    expect(rangeErr.message).not.toContain("api_key=leak");
+    expect(cursorWrites(db)).toEqual([]);
   });
 });
