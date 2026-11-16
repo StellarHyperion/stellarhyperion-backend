@@ -12,6 +12,10 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import {
+  getCctpDeliveryEvidenceById,
+  getCctpDeliveryEvidenceByOriginNonce,
+} from "../../rails/cctp/delivery.js";
 import type { ServerDeps } from "../server.js";
 
 export type TransferLifecycleStage =
@@ -398,6 +402,54 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
 
   app.get("/v1/transfers/:id/stream", handleStream);
   app.get("/api/v1/transfers/:id/stream", handleStream);
+
+  // Read-only CCTP delivery evidence endpoints
+  const getEvidenceById = async (
+    request: FastifyRequest<{ Params: { id: string } }>,
+    reply: FastifyReply,
+  ) => {
+    const { id } = request.params;
+    const result = await getCctpDeliveryEvidenceById(db, id);
+    if (result.kind === "not_found") {
+      return reply.code(404).send({
+        error: "not_found",
+        message: `no transfer found with id ${id}`,
+      });
+    }
+    if (result.kind === "wrong_route") {
+      return reply.code(400).send({
+        error: "bad_request",
+        message: `transfer ${id} does not use the CCTP rail`,
+      });
+    }
+    return reply.send(result.evidence);
+  };
+
+  const getEvidenceByOriginNonce = async (
+    request: FastifyRequest<{ Params: { originChain: string; nonce: string } }>,
+    reply: FastifyReply,
+  ) => {
+    const { originChain, nonce } = request.params;
+    const result = await getCctpDeliveryEvidenceByOriginNonce(db, originChain, nonce);
+    if (result.kind === "not_found") {
+      return reply.code(404).send({
+        error: "not_found",
+        message: `no transfer found for chain ${originChain} and nonce ${nonce}`,
+      });
+    }
+    if (result.kind === "wrong_route") {
+      return reply.code(400).send({
+        error: "bad_request",
+        message: `transfer ${originChain}/${nonce} does not use the CCTP rail`,
+      });
+    }
+    return reply.send(result.evidence);
+  };
+
+  app.get("/v1/transfers/:id/evidence", getEvidenceById);
+  app.get("/api/v1/transfers/:id/evidence", getEvidenceById);
+  app.get("/v1/transfers/:originChain/:nonce/evidence", getEvidenceByOriginNonce);
+  app.get("/api/v1/transfers/:originChain/:nonce/evidence", getEvidenceByOriginNonce);
 
   // 4. Look up by ID
   const getTransferById = async (

@@ -538,4 +538,30 @@ function describe(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
 
+export const MAX_PUBLIC_REFERENCE_LENGTH = 130;
+
+/**
+ * Returns a bounded, credential-free public reference (hex hash/address, Stellar public strkey, or
+ * numeric identifier), or `null` if malformed, oversized, or carrying URL/credential markers.
+ */
+export function sanitizeBoundedPublicRef(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_PUBLIC_REFERENCE_LENGTH) return null;
+  if (/(:\/\/|@|\?|&|=|\s|bearer|apikey|secret|password|token)/i.test(trimmed)) return null;
+  if (/^0x[0-9a-fA-F]{2,128}$/.test(trimmed) && trimmed.length % 2 === 0) {
+    return trimmed.toLowerCase();
+  }
+  if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+    return trimmed.toLowerCase();
+  }
+  if (/^[GC][A-Z2-7]{55}$/.test(trimmed)) {
+    return trimmed;
+  }
+  if (/^\d{1,78}$/.test(trimmed)) {
+    return trimmed;
+  }
+  return null;
+}
+
 export { PENDING as IRIS_PENDING, COMPLETE as IRIS_COMPLETE, RATE_LIMIT_COOLDOWN_MS };
