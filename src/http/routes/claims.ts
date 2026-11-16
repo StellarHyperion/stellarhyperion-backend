@@ -9,6 +9,11 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text } from "../../db/rows.js";
+import {
+  validateClaimListQuery,
+  validateNetworkChain,
+  validateUnsignedBigIntParam,
+} from "../query-validation.js";
 import type { ServerDeps } from "../server.js";
 
 export interface FormattedClaim {
@@ -53,7 +58,26 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       request: FastifyRequest<{ Params: { chain: string; claimId: string } }>,
       reply: FastifyReply,
     ) => {
-      const { chain, claimId } = request.params;
+      const chainResult = validateNetworkChain("chain", request.params.chain, deps.config);
+      if (!chainResult.ok) {
+        return reply.code(400).send({
+          error: "invalid_query",
+          message: chainResult.message,
+          issues: chainResult.issues,
+          requestId: request.id,
+        });
+      }
+      const claimIdResult = validateUnsignedBigIntParam("claimId", request.params.claimId);
+      if (!claimIdResult.ok) {
+        return reply.code(400).send({
+          error: "invalid_query",
+          message: claimIdResult.message,
+          issues: claimIdResult.issues,
+          requestId: request.id,
+        });
+      }
+      const chain = chainResult.value;
+      const claimId = claimIdResult.value;
       const { rows } = await db.query(
         `SELECT chain || ':' || claim_id::text AS id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
                 created_at, settled, observed_at
@@ -83,6 +107,8 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
         Querystring: {
           chain?: string;
           recipient?: string;
+          token?: string;
+          route?: string;
           settled?: string;
           limit?: string;
           offset?: string;
@@ -90,31 +116,56 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       }>,
       reply: FastifyReply,
     ) => {
-      const { chain, recipient, settled, limit, offset } = request.query;
+      const validation = validateClaimListQuery(request.query, deps.config);
+      if (!validation.ok) {
+        return reply.code(400).send({
+          error: "invalid_query",
+          message: validation.message,
+          issues: validation.issues,
+          requestId: request.id,
+        });
+      }
 
+      const validated = validation.value;
       const conditions: string[] = [];
       const params: unknown[] = [];
 
-      if (chain) {
-        params.push(chain);
+      if (validated.chain !== null) {
+        params.push(validated.chain);
         conditions.push(`chain = $${String(params.length)}`);
       }
-      if (recipient) {
-        params.push(recipient);
-        conditions.push(`recipient = $${String(params.length)}`);
+      if (validated.recipient !== null) {
+        if (validated.recipient.family === "evm") {
+          const placeholders = validated.recipient.destinationMatches.map((candidate) => {
+            params.push(candidate);
+            return `$${String(params.length)}`;
+          });
+          conditions.push(`LOWER(recipient) IN (${placeholders.join(", ")})`);
+        } else {
+          params.push(validated.recipient.canonical);
+          conditions.push(`recipient = $${String(params.length)}`);
+        }
       }
-      if (settled !== undefined) {
-        params.push(settled === "true");
+      if (validated.token !== null) {
+        const placeholders = validated.token.matchValuesLower.map((candidate) => {
+          params.push(candidate);
+          return `$${String(params.length)}`;
+        });
+        conditions.push(`LOWER(token) IN (${placeholders.join(", ")})`);
+      }
+      if (validated.route !== null) {
+        params.push(validated.route);
+        conditions.push(`route = $${String(params.length)}`);
+      }
+      if (validated.settled !== null) {
+        params.push(validated.settled);
         conditions.push(`settled = $${String(params.length)}`);
       }
 
       const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-      const parsedLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
-      const parsedOffset = Math.max(Number(offset) || 0, 0);
-
-      params.push(parsedLimit);
+      params.push(validated.limit);
       const limitClause = `LIMIT $${String(params.length)}`;
-      params.push(parsedOffset);
+      params.push(validated.offset);
       const offsetClause = `OFFSET $${String(params.length)}`;
 
       const { rows } = await db.query(
@@ -130,8 +181,8 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
 
       return reply.send({
         claims: rows.map(formatClaimRow),
-        limit: parsedLimit,
-        offset: parsedOffset,
+        limit: validated.limit,
+        offset: validated.offset,
         count: rows.length,
       });
     },

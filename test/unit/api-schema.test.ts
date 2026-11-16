@@ -105,6 +105,14 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     const quoted = await app.inject("/v1/transfers?search=%27%20OR%201%3D1%20--");
     expect(quoted.statusCode).toBe(200);
     expect(quoted.json().transfers).toHaveLength(0);
+    const wildcard = await app.inject("/v1/transfers?search=%25");
+    expect(wildcard.statusCode).toBe(200);
+    expect(wildcard.json().transfers).toHaveLength(0);
+    const invalidCombo = await app.inject(
+      "/v1/transfers?originChain=stellar-testnet&destinationChain=stellar-testnet",
+    );
+    expect(invalidCombo.statusCode).toBe(400);
+    expect(invalidCombo.json().error).toBe("invalid_query");
   });
   it("reports the actual native-USDC payout after Circle fees in destination precision", async () => {
     const source = config.deployments.networks["stellar-testnet"];

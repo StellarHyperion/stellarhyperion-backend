@@ -12,6 +12,12 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import {
+  validateNetworkChain,
+  validateTransferListQuery,
+  validateTxHashParam,
+  validateUnsignedBigIntParam,
+} from "../query-validation.js";
 import type { ServerDeps } from "../server.js";
 
 export type TransferLifecycleStage =
@@ -249,7 +255,31 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       request: FastifyRequest<{ Params: { originChain: string; nonce: string } }>,
       reply: FastifyReply,
     ) => {
-      const { originChain, nonce } = request.params;
+      const chainResult = validateNetworkChain(
+        "originChain",
+        request.params.originChain,
+        deps.config,
+      );
+      if (!chainResult.ok) {
+        return reply.code(400).send({
+          error: "invalid_query",
+          message: chainResult.message,
+          issues: chainResult.issues,
+          requestId: request.id,
+        });
+      }
+      const nonceResult = validateUnsignedBigIntParam("nonce", request.params.nonce);
+      if (!nonceResult.ok) {
+        return reply.code(400).send({
+          error: "invalid_query",
+          message: nonceResult.message,
+          issues: nonceResult.issues,
+          requestId: request.id,
+        });
+      }
+
+      const originChain = chainResult.value;
+      const nonce = nonceResult.value;
       const { rows } = await db.query(
         `${TRANSFER_QUERY} WHERE t.origin_chain = $1 AND t.nonce = $2 LIMIT 1`,
         [originChain, nonce],
@@ -271,7 +301,16 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
   app.get(
     "/v1/transfers/by-tx/:txHash",
     async (request: FastifyRequest<{ Params: { txHash: string } }>, reply: FastifyReply) => {
-      const { txHash } = request.params;
+      const txResult = validateTxHashParam(request.params.txHash);
+      if (!txResult.ok) {
+        return reply.code(400).send({
+          error: "invalid_query",
+          message: txResult.message,
+          issues: txResult.issues,
+          requestId: request.id,
+        });
+      }
+      const txHash = txResult.value;
       const { rows } = await db.query(
         `${TRANSFER_QUERY} WHERE t.origin_tx = $1 OR d.destination_tx = $1 LIMIT 1`,
         [txHash],
@@ -297,7 +336,16 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     }>,
     reply: FastifyReply,
   ) => {
-    const { id } = request.params;
+    const idResult = validateUnsignedBigIntParam("id", request.params.id);
+    if (!idResult.ok) {
+      return reply.code(400).send({
+        error: "invalid_query",
+        message: idResult.message,
+        issues: idResult.issues,
+        requestId: request.id,
+      });
+    }
+    const id = idResult.value;
     const initial = await queryTransferById(id);
     if (initial === null) {
       return reply.code(404).send({
@@ -404,7 +452,16 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     request: FastifyRequest<{ Params: { id: string } }>,
     reply: FastifyReply,
   ) => {
-    const { id } = request.params;
+    const idResult = validateUnsignedBigIntParam("id", request.params.id);
+    if (!idResult.ok) {
+      return reply.code(400).send({
+        error: "invalid_query",
+        message: idResult.message,
+        issues: idResult.issues,
+        requestId: request.id,
+      });
+    }
+    const id = idResult.value;
     const transfer = await queryTransferById(id);
     if (transfer === null) {
       return reply.code(404).send({
@@ -429,6 +486,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
           route?: string;
           sender?: string;
           recipient?: string;
+          token?: string;
           search?: string;
           limit?: string;
           offset?: string;
@@ -436,48 +494,71 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       }>,
       reply: FastifyReply,
     ) => {
-      const { originChain, destinationChain, route, sender, recipient, search, limit, offset } =
-        request.query;
+      const validation = validateTransferListQuery(request.query, deps.config);
+      if (!validation.ok) {
+        return reply.code(400).send({
+          error: "invalid_query",
+          message: validation.message,
+          issues: validation.issues,
+          requestId: request.id,
+        });
+      }
 
+      const validated = validation.value;
       const conditions: string[] = [];
       const params: unknown[] = [];
 
-      if (originChain) {
-        params.push(originChain);
+      if (validated.originChain !== null) {
+        params.push(validated.originChain);
         conditions.push(`t.origin_chain = $${String(params.length)}`);
       }
-      if (destinationChain) {
-        params.push(destinationChain);
+      if (validated.destinationChain !== null) {
+        params.push(validated.destinationChain);
         conditions.push(`t.destination_chain = $${String(params.length)}`);
       }
-      if (route !== undefined) {
-        params.push(Number(route));
+      if (validated.route !== null) {
+        params.push(validated.route);
         conditions.push(`t.route = $${String(params.length)}`);
       }
-      if (sender) {
-        params.push(sender);
-        conditions.push(`t.sender = $${String(params.length)}`);
+      if (validated.sender !== null) {
+        params.push(validated.sender.canonical);
+        const param = `$${String(params.length)}`;
+        conditions.push(
+          validated.sender.family === "evm" ? `LOWER(t.sender) = ${param}` : `t.sender = ${param}`,
+        );
       }
-      if (recipient) {
-        params.push(recipient);
-        conditions.push(`t.destination = $${String(params.length)}`);
+      if (validated.recipient !== null) {
+        if (validated.recipient.family === "evm") {
+          const placeholders = validated.recipient.destinationMatches.map((candidate) => {
+            params.push(candidate);
+            return `$${String(params.length)}`;
+          });
+          conditions.push(`LOWER(t.destination) IN (${placeholders.join(", ")})`);
+        } else {
+          params.push(validated.recipient.canonical);
+          conditions.push(`t.destination = $${String(params.length)}`);
+        }
+      }
+      if (validated.token !== null) {
+        const placeholders = validated.token.matchValuesLower.map((candidate) => {
+          params.push(candidate);
+          return `$${String(params.length)}`;
+        });
+        conditions.push(`LOWER(t.token) IN (${placeholders.join(", ")})`);
       }
 
-      if (search?.trim()) {
-        params.push(`%${search.trim()}%`);
+      if (validated.searchLikePattern !== null) {
+        params.push(validated.searchLikePattern);
         const parameter = `$${String(params.length)}`;
         conditions.push(
-          `(t.origin_tx ILIKE ${parameter} OR d.destination_tx ILIKE ${parameter} OR t.sender ILIKE ${parameter} OR t.destination ILIKE ${parameter} OR t.nonce::text ILIKE ${parameter})`,
+          `(t.origin_tx ILIKE ${parameter} ESCAPE '\\' OR d.destination_tx ILIKE ${parameter} ESCAPE '\\' OR t.sender ILIKE ${parameter} ESCAPE '\\' OR t.destination ILIKE ${parameter} ESCAPE '\\' OR t.nonce::text ILIKE ${parameter} ESCAPE '\\')`,
         );
       }
 
       const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-      const parsedLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
-      const parsedOffset = Math.max(Number(offset) || 0, 0);
-
-      params.push(parsedLimit);
+      params.push(validated.limit);
       const limitClause = `LIMIT $${String(params.length)}`;
-      params.push(parsedOffset);
+      params.push(validated.offset);
       const offsetClause = `OFFSET $${String(params.length)}`;
 
       const { rows } = await db.query(
@@ -487,8 +568,8 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
 
       return reply.send({
         transfers: rows.map((row) => formatRow(row, deps.config)),
-        limit: parsedLimit,
-        offset: parsedOffset,
+        limit: validated.limit,
+        offset: validated.offset,
         count: rows.length,
       });
     },
