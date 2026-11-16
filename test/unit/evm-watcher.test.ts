@@ -7,10 +7,15 @@
  * rather than pointed at anvil, which will mine on demand but will not rewrite history underneath
  * a running watcher.
  */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { PGlite } from "@electric-sql/pglite";
 import { describe, expect, it } from "vitest";
 
 import { EvmWatcher } from "../../src/chains/evm/watcher.js";
+import { readOpenReorgRecovery, resolveReorgRecovery } from "../../src/chains/evm/store.js";
 import { viemClient, type EvmClient } from "../../src/chains/evm/client.js";
+import type { Queryable, Transactional } from "../../src/db/pool.js";
 import {
   ANVIL_HISTORY,
   ANVIL_CHAIN_ID,
@@ -545,5 +550,240 @@ describe("RPC endpoint failover", () => {
 
     // Cursor now advances properly from cursorRow(20n)
     expect(cursorWrites(db)).toEqual([{ block: 57n, family: "evm", hash: expect.any(String) }]);
+  });
+});
+
+async function openRecoveryDb(): Promise<{
+  readonly db: Transactional;
+  readonly close: () => Promise<void>;
+}> {
+  const pg = new PGlite();
+  for (const migration of [
+    "1790900000000_initial-schema.sql",
+    "1791000000000_cursor-block-hash.sql",
+    "1791100000000_cursor-autovacuum-tuning.sql",
+    "1791200000000_evm-deep-reorg-recovery.sql",
+  ]) {
+    const filePath = fileURLToPath(new URL(`../../migrations/${migration}`, import.meta.url));
+    const upSql = readFileSync(filePath, "utf8").split("-- Down Migration")[0]!;
+    await pg.exec(upSql);
+  }
+
+  const runQuery = async (sql: string, params: readonly unknown[] = []) => {
+    const result = await pg.query(sql, [...params]);
+    const int8 = result.fields.filter((f) => f.dataTypeID === 20).map((f) => f.name);
+    const rows = result.rows.map((raw) => {
+      const row = { ...(raw as Record<string, unknown>) };
+      for (const col of int8) {
+        const val = row[col];
+        if (typeof val === "number" || typeof val === "bigint") row[col] = String(val);
+      }
+      return row;
+    });
+    return { rows, rowCount: result.affectedRows ?? result.rows.length };
+  };
+
+  const db: Transactional = {
+    query: runQuery,
+    transaction: async <T>(fn: (tx: Queryable) => Promise<T>): Promise<T> => {
+      await pg.exec("BEGIN");
+      try {
+        const value = await fn({ query: runQuery });
+        await pg.exec("COMMIT");
+        return value;
+      } catch (error) {
+        await pg.exec("ROLLBACK");
+        throw error;
+      }
+    },
+  };
+
+  return {
+    db,
+    close: () => pg.close(),
+  };
+}
+
+describe("deep EVM reorg recovery beyond configured rewind depth", () => {
+  const RECIPIENT = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8";
+  const TOKEN = "0x5fbdb2315678afecb367f032d93f642f64180aa3";
+
+  it("marks affected deliveries non-canonical and enters bounded operator-visible recovery on deep reorg", async () => {
+    const { db, close } = await openRecoveryDb();
+    try {
+      const safeDelivery = encodedLog(
+        "BridgeIn",
+        {
+          route: 0,
+          recipient: RECIPIENT,
+          token: TOKEN,
+          amount: 100_000n,
+          sourceChain: "stellar-testnet",
+          sourceNonce: 1n,
+          messageId: `0x${"11".repeat(32)}`,
+        },
+        { blockNumber: 12n, logIndex: 0, txHash: `0x${"aa".repeat(32)}` },
+      );
+      const staleDelivery = encodedLog(
+        "BridgeIn",
+        {
+          route: 0,
+          recipient: RECIPIENT,
+          token: TOKEN,
+          amount: 250_000n,
+          sourceChain: "stellar-testnet",
+          sourceNonce: 2n,
+          messageId: `0x${"22".repeat(32)}`,
+        },
+        { blockNumber: 16n, logIndex: 0, txHash: `0x${"bb".repeat(32)}` },
+      );
+
+      const client = new FakeEvmClient({
+        logs: [safeDelivery, staleDelivery],
+        head: 22n,
+      });
+      const { logger, lines } = capturingLogger();
+      const watcher = new EvmWatcher({
+        chainKey: CHAIN,
+        router: ANVIL_ROUTER,
+        chainId: ANVIL_CHAIN_ID,
+        startBlock: 10n,
+        confirmations: 0,
+        reorgDepth: 3,
+        logRange: 20,
+        client,
+        db,
+        logger,
+      });
+
+      await watcher.tick(AbortSignal.timeout(5_000));
+      expect(watcher.readiness().state).toBe("ready");
+
+      // Trigger a deep reorg starting at block 15 (cursor=22, reorgDepth=3 -> anchorBoundary=19; 15 <= 19).
+      client.reorg(15n, []);
+      client.advanceHeadTo(24n);
+
+      const progressed = await watcher.tick(AbortSignal.timeout(5_000));
+      expect(progressed).toBe(false);
+
+      // Recovery state is bounded (15..22) and operator-visible.
+      expect(watcher.recovery).not.toBeNull();
+      expect(watcher.recovery?.recoveryFromBlock).toBe(15n);
+      expect(watcher.recovery?.recoveryToBlock).toBe(22n);
+      expect(watcher.recovery?.safeAnchorBlock).toBe(14n);
+      expect(watcher.recovery?.affectedDeliveries).toBe(1);
+      expect(watcher.readiness()).toMatchObject({
+        name: CHAIN,
+        state: "degraded",
+      });
+      expect(watcher.readiness().detail).toContain("15..22");
+      expect(
+        lines.some((line) => line.message.includes("deep reorg exceeded configured rewind depth")),
+      ).toBe(true);
+
+      // Delivery at block 16 is marked non-canonical; delivery at block 12 below fork remains canonical.
+      const deliveries = await db.query(
+        `SELECT source_nonce, canonical
+           FROM inbound_delivery
+          WHERE destination_chain = $1
+          ORDER BY source_nonce`,
+        [CHAIN],
+      );
+      expect(deliveries.rows).toEqual([
+        { source_nonce: "1", canonical: true },
+        { source_nonce: "2", canonical: false },
+      ]);
+
+      // Subsequent ticks stay paused while recovery remains open.
+      expect(await watcher.tick(AbortSignal.timeout(5_000))).toBe(false);
+      expect(await readOpenReorgRecovery(db, CHAIN, ANVIL_ROUTER)).not.toBeNull();
+
+      // Operator resolves recovery -> cursor rewinds to verified safe anchor 14 and resumes cleanly.
+      const resolved = await resolveReorgRecovery(db, {
+        chainKey: CHAIN,
+        contract: ANVIL_ROUTER,
+        startBlock: 10n,
+        note: "verified replacement fork from block 15",
+      });
+      expect(resolved.status).toBe("resolved");
+
+      await watcher.tick(AbortSignal.timeout(5_000));
+      expect(watcher.recovery).toBeNull();
+      expect(watcher.readiness().state).toBe("ready");
+      expect(watcher.progress?.block).toBe(24n);
+    } finally {
+      await close();
+    }
+  });
+
+  it("keeps normal shallow reorg processing automatic and replay-safe", async () => {
+    const { db, close } = await openRecoveryDb();
+    try {
+      const initialDelivery = encodedLog(
+        "BridgeIn",
+        {
+          route: 0,
+          recipient: RECIPIENT,
+          token: TOKEN,
+          amount: 100_000n,
+          sourceChain: "stellar-testnet",
+          sourceNonce: 9n,
+          messageId: `0x${"33".repeat(32)}`,
+        },
+        { blockNumber: 20n, logIndex: 0, txHash: `0x${"cc".repeat(32)}` },
+      );
+      const correctedDelivery = encodedLog(
+        "BridgeIn",
+        {
+          route: 0,
+          recipient: RECIPIENT,
+          token: TOKEN,
+          amount: 150_000n,
+          sourceChain: "stellar-testnet",
+          sourceNonce: 9n,
+          messageId: `0x${"33".repeat(32)}`,
+        },
+        { blockNumber: 21n, logIndex: 0, txHash: `0x${"dd".repeat(32)}` },
+      );
+
+      const client = new FakeEvmClient({ logs: [initialDelivery], head: 22n });
+      const { logger } = capturingLogger();
+      const watcher = new EvmWatcher({
+        chainKey: CHAIN,
+        router: ANVIL_ROUTER,
+        chainId: ANVIL_CHAIN_ID,
+        startBlock: 10n,
+        confirmations: 0,
+        reorgDepth: 4,
+        logRange: 20,
+        client,
+        db,
+        logger,
+      });
+
+      await watcher.tick(AbortSignal.timeout(5_000));
+
+      // Shallow reorg at block 20 (cursor=22, reorgDepth=4 -> anchorBoundary=18 still matches).
+      client.reorg(20n, [correctedDelivery]);
+      client.advanceHeadTo(23n);
+
+      await watcher.tick(AbortSignal.timeout(5_000));
+
+      expect(watcher.recovery).toBeNull();
+      expect(await readOpenReorgRecovery(db, CHAIN, ANVIL_ROUTER)).toBeNull();
+      expect(watcher.readiness().state).toBe("ready");
+
+      const deliveries = await db.query(
+        `SELECT amount, destination_block, canonical
+           FROM inbound_delivery
+          WHERE destination_chain = $1 AND source_nonce = 9`,
+        [CHAIN],
+      );
+      expect(deliveries.rows).toEqual([
+        { amount: "150000", destination_block: "21", canonical: true },
+      ]);
+    } finally {
+      await close();
+    }
   });
 });

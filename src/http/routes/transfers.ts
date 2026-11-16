@@ -220,6 +220,7 @@ const TRANSFER_QUERY = `
      AND d.route = t.route
      AND d.source_chain = t.origin_chain
      AND d.source_nonce = t.nonce
+     AND d.canonical = true
     LEFT JOIN pending_claim c
       ON c.chain = t.destination_chain
      AND c.route = t.route

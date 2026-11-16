@@ -39,6 +39,8 @@ const TABLES = [
   ["outbound_transfer", "origin_chain"],
   ["inbound_delivery", "destination_chain"],
   ["pending_claim", "chain"],
+  ["evm_block_anchor", "chain_key"],
+  ["evm_reorg_recovery", "chain_key"],
 ] as const;
 
 suite("replaying the anvil deployment's logs", () => {
@@ -193,6 +195,44 @@ suite("replaying the anvil deployment's logs", () => {
 
     expect(passes).toBeGreaterThan(5);
     expect(narrow).toEqual(wide);
+
+    await clean();
+    await drain();
+  });
+
+  it("enters bounded recovery mode and demotes canonical state on deep reorg beyond rewind depth", async () => {
+    await clean();
+    const client = new FakeEvmClient({ head: ANVIL_HEAD });
+    const { logger } = capturingLogger();
+    const watcher = new EvmWatcher({
+      chainKey: CHAIN,
+      router: ANVIL_ROUTER,
+      chainId: ANVIL_CHAIN_ID,
+      startBlock: ANVIL_START_BLOCK,
+      confirmations: 0,
+      reorgDepth: 3,
+      logRange: 2_000,
+      client,
+      db,
+      logger,
+    });
+
+    await watcher.tick(AbortSignal.timeout(20_000));
+
+    // Reorg from block 25 (cursor=35, reorgDepth=3 -> anchorBoundary=32; 25 <= 32 is a deep reorg).
+    client.reorg(25n, []);
+    client.advanceHeadTo(ANVIL_HEAD + 1n);
+
+    expect(await watcher.tick(AbortSignal.timeout(20_000))).toBe(false);
+    expect(watcher.recovery?.recoveryFromBlock).toBe(25n);
+    expect(watcher.recovery?.recoveryToBlock).toBe(ANVIL_HEAD);
+
+    const { rows } = await db.query(
+      "SELECT canonical FROM outbound_transfer WHERE origin_chain = $1 AND origin_block >= 25",
+      [CHAIN],
+    );
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((r) => r.canonical === false)).toBe(true);
 
     await clean();
     await drain();

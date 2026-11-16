@@ -31,7 +31,18 @@ import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
 import type { Position } from "../writers.js";
-import { ClaimPairing, applyRouterLog } from "./store.js";
+import {
+  ClaimPairing,
+  type EvmBlockAnchor,
+  type EvmReorgRecovery,
+  applyRouterLog,
+  deleteBlockAnchorsAbove,
+  enterDeepReorgRecovery,
+  pruneBlockAnchors,
+  readBlockAnchors,
+  readOpenReorgRecovery,
+  writeBlockAnchors,
+} from "./store.js";
 import { decodeRouterLog, signatureOf } from "./logs.js";
 import type { EvmClient, RawEvmLog } from "./client.js";
 
@@ -58,6 +69,8 @@ export interface EvmWatcherOptions {
   readonly reorgDepth: number;
   /** Blocks per `getLogs` call. Public endpoints reject wide ranges. */
   readonly logRange: number;
+  /** Maximum number of recent canonical block anchors retained for deep-reorg detection. */
+  readonly anchorRetentionBlocks?: number;
   readonly client: EvmClient;
   readonly db: Transactional;
   readonly logger: Logger;
@@ -77,13 +90,21 @@ export interface EvmProgress {
 
 export class EvmWatcher {
   private lastProgress: EvmProgress | null = null;
+  private activeRecovery: EvmReorgRecovery | null = null;
   private reorgs = 0;
+  private readonly anchorRetention: number;
   /** Set once the node has confirmed which chain it is. */
   private chainConfirmed = false;
   /** Signatures seen once and logged once. A router ahead of this build is not a log flood. */
   private readonly reportedUnknown = new Set<string>();
 
-  constructor(private readonly options: EvmWatcherOptions) {}
+  constructor(private readonly options: EvmWatcherOptions) {
+    const retention = options.anchorRetentionBlocks ?? Math.max(options.reorgDepth * 4, 64);
+    if (!Number.isInteger(retention) || retention < 1) {
+      throw new Error(`anchorRetentionBlocks must be a positive integer, got ${String(retention)}`);
+    }
+    this.anchorRetention = retention;
+  }
 
   get name(): string {
     return this.options.chainKey;
@@ -91,6 +112,10 @@ export class EvmWatcher {
 
   get progress(): EvmProgress | null {
     return this.lastProgress;
+  }
+
+  get recovery(): EvmReorgRecovery | null {
+    return this.activeRecovery;
   }
 
   /**
@@ -101,6 +126,16 @@ export class EvmWatcher {
    * reason to stop answering about the chains that are reachable.
    */
   readiness(): ReadinessReport {
+    if (this.activeRecovery !== null) {
+      return {
+        name: this.name,
+        state: "degraded",
+        detail:
+          `deep reorg recovery required on bounded range ` +
+          `${this.activeRecovery.recoveryFromBlock.toString()}..${this.activeRecovery.recoveryToBlock.toString()} ` +
+          `(exceeds reorgDepth=${String(this.activeRecovery.configuredReorgDepth)})`,
+      };
+    }
     const progress = this.lastProgress;
     if (progress === null) {
       return {
@@ -135,6 +170,21 @@ export class EvmWatcher {
   async tick(signal: AbortSignal): Promise<boolean> {
     const { chainKey, router, db, logger, client, confirmations } = this.options;
 
+    const openRecovery = await readOpenReorgRecovery(db, chainKey, router);
+    this.activeRecovery = openRecovery;
+    if (openRecovery !== null) {
+      logger.warn(
+        {
+          chain: chainKey,
+          recoveryFrom: openRecovery.recoveryFromBlock.toString(),
+          recoveryTo: openRecovery.recoveryToBlock.toString(),
+          configuredReorgDepth: openRecovery.configuredReorgDepth,
+        },
+        "evm watcher paused in deep reorg recovery mode",
+      );
+      return false;
+    }
+
     const stored = await readCursor(db, chainKey);
     if (stored !== null && stored.contract.toLowerCase() !== router.toLowerCase()) {
       // A different router at a different address shares no history with this cursor. Carrying it
@@ -154,8 +204,15 @@ export class EvmWatcher {
 
     let from = stored === null ? this.options.startBlock : stored.position + 1n;
     if (stored !== null && stored.hash !== null) {
-      const rewound = await this.checkForReorg(stored.position, stored.hash, signal);
-      if (rewound !== null) from = rewound;
+      const anchors = await readBlockAnchors(db, chainKey, router, this.anchorRetention);
+      const outcome = await this.inspectReorg(stored.position, stored.hash, anchors, signal);
+      if (outcome.kind === "deep-recovery") {
+        this.activeRecovery = outcome.recovery;
+        return false;
+      }
+      if (outcome.kind === "shallow-rewind") {
+        from = outcome.from;
+      }
     }
 
     if (from > confirmed) {
@@ -175,10 +232,17 @@ export class EvmWatcher {
     const to = min(from + BigInt(this.options.logRange) - 1n, confirmed);
     const logs = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
 
-    // Block timestamps, which `getLogs` does not return and three columns need. One call per block
-    // that actually has logs, plus the range end for its hash, rather than one per block in range.
+    const minRetainedAnchor = max(
+      this.options.startBlock,
+      to >= BigInt(this.anchorRetention) - 1n ? to - BigInt(this.anchorRetention) + 1n : 0n,
+    );
+    const anchorFloor = max(from, minRetainedAnchor);
+
+    // Block timestamps for log-bearing blocks plus bounded canonical anchors across `[anchorFloor..to]`.
     const wanted = new Set<bigint>(logs.map((log) => log.blockNumber));
-    wanted.add(to);
+    for (let blockNum = anchorFloor; blockNum <= to; blockNum += 1n) {
+      wanted.add(blockNum);
+    }
     const blocks = await client.blocks([...wanted], signal);
 
     const endHash = blocks.get(to)?.hash ?? null;
@@ -192,12 +256,24 @@ export class EvmWatcher {
       return false;
     }
 
+    const anchorsToWrite: EvmBlockAnchor[] = [];
+    for (let blockNum = anchorFloor; blockNum <= to; blockNum += 1n) {
+      const stamp = blocks.get(blockNum);
+      if (stamp !== undefined) {
+        anchorsToWrite.push({
+          chainKey,
+          contract: router,
+          blockNumber: blockNum,
+          blockHash: stamp.hash,
+        });
+      }
+    }
+
     let written = 0;
     let ignored = 0;
     const pairing = new ClaimPairing();
 
-    // One transaction for the range and the cursor advance past it. This is the restart guarantee,
-    // and splitting it would turn every crash into either a lost range or a duplicated one.
+    // One transaction for the range, canonical anchors, and the cursor advance past it.
     await db.transaction(async (tx: Queryable) => {
       for (const log of logs) {
         if (log.removed) {
@@ -215,6 +291,12 @@ export class EvmWatcher {
         if (await this.apply(tx, log, timestamp, pairing)) written += 1;
         else ignored += 1;
       }
+
+      if (stored !== null && to < stored.position) {
+        await deleteBlockAnchorsAbove(tx, chainKey, router, to);
+      }
+      await writeBlockAnchors(tx, anchorsToWrite);
+      await pruneBlockAnchors(tx, chainKey, router, minRetainedAnchor);
 
       await writeCursor(tx, {
         chainKey,
@@ -274,41 +356,103 @@ export class EvmWatcher {
   }
 
   /**
-   * Confirm the cursor still sits on the block it was written for.
+   * Inspect canonical block hashes across retained anchors and the stored cursor.
    *
-   * Returns the block to resume from when it does not, and null when nothing has changed. A
-   * mismatch here is not an ordinary reorg: it is one that reached past the confirmation depth
-   * this chain's registry entry claims is enough, which is worth saying out loud at error level
-   * rather than handling quietly.
+   * Shallow reorgs (`<= reorgDepth`) rewind automatically; deep mismatches extending at or below
+   * `position - reorgDepth` enter explicit bounded recovery mode and mark suspect state non-canonical.
    */
-  private async checkForReorg(
+  private async inspectReorg(
     position: bigint,
-    expected: string,
+    expectedCursorHash: string,
+    anchors: readonly EvmBlockAnchor[],
     signal: AbortSignal,
-  ): Promise<bigint | null> {
-    const { chainKey, logger, reorgDepth, confirmations } = this.options;
-    const blocks = await this.options.client.blocks([position], signal);
-    const actual = blocks.get(position)?.hash ?? null;
+  ): Promise<
+    | { readonly kind: "clean" }
+    | { readonly kind: "shallow-rewind"; readonly from: bigint }
+    | { readonly kind: "deep-recovery"; readonly recovery: EvmReorgRecovery }
+  > {
+    const { chainKey, router, db, logger, reorgDepth, confirmations, startBlock } = this.options;
+    const expectedMap = new Map<bigint, string>();
+    for (const anchor of anchors) {
+      if (anchor.blockNumber >= startBlock && anchor.blockNumber <= position) {
+        expectedMap.set(anchor.blockNumber, anchor.blockHash);
+      }
+    }
+    expectedMap.set(position, expectedCursorHash);
 
-    if (actual !== null && actual.toLowerCase() === expected.toLowerCase()) return null;
+    const numbers = [...expectedMap.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    const blocks = await this.options.client.blocks(numbers, signal);
+
+    let earliestMismatch: bigint | null = null;
+    let safeAnchor: { readonly blockNumber: bigint; readonly blockHash: string } | null = null;
+
+    for (const blockNum of numbers) {
+      const expectedHash = expectedMap.get(blockNum);
+      if (expectedHash === undefined) continue;
+      const candidateHash = blocks.get(blockNum)?.hash ?? null;
+      if (candidateHash?.toLowerCase() !== expectedHash.toLowerCase()) {
+        earliestMismatch = blockNum;
+        break;
+      }
+      safeAnchor = { blockNumber: blockNum, blockHash: expectedHash };
+    }
+
+    if (earliestMismatch === null) {
+      return { kind: "clean" };
+    }
 
     this.reorgs += 1;
-    const rewound = position - BigInt(reorgDepth) + 1n;
-    const from = rewound < this.options.startBlock ? this.options.startBlock : rewound;
+    const anchorBoundary = position - BigInt(reorgDepth);
+    const mismatchExpected = expectedMap.get(earliestMismatch) ?? expectedCursorHash;
+    const mismatchActual = blocks.get(earliestMismatch)?.hash ?? null;
+
+    if (anchorBoundary >= startBlock && earliestMismatch <= anchorBoundary) {
+      const recoveryFromBlock = safeAnchor !== null ? safeAnchor.blockNumber + 1n : startBlock;
+      const recovery = await enterDeepReorgRecovery(db, {
+        chainKey,
+        contract: router,
+        detectedAtBlock: position,
+        configuredReorgDepth: reorgDepth,
+        recoveryFromBlock,
+        recoveryToBlock: position,
+        safeAnchorBlock: safeAnchor?.blockNumber ?? null,
+        safeAnchorHash: safeAnchor?.blockHash ?? null,
+        mismatchedBlock: earliestMismatch,
+        expectedHash: mismatchExpected,
+        actualHash: mismatchActual,
+      });
+      logger.error(
+        {
+          chain: chainKey,
+          cursorBlock: position.toString(),
+          mismatchedBlock: earliestMismatch.toString(),
+          recoveryFrom: recovery.recoveryFromBlock.toString(),
+          recoveryTo: recovery.recoveryToBlock.toString(),
+          configuredReorgDepth: reorgDepth,
+          affectedDeliveries: recovery.affectedDeliveries,
+          affectedTransfers: recovery.affectedTransfers,
+        },
+        "deep reorg exceeded configured rewind depth; entering explicit recovery mode",
+      );
+      return { kind: "deep-recovery", recovery };
+    }
+
+    const rewound = anchorBoundary + 1n;
+    const from = rewound < startBlock ? startBlock : rewound;
     logger.error(
       {
         chain: chainKey,
-        block: position.toString(),
-        expected,
-        actual,
+        block: earliestMismatch.toString(),
+        expected: mismatchExpected,
+        actual: mismatchActual,
         confirmations,
         resumingFrom: from.toString(),
       },
-      actual === null
+      mismatchActual === null
         ? "the block at the cursor is gone from this node, which is a reorg past the confirmation depth; winding back"
         : "the block at the cursor has a different hash, which is a reorg past the confirmation depth; winding back",
     );
-    return from;
+    return { kind: "shallow-rewind", from };
   }
 
   private async apply(
@@ -357,6 +501,10 @@ export class EvmWatcher {
 
 function min(a: bigint, b: bigint): bigint {
   return a < b ? a : b;
+}
+
+function max(a: bigint, b: bigint): bigint {
+  return a > b ? a : b;
 }
 
 function timestampOf(seconds: bigint | null): Date | null {
