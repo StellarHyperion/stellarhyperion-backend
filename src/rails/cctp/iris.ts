@@ -33,6 +33,7 @@ import type {
   AttestationStatus,
 } from "../types.js";
 import { RailError } from "../types.js";
+import { sanitizeCctpDiagnosticText } from "./events.js";
 
 /** Circle's own status values. */
 const PENDING = "pending_confirmations";
@@ -526,8 +527,8 @@ async function describeError(response: Response): Promise<string> {
     const body = (await response.json()) as { error?: unknown; message?: unknown };
     // Two shapes, both real: the reference documents `{code, message}` and the sandbox returns
     // `{error}`.
-    if (typeof body.error === "string") return body.error;
-    if (typeof body.message === "string") return body.message;
+    if (typeof body.error === "string") return sanitizeCctpDiagnosticText(body.error);
+    if (typeof body.message === "string") return sanitizeCctpDiagnosticText(body.message);
     return "no reason given";
   } catch {
     return "no reason given";
@@ -535,7 +536,8 @@ async function describeError(response: Response): Promise<string> {
 }
 
 function describe(cause: unknown): string {
-  return cause instanceof Error ? cause.message : String(cause);
+  const raw = cause instanceof Error ? cause.message : String(cause);
+  return sanitizeCctpDiagnosticText(raw);
 }
 
 export { PENDING as IRIS_PENDING, COMPLETE as IRIS_COMPLETE, RATE_LIMIT_COOLDOWN_MS };

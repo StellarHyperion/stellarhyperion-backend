@@ -198,9 +198,11 @@ export class RailPass {
     }
 
     const { report } = lookup;
-    if (this.options.config && (report.execution || report.forwardTxHash)) {
+    if (this.options.config && (transfer.route === 0 || report.execution || report.forwardTxHash)) {
       const verified =
-        (await verifyItsDelivery(this.options.config, this.options.db, transfer, report)) ??
+        (report.execution
+          ? await verifyItsDelivery(this.options.config, this.options.db, transfer, report)
+          : null) ??
         (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report));
       if (verified) {
         await this.options.db.transaction(async (tx) => {

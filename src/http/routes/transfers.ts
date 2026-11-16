@@ -12,6 +12,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import { sanitizeCctpDiagnosticText } from "../../rails/cctp/events.js";
 import type { ServerDeps } from "../server.js";
 
 export type TransferLifecycleStage =
@@ -60,6 +61,17 @@ export interface FormattedTransfer {
     readonly reference: string | null;
     readonly attestedAt: string | null;
     readonly lastError: string | null;
+  } | null;
+  readonly verificationDiagnostic: {
+    readonly outcome: string;
+    readonly category: string;
+    readonly retryable: boolean;
+    readonly field: string | null;
+    readonly expected: string | null;
+    readonly observed: string | null;
+    readonly detail: string;
+    readonly candidateTxHash: string | null;
+    readonly candidateBlock: string | null;
   } | null;
   readonly claim: {
     readonly id: string;
@@ -130,6 +142,27 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
   const railStatus = textOrNull(row, "attestation_status");
 
   const stage = deriveStage(delivered, hasClaim, claimSettled, railStatus);
+  const rawLastError = textOrNull(row, "last_error");
+  const safeLastError =
+    rawLastError !== null ? sanitizeCctpDiagnosticText(rawLastError, 240) : null;
+
+  const vdOutcome = textOrNull(row, "vd_outcome");
+  const vdCategory = textOrNull(row, "vd_category");
+  const vdDetail = textOrNull(row, "vd_detail");
+  const verificationDiagnostic =
+    vdOutcome !== null && vdCategory !== null && vdDetail !== null
+      ? {
+          outcome: vdOutcome,
+          category: vdCategory,
+          retryable: row.vd_retryable === true,
+          field: textOrNull(row, "vd_field_name"),
+          expected: textOrNull(row, "vd_expected_summary"),
+          observed: textOrNull(row, "vd_observed_summary"),
+          detail: sanitizeCctpDiagnosticText(vdDetail, 240),
+          candidateTxHash: textOrNull(row, "vd_candidate_tx_hash"),
+          candidateBlock: textOrNull(row, "vd_candidate_block"),
+        }
+      : null;
 
   return {
     id: text(row, "id"),
@@ -173,8 +206,9 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
             attestedAt: row.attested_at
               ? new Date(row.attested_at as string | number | Date).toISOString()
               : null,
-            lastError: textOrNull(row, "last_error"),
+            lastError: safeLastError,
           },
+    verificationDiagnostic,
     claim: hasClaim
       ? {
           id: text(row, "claim_id"),
@@ -212,9 +246,19 @@ const TRANSFER_QUERY = `
          d.amount AS received_amount,
          d.observed_at AS delivered_at,
          c.claim_id,
-         c.settled AS claim_settled
+         c.settled AS claim_settled,
+         vd.outcome AS vd_outcome,
+         vd.category AS vd_category,
+         vd.retryable AS vd_retryable,
+         vd.field_name AS vd_field_name,
+         vd.expected_summary AS vd_expected_summary,
+         vd.observed_summary AS vd_observed_summary,
+         vd.detail AS vd_detail,
+         vd.candidate_tx_hash AS vd_candidate_tx_hash,
+         vd.candidate_block::text AS vd_candidate_block
     FROM outbound_transfer t
     LEFT JOIN rail_attestation a ON a.transfer_id = t.id
+    LEFT JOIN cctp_verification_diagnostic vd ON vd.transfer_id = t.id
     LEFT JOIN inbound_delivery d
       ON d.destination_chain = t.destination_chain
      AND d.route = t.route
