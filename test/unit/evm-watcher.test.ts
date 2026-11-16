@@ -7,10 +7,15 @@
  * rather than pointed at anvil, which will mine on demand but will not rewrite history underneath
  * a running watcher.
  */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { PGlite } from "@electric-sql/pglite";
 import { describe, expect, it } from "vitest";
 
 import { EvmWatcher } from "../../src/chains/evm/watcher.js";
+import { readBlockCheckpoints } from "../../src/chains/evm/store.js";
 import { viemClient, type EvmClient } from "../../src/chains/evm/client.js";
+import type { Queryable, Transactional } from "../../src/db/pool.js";
 import {
   ANVIL_HISTORY,
   ANVIL_CHAIN_ID,
@@ -545,5 +550,161 @@ describe("RPC endpoint failover", () => {
 
     // Cursor now advances properly from cursorRow(20n)
     expect(cursorWrites(db)).toEqual([{ block: 57n, family: "evm", hash: expect.any(String) }]);
+  });
+});
+
+async function openCheckpointDb(): Promise<{
+  readonly db: Transactional;
+  readonly close: () => Promise<void>;
+}> {
+  const pg = new PGlite();
+  for (const migration of [
+    "1790900000000_initial-schema.sql",
+    "1791000000000_cursor-block-hash.sql",
+    "1791100000000_cursor-autovacuum-tuning.sql",
+    "1791200000000_evm-block-checkpoints.sql",
+  ]) {
+    const filePath = fileURLToPath(new URL(`../../migrations/${migration}`, import.meta.url));
+    const upSql = readFileSync(filePath, "utf8").split("-- Down Migration")[0]!;
+    await pg.exec(upSql);
+  }
+
+  const runQuery = async (sql: string, params: readonly unknown[] = []) => {
+    const result = await pg.query(sql, [...params]);
+    const int8 = result.fields.filter((f) => f.dataTypeID === 20).map((f) => f.name);
+    const rows = result.rows.map((raw) => {
+      const row = { ...(raw as Record<string, unknown>) };
+      for (const col of int8) {
+        const val = row[col];
+        if (typeof val === "number" || typeof val === "bigint") row[col] = String(val);
+      }
+      return row;
+    });
+    return { rows, rowCount: result.affectedRows ?? result.rows.length };
+  };
+
+  const db: Transactional = {
+    query: runQuery,
+    transaction: async <T>(fn: (tx: Queryable) => Promise<T>): Promise<T> => {
+      await pg.exec("BEGIN");
+      try {
+        const value = await fn({ query: runQuery });
+        await pg.exec("COMMIT");
+        return value;
+      } catch (error) {
+        await pg.exec("ROLLBACK");
+        throw error;
+      }
+    },
+  };
+
+  return {
+    db,
+    close: () => pg.close(),
+  };
+}
+
+describe("independent EVM block checkpoints", () => {
+  it("detects empty-block reorgs across retained checkpoints without emitted router events", async () => {
+    const { db, close } = await openCheckpointDb();
+    try {
+      const client = new FakeEvmClient({ logs: [], head: 22n });
+      const { logger, lines } = capturingLogger();
+      const watcher = new EvmWatcher({
+        chainKey: CHAIN,
+        router: ANVIL_ROUTER,
+        chainId: ANVIL_CHAIN_ID,
+        startBlock: 10n,
+        confirmations: 0,
+        reorgDepth: 3,
+        logRange: 4,
+        checkpointRetentionBlocks: 10,
+        client,
+        db,
+        logger,
+      });
+
+      while (await watcher.tick(AbortSignal.timeout(5_000))) {
+        // catch up across empty ranges 10..13, 14..17, 18..21, 22..22
+      }
+
+      const beforeReorg = await readBlockCheckpoints(db, CHAIN, ANVIL_ROUTER, 20);
+      expect(beforeReorg.map((cp) => cp.blockNumber)).toEqual([
+        13n,
+        14n,
+        15n,
+        16n,
+        17n,
+        18n,
+        19n,
+        20n,
+        21n,
+        22n,
+      ]);
+      const oldHash15 = beforeReorg.find((cp) => cp.blockNumber === 15n)?.blockHash;
+
+      // Rewrite empty blocks starting at 15 (deeper than reorgDepth=3 from cursor 22, within retained 13..22).
+      client.reorg(15n, []);
+      client.advanceHeadTo(23n);
+
+      await watcher.tick(AbortSignal.timeout(5_000));
+
+      // Resumed from earliest mismatched retained checkpoint (15), even with zero router events.
+      const rescan = client.logQueries.at(-1);
+      expect(rescan?.fromBlock).toBe(15n);
+      expect(watcher.progress?.reorgs).toBe(1);
+      expect(lines.some((line) => line.message.includes("reorg past the confirmation depth"))).toBe(
+        true,
+      );
+
+      while (await watcher.tick(AbortSignal.timeout(5_000))) {
+        // finish catching up to 23
+      }
+
+      const afterReorg = await readBlockCheckpoints(db, CHAIN, ANVIL_ROUTER, 20);
+      const updatedHash15 = afterReorg.find((cp) => cp.blockNumber === 15n)?.blockHash;
+      expect(updatedHash15).toBe(client.stampFor(15n).hash);
+      expect(updatedHash15).not.toBe(oldHash15);
+    } finally {
+      await close();
+    }
+  });
+
+  it("enforces explicit bounded checkpoint cleanup and commits cursor checkpoints atomically", async () => {
+    const { db, close } = await openCheckpointDb();
+    try {
+      const client = new FakeEvmClient({ logs: [], head: 35n });
+      const { logger } = capturingLogger();
+      const watcher = new EvmWatcher({
+        chainKey: CHAIN,
+        router: ANVIL_ROUTER,
+        chainId: ANVIL_CHAIN_ID,
+        startBlock: 5n,
+        confirmations: 0,
+        reorgDepth: 3,
+        logRange: 6,
+        checkpointRetentionBlocks: 6,
+        client,
+        db,
+        logger,
+      });
+
+      while (await watcher.tick(AbortSignal.timeout(5_000))) {
+        // advance through empty windows with retention=6
+      }
+
+      const retained = await readBlockCheckpoints(db, CHAIN, ANVIL_ROUTER, 50);
+      expect(retained).toHaveLength(6);
+      expect(retained.map((cp) => cp.blockNumber)).toEqual([30n, 31n, 32n, 33n, 34n, 35n]);
+
+      const cursorRes = await db.query(
+        "SELECT last_processed, last_processed_hash FROM indexer_cursor WHERE chain_key = $1",
+        [CHAIN],
+      );
+      expect(String(cursorRes.rows[0]?.last_processed)).toBe("35");
+      expect(cursorRes.rows[0]?.last_processed_hash).toBe(retained.at(-1)?.blockHash);
+    } finally {
+      await close();
+    }
   });
 });

@@ -10,6 +10,7 @@
 import { ROUTE_KINDS } from "@hyperion/protocol";
 
 import type { Queryable } from "../../db/pool.js";
+import { bigintOf, text, timestamp } from "../../db/rows.js";
 import type { Position } from "../writers.js";
 import {
   settleAction,
@@ -249,4 +250,119 @@ export async function applyRouterLog(
     default:
       return { kind: "ignored" };
   }
+}
+
+export interface EvmBlockCheckpoint {
+  readonly chainKey: string;
+  readonly contract: string;
+  readonly blockNumber: bigint;
+  readonly blockHash: string;
+  readonly blockTimestamp: Date;
+}
+
+/**
+ * Read up to `limit` most recent canonical checkpoints for a chain and router in ascending block order.
+ */
+export async function readBlockCheckpoints(
+  db: Queryable,
+  chainKey: string,
+  contract: string,
+  limit: number,
+): Promise<readonly EvmBlockCheckpoint[]> {
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new Error(`checkpoint limit must be a positive integer, got ${String(limit)}`);
+  }
+  const { rows } = await db.query(
+    `SELECT chain_key, contract, block_number, block_hash, block_timestamp
+       FROM evm_block_checkpoint
+      WHERE chain_key = $1
+        AND lower(contract) = lower($2)
+      ORDER BY block_number DESC
+      LIMIT $3`,
+    [chainKey, contract, limit],
+  );
+  return rows
+    .map((row) => ({
+      chainKey: text(row, "chain_key"),
+      contract: text(row, "contract"),
+      blockNumber: bigintOf(row, "block_number"),
+      blockHash: text(row, "block_hash"),
+      blockTimestamp: timestamp(row, "block_timestamp"),
+    }))
+    .reverse();
+}
+
+/**
+ * Persist canonical block checkpoints inside the active scan commit transaction.
+ */
+export async function writeBlockCheckpoints(
+  db: Queryable,
+  checkpoints: readonly EvmBlockCheckpoint[],
+): Promise<void> {
+  if (checkpoints.length === 0) return;
+
+  const params: unknown[] = [];
+  const tuples: string[] = [];
+  for (const cp of checkpoints) {
+    const base = params.length;
+    params.push(
+      cp.chainKey,
+      cp.contract.toLowerCase(),
+      cp.blockNumber.toString(),
+      cp.blockHash,
+      cp.blockTimestamp,
+    );
+    tuples.push(
+      `($${String(base + 1)}, $${String(base + 2)}, $${String(base + 3)}, $${String(base + 4)}, $${String(base + 5)}, now())`,
+    );
+  }
+
+  await db.query(
+    `INSERT INTO evm_block_checkpoint
+       (chain_key, contract, block_number, block_hash, block_timestamp, recorded_at)
+     VALUES ${tuples.join(", ")}
+     ON CONFLICT (chain_key, contract, block_number) DO UPDATE SET
+       block_hash = EXCLUDED.block_hash,
+       block_timestamp = EXCLUDED.block_timestamp,
+       recorded_at = now()`,
+    params,
+  );
+}
+
+/**
+ * Remove checkpoints older than `minRetainedBlock` so checkpoint storage stays strictly bounded.
+ */
+export async function pruneBlockCheckpoints(
+  db: Queryable,
+  chainKey: string,
+  contract: string,
+  minRetainedBlock: bigint,
+): Promise<number> {
+  const { rowCount } = await db.query(
+    `DELETE FROM evm_block_checkpoint
+      WHERE chain_key = $1
+        AND lower(contract) = lower($2)
+        AND block_number < $3`,
+    [chainKey, contract, minRetainedBlock.toString()],
+  );
+  return rowCount;
+}
+
+/**
+ * Remove checkpoints strictly above `maxCanonicalBlock` when a reorg rewind moves the cursor back.
+ */
+export async function deleteBlockCheckpointsAbove(
+  db: Queryable,
+  chainKey: string,
+  contract: string,
+  maxCanonicalBlock: bigint,
+): Promise<number> {
+  const { rowCount } = await db.query(
+    `DELETE FROM evm_block_checkpoint
+      WHERE chain_key = $1
+        AND lower(contract) = lower($2)
+        AND block_number > $3`,
+    [chainKey, contract, maxCanonicalBlock.toString()],
+  );
+  return rowCount;
 }

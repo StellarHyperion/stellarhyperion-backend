@@ -31,7 +31,15 @@ import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
 import type { Position } from "../writers.js";
-import { ClaimPairing, applyRouterLog } from "./store.js";
+import {
+  ClaimPairing,
+  type EvmBlockCheckpoint,
+  applyRouterLog,
+  deleteBlockCheckpointsAbove,
+  pruneBlockCheckpoints,
+  readBlockCheckpoints,
+  writeBlockCheckpoints,
+} from "./store.js";
 import { decodeRouterLog, signatureOf } from "./logs.js";
 import type { EvmClient, RawEvmLog } from "./client.js";
 
@@ -58,6 +66,8 @@ export interface EvmWatcherOptions {
   readonly reorgDepth: number;
   /** Blocks per `getLogs` call. Public endpoints reject wide ranges. */
   readonly logRange: number;
+  /** Maximum number of recent canonical block checkpoints retained per router. */
+  readonly checkpointRetentionBlocks?: number;
   readonly client: EvmClient;
   readonly db: Transactional;
   readonly logger: Logger;
@@ -68,6 +78,8 @@ export interface EvmProgress {
   readonly block: bigint;
   readonly written: number;
   readonly ignored: number;
+  readonly checkpointsWritten: number;
+  readonly checkpointsPruned: number;
   readonly head: bigint;
   /** Blocks between the cursor and the deepest block this watcher will read. */
   readonly behind: number;
@@ -78,12 +90,21 @@ export interface EvmProgress {
 export class EvmWatcher {
   private lastProgress: EvmProgress | null = null;
   private reorgs = 0;
+  private readonly retentionBlocks: number;
   /** Set once the node has confirmed which chain it is. */
   private chainConfirmed = false;
   /** Signatures seen once and logged once. A router ahead of this build is not a log flood. */
   private readonly reportedUnknown = new Set<string>();
 
-  constructor(private readonly options: EvmWatcherOptions) {}
+  constructor(private readonly options: EvmWatcherOptions) {
+    const retention = options.checkpointRetentionBlocks ?? Math.max(options.reorgDepth * 2, 16);
+    if (!Number.isInteger(retention) || retention < 1) {
+      throw new Error(
+        `checkpointRetentionBlocks must be a positive integer, got ${String(retention)}`,
+      );
+    }
+    this.retentionBlocks = retention;
+  }
 
   get name(): string {
     return this.options.chainKey;
@@ -153,9 +174,21 @@ export class EvmWatcher {
     const confirmed = head - BigInt(confirmations);
 
     let from = stored === null ? this.options.startBlock : stored.position + 1n;
-    if (stored !== null && stored.hash !== null) {
-      const rewound = await this.checkForReorg(stored.position, stored.hash, signal);
-      if (rewound !== null) from = rewound;
+    if (stored !== null) {
+      const retained = await readBlockCheckpoints(db, chainKey, router, this.retentionBlocks);
+      const expectedCheckpoints = new Map<bigint, string>();
+      for (const cp of retained) {
+        if (cp.blockNumber >= this.options.startBlock && cp.blockNumber <= stored.position) {
+          expectedCheckpoints.set(cp.blockNumber, cp.blockHash);
+        }
+      }
+      if (stored.hash !== null && !expectedCheckpoints.has(stored.position)) {
+        expectedCheckpoints.set(stored.position, stored.hash);
+      }
+      if (expectedCheckpoints.size > 0) {
+        const rewound = await this.checkForReorg(stored.position, expectedCheckpoints, signal);
+        if (rewound !== null) from = rewound;
+      }
     }
 
     if (from > confirmed) {
@@ -164,6 +197,8 @@ export class EvmWatcher {
         block: stored?.position ?? this.options.startBlock - 1n,
         written: 0,
         ignored: 0,
+        checkpointsWritten: 0,
+        checkpointsPruned: 0,
         head,
         behind: Number(confirmed - (stored?.position ?? this.options.startBlock - 1n)),
         reorgs: this.reorgs,
@@ -175,14 +210,23 @@ export class EvmWatcher {
     const to = min(from + BigInt(this.options.logRange) - 1n, confirmed);
     const logs = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
 
-    // Block timestamps, which `getLogs` does not return and three columns need. One call per block
-    // that actually has logs, plus the range end for its hash, rather than one per block in range.
+    const minRetainedBlock = max(
+      this.options.startBlock,
+      to >= BigInt(this.retentionBlocks) - 1n ? to - BigInt(this.retentionBlocks) + 1n : 0n,
+    );
+    const checkpointFloor = max(from, minRetainedBlock);
+
+    // Block timestamps for every log-bearing block plus the bounded canonical checkpoint tail
+    // (always including `to`), so empty scanned ranges still persist canonical block hashes.
     const wanted = new Set<bigint>(logs.map((log) => log.blockNumber));
-    wanted.add(to);
+    for (let blockNum = checkpointFloor; blockNum <= to; blockNum += 1n) {
+      wanted.add(blockNum);
+    }
     const blocks = await client.blocks([...wanted], signal);
 
-    const endHash = blocks.get(to)?.hash ?? null;
-    if (endHash === null) {
+    const endStamp = blocks.get(to);
+    const endHash = endStamp?.hash ?? null;
+    if (endHash === null || endStamp === undefined) {
       // The range end vanished between the log read and the block read, which is a reorg landing
       // mid pass. Nothing is written and the next pass finds it through the cursor hash.
       logger.warn(
@@ -192,12 +236,27 @@ export class EvmWatcher {
       return false;
     }
 
+    const checkpointsToWrite: EvmBlockCheckpoint[] = [];
+    for (let blockNum = checkpointFloor; blockNum <= to; blockNum += 1n) {
+      const stamp = blocks.get(blockNum);
+      if (stamp !== undefined) {
+        checkpointsToWrite.push({
+          chainKey,
+          contract: router,
+          blockNumber: blockNum,
+          blockHash: stamp.hash,
+          blockTimestamp: new Date(Number(stamp.timestamp) * 1000),
+        });
+      }
+    }
+
     let written = 0;
     let ignored = 0;
+    let checkpointsPruned = 0;
     const pairing = new ClaimPairing();
 
-    // One transaction for the range and the cursor advance past it. This is the restart guarantee,
-    // and splitting it would turn every crash into either a lost range or a duplicated one.
+    // One transaction for the range, canonical block checkpoints, bounded retention cleanup,
+    // and the cursor advance past it.
     await db.transaction(async (tx: Queryable) => {
       for (const log of logs) {
         if (log.removed) {
@@ -216,12 +275,18 @@ export class EvmWatcher {
         else ignored += 1;
       }
 
+      if (stored !== null && to < stored.position) {
+        await deleteBlockCheckpointsAbove(tx, chainKey, router, to);
+      }
+      await writeBlockCheckpoints(tx, checkpointsToWrite);
+      checkpointsPruned = await pruneBlockCheckpoints(tx, chainKey, router, minRetainedBlock);
+
       await writeCursor(tx, {
         chainKey,
         family: "evm",
         contract: router,
         position: to,
-        observedAt: timestampOf(blocks.get(to)?.timestamp ?? null),
+        observedAt: timestampOf(endStamp.timestamp),
         // The whole reason the column exists. Without it the next pass cannot tell advancing from
         // being handed a different history.
         hash: endHash,
@@ -233,6 +298,8 @@ export class EvmWatcher {
       block: to,
       written,
       ignored,
+      checkpointsWritten: checkpointsToWrite.length,
+      checkpointsPruned,
       head,
       behind,
       reorgs: this.reorgs,
@@ -245,6 +312,8 @@ export class EvmWatcher {
         to: to.toString(),
         written,
         ignored,
+        checkpointsWritten: checkpointsToWrite.length,
+        checkpointsPruned,
         behind,
       },
       "evm range indexed",
@@ -274,31 +343,47 @@ export class EvmWatcher {
   }
 
   /**
-   * Confirm the cursor still sits on the block it was written for.
+   * Confirm retained checkpoints and the cursor block still match canonical chain history.
    *
-   * Returns the block to resume from when it does not, and null when nothing has changed. A
-   * mismatch here is not an ordinary reorg: it is one that reached past the confirmation depth
-   * this chain's registry entry claims is enough, which is worth saying out loud at error level
-   * rather than handling quietly.
+   * Returns the earliest safe block to resume from when any retained checkpoint disagrees or
+   * disappears, and null when every retained checkpoint still matches.
    */
   private async checkForReorg(
     position: bigint,
-    expected: string,
+    expectedCheckpoints: ReadonlyMap<bigint, string>,
     signal: AbortSignal,
   ): Promise<bigint | null> {
     const { chainKey, logger, reorgDepth, confirmations } = this.options;
-    const blocks = await this.options.client.blocks([position], signal);
-    const actual = blocks.get(position)?.hash ?? null;
+    const numbers = [...expectedCheckpoints.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    const blocks = await this.options.client.blocks(numbers, signal);
 
-    if (actual !== null && actual.toLowerCase() === expected.toLowerCase()) return null;
+    let mismatchBlock: bigint | null = null;
+    let expected = "";
+    let actual: string | null = null;
+
+    for (const blockNum of numbers) {
+      const expectedHash = expectedCheckpoints.get(blockNum);
+      if (expectedHash === undefined) continue;
+      const candidateHash = blocks.get(blockNum)?.hash ?? null;
+      if (candidateHash?.toLowerCase() !== expectedHash.toLowerCase()) {
+        mismatchBlock = blockNum;
+        expected = expectedHash;
+        actual = candidateHash;
+        break;
+      }
+    }
+
+    if (mismatchBlock === null) return null;
 
     this.reorgs += 1;
-    const rewound = position - BigInt(reorgDepth) + 1n;
-    const from = rewound < this.options.startBlock ? this.options.startBlock : rewound;
+    const standardRewind = position - BigInt(reorgDepth) + 1n;
+    const target = min(mismatchBlock, standardRewind);
+    const from = target < this.options.startBlock ? this.options.startBlock : target;
     logger.error(
       {
         chain: chainKey,
-        block: position.toString(),
+        block: mismatchBlock.toString(),
+        cursorBlock: position.toString(),
         expected,
         actual,
         confirmations,
@@ -357,6 +442,10 @@ export class EvmWatcher {
 
 function min(a: bigint, b: bigint): bigint {
   return a < b ? a : b;
+}
+
+function max(a: bigint, b: bigint): bigint {
+  return a > b ? a : b;
 }
 
 function timestampOf(seconds: bigint | null): Date | null {

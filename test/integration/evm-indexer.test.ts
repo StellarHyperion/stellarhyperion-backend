@@ -39,6 +39,7 @@ const TABLES = [
   ["outbound_transfer", "origin_chain"],
   ["inbound_delivery", "destination_chain"],
   ["pending_claim", "chain"],
+  ["evm_block_checkpoint", "chain_key"],
 ] as const;
 
 suite("replaying the anvil deployment's logs", () => {
@@ -193,6 +194,45 @@ suite("replaying the anvil deployment's logs", () => {
 
     expect(passes).toBeGreaterThan(5);
     expect(narrow).toEqual(wide);
+
+    await clean();
+    await drain();
+  });
+
+  it("persists bounded block checkpoints across empty ranges and detects empty-block reorgs", async () => {
+    await clean();
+    const client = new FakeEvmClient({ logs: [], head: ANVIL_START_BLOCK + 15n });
+    const { logger } = capturingLogger();
+    const watcher = new EvmWatcher({
+      chainKey: CHAIN,
+      router: ANVIL_ROUTER,
+      chainId: ANVIL_CHAIN_ID,
+      startBlock: ANVIL_START_BLOCK,
+      confirmations: 0,
+      reorgDepth: 4,
+      logRange: 5,
+      checkpointRetentionBlocks: 8,
+      client,
+      db,
+      logger,
+    });
+
+    while (await watcher.tick(AbortSignal.timeout(20_000))) {
+      // catch up across empty blocks
+    }
+
+    const { rows: cpRows } = await db.query(
+      "SELECT block_number, block_hash FROM evm_block_checkpoint WHERE chain_key = $1 ORDER BY block_number",
+      [CHAIN],
+    );
+    expect(cpRows).toHaveLength(8);
+    const reorgTarget = ANVIL_START_BLOCK + 10n;
+    client.reorg(reorgTarget, []);
+    client.advanceHeadTo(ANVIL_START_BLOCK + 16n);
+
+    await watcher.tick(AbortSignal.timeout(20_000));
+    expect(watcher.progress?.reorgs).toBe(1);
+    expect(client.logQueries.at(-1)?.fromBlock).toBe(reorgTarget);
 
     await clean();
     await drain();
