@@ -40,6 +40,13 @@ export class EventCursorError extends Error {
   }
 }
 
+export class EventSourceCompletenessError extends Error {
+  constructor(reason: string) {
+    super(`stellar event source completeness check failed: ${reason}`);
+    this.name = "EventSourceCompletenessError";
+  }
+}
+
 export interface CursorPosition {
   /** The ledger the cursor sits in. */
   readonly ledger: number;
@@ -85,13 +92,43 @@ export function parseEventCursor(cursor: string): CursorPosition {
   if (!/^\d+$/.test(toidText) || !/^\d+$/.test(indexText)) {
     throw new EventCursorError(cursor, "has a non numeric part");
   }
+  if ((toidText.length !== 19 && toidText.length !== 20) || indexText.length !== 10) {
+    throw new EventCursorError(cursor, "does not match canonical padded cursor width");
+  }
 
   const toid = BigInt(toidText);
+  const index = BigInt(indexText);
+  if (index > BigInt(END_OF_WINDOW_INDEX)) {
+    throw new EventCursorError(cursor, "has an event index exceeding uint32 bounds");
+  }
   const ledger = Number(toid >> 32n);
   if (!Number.isSafeInteger(ledger)) {
     throw new EventCursorError(cursor, "names a ledger too large to be real");
   }
-  return { ledger, completesLedger: Number(indexText) === END_OF_WINDOW_INDEX };
+  const completesLedger = Number(index) === END_OF_WINDOW_INDEX;
+  if (completesLedger && cursor !== endOfLedgerCursor(ledger)) {
+    throw new EventCursorError(
+      cursor,
+      "carries the end-of-window index without the end-of-ledger toid boundary",
+    );
+  }
+  return { ledger, completesLedger };
+}
+
+export function compareEventCursors(left: string, right: string): -1 | 0 | 1 {
+  parseEventCursor(left);
+  parseEventCursor(right);
+  const [leftToidText, leftIndexText] = left.split("-");
+  const [rightToidText, rightIndexText] = right.split("-");
+  const leftToid = BigInt(leftToidText ?? "0");
+  const rightToid = BigInt(rightToidText ?? "0");
+  if (leftToid !== rightToid) {
+    return leftToid < rightToid ? -1 : 1;
+  }
+  const leftIndex = BigInt(leftIndexText ?? "0");
+  const rightIndex = BigInt(rightIndexText ?? "0");
+  if (leftIndex === rightIndex) return 0;
+  return leftIndex < rightIndex ? -1 : 1;
 }
 
 /**
@@ -109,4 +146,201 @@ export function parseEventCursor(cursor: string): CursorPosition {
  */
 export function completeThrough(position: CursorPosition): number {
   return position.completesLedger ? position.ledger : position.ledger - 1;
+}
+
+export interface RawEventEnvelope {
+  readonly id: string;
+  readonly ledger: number;
+  readonly contractId: string;
+  readonly type: string;
+  readonly txHash: string;
+  readonly ledgerClosedAt: string;
+}
+
+export interface ValidatedEventsPage<TEvent extends RawEventEnvelope = RawEventEnvelope> {
+  readonly events: readonly TEvent[];
+  readonly cursor: string;
+  readonly candidateThrough: number;
+  readonly repeatedTerminalMarker: boolean;
+}
+
+function isEnvelope(value: unknown): value is RawEventEnvelope {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.id === "string" &&
+    typeof record.ledger === "number" &&
+    typeof record.contractId === "string" &&
+    typeof record.type === "string" &&
+    typeof record.txHash === "string" &&
+    typeof record.ledgerClosedAt === "string"
+  );
+}
+
+/**
+ * Validate provider ledger metadata, event ordering, contract identity, and completion markers
+ * before accepting a page or advancing a scan boundary.
+ */
+export function validateEventsPageCompleteness<TEvent extends RawEventEnvelope = RawEventEnvelope>(
+  page: {
+    readonly events: readonly unknown[];
+    readonly cursor: string | null;
+    readonly latestLedger: number;
+    readonly oldestLedger: number;
+  },
+  context: {
+    readonly expectedContract: string;
+    readonly query: {
+      readonly startLedger?: number;
+      readonly cursor?: string;
+      readonly limit: number;
+    };
+  },
+): ValidatedEventsPage<TEvent> {
+  if (
+    !Number.isSafeInteger(page.latestLedger) ||
+    !Number.isSafeInteger(page.oldestLedger) ||
+    page.latestLedger < 0 ||
+    page.oldestLedger < 0 ||
+    page.oldestLedger > page.latestLedger
+  ) {
+    throw new EventSourceCompletenessError(
+      `invalid provider ledger bounds oldest=${String(page.oldestLedger)} latest=${String(page.latestLedger)}`,
+    );
+  }
+
+  if (context.query.startLedger !== undefined && context.query.startLedger > page.latestLedger) {
+    throw new EventSourceCompletenessError(
+      `requested startLedger ${String(context.query.startLedger)} exceeds provider latestLedger ${String(page.latestLedger)}`,
+    );
+  }
+
+  if (page.events.length > context.query.limit) {
+    throw new EventSourceCompletenessError(
+      `provider returned ${String(page.events.length)} events exceeding requested limit ${String(context.query.limit)}`,
+    );
+  }
+
+  if (page.cursor === null) {
+    throw new EventSourceCompletenessError("provider response omitted completion cursor");
+  }
+
+  let parsedPageCursor: CursorPosition;
+  try {
+    parsedPageCursor = parseEventCursor(page.cursor);
+  } catch (error) {
+    throw new EventSourceCompletenessError(error instanceof Error ? error.message : String(error));
+  }
+
+  if (parsedPageCursor.ledger > page.latestLedger) {
+    throw new EventSourceCompletenessError(
+      `page cursor ledger ${String(parsedPageCursor.ledger)} exceeds provider latestLedger ${String(page.latestLedger)}`,
+    );
+  }
+
+  let minLedger = 0;
+  if (context.query.cursor !== undefined) {
+    const requestedPos = parseEventCursor(context.query.cursor);
+    const cursorCmp = compareEventCursors(page.cursor, context.query.cursor);
+    if (cursorCmp < 0) {
+      throw new EventSourceCompletenessError(
+        `page cursor ${page.cursor} regressed behind requested cursor ${context.query.cursor}`,
+      );
+    }
+    if (cursorCmp === 0) {
+      if (page.events.length > 0) {
+        throw new EventSourceCompletenessError(
+          `repeated cursor ${page.cursor} accompanied non-empty events page`,
+        );
+      }
+      return {
+        events: [],
+        cursor: page.cursor,
+        candidateThrough: completeThrough(parsedPageCursor),
+        repeatedTerminalMarker: true,
+      };
+    }
+    minLedger = requestedPos.completesLedger ? requestedPos.ledger + 1 : requestedPos.ledger;
+  } else if (context.query.startLedger !== undefined) {
+    minLedger = context.query.startLedger;
+    if (parsedPageCursor.ledger < minLedger) {
+      throw new EventSourceCompletenessError(
+        `page cursor ledger ${String(parsedPageCursor.ledger)} precedes startLedger ${String(minLedger)}`,
+      );
+    }
+  }
+
+  const verifiedEvents: TEvent[] = [];
+  let previousEventCursor: string | null = context.query.cursor ?? null;
+
+  for (const raw of page.events) {
+    if (!isEnvelope(raw)) {
+      throw new EventSourceCompletenessError("provider returned malformed event envelope");
+    }
+    if (raw.contractId !== context.expectedContract) {
+      throw new EventSourceCompletenessError(
+        `event ${raw.id} belongs to unexpected contract ${raw.contractId}`,
+      );
+    }
+
+    let eventCursorPos: CursorPosition;
+    try {
+      eventCursorPos = parseEventCursor(raw.id);
+    } catch (error) {
+      throw new EventSourceCompletenessError(
+        `invalid event id ${JSON.stringify(raw.id)}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+
+    if (eventCursorPos.completesLedger) {
+      throw new EventSourceCompletenessError(
+        `event ${raw.id} illegally carries end-of-window index`,
+      );
+    }
+    if (eventCursorPos.ledger !== raw.ledger) {
+      throw new EventSourceCompletenessError(
+        `event ${raw.id} encodes ledger ${String(eventCursorPos.ledger)} while envelope reports ${String(raw.ledger)}`,
+      );
+    }
+    if (raw.ledger < minLedger || raw.ledger > page.latestLedger) {
+      throw new EventSourceCompletenessError(
+        `event ${raw.id} at ledger ${String(raw.ledger)} falls outside [${String(minLedger)}, ${String(page.latestLedger)}]`,
+      );
+    }
+    if (previousEventCursor !== null && compareEventCursors(raw.id, previousEventCursor) <= 0) {
+      throw new EventSourceCompletenessError(
+        `event ${raw.id} is not strictly ordered after ${previousEventCursor}`,
+      );
+    }
+
+    previousEventCursor = raw.id;
+    verifiedEvents.push(raw as TEvent);
+  }
+
+  const lastEvent = verifiedEvents[verifiedEvents.length - 1];
+  if (lastEvent !== undefined && compareEventCursors(page.cursor, lastEvent.id) < 0) {
+    throw new EventSourceCompletenessError(
+      `page cursor ${page.cursor} precedes final event ${lastEvent.id}`,
+    );
+  }
+
+  if (!parsedPageCursor.completesLedger) {
+    if (verifiedEvents.length < context.query.limit) {
+      throw new EventSourceCompletenessError(
+        `truncated mid-ledger page returned ${String(verifiedEvents.length)} of ${String(context.query.limit)} events without an end-of-window marker`,
+      );
+    }
+    if (lastEvent?.id !== page.cursor) {
+      throw new EventSourceCompletenessError(
+        `mid-ledger page cursor ${page.cursor} does not match final event id ${lastEvent?.id ?? "none"}`,
+      );
+    }
+  }
+
+  return {
+    events: verifiedEvents,
+    cursor: page.cursor,
+    candidateThrough: completeThrough(parsedPageCursor),
+    repeatedTerminalMarker: false,
+  };
 }

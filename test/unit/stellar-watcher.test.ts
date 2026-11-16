@@ -8,8 +8,12 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { endOfLedgerCursor } from "../../src/chains/stellar/cursor.js";
+import {
+  EventSourceCompletenessError,
+  endOfLedgerCursor,
+} from "../../src/chains/stellar/cursor.js";
 import type { RawStellarEvent } from "../../src/chains/stellar/events.js";
+import type { EventSource } from "../../src/chains/stellar/rpc.js";
 import { StellarWatcher } from "../../src/chains/stellar/watcher.js";
 import {
   FakeRpc,
@@ -342,5 +346,175 @@ describe("gaps it cannot close", () => {
 
     const warnings = lines.filter((line) => line.message.includes("running ahead of the indexer"));
     expect(warnings).toHaveLength(1);
+  });
+});
+
+describe("event-source completeness checks in watcher passes", () => {
+  it("refuses to advance the cursor on truncated, out-of-order, or over-head provider pages", async () => {
+    const e1 = syntheticEvent({
+      ledger: FIRST_EVENT_LEDGER + 1,
+      id: `${toid(FIRST_EVENT_LEDGER + 1, 0, 0)
+        .toString()
+        .padStart(19, "0")}-0000000000`,
+    });
+    const e2 = syntheticEvent({
+      ledger: FIRST_EVENT_LEDGER + 2,
+      id: `${toid(FIRST_EVENT_LEDGER + 2, 0, 0)
+        .toString()
+        .padStart(19, "0")}-0000000000`,
+    });
+
+    const scenarios: readonly EventSource[] = [
+      // Truncated mid-ledger page (1 event when limit is 200, non-boundary cursor).
+      {
+        events: () =>
+          Promise.resolve({
+            events: [e1],
+            cursor: e1.id,
+            latestLedger: FIRST_EVENT_LEDGER + 10,
+            oldestLedger: FIRST_EVENT_LEDGER - 100,
+          }),
+      },
+      // Out-of-order events.
+      {
+        events: () =>
+          Promise.resolve({
+            events: [e2, e1],
+            cursor: endOfLedgerCursor(FIRST_EVENT_LEDGER + 10),
+            latestLedger: FIRST_EVENT_LEDGER + 10,
+            oldestLedger: FIRST_EVENT_LEDGER - 100,
+          }),
+      },
+      // Cursor claiming completion past latestLedger.
+      {
+        events: () =>
+          Promise.resolve({
+            events: [],
+            cursor: endOfLedgerCursor(FIRST_EVENT_LEDGER + 50),
+            latestLedger: FIRST_EVENT_LEDGER + 10,
+            oldestLedger: FIRST_EVENT_LEDGER - 100,
+          }),
+      },
+    ];
+
+    for (const badRpc of scenarios) {
+      const db = new RecordingDb();
+      db.cursorRow = cursorRow(FIRST_EVENT_LEDGER);
+      const { logger } = capturingLogger();
+      const watcher = new StellarWatcher({
+        chainKey: CHAIN,
+        router: LIVE_ROUTER,
+        startLedger: FIRST_EVENT_LEDGER,
+        pageSize: 200,
+        rpc: badRpc,
+        db,
+        logger,
+      });
+
+      await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+        EventSourceCompletenessError,
+      );
+      expect(cursorWrites(db)).toEqual([]);
+    }
+  });
+
+  it("handles repeated terminal cursor markers deterministically without looping or advancing past evidence", async () => {
+    const firstInLedger = syntheticEvent({
+      ledger: FIRST_EVENT_LEDGER + 1,
+      id: `${toid(FIRST_EVENT_LEDGER + 1, 0, 0)
+        .toString()
+        .padStart(19, "0")}-0000000000`,
+    });
+    const secondInLedger = syntheticEvent({
+      ledger: FIRST_EVENT_LEDGER + 1,
+      id: `${toid(FIRST_EVENT_LEDGER + 1, 0, 1)
+        .toString()
+        .padStart(19, "0")}-0000000000`,
+    });
+
+    let calls = 0;
+    const repeatedMarkerRpc: EventSource = {
+      events: () => {
+        calls += 1;
+        if (calls === 1) {
+          return Promise.resolve({
+            events: [firstInLedger, secondInLedger],
+            cursor: secondInLedger.id,
+            latestLedger: FIRST_EVENT_LEDGER + 5,
+            oldestLedger: FIRST_EVENT_LEDGER - 100,
+          });
+        }
+        // Provider repeats the terminal mid-ledger marker with no new events.
+        return Promise.resolve({
+          events: [],
+          cursor: secondInLedger.id,
+          latestLedger: FIRST_EVENT_LEDGER + 5,
+          oldestLedger: FIRST_EVENT_LEDGER - 100,
+        });
+      },
+    };
+
+    const db = new RecordingDb();
+    db.cursorRow = cursorRow(FIRST_EVENT_LEDGER);
+    const { logger } = capturingLogger();
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 2,
+      rpc: repeatedMarkerRpc,
+      db,
+      logger,
+    });
+
+    const progressed = await watcher.tick(AbortSignal.timeout(5_000));
+
+    expect(calls).toBe(2);
+    expect(progressed).toBe(false);
+    // Stored cursor stayed at FIRST_EVENT_LEDGER rather than claiming FIRST_EVENT_LEDGER + 1 complete.
+    expect(cursorWrites(db)).toEqual([{ ledger: FIRST_EVENT_LEDGER, contract: LIVE_ROUTER }]);
+  });
+
+  it("preserves successful-call filtering alongside completeness validation", async () => {
+    const queued = ROUTER_HISTORY.find((event) => event.topicJson[1]?.symbol === "queued");
+    if (!queued) throw new Error("expected queued event");
+
+    const revertedCall: RawStellarEvent = {
+      ...queued,
+      ledger: FIRST_EVENT_LEDGER + 1,
+      id: `${toid(FIRST_EVENT_LEDGER + 1, 0, 0)
+        .toString()
+        .padStart(19, "0")}-0000000000`,
+      inSuccessfulContractCall: false,
+    };
+    const diagnosticCall: RawStellarEvent = {
+      ...queued,
+      ledger: FIRST_EVENT_LEDGER + 1,
+      id: `${toid(FIRST_EVENT_LEDGER + 1, 0, 1)
+        .toString()
+        .padStart(19, "0")}-0000000001`,
+      type: "diagnostic",
+    };
+    const succeededCall: RawStellarEvent = {
+      ...queued,
+      ledger: FIRST_EVENT_LEDGER + 2,
+      id: `${toid(FIRST_EVENT_LEDGER + 2, 0, 0)
+        .toString()
+        .padStart(19, "0")}-0000000000`,
+    };
+    delete (succeededCall as { inSuccessfulContractCall?: boolean }).inSuccessfulContractCall;
+
+    const { watcher, db } = harness({
+      events: [revertedCall, diagnosticCall, succeededCall],
+      startLedger: FIRST_EVENT_LEDGER,
+      latestLedger: FIRST_EVENT_LEDGER + 3,
+    });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    expect(watcher.progress?.decoded).toBe(1);
+    expect(watcher.progress?.skipped).toBe(2);
+    expect(db.matching("INSERT INTO admin_action")).toHaveLength(1);
+    expect(cursorWrites(db)).toEqual([{ ledger: FIRST_EVENT_LEDGER + 3, contract: LIVE_ROUTER }]);
   });
 });

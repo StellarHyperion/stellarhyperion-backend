@@ -11,10 +11,14 @@ import { describe, expect, it } from "vitest";
 
 import {
   EventCursorError,
+  EventSourceCompletenessError,
+  compareEventCursors,
   completeThrough,
   endOfLedgerCursor,
   parseEventCursor,
+  validateEventsPageCompleteness,
 } from "../../src/chains/stellar/cursor.js";
+import { LIVE_ROUTER, syntheticEvent, toid } from "../stellar-fakes.js";
 
 /**
  * Captured from testnet while the router at CDMOLDF4...WCWF was live.
@@ -105,5 +109,64 @@ describe("what a page leaves fully read", () => {
     // next pass re-reading that ledger a no-op, which is cheaper than a cursor that would have to
     // describe half a ledger.
     expect(completeThrough(parseEventCursor(LIVE.midLedger))).toBe(LIVE.midLedgerLedger - 1);
+  });
+});
+
+describe("event-source completeness validation", () => {
+  it("rejects partial end-of-window markers that do not sit at the ledger toid ceiling", () => {
+    const forgedMarker = `${toid(4_889_999, 0, 0).toString().padStart(19, "0")}-4294967295`;
+    expect(() => parseEventCursor(forgedMarker)).toThrow(EventCursorError);
+  });
+
+  it("compares cursors monotonically across ledgers and event indices", () => {
+    const early = `${toid(4_900_000, 0, 0).toString().padStart(19, "0")}-0000000000`;
+    const nextIdx = `${toid(4_900_000, 0, 0).toString().padStart(19, "0")}-0000000001`;
+    const boundary = endOfLedgerCursor(4_900_000);
+    expect(compareEventCursors(early, nextIdx)).toBe(-1);
+    expect(compareEventCursors(nextIdx, boundary)).toBe(-1);
+    expect(compareEventCursors(boundary, boundary)).toBe(0);
+  });
+
+  it("rejects truncated mid-ledger pages and out-of-order events", () => {
+    const e1 = syntheticEvent({
+      ledger: 4_900_001,
+      id: `${toid(4_900_001, 0, 0).toString().padStart(19, "0")}-0000000000`,
+    });
+    const e2 = syntheticEvent({
+      ledger: 4_900_002,
+      id: `${toid(4_900_002, 0, 0).toString().padStart(19, "0")}-0000000000`,
+    });
+
+    // Truncated: limit is 10, returned 1 event, cursor is mid-ledger rather than end-of-window.
+    expect(() =>
+      validateEventsPageCompleteness(
+        {
+          events: [e1],
+          cursor: e1.id,
+          latestLedger: 4_900_010,
+          oldestLedger: 4_890_000,
+        },
+        {
+          expectedContract: LIVE_ROUTER,
+          query: { startLedger: 4_900_001, limit: 10 },
+        },
+      ),
+    ).toThrow(EventSourceCompletenessError);
+
+    // Out-of-order: e2 before e1.
+    expect(() =>
+      validateEventsPageCompleteness(
+        {
+          events: [e2, e1],
+          cursor: endOfLedgerCursor(4_900_010),
+          latestLedger: 4_900_010,
+          oldestLedger: 4_890_000,
+        },
+        {
+          expectedContract: LIVE_ROUTER,
+          query: { startLedger: 4_900_001, limit: 10 },
+        },
+      ),
+    ).toThrow(EventSourceCompletenessError);
   });
 });

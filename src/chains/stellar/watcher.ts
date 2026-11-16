@@ -26,7 +26,11 @@ import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
-import { completeThrough, endOfLedgerCursor, parseEventCursor } from "./cursor.js";
+import {
+  EventSourceCompletenessError,
+  endOfLedgerCursor,
+  validateEventsPageCompleteness,
+} from "./cursor.js";
 import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
 import type { EventSource, EventsQuery } from "./rpc.js";
 import { StellarRpcError } from "./rpc.js";
@@ -206,27 +210,34 @@ export class StellarWatcher {
         else skipped += 1;
       }
 
-      await writeCursor(tx, {
-        chainKey,
-        family: "stellar",
-        contract: router,
-        position: BigInt(scan.through),
-        observedAt: closedAt,
-        // Nothing to record: a closed ledger cannot be replaced by a different one.
-        hash: null,
-      });
+      if (scan.through > base || stored !== null) {
+        await writeCursor(tx, {
+          chainKey,
+          family: "stellar",
+          contract: router,
+          position: BigInt(Math.max(scan.through, base)),
+          observedAt: closedAt,
+          // Nothing to record: a closed ledger cannot be replaced by a different one.
+          hash: null,
+        });
+      }
     });
 
-    const behind = Math.max(scan.latestLedger - scan.through, 0);
-    this.lastProgress = { ledger: scan.through, decoded, skipped, behind, at: new Date() };
+    const effectiveLedger = Math.max(scan.through, base);
+    const behind = Math.max(scan.latestLedger - effectiveLedger, 0);
+    this.lastProgress = { ledger: effectiveLedger, decoded, skipped, behind, at: new Date() };
     logger.info(
-      { chain: chainKey, ledger: scan.through, decoded, skipped, behind, pages: scan.pages },
+      { chain: chainKey, ledger: effectiveLedger, decoded, skipped, behind, pages: scan.pages },
       "stellar window indexed",
     );
 
+    if (scan.repeatedTerminalMarker && scan.through <= base) {
+      return false;
+    }
+
     // Behind the head means there is another window waiting, so say we progressed and let the
     // poller come straight back rather than sleeping out the interval mid-backfill.
-    return behind > 0;
+    return scan.through > base && behind > 0;
   }
 
   /**
@@ -246,6 +257,7 @@ export class StellarWatcher {
     readonly latestLedger: number;
     readonly oldestLedger: number;
     readonly pages: number;
+    readonly repeatedTerminalMarker: boolean;
   }> {
     const { router, pageSize, logger, chainKey } = this.options;
     const maxPages = this.options.maxPagesPerTick ?? MAX_PAGES_PER_TICK;
@@ -255,6 +267,7 @@ export class StellarWatcher {
     let latestLedger = 0;
     let oldestLedger = 0;
     let pages = 0;
+    let repeatedTerminalMarker = false;
     // A fresh cursor starts by ledger. Everything after resumes from a cursor, which is the only
     // account of where the previous scan actually stopped.
     let pagination: Pick<EventsQuery, "startLedger" | "cursor"> = fresh
@@ -262,41 +275,50 @@ export class StellarWatcher {
       : { cursor: endOfLedgerCursor(base) };
 
     while (pages < maxPages) {
-      const page = await this.fetch(
-        { ...pagination, contractIds: [router], limit: pageSize },
-        signal,
-      );
+      const query: EventsQuery = { ...pagination, contractIds: [router], limit: pageSize };
+      const page = await this.fetch(query, signal);
       pages += 1;
-      events.push(...(page.events as readonly RawStellarEvent[]));
       latestLedger = page.latestLedger;
       oldestLedger = page.oldestLedger;
 
-      if (page.cursor === null) {
-        // Not something the live RPC does, and bailing is still better than inventing a position.
-        logger.warn(
-          { chain: chainKey, pages },
-          "the rpc returned a page with no cursor, so this pass cannot say what it finished reading",
-        );
+      let validated;
+      try {
+        validated = validateEventsPageCompleteness<RawStellarEvent>(page, {
+          expectedContract: router,
+          query,
+        });
+      } catch (error) {
+        if (error instanceof EventSourceCompletenessError) {
+          logger.error(
+            { err: error, chain: chainKey, pages },
+            "event source failed completeness verification; refusing to advance cursor",
+          );
+        }
+        throw error;
+      }
+
+      if (validated.repeatedTerminalMarker) {
+        repeatedTerminalMarker = true;
         break;
       }
 
-      const candidate = completeThrough(parseEventCursor(page.cursor));
-      if (candidate > through) {
-        through = candidate;
+      events.push(...validated.events);
+      if (validated.candidateThrough > through) {
+        through = validated.candidateThrough;
         break;
       }
       // Still inside one ledger. Keep pulling with the RPC's own cursor until it is drained.
-      pagination = { cursor: page.cursor };
+      pagination = { cursor: validated.cursor };
     }
 
-    if (pages >= maxPages && through <= base) {
+    if (!repeatedTerminalMarker && pages >= maxPages && through <= base) {
       logger.error(
         { chain: chainKey, ledger: base + 1, pages, pageSize },
         "a single ledger holds more router events than this many pages could drain; raise STELLAR_EVENT_PAGE_SIZE",
       );
     }
 
-    return { events, through, latestLedger, oldestLedger, pages };
+    return { events, through, latestLedger, oldestLedger, pages, repeatedTerminalMarker };
   }
 
   private async fetch(query: EventsQuery, signal: AbortSignal) {
