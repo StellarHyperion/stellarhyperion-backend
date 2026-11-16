@@ -23,6 +23,8 @@ export interface ServerDeps {
   readonly readiness: readonly ReadinessSource[];
   /** Set at boot so `/health` can report how long the process has been up. */
   readonly startedAt?: Date;
+  readonly bulkLookupMaxItems?: number;
+  readonly bulkLookupTimeoutMs?: number;
 }
 
 export function buildServer(deps: ServerDeps): FastifyInstance {
@@ -51,7 +53,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // This API exposes public chain data and never accepts a signed transaction or a key.
   app.addHook("onRequest", async (_request, reply) => {
     reply.header("Access-Control-Allow-Origin", "*");
-    reply.header("Access-Control-Allow-Methods", "GET, OPTIONS");
+    reply.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     reply.header("Access-Control-Allow-Headers", "Accept, Content-Type");
   });
   app.options("/*", async (_request, reply) => reply.code(204).send());

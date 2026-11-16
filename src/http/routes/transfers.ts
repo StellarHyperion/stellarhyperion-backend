@@ -12,6 +12,14 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import {
+  BulkLookupTimeoutError,
+  BulkLookupValidationError,
+  DEFAULT_BULK_LOOKUP_TIMEOUT_MS,
+  DEFAULT_MAX_BULK_LOOKUP_ITEMS,
+  executeBulkTransferLookup,
+  parseBulkLookupRequest,
+} from "../bulk-lookup.js";
 import type { ServerDeps } from "../server.js";
 
 export type TransferLifecycleStage =
@@ -241,6 +249,52 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     const row = rows[0];
     return row !== undefined ? formatRow(row, deps.config) : null;
   };
+
+  const handleBulkLookup = async (request: FastifyRequest, reply: FastifyReply) => {
+    const maxItems = deps.bulkLookupMaxItems ?? DEFAULT_MAX_BULK_LOOKUP_ITEMS;
+    const timeoutMs = deps.bulkLookupTimeoutMs ?? DEFAULT_BULK_LOOKUP_TIMEOUT_MS;
+
+    let keys;
+    try {
+      keys = parseBulkLookupRequest(request.body, maxItems);
+    } catch (error) {
+      if (error instanceof BulkLookupValidationError) {
+        return reply.code(400).send({
+          error: "bad_request",
+          message: error.message,
+          requestId: request.id,
+        });
+      }
+      throw error;
+    }
+
+    try {
+      const response = await executeBulkTransferLookup({
+        db,
+        config: deps.config,
+        readiness: deps.readiness,
+        transferQuery: TRANSFER_QUERY,
+        formatTransfer: formatRow,
+        keys,
+        maxItems,
+        timeoutMs,
+      });
+      return await reply.send(response);
+    } catch (error) {
+      if (error instanceof BulkLookupTimeoutError) {
+        reply.header("Retry-After", "1");
+        return reply.code(504).send({
+          error: "request_timeout",
+          message: "bulk transfer lookup exceeded the server time budget",
+          requestId: request.id,
+        });
+      }
+      throw error;
+    }
+  };
+
+  app.post("/v1/transfers/lookup", { bodyLimit: 16 * 1024 }, handleBulkLookup);
+  app.post("/api/v1/transfers/lookup", { bodyLimit: 16 * 1024 }, handleBulkLookup);
 
   // 1. Look up by originChain and nonce
   app.get(

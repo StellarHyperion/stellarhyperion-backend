@@ -124,4 +124,42 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     expect(response.json().destination.symbol).toBe("USDC");
     expect(response.json().origin.netAmount).toBe("9970000");
   });
+
+  it("reconciles canonical transfer identities in bulk without cross-chain nonce collisions", async () => {
+    const bulkRes = await app.inject({
+      method: "POST",
+      url: "/v1/transfers/lookup",
+      payload: {
+        items: [
+          { originChain: "stellar-testnet", nonce: "42" },
+          { originChain: "stellar-testnet", nonce: "99999" },
+          { originChain: "sepolia", nonce: "42" },
+          { chain: "sepolia", txHash: "cctp-mint" },
+        ],
+      },
+    });
+    expect(bulkRes.statusCode).toBe(200);
+    const body = bulkRes.json<{
+      items: {
+        status: string;
+        reason?: string;
+        transfer?: { origin: { chain: string; nonce: string } };
+      }[];
+      summary: { requested: number; found: number; missing: number; unavailable: number };
+    }>();
+    expect(body.summary).toEqual({
+      requested: 4,
+      found: 2,
+      missing: 1,
+      unavailable: 1,
+    });
+    expect(body.items[0]?.status).toBe("found");
+    expect(body.items[0]?.transfer?.origin.chain).toBe("stellar-testnet");
+    expect(body.items[1]?.status).toBe("missing");
+    // Sepolia has no recorded indexer_cursor in this database, so nonce 42 does not collide with Stellar and reports unavailable.
+    expect(body.items[2]?.status).toBe("unavailable");
+    expect(body.items[2]?.reason).toBe("cursor_unavailable");
+    // Destination mint hash on Sepolia matches the verified inbound_delivery row.
+    expect(body.items[3]?.status).toBe("found");
+  });
 });
