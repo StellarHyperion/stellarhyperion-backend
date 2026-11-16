@@ -32,6 +32,7 @@ import type {
   ClaimParkedEvent,
   ClaimSettledEvent,
   PauseSetEvent,
+  RawStellarEvent,
   RouteConfiguredEvent,
   TokenRegisteredEvent,
 } from "./events.js";
@@ -287,4 +288,114 @@ export async function recordRouteConfigured(
     blocker: event.enabled ? 0 : 2,
     flowAvailable: null,
   });
+}
+
+const MAX_PAYLOAD_STRING_LENGTH = 16_384;
+const SENSITIVE_KEY_PATTERN = /^(secret|token|password|auth|bearer|private_?key|seed|credential)$/i;
+
+export function sanitizeAndBoundPayload(payload: unknown, depth = 0): unknown {
+  if (depth > 6) return "[Truncated: Max Depth]";
+  if (typeof payload === "string") {
+    if (payload.length > MAX_PAYLOAD_STRING_LENGTH) {
+      return `${payload.slice(0, MAX_PAYLOAD_STRING_LENGTH)}...[Truncated]`;
+    }
+    return payload;
+  }
+  if (payload === null || typeof payload !== "object") {
+    return payload;
+  }
+  if (Array.isArray(payload)) {
+    return payload.slice(0, 100).map((item) => sanitizeAndBoundPayload(item, depth + 1));
+  }
+  const result: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(payload as Record<string, unknown>)) {
+    if (SENSITIVE_KEY_PATTERN.test(key)) {
+      result[key] = "[REDACTED]";
+    } else {
+      result[key] = sanitizeAndBoundPayload(val, depth + 1);
+    }
+  }
+  return result;
+}
+
+export interface QuarantinedStellarEventRow {
+  readonly id: string;
+  readonly chainKey: string;
+  readonly contract: string;
+  readonly ledger: number;
+  readonly txHash: string;
+  readonly operationIndex: number | null;
+  readonly transactionIndex: number | null;
+  readonly errorMessage: string;
+  readonly payload: unknown;
+}
+
+export async function recordQuarantinedEvent(
+  db: Queryable,
+  context: EventContext,
+  raw: RawStellarEvent,
+  reason: string,
+): Promise<void> {
+  const boundedPayload = sanitizeAndBoundPayload(raw.valueJson);
+  await db.query(
+    `INSERT INTO stellar_quarantined_event
+       (id, chain_key, contract, ledger, tx_hash, operation_index, transaction_index, error_message, payload)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     ON CONFLICT (id) DO UPDATE
+       SET error_message = EXCLUDED.error_message,
+           payload = EXCLUDED.payload`,
+    [
+      raw.id,
+      context.chainKey,
+      raw.contractId,
+      context.ledger.toString(),
+      context.txHash,
+      raw.operationIndex,
+      raw.transactionIndex,
+      reason,
+      JSON.stringify(boundedPayload),
+    ],
+  );
+}
+
+export async function readPendingQuarantinedEvents(
+  db: Queryable,
+  chainKey: string,
+  limit = 100,
+): Promise<readonly QuarantinedStellarEventRow[]> {
+  const { rows } = await db.query(
+    `SELECT id, chain_key, contract, ledger, tx_hash, operation_index, transaction_index, error_message, payload
+       FROM stellar_quarantined_event
+      WHERE chain_key = $1 AND replayed = false
+      ORDER BY ledger ASC, id ASC
+      LIMIT $2`,
+    [chainKey, limit],
+  );
+  return rows.map((r) => ({
+    id: text(r, "id"),
+    chainKey: text(r, "chain_key"),
+    contract: text(r, "contract"),
+    ledger: Number(bigintOf(r, "ledger")),
+    txHash: text(r, "tx_hash"),
+    operationIndex:
+      r.operation_index !== null && r.operation_index !== undefined
+        ? Number(r.operation_index)
+        : null,
+    transactionIndex:
+      r.transaction_index !== null && r.transaction_index !== undefined
+        ? Number(r.transaction_index)
+        : null,
+    errorMessage: text(r, "error_message"),
+    payload: r.payload,
+  }));
+}
+
+export async function markQuarantinedEventReplayed(db: Queryable, id: string): Promise<void> {
+  await db.query(
+    `UPDATE stellar_quarantined_event
+        SET replayed = true,
+            replayed_at = now()
+      WHERE id = $1`,
+    [id],
+  );
 }

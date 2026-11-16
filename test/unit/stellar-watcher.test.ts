@@ -10,6 +10,10 @@ import { describe, expect, it } from "vitest";
 
 import { endOfLedgerCursor } from "../../src/chains/stellar/cursor.js";
 import type { RawStellarEvent } from "../../src/chains/stellar/events.js";
+import {
+  markQuarantinedEventReplayed,
+  sanitizeAndBoundPayload,
+} from "../../src/chains/stellar/store.js";
 import { StellarWatcher } from "../../src/chains/stellar/watcher.js";
 import {
   FakeRpc,
@@ -342,5 +346,54 @@ describe("gaps it cannot close", () => {
 
     const warnings = lines.filter((line) => line.message.includes("running ahead of the indexer"));
     expect(warnings).toHaveLength(1);
+  });
+});
+
+describe("quarantine storage for unknown events", () => {
+  it("persists unknown events associated with router, ledger, and transaction", async () => {
+    const unknownEv = syntheticEvent({
+      ledger: FIRST_EVENT_LEDGER + 2,
+      topicJson: [{ symbol: "hyperion" }, { symbol: "quantum_hop" }],
+      valueJson: { secret: "sensitive-private-key", amount: "1000" },
+    });
+    const { watcher, db } = harness({ events: [unknownEv], startLedger: FIRST_EVENT_LEDGER });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    const quarantined = db.matching("INSERT INTO stellar_quarantined_event");
+    expect(quarantined).toHaveLength(1);
+    const params = quarantined[0]?.params;
+    expect(params?.[0]).toBe(unknownEv.id);
+    expect(params?.[1]).toBe(CHAIN);
+    expect(params?.[2]).toBe(LIVE_ROUTER);
+    expect(params?.[3]).toBe(String(FIRST_EVENT_LEDGER + 2));
+    expect(params?.[4]).toBe(unknownEv.txHash);
+  });
+
+  it("redacts sensitive fields and bounds payload size", () => {
+    const sanitized = sanitizeAndBoundPayload({
+      token: "secret-token",
+      password: "very-secure-password",
+      normalData: "safe-field",
+      nested: {
+        credential: "hidden-key",
+      },
+    }) as Record<string, unknown>;
+
+    expect(sanitized.token).toBe("[REDACTED]");
+    expect(sanitized.password).toBe("[REDACTED]");
+    expect(sanitized.normalData).toBe("safe-field");
+    expect((sanitized.nested as Record<string, unknown>).credential).toBe("[REDACTED]");
+  });
+
+  it("allows idempotent replay of quarantined events when decoder is provided", async () => {
+    const db = new RecordingDb();
+    const eventId = "0000000002133000000-0000000000";
+
+    await markQuarantinedEventReplayed(db, eventId);
+
+    const updateQuery = db.matching("UPDATE stellar_quarantined_event");
+    expect(updateQuery).toHaveLength(1);
+    expect(updateQuery[0]?.params[0]).toBe(eventId);
   });
 });

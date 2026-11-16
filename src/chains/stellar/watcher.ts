@@ -39,6 +39,7 @@ import {
   recordClaimParked,
   recordClaimSettled,
   recordPauseSet,
+  recordQuarantinedEvent,
   recordRouteConfigured,
   recordTokenRegistered,
   writeCursor,
@@ -320,7 +321,18 @@ export class StellarWatcher {
     context: EventContext,
     raw: RawStellarEvent,
   ): Promise<boolean> {
-    const event = decodeStellarEvent(raw);
+    let event;
+    try {
+      event = decodeStellarEvent(raw);
+    } catch (error) {
+      await recordQuarantinedEvent(
+        tx,
+        context,
+        raw,
+        error instanceof Error ? error.message : "decode error",
+      );
+      return false;
+    }
 
     switch (event.kind) {
       case "bridgeOut":
@@ -378,6 +390,7 @@ export class StellarWatcher {
             "the router emitted an event tag this build does not know; it is running ahead of the indexer",
           );
         }
+        await recordQuarantinedEvent(tx, context, raw, `unsupported event tag: ${event.tag}`);
         return false;
       default:
         // Unreachable while the switch covers the union, and the point is that it stops compiling
