@@ -8,6 +8,7 @@
 import { Queue, Worker } from "bullmq";
 import { Redis } from "ioredis";
 
+import { PostgresTxCheckpointStore, sanitizeCheckpointError } from "./checkpoints.js";
 import { processClaimSettlement } from "./jobs/claims.js";
 import { processTtlBump } from "./jobs/ttl.js";
 import type { KeeperContext, KeeperJobName, KeeperJobResult } from "./types.js";
@@ -34,6 +35,12 @@ export async function startKeeperQueue(
   redisUrl: string,
 ): Promise<KeeperHandle> {
   const { config, logger } = ctx;
+  const checkpointStore = ctx.checkpointStore ?? new PostgresTxCheckpointStore(ctx.db);
+  const runtimeCtx: KeeperContext = {
+    ...ctx,
+    checkpointStore,
+  };
+
   const redis = createKeeperRedis(redisUrl);
   await redis.connect();
 
@@ -47,11 +54,11 @@ export async function startKeeperQueue(
       logger.info({ jobName: job.name, jobId: job.id }, "processing keeper job");
       switch (job.name as KeeperJobName) {
         case "ttl-bump": {
-          const result = await processTtlBump(ctx, job.data as object);
+          const result = await processTtlBump(runtimeCtx, job.data as object);
           return { kind: "ttl-bump", result };
         }
         case "claim-settlement": {
-          const result = await processClaimSettlement(ctx, job.data as object);
+          const result = await processClaimSettlement(runtimeCtx, job.data as object);
           return { kind: "claim-settlement", result };
         }
         default:
@@ -69,7 +76,14 @@ export async function startKeeperQueue(
   });
 
   worker.on("failed", (job, error) => {
-    logger.error({ jobName: job?.name, jobId: job?.id, err: error }, "keeper job failed");
+    logger.error(
+      {
+        jobName: job?.name,
+        jobId: job?.id,
+        reason: sanitizeCheckpointError(error),
+      },
+      "keeper job failed",
+    );
   });
 
   // Schedule repeatable jobs for the two Stellar tasks

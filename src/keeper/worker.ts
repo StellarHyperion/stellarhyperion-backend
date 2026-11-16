@@ -9,7 +9,9 @@ import type { Logger } from "pino";
 import type { AppConfig } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
+import { sanitizeCheckpointError } from "./checkpoints.js";
 import { startKeeperQueue, type KeeperHandle } from "./queue.js";
+import type { TxCheckpointStorePort } from "./types.js";
 
 export class KeeperWorker implements ReadinessSource {
   readonly name = "keeper";
@@ -21,6 +23,7 @@ export class KeeperWorker implements ReadinessSource {
     private readonly config: AppConfig,
     private readonly db: Transactional,
     private readonly logger: Logger,
+    private readonly checkpointStore?: TxCheckpointStorePort,
   ) {}
 
   readiness(): ReadinessReport {
@@ -57,7 +60,12 @@ export class KeeperWorker implements ReadinessSource {
     this.starting = true;
 
     startKeeperQueue(
-      { db: this.db, config: this.config, logger: this.logger },
+      {
+        db: this.db,
+        config: this.config,
+        logger: this.logger,
+        checkpointStore: this.checkpointStore,
+      },
       this.config.redisUrl,
     )
       .then((handle) => {
@@ -67,8 +75,8 @@ export class KeeperWorker implements ReadinessSource {
       })
       .catch((err: unknown) => {
         this.starting = false;
-        this.failedError = err instanceof Error ? err.message : String(err);
-        this.logger.error({ err }, "failed to start keeper queue");
+        this.failedError = sanitizeCheckpointError(err);
+        this.logger.error({ reason: this.failedError }, "failed to start keeper queue");
       });
   }
 

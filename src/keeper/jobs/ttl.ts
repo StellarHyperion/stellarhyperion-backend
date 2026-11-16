@@ -1,7 +1,9 @@
 import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 import { bigintOf } from "../../db/rows.js";
+import { buildKeeperOperationKey } from "../checkpoints.js";
 import { submitStellar } from "../stellar.js";
 import type { KeeperContext, TtlBumpPayload, TtlBumpResult } from "../types.js";
+
 export async function processTtlBump(
   ctx: KeeperContext,
   payload: TtlBumpPayload = {},
@@ -41,12 +43,31 @@ export async function processTtlBump(
       detail: `No signer: ${tokens.length} tokens, ${claims.length} claims, ${transfers.length} transfers need maintenance.`,
     };
   const vector = (values: xdr.ScVal[]) => xdr.ScVal.scvVec(values);
-  const hash = await submitStellar(ctx.config, chain.routerContractId, "keep_alive", () => [
-    vector(tokens.map((token) => new Address(token).toScVal())),
-    vector([0, 1, 2, 3].map((route) => nativeToScVal(route, { type: "u32" }))),
-    vector(claims.map((id) => nativeToScVal(id, { type: "u64" }))),
-    vector(transfers.map((id) => nativeToScVal(id, { type: "u64" }))),
-  ]);
+  const hash = await submitStellar(
+    ctx.config,
+    chain.routerContractId,
+    "keep_alive",
+    () => [
+      vector(tokens.map((token) => new Address(token).toScVal())),
+      vector([0, 1, 2, 3].map((route) => nativeToScVal(route, { type: "u32" }))),
+      vector(claims.map((id) => nativeToScVal(id, { type: "u64" }))),
+      vector(transfers.map((id) => nativeToScVal(id, { type: "u64" }))),
+    ],
+    {
+      checkpointStore: ctx.checkpointStore,
+      operation: {
+        operationKey: buildKeeperOperationKey("ttl-bump", chain.chain),
+        chain: chain.chain,
+        jobKind: "ttl-bump",
+        claimId: null,
+        contract: chain.routerContractId,
+        method: "keep_alive",
+      },
+      logger: ctx.logger,
+      pollIntervalMs: ctx.pollIntervalMs,
+      maxPollAttempts: ctx.maxPollAttempts,
+    },
+  );
   ctx.logger.info({ hash }, "router keep_alive confirmed");
   return {
     bumpedTokens: tokens.length,

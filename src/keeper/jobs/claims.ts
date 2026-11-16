@@ -1,7 +1,13 @@
 import { Address, nativeToScVal } from "@stellar/stellar-sdk";
 import { bigintOf } from "../../db/rows.js";
+import {
+  buildKeeperOperationKey,
+  sanitizeCheckpointError,
+  UncertainBroadcastError,
+} from "../checkpoints.js";
 import { submitStellar } from "../stellar.js";
 import type { ClaimSettlementPayload, ClaimSettlementResult, KeeperContext } from "../types.js";
+
 export async function processClaimSettlement(
   ctx: KeeperContext,
   payload: ClaimSettlementPayload = {},
@@ -28,6 +34,7 @@ export async function processClaimSettlement(
       detail: "No signer configured; no settlement was attempted.",
     };
   let settled = 0;
+  let uncertain = 0;
   for (const row of rows) {
     const id = bigintOf(row, "claim_id");
     try {
@@ -36,6 +43,20 @@ export async function processClaimSettlement(
         chain.routerContractId,
         "settle_claim",
         (sender) => [new Address(sender).toScVal(), nativeToScVal(id, { type: "u64" })],
+        {
+          checkpointStore: ctx.checkpointStore,
+          operation: {
+            operationKey: buildKeeperOperationKey("claim-settlement", chain.chain, id),
+            chain: chain.chain,
+            jobKind: "claim-settlement",
+            claimId: id,
+            contract: chain.routerContractId,
+            method: "settle_claim",
+          },
+          logger: ctx.logger,
+          pollIntervalMs: ctx.pollIntervalMs,
+          maxPollAttempts: ctx.maxPollAttempts,
+        },
       );
       ctx.logger.info(
         { claimId: String(id), hash },
@@ -43,14 +64,34 @@ export async function processClaimSettlement(
       );
       settled += 1;
     } catch (error) {
-      ctx.logger.warn({ err: error, claimId: String(id) }, "claim is not ready for settlement");
+      if (error instanceof UncertainBroadcastError) {
+        uncertain += 1;
+        ctx.logger.warn(
+          {
+            claimId: String(id),
+            txHash: error.txHash,
+            checkpointState: error.state,
+            reason: error.reason,
+          },
+          "claim settlement outcome uncertain; reconcile saved hash before retrying",
+        );
+      } else {
+        ctx.logger.warn(
+          {
+            claimId: String(id),
+            reason: sanitizeCheckpointError(error),
+          },
+          "claim is not ready for settlement",
+        );
+      }
     }
   }
   return {
     settled,
     attempted: rows.length,
     pending: rows.length - settled,
+    uncertain,
     dryRun: false,
-    detail: `${settled} confirmed settlements of ${rows.length} attempts.`,
+    detail: `${settled} confirmed settlements of ${rows.length} attempts (${uncertain} awaiting hash reconciliation).`,
   };
 }

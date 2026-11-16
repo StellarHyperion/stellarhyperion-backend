@@ -57,6 +57,7 @@ suite("the schema", () => {
       "admin_action",
       "inbound_delivery",
       "indexer_cursor",
+      "keeper_tx_checkpoint",
       "outbound_transfer",
       "pending_claim",
       "rail_attestation",
@@ -334,5 +335,52 @@ suite("maintenance and pruning", () => {
     expect(ids).not.toContain(999991);
     expect(ids).toContain(999992);
     expect(ids).toContain(999993);
+  });
+});
+
+suite("keeper_tx_checkpoint", () => {
+  let db: Database;
+
+  beforeAll(() => {
+    db = Database.open(CONNECTION ?? "", { applicationName: "hyperion-schema-test" });
+  });
+
+  afterAll(async () => {
+    await db.query(
+      "DELETE FROM public.keeper_tx_checkpoint WHERE operation_key LIKE 'schema-test:%'",
+    );
+    await db.close();
+  });
+
+  it("enforces claim_id shape against job_kind and valid confirmation states", async () => {
+    await expect(
+      db.query(
+        `INSERT INTO public.keeper_tx_checkpoint
+           (operation_key, tx_hash, chain, job_kind, claim_id, contract, method,
+            signer_public_key, sequence_number, fee_stroops, state)
+         VALUES ('schema-test:claim-missing-id', 'tx-1', 'stellar-testnet', 'claim-settlement', NULL,
+                 'CROUTER', 'settle_claim', 'GSIGNER', 1, 100, 'signed_pending_broadcast')`,
+      ),
+    ).rejects.toSatisfy((error: unknown) => codeOf(error) === CHECK_VIOLATION);
+
+    await expect(
+      db.query(
+        `INSERT INTO public.keeper_tx_checkpoint
+           (operation_key, tx_hash, chain, job_kind, claim_id, contract, method,
+            signer_public_key, sequence_number, fee_stroops, state)
+         VALUES ('schema-test:ttl-with-id', 'tx-2', 'stellar-testnet', 'ttl-bump', 5,
+                 'CROUTER', 'keep_alive', 'GSIGNER', 2, 100, 'signed_pending_broadcast')`,
+      ),
+    ).rejects.toSatisfy((error: unknown) => codeOf(error) === CHECK_VIOLATION);
+
+    await expect(
+      db.query(
+        `INSERT INTO public.keeper_tx_checkpoint
+           (operation_key, tx_hash, chain, job_kind, claim_id, contract, method,
+            signer_public_key, sequence_number, fee_stroops, state)
+         VALUES ('schema-test:bad-state', 'tx-3', 'stellar-testnet', 'ttl-bump', NULL,
+                 'CROUTER', 'keep_alive', 'GSIGNER', 3, 100, 'invented_state')`,
+      ),
+    ).rejects.toSatisfy((error: unknown) => codeOf(error) === CHECK_VIOLATION);
   });
 });
