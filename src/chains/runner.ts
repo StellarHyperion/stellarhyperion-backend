@@ -29,7 +29,7 @@ import { RouteKind } from "@hyperion/protocol";
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
 import { IrisClient } from "../rails/cctp/iris.js";
 import { RailPass } from "../rails/pass.js";
-import type { RailClient } from "../rails/types.js";
+import type { FairSchedulingConfig, RailClient } from "../rails/types.js";
 import { KeeperWorker } from "../keeper/worker.js";
 import { viemClient } from "./evm/client.js";
 import { EvmWatcher } from "./evm/watcher.js";
@@ -118,6 +118,7 @@ export interface BuildIndexerDeps {
   readonly config: AppConfig;
   readonly logger: Logger;
   readonly db: Transactional;
+  readonly railScheduling?: FairSchedulingConfig | undefined;
 }
 
 /**
@@ -171,7 +172,14 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // They are not conditional on a router being watched: a transfer indexed by a previous run is
   // still waiting on its rail whether or not this replica is watching the chain it left.
   if (config.rails.enabled) {
-    for (const worker of railWorkers(config.rails, config.network, db, logger, config)) {
+    for (const worker of railWorkers(
+      config.rails,
+      config.network,
+      db,
+      logger,
+      config,
+      deps.railScheduling,
+    )) {
       workers.push(worker);
     }
   } else {
@@ -242,6 +250,7 @@ function railWorkers(
   db: Transactional,
   logger: Logger,
   appConfig: AppConfig,
+  scheduling?: FairSchedulingConfig,
 ): readonly Worker[] {
   const clients: readonly { readonly route: RouteKind; readonly client: RailClient }[] = [
     {
@@ -272,6 +281,7 @@ function railWorkers(
       batchSize: config.batchSize,
       recheckAfterMs: config.recheckAfterMs,
       maxCheckFailures: config.maxCheckFailures,
+      scheduling,
     });
     return new PolledWorker(pass, config.pollIntervalMs, child);
   });

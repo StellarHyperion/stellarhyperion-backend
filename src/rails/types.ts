@@ -86,6 +86,30 @@ export class RailError extends Error {
   }
 }
 
+export type RailAgeBucket = "fresh" | "aging" | "stale";
+
+export interface FairSchedulingConfig {
+  /** Maximum age in milliseconds for the `fresh` bucket (default 5 minutes). */
+  readonly freshMaxAgeMs?: number | undefined;
+  /** Maximum age in milliseconds for the `aging` bucket (default 60 minutes; older is `stale`). */
+  readonly agingMaxAgeMs?: number | undefined;
+  /** Target batch weight for `fresh` transfers. */
+  readonly freshWeight?: number | undefined;
+  /** Target batch weight for `aging` transfers. */
+  readonly agingWeight?: number | undefined;
+  /** Target batch weight for `stale` transfers. */
+  readonly staleWeight?: number | undefined;
+  /** Explicit hard cap on transfers to any single destination chain in one pass. */
+  readonly maxPerDestination?: number | undefined;
+  /** Maximum fraction (0 < share <= 1) one destination may take while other destinations wait. */
+  readonly maxDestinationShare?: number | undefined;
+}
+
+export interface FairSchedulerCursor {
+  readonly bucketOffset: number;
+  readonly destinationOffset: number;
+}
+
 /** One transfer waiting on a rail, as the queue hands it over. */
 export interface PendingTransfer {
   readonly transferId: bigint;
@@ -99,6 +123,8 @@ export interface PendingTransfer {
   readonly checkFailures: number;
   /** True when an inbound delivery already exists, which settles it without asking the rail. */
   readonly delivered: boolean;
+  readonly observedAt?: Date | undefined;
+  readonly ageBucket?: RailAgeBucket | undefined;
 }
 
 /** What a rail client has to offer the pass that polls it. */

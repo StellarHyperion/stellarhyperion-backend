@@ -9,7 +9,11 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { writeOutbound, writeInbound } from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
-import { outstandingForRail, pendingForRail } from "../../src/rails/queue.js";
+import {
+  outstandingForRail,
+  pendingForRail,
+  schedulePendingForRail,
+} from "../../src/rails/queue.js";
 import { RailPass } from "../../src/rails/pass.js";
 import type { PendingTransfer, RailClient, RailLookup } from "../../src/rails/types.js";
 import { capturingLogger } from "../stellar-fakes.js";
@@ -214,5 +218,69 @@ suite("rail pollers against real Postgres", () => {
     // Outstanding should now be 0 for this transfer since delivered is terminal
     const outstanding = await outstandingForRail(db, 1);
     expect(outstanding).toBe(0);
+  });
+
+  it("schedules across fresh and stale age buckets and caps per-destination share", async () => {
+    const now = new Date("2026-10-16T12:00:00Z");
+    await db.transaction(async (tx) => {
+      for (let i = 601; i <= 606; i += 1) {
+        await writeOutbound(
+          tx,
+          {
+            chainKey: ORIGIN_CHAIN,
+            block: BigInt(1100 + i),
+            txHash: `0xaaa${String(i)}`,
+            logIndex: 0,
+            observedAt: new Date("2026-10-16T08:00:00Z"),
+          },
+          {
+            route: 0,
+            nonce: BigInt(i),
+            sender: "0x1111111111111111111111111111111111111111",
+            token: "0x3333333333333333333333333333333333333333",
+            grossAmount: 1001000n,
+            fee: 1000n,
+            netAmount: 1000000n,
+            destinationChain: DESTINATION_CHAIN,
+            destination: "0x2222222222222222222222222222222222222222",
+            railRef: "0x0000",
+          },
+        );
+      }
+      await writeOutbound(
+        tx,
+        {
+          chainKey: ORIGIN_CHAIN,
+          block: 1800n,
+          txHash: "0xaaa699",
+          logIndex: 0,
+          observedAt: new Date("2026-10-16T11:59:30Z"),
+        },
+        {
+          route: 0,
+          nonce: 699n,
+          sender: "0x1111111111111111111111111111111111111111",
+          token: "0x3333333333333333333333333333333333333333",
+          grossAmount: 1001000n,
+          fee: 1000n,
+          netAmount: 1000000n,
+          destinationChain: "base-sepolia",
+          destination: "0x2222222222222222222222222222222222222222",
+          railRef: "0x0000",
+        },
+      );
+    });
+
+    const scheduled = await schedulePendingForRail(db, {
+      route: 0,
+      limit: 4,
+      notCheckedSince: new Date("2026-10-16T12:01:00Z"),
+      maxCheckFailures: 5,
+      now,
+      scheduling: { maxPerDestination: 2 },
+    });
+
+    expect(scheduled.selected.some((item) => item.nonce === 699n)).toBe(true);
+    expect(scheduled.destinationCounts[DESTINATION_CHAIN] ?? 0).toBeLessThanOrEqual(2);
   });
 });

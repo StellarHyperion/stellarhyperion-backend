@@ -25,8 +25,16 @@ import type { Logger } from "pino";
 import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
 import { writeInbound, writeAttestation } from "../chains/writers.js";
-import { outstandingForRail, pendingForRail } from "./queue.js";
-import { RailError, isTerminal, type PendingTransfer, type RailClient } from "./types.js";
+import { initialFairSchedulerCursor, outstandingForRail, schedulePendingForRail } from "./queue.js";
+import {
+  RailError,
+  isTerminal,
+  type FairSchedulerCursor,
+  type FairSchedulingConfig,
+  type PendingTransfer,
+  type RailAgeBucket,
+  type RailClient,
+} from "./types.js";
 
 /**
  * How many outstanding transfers still counts as keeping up.
@@ -48,6 +56,7 @@ export interface RailPassOptions {
   readonly maxCheckFailures: number;
   readonly now?: () => Date;
   readonly config?: AppConfig;
+  readonly scheduling?: FairSchedulingConfig | undefined;
 }
 
 export interface RailProgress {
@@ -56,11 +65,14 @@ export interface RailProgress {
   readonly failures: number;
   readonly outstanding: number;
   readonly at: Date;
+  readonly bucketCounts?: Readonly<Record<RailAgeBucket, number>> | undefined;
+  readonly destinationCounts?: Readonly<Record<string, number>> | undefined;
 }
 
 export class RailPass {
   private lastProgress: RailProgress | null = null;
   private cooldownUntil: Date | null = null;
+  private schedulerCursor: FairSchedulerCursor = initialFairSchedulerCursor();
 
   constructor(private readonly options: RailPassOptions) {}
 
@@ -115,12 +127,18 @@ export class RailPass {
     if (cooldown !== null && cooldown > this.now()) return false;
     this.cooldownUntil = null;
 
-    const queue = await pendingForRail(db, {
+    const passTime = this.now();
+    const scheduled = await schedulePendingForRail(db, {
       route: this.options.route,
       limit: batchSize,
-      notCheckedSince: new Date(this.now().getTime() - this.options.recheckAfterMs),
+      notCheckedSince: new Date(passTime.getTime() - this.options.recheckAfterMs),
       maxCheckFailures: this.options.maxCheckFailures,
+      now: passTime,
+      scheduling: this.options.scheduling,
+      cursor: this.schedulerCursor,
     });
+    this.schedulerCursor = scheduled.nextCursor;
+    const queue = scheduled.selected;
 
     let checked = 0;
     let settled = 0;
@@ -150,11 +168,27 @@ export class RailPass {
     }
 
     const outstanding = await outstandingForRail(db, this.options.route);
-    this.lastProgress = { checked, settled, failures, outstanding, at: this.now() };
+    this.lastProgress = {
+      checked,
+      settled,
+      failures,
+      outstanding,
+      at: this.now(),
+      bucketCounts: scheduled.bucketCounts,
+      destinationCounts: scheduled.destinationCounts,
+    };
 
     if (checked > 0 || failures > 0) {
       logger.info(
-        { rail: client.rail, checked, settled, failures, outstanding },
+        {
+          rail: client.rail,
+          checked,
+          settled,
+          failures,
+          outstanding,
+          bucketCounts: scheduled.bucketCounts,
+          destinationCounts: scheduled.destinationCounts,
+        },
         "rail statuses refreshed",
       );
     }
