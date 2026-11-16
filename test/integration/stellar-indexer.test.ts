@@ -17,9 +17,10 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import { readStellarEventConflicts } from "../../src/chains/stellar/store.js";
 import { StellarWatcher } from "../../src/chains/stellar/watcher.js";
 import { Database } from "../../src/db/pool.js";
-import { FakeRpc, LIVE_ROUTER, ROUTER_HISTORY, capturingLogger } from "../stellar-fakes.js";
+import { FakeRpc, LIVE_ROUTER, ROUTER_HISTORY, capturingLogger, toid } from "../stellar-fakes.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
 const suite = CONNECTION === undefined ? describe.skip : describe;
@@ -32,6 +33,8 @@ const FIRST_EVENT_LEDGER = 4_965_951;
 const HEAD = 4_994_010;
 
 const TABLES = [
+  ["stellar_event_conflict", "chain_key"],
+  ["stellar_event_identity", "chain_key"],
   ["admin_action", "chain"],
   ["route_health", "origin_chain"],
   ["outbound_transfer", "origin_chain"],
@@ -230,6 +233,43 @@ suite("replaying the live router's history", () => {
     await expect(other.tick(AbortSignal.timeout(20_000))).rejects.toThrow(
       /needs its cursor reset rather than reused/,
     );
+  });
+
+  it("retains conflict evidence instead of overwriting an indexed action on divergent payload", async () => {
+    await clean();
+    await drain();
+    const queued1 = ROUTER_HISTORY.find((entry) => entry.topicJson[1]?.symbol === "queued");
+    if (!queued1) throw new Error("expected queued action");
+    const altered = {
+      ...queued1,
+      ledger: HEAD + 1,
+      id: `${toid(HEAD + 1, 0, 0)
+        .toString()
+        .padStart(19, "0")}-0000000000`,
+      txHash: "tx-divergent-queued",
+      valueJson: {
+        map: [
+          { key: { symbol: "action" }, val: { vec: [{ symbol: "Pause" }] } },
+          { key: { symbol: "eta" }, val: { u64: "1790999999" } },
+          { key: { symbol: "expires_at" }, val: { u64: "1791999999" } },
+          { key: { symbol: "id" }, val: { u64: "1" } },
+        ],
+      },
+    };
+    const { logger } = capturingLogger();
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 200,
+      rpc: new FakeRpc({ events: [...ROUTER_HISTORY, altered], latestLedger: HEAD + 2 }),
+      db,
+      logger,
+    });
+    await watcher.tick(AbortSignal.timeout(20_000));
+    const conflicts = await readStellarEventConflicts(db, CHAIN);
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]?.canonicalKey).toBe("actionQueued:1");
   });
 });
 

@@ -31,6 +31,7 @@ import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
 import type { EventSource, EventsQuery } from "./rpc.js";
 import { StellarRpcError } from "./rpc.js";
 import {
+  deriveStellarEventIdentity,
   readCursor,
   recordActionQueued,
   recordActionSettled,
@@ -41,8 +42,11 @@ import {
   recordPauseSet,
   recordRouteConfigured,
   recordTokenRegistered,
+  verifyAndRecordEventIdentity,
   writeCursor,
   type EventContext,
+  type EventIdentityEvidence,
+  type StellarEventConflictReport,
 } from "./store.js";
 
 /**
@@ -93,6 +97,8 @@ export class StellarWatcher {
   private lastProgress: WatcherProgress | null = null;
   /** Tags seen once and logged once. A contract ahead of this build should not be a log flood. */
   private readonly reportedUnknown = new Set<string>();
+  private readonly knownIdentities = new Map<string, EventIdentityEvidence>();
+  private readonly detectedConflicts = new Map<string, StellarEventConflictReport>();
 
   constructor(private readonly options: StellarWatcherOptions) {}
 
@@ -102,6 +108,10 @@ export class StellarWatcher {
 
   get progress(): WatcherProgress | null {
     return this.lastProgress;
+  }
+
+  get conflicts(): readonly StellarEventConflictReport[] {
+    return [...this.detectedConflicts.values()];
   }
 
   /**
@@ -119,6 +129,13 @@ export class StellarWatcher {
         name: this.name,
         state: "degraded",
         detail: "has not completed a pass yet, so nothing it could be asked about is indexed",
+      };
+    }
+    if (this.detectedConflicts.size > 0) {
+      return {
+        name: this.name,
+        state: "degraded",
+        detail: `${String(this.detectedConflicts.size)} event identity conflict(s) awaiting operator reconciliation at ledger ${String(progress.ledger)}`,
       };
     }
     if (progress.behind > CURRENT_WITHIN_LEDGERS) {
@@ -185,6 +202,9 @@ export class StellarWatcher {
       if (raw.ledger <= scan.through) closedAt = new Date(raw.ledgerClosedAt);
     }
 
+    const txIdentities = new Map(this.knownIdentities);
+    const txConflicts: StellarEventConflictReport[] = [];
+
     // One transaction for the page and the cursor. This is the restart guarantee, and splitting it
     // would turn every crash into either a lost page or a duplicated one.
     await db.transaction(async (tx: Queryable) => {
@@ -202,7 +222,7 @@ export class StellarWatcher {
           txHash: raw.txHash,
           closedAt: new Date(raw.ledgerClosedAt),
         };
-        if (await this.apply(tx, context, raw)) decoded += 1;
+        if (await this.apply(tx, context, raw, txIdentities, txConflicts)) decoded += 1;
         else skipped += 1;
       }
 
@@ -216,6 +236,14 @@ export class StellarWatcher {
         hash: null,
       });
     });
+
+    for (const [key, identity] of txIdentities) {
+      this.knownIdentities.set(key, identity);
+    }
+    for (const conflict of txConflicts) {
+      const dedupeKey = `${conflict.canonicalKey}::${conflict.conflictingPayloadDigest}::${conflict.conflictingEventId}`;
+      this.detectedConflicts.set(dedupeKey, conflict);
+    }
 
     const behind = Math.max(scan.latestLedger - scan.through, 0);
     this.lastProgress = { ledger: scan.through, decoded, skipped, behind, at: new Date() };
@@ -319,8 +347,34 @@ export class StellarWatcher {
     tx: Queryable,
     context: EventContext,
     raw: RawStellarEvent,
+    txIdentities: Map<string, EventIdentityEvidence>,
+    txConflicts: StellarEventConflictReport[],
   ): Promise<boolean> {
     const event = decodeStellarEvent(raw);
+    const identity = deriveStellarEventIdentity(context.chainKey, this.options.router, raw, event);
+    if (identity !== null) {
+      const outcome = await verifyAndRecordEventIdentity(tx, identity, event, txIdentities);
+      if (outcome.status === "conflict") {
+        txConflicts.push(outcome.report);
+        this.options.logger.error(
+          {
+            chain: context.chainKey,
+            contract: outcome.report.contract,
+            canonicalKey: outcome.report.canonicalKey,
+            existingEventId: outcome.report.existingEventId,
+            existingLedger: outcome.report.existingLedger,
+            existingTxHash: outcome.report.existingTxHash,
+            existingPayloadDigest: outcome.report.existingPayloadDigest,
+            conflictingEventId: outcome.report.conflictingEventId,
+            conflictingLedger: outcome.report.conflictingLedger,
+            conflictingTxHash: outcome.report.conflictingTxHash,
+            conflictingPayloadDigest: outcome.report.conflictingPayloadDigest,
+          },
+          "conflicting stellar event payload detected for canonical identity; retained reconciliation evidence without overwriting indexed state",
+        );
+        return false;
+      }
+    }
 
     switch (event.kind) {
       case "bridgeOut":

@@ -6,11 +6,16 @@
  * even when it finds nothing, a page and the cursor advance commit together, and a cursor is never
  * reused across routers.
  */
+import { readdirSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { PGlite } from "@electric-sql/pglite";
 import { describe, expect, it } from "vitest";
 
 import { endOfLedgerCursor } from "../../src/chains/stellar/cursor.js";
 import type { RawStellarEvent } from "../../src/chains/stellar/events.js";
+import { readStellarEventConflicts } from "../../src/chains/stellar/store.js";
 import { StellarWatcher } from "../../src/chains/stellar/watcher.js";
+import type { Queryable, Transactional } from "../../src/db/pool.js";
 import {
   FakeRpc,
   LIVE_ROUTER,
@@ -342,5 +347,278 @@ describe("gaps it cannot close", () => {
 
     const warnings = lines.filter((line) => line.message.includes("running ahead of the indexer"));
     expect(warnings).toHaveLength(1);
+  });
+});
+
+function syntheticBridgeOut(overrides: {
+  readonly ledger: number;
+  readonly eventIndex?: number;
+  readonly txHash: string;
+  readonly nonce: string;
+  readonly grossAmount: string;
+  readonly netAmount: string;
+  readonly destination?: string;
+}): RawStellarEvent {
+  const eventIndex = overrides.eventIndex ?? 0;
+  return syntheticEvent({
+    ledger: overrides.ledger,
+    id: `${toid(overrides.ledger, 0, eventIndex).toString().padStart(19, "0")}-${String(eventIndex).padStart(10, "0")}`,
+    txHash: overrides.txHash,
+    topicJson: [{ symbol: "hyperion" }, { symbol: "out" }],
+    valueJson: {
+      map: [
+        {
+          key: { symbol: "transfer" },
+          val: {
+            map: [
+              { key: { symbol: "created_at" }, val: { u64: "1790859057" } },
+              { key: { symbol: "created_ledger" }, val: { u32: overrides.ledger } },
+              {
+                key: { symbol: "destination" },
+                val: {
+                  bytes:
+                    overrides.destination ??
+                    "0000000000000000000000006ef8032ffe4943f27388172549f6700f18bb8b38",
+                },
+              },
+              { key: { symbol: "destination_chain" }, val: { string: "sepolia" } },
+              { key: { symbol: "fee" }, val: { i128: "30000" } },
+              { key: { symbol: "gross_amount" }, val: { i128: overrides.grossAmount } },
+              { key: { symbol: "net_amount" }, val: { i128: overrides.netAmount } },
+              { key: { symbol: "nonce" }, val: { u64: overrides.nonce } },
+              { key: { symbol: "route" }, val: { u32: 1 } },
+              {
+                key: { symbol: "sender" },
+                val: { address: "GCHPVETUL5E4YKDLMRIBFUGFK4PMYOVKPFALVSYMP2QDYAVBA3ITQDAI" },
+              },
+              {
+                key: { symbol: "token" },
+                val: { address: "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA" },
+              },
+            ],
+          },
+        },
+      ],
+    },
+  });
+}
+
+async function openMigratedPgLite(): Promise<{
+  readonly db: Transactional;
+  readonly close: () => Promise<void>;
+}> {
+  const pg = new PGlite();
+  const migrationsDir = fileURLToPath(new URL("../../migrations", import.meta.url));
+  const migrationNames = readdirSync(migrationsDir)
+    .filter((name) => name.endsWith(".sql"))
+    .sort();
+  for (const name of migrationNames) {
+    const sql = readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8").split(
+      "-- Down Migration",
+    )[0]!;
+    await pg.exec(sql);
+  }
+
+  const queryable: Queryable = {
+    query: async (sql: string, params: readonly unknown[] = []) => {
+      const result = await pg.query(sql, [...params]);
+      const int8 = result.fields
+        .filter((field) => field.dataTypeID === 20)
+        .map((field) => field.name);
+      const rows = result.rows.map((raw) => {
+        const row = { ...(raw as Record<string, unknown>) };
+        for (const column of int8) {
+          const value = row[column];
+          if (typeof value === "number" || typeof value === "bigint") row[column] = String(value);
+        }
+        return row;
+      });
+      return {
+        rows,
+        rowCount: result.rows.length > 0 ? result.rows.length : (result.affectedRows ?? 0),
+      };
+    },
+  };
+
+  const db: Transactional = {
+    query: (sql, params) => queryable.query(sql, params),
+    transaction: async <T>(work: (tx: Queryable) => Promise<T>): Promise<T> => {
+      await pg.exec("BEGIN");
+      try {
+        const out = await work(queryable);
+        await pg.exec("COMMIT");
+        return out;
+      } catch (error) {
+        await pg.exec("ROLLBACK");
+        throw error;
+      }
+    },
+  };
+
+  return { db, close: () => pg.close() };
+}
+
+describe("event identity conflict detection", () => {
+  it("keeps identical replays idempotent and blocks distinct payloads from overwriting a transfer", async () => {
+    const { db, close } = await openMigratedPgLite();
+    try {
+      const { logger, lines } = capturingLogger();
+      const first = syntheticBridgeOut({
+        ledger: FIRST_EVENT_LEDGER + 1,
+        txHash: "tx-canonical-transfer",
+        nonce: "77",
+        grossAmount: "10000000",
+        netAmount: "9970000",
+      });
+      const identicalReplay = syntheticBridgeOut({
+        ledger: FIRST_EVENT_LEDGER + 1,
+        txHash: "tx-canonical-transfer",
+        nonce: "77",
+        grossAmount: "10000000",
+        netAmount: "9970000",
+      });
+      const forgedConflict = syntheticBridgeOut({
+        ledger: FIRST_EVENT_LEDGER + 2,
+        eventIndex: 1,
+        txHash: "tx-forged-transfer",
+        nonce: "77",
+        grossAmount: "99000000",
+        netAmount: "98970000",
+        destination: "0000000000000000000000001111111111111111111111111111111111111111",
+      });
+
+      const watcher1 = new StellarWatcher({
+        chainKey: CHAIN,
+        router: LIVE_ROUTER,
+        startLedger: FIRST_EVENT_LEDGER,
+        pageSize: 200,
+        rpc: new FakeRpc({ events: [first], latestLedger: FIRST_EVENT_LEDGER + 5 }),
+        db,
+        logger,
+      });
+      await watcher1.tick(AbortSignal.timeout(5_000));
+      expect(watcher1.conflicts).toHaveLength(0);
+      expect(watcher1.readiness().state).toBe("ready");
+
+      // Replay the exact same event from scratch: idempotent, zero conflicts.
+      await db.query("DELETE FROM indexer_cursor WHERE chain_key = $1", [CHAIN]);
+      const watcherReplay = new StellarWatcher({
+        chainKey: CHAIN,
+        router: LIVE_ROUTER,
+        startLedger: FIRST_EVENT_LEDGER,
+        pageSize: 200,
+        rpc: new FakeRpc({ events: [identicalReplay], latestLedger: FIRST_EVENT_LEDGER + 5 }),
+        db,
+        logger,
+      });
+      await watcherReplay.tick(AbortSignal.timeout(5_000));
+      expect(watcherReplay.conflicts).toHaveLength(0);
+      expect(await readStellarEventConflicts(db, CHAIN)).toHaveLength(0);
+
+      // Now deliver a distinct payload claiming the same canonical nonce 77.
+      await db.query("DELETE FROM indexer_cursor WHERE chain_key = $1", [CHAIN]);
+      const watcherConflict = new StellarWatcher({
+        chainKey: CHAIN,
+        router: LIVE_ROUTER,
+        startLedger: FIRST_EVENT_LEDGER,
+        pageSize: 200,
+        rpc: new FakeRpc({
+          events: [first, forgedConflict],
+          latestLedger: FIRST_EVENT_LEDGER + 5,
+        }),
+        db,
+        logger,
+      });
+      await watcherConflict.tick(AbortSignal.timeout(5_000));
+
+      // Original transfer is untouched in PostgreSQL.
+      const transfers = await db.query(
+        "SELECT net_amount, destination, origin_tx FROM outbound_transfer WHERE origin_chain = $1 AND nonce = 77",
+        [CHAIN],
+      );
+      expect(transfers.rows).toEqual([
+        {
+          net_amount: "9970000",
+          destination: "0x0000000000000000000000006ef8032ffe4943f27388172549f6700f18bb8b38",
+          origin_tx: "tx-canonical-transfer",
+        },
+      ]);
+
+      // Operator conflict report retains source references and payload digests.
+      expect(watcherConflict.conflicts).toHaveLength(1);
+      expect(watcherConflict.readiness().state).toBe("degraded");
+      expect(watcherConflict.readiness().detail).toContain("identity conflict");
+      expect(lines.some((line) => line.message.includes("conflicting stellar event payload"))).toBe(
+        true,
+      );
+
+      const persisted = await readStellarEventConflicts(db, CHAIN);
+      expect(persisted).toHaveLength(1);
+      const report = persisted[0]!;
+      expect(report.contract).toBe(LIVE_ROUTER);
+      expect(report.canonicalKey).toBe("bridgeOut:77");
+      expect(report.existingEventId).toBe(first.id);
+      expect(report.existingLedger).toBe(first.ledger);
+      expect(report.existingTxHash).toBe("tx-canonical-transfer");
+      expect(report.conflictingEventId).toBe(forgedConflict.id);
+      expect(report.conflictingLedger).toBe(forgedConflict.ledger);
+      expect(report.conflictingTxHash).toBe("tx-forged-transfer");
+      expect(report.existingPayloadDigest).toMatch(/^[0-9a-f]{64}$/);
+      expect(report.conflictingPayloadDigest).toMatch(/^[0-9a-f]{64}$/);
+      expect(report.existingPayloadDigest).not.toBe(report.conflictingPayloadDigest);
+    } finally {
+      await close();
+    }
+  });
+
+  it("bounds oversized conflicting payload summaries in operator reports", async () => {
+    const queuedTemplate = ROUTER_HISTORY.find((entry) => entry.topicJson[1]?.symbol === "queued");
+    if (!queuedTemplate) throw new Error("expected queued template");
+
+    const actionA: RawStellarEvent = {
+      ...queuedTemplate,
+      ledger: FIRST_EVENT_LEDGER + 1,
+      id: `${toid(FIRST_EVENT_LEDGER + 1, 0, 0)
+        .toString()
+        .padStart(19, "0")}-0000000000`,
+      txHash: "tx-action-a",
+    };
+    const hugeNote = "X".repeat(5000);
+    const actionB: RawStellarEvent = {
+      ...queuedTemplate,
+      ledger: FIRST_EVENT_LEDGER + 2,
+      id: `${toid(FIRST_EVENT_LEDGER + 2, 0, 1)
+        .toString()
+        .padStart(19, "0")}-0000000001`,
+      txHash: "tx-action-b",
+      valueJson: {
+        map: [
+          {
+            key: { symbol: "action" },
+            val: { vec: [{ symbol: "RegisterToken" }, { string: hugeNote }] },
+          },
+          { key: { symbol: "eta" }, val: { u64: "1790859999" } },
+          { key: { symbol: "expires_at" }, val: { u64: "1791463857" } },
+          { key: { symbol: "id" }, val: { u64: "1" } },
+        ],
+      },
+    };
+
+    const { watcher, db } = harness({
+      events: [actionA, actionB],
+      startLedger: FIRST_EVENT_LEDGER,
+      latestLedger: FIRST_EVENT_LEDGER + 5,
+    });
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    expect(db.matching("INSERT INTO admin_action")).toHaveLength(1);
+    expect(watcher.conflicts).toHaveLength(1);
+    const summary = watcher.conflicts[0]?.conflictingSummary as {
+      truncated?: boolean;
+      payloadDigest?: string;
+    };
+    expect(summary.truncated).toBe(true);
+    expect(summary.payloadDigest).toBe(watcher.conflicts[0]?.conflictingPayloadDigest);
+    expect(JSON.stringify(summary).length).toBeLessThan(2500);
   });
 });

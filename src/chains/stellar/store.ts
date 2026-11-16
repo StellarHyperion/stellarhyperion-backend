@@ -10,10 +10,22 @@
  * transaction. That is the whole restart safety claim: a page of events and the cursor advance past
  * it land together or not at all.
  */
+import { createHash } from "node:crypto";
 import { ROUTE_KINDS } from "@hyperion/protocol";
 
 import type { Queryable } from "../../db/pool.js";
-import { bigintOf, maybeOne, text, textOrNull, timestampOrNull } from "../../db/rows.js";
+import {
+  bigintOf,
+  bigintOrNull,
+  boolean as booleanOf,
+  integer,
+  json,
+  maybeOne,
+  text,
+  textOrNull,
+  timestamp,
+  timestampOrNull,
+} from "../../db/rows.js";
 import type { Position } from "../writers.js";
 import {
   settleAction,
@@ -32,7 +44,9 @@ import type {
   ClaimParkedEvent,
   ClaimSettledEvent,
   PauseSetEvent,
+  RawStellarEvent,
   RouteConfiguredEvent,
+  StellarEvent,
   TokenRegisteredEvent,
 } from "./events.js";
 
@@ -287,4 +301,413 @@ export async function recordRouteConfigured(
     blocker: event.enabled ? 0 : 2,
     flowAvailable: null,
   });
+}
+
+const MAX_SUMMARY_BYTES = 2048;
+
+export interface EventIdentityEvidence {
+  readonly chainKey: string;
+  readonly canonicalKey: string;
+  readonly eventKind: "bridgeOut" | "bridgeIn" | "claimParked" | "actionQueued";
+  readonly contract: string;
+  readonly eventId: string;
+  readonly ledger: number;
+  readonly txHash: string;
+  readonly payloadDigest: string;
+  readonly boundedSummary: Record<string, unknown>;
+}
+
+export interface StellarEventConflictReport {
+  readonly chainKey: string;
+  readonly canonicalKey: string;
+  readonly eventKind: string;
+  readonly contract: string;
+  readonly existingEventId: string;
+  readonly existingLedger: number;
+  readonly existingTxHash: string;
+  readonly existingPayloadDigest: string;
+  readonly existingSummary: unknown;
+  readonly conflictingEventId: string;
+  readonly conflictingLedger: number;
+  readonly conflictingTxHash: string;
+  readonly conflictingPayloadDigest: string;
+  readonly conflictingSummary: unknown;
+  readonly detectedAt: Date;
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableJson(item)).join(",")}]`;
+  }
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableJson(v)}`).join(",")}}`;
+}
+
+function digestOfPayload(payload: Record<string, unknown>): string {
+  return createHash("sha256").update(stableJson(payload)).digest("hex");
+}
+
+function boundSummary(
+  payload: Record<string, unknown>,
+  payloadDigest: string,
+): Record<string, unknown> {
+  const serialized = stableJson(payload);
+  const byteLength = Buffer.byteLength(serialized, "utf8");
+  if (byteLength <= MAX_SUMMARY_BYTES) {
+    return payload;
+  }
+  const preview = serialized.slice(0, MAX_SUMMARY_BYTES - 256);
+  return {
+    truncated: true,
+    originalByteLength: byteLength,
+    payloadDigest,
+    preview,
+  };
+}
+
+export function deriveStellarEventIdentity(
+  chainKey: string,
+  contract: string,
+  raw: RawStellarEvent,
+  decoded: StellarEvent,
+): EventIdentityEvidence | null {
+  switch (decoded.kind) {
+    case "bridgeOut": {
+      const payload: Record<string, unknown> = {
+        route: decoded.data.route,
+        nonce: decoded.data.nonce.toString(),
+        sender: decoded.data.sender,
+        token: decoded.data.token,
+        grossAmount: decoded.data.grossAmount.toString(),
+        fee: decoded.data.fee.toString(),
+        netAmount: decoded.data.netAmount.toString(),
+        destinationChain: decoded.data.destinationChain,
+        destination: decoded.data.destination,
+      };
+      const payloadDigest = digestOfPayload(payload);
+      return {
+        chainKey,
+        canonicalKey: `bridgeOut:${decoded.data.nonce.toString()}`,
+        eventKind: "bridgeOut",
+        contract,
+        eventId: raw.id,
+        ledger: raw.ledger,
+        txHash: raw.txHash,
+        payloadDigest,
+        boundedSummary: boundSummary(payload, payloadDigest),
+      };
+    }
+    case "bridgeIn": {
+      const claimId = decoded.data.delivered ? null : decoded.data.claimId.toString();
+      const payload: Record<string, unknown> = {
+        route: decoded.data.route,
+        sourceChain: decoded.data.sourceChain,
+        sourceNonce: decoded.data.sourceNonce.toString(),
+        recipient: decoded.data.recipient,
+        token: decoded.data.token,
+        amount: decoded.data.amount.toString(),
+        delivered: decoded.data.delivered,
+        claimId,
+      };
+      const payloadDigest = digestOfPayload(payload);
+      return {
+        chainKey,
+        canonicalKey: `bridgeIn:${String(decoded.data.route)}:${decoded.data.sourceChain}:${decoded.data.sourceNonce.toString()}`,
+        eventKind: "bridgeIn",
+        contract,
+        eventId: raw.id,
+        ledger: raw.ledger,
+        txHash: raw.txHash,
+        payloadDigest,
+        boundedSummary: boundSummary(payload, payloadDigest),
+      };
+    }
+    case "claimParked": {
+      const payload: Record<string, unknown> = {
+        claimId: decoded.data.claimId.toString(),
+        recipient: decoded.data.recipient,
+        token: decoded.data.token,
+        amount: decoded.data.amount.toString(),
+        route: decoded.data.route,
+        sourceChain: decoded.data.sourceChain,
+        sourceNonce: decoded.data.sourceNonce.toString(),
+        createdAt: decoded.data.createdAt.toString(),
+      };
+      const payloadDigest = digestOfPayload(payload);
+      return {
+        chainKey,
+        canonicalKey: `claimParked:${decoded.data.claimId.toString()}`,
+        eventKind: "claimParked",
+        contract,
+        eventId: raw.id,
+        ledger: raw.ledger,
+        txHash: raw.txHash,
+        payloadDigest,
+        boundedSummary: boundSummary(payload, payloadDigest),
+      };
+    }
+    case "actionQueued": {
+      const payload: Record<string, unknown> = {
+        id: decoded.data.id.toString(),
+        variant: decoded.data.variant,
+        eta: decoded.data.eta.toString(),
+        expiresAt: decoded.data.expiresAt.toString(),
+        action: raw.valueJson,
+      };
+      const payloadDigest = digestOfPayload(payload);
+      return {
+        chainKey,
+        canonicalKey: `actionQueued:${decoded.data.id.toString()}`,
+        eventKind: "actionQueued",
+        contract,
+        eventId: raw.id,
+        ledger: raw.ledger,
+        txHash: raw.txHash,
+        payloadDigest,
+        boundedSummary: boundSummary(payload, payloadDigest),
+      };
+    }
+    default:
+      return null;
+  }
+}
+
+async function readFallbackMaterializedIdentity(
+  db: Queryable,
+  incoming: EventIdentityEvidence,
+  decoded: StellarEvent,
+): Promise<EventIdentityEvidence | null> {
+  if (decoded.kind === "bridgeOut") {
+    const { rows } = await db.query(
+      `SELECT route, nonce, sender, token, gross_amount, fee, net_amount,
+              destination_chain, destination, origin_block, origin_tx
+         FROM outbound_transfer
+        WHERE origin_chain = $1 AND nonce = $2`,
+      [incoming.chainKey, decoded.data.nonce.toString()],
+    );
+    const row = maybeOne(rows, `outbound transfer ${decoded.data.nonce.toString()}`);
+    if (row === null) return null;
+    const payload: Record<string, unknown> = {
+      route: integer(row, "route"),
+      nonce: bigintOf(row, "nonce").toString(),
+      sender: text(row, "sender"),
+      token: text(row, "token"),
+      grossAmount: bigintOf(row, "gross_amount").toString(),
+      fee: bigintOf(row, "fee").toString(),
+      netAmount: bigintOf(row, "net_amount").toString(),
+      destinationChain: text(row, "destination_chain"),
+      destination: text(row, "destination"),
+    };
+    const payloadDigest = digestOfPayload(payload);
+    return {
+      chainKey: incoming.chainKey,
+      canonicalKey: incoming.canonicalKey,
+      eventKind: "bridgeOut",
+      contract: incoming.contract,
+      eventId: `materialized:outbound:${decoded.data.nonce.toString()}`,
+      ledger: Number(bigintOf(row, "origin_block")),
+      txHash: text(row, "origin_tx"),
+      payloadDigest,
+      boundedSummary: boundSummary(payload, payloadDigest),
+    };
+  }
+
+  if (decoded.kind === "bridgeIn") {
+    const { rows } = await db.query(
+      `SELECT route, source_chain, source_nonce, recipient, token, amount,
+              delivered, claim_id, destination_block, destination_tx
+         FROM inbound_delivery
+        WHERE destination_chain = $1
+          AND route = $2
+          AND source_chain = $3
+          AND source_nonce = $4`,
+      [
+        incoming.chainKey,
+        decoded.data.route,
+        decoded.data.sourceChain,
+        decoded.data.sourceNonce.toString(),
+      ],
+    );
+    const row = maybeOne(rows, `inbound delivery ${incoming.canonicalKey}`);
+    if (row === null) return null;
+    const claimIdVal = bigintOrNull(row, "claim_id");
+    const delivered = booleanOf(row, "delivered");
+    const payload: Record<string, unknown> = {
+      route: integer(row, "route"),
+      sourceChain: text(row, "source_chain"),
+      sourceNonce: bigintOf(row, "source_nonce").toString(),
+      recipient: text(row, "recipient"),
+      token: text(row, "token"),
+      amount: bigintOf(row, "amount").toString(),
+      delivered,
+      claimId: delivered || claimIdVal === null ? null : claimIdVal.toString(),
+    };
+    const payloadDigest = digestOfPayload(payload);
+    return {
+      chainKey: incoming.chainKey,
+      canonicalKey: incoming.canonicalKey,
+      eventKind: "bridgeIn",
+      contract: incoming.contract,
+      eventId: `materialized:inbound:${incoming.canonicalKey}`,
+      ledger: Number(bigintOf(row, "destination_block")),
+      txHash: text(row, "destination_tx"),
+      payloadDigest,
+      boundedSummary: boundSummary(payload, payloadDigest),
+    };
+  }
+
+  return null;
+}
+
+export async function verifyAndRecordEventIdentity(
+  db: Queryable,
+  incoming: EventIdentityEvidence,
+  decoded: StellarEvent,
+  memoryCache: Map<string, EventIdentityEvidence>,
+): Promise<
+  | { readonly status: "accepted"; readonly replay: boolean }
+  | { readonly status: "conflict"; readonly report: StellarEventConflictReport }
+> {
+  const cacheKey = `${incoming.chainKey}::${incoming.canonicalKey}`;
+  let existing: EventIdentityEvidence | null = null;
+
+  const { rows } = await db.query(
+    `SELECT contract, event_id, ledger, tx_hash, payload_digest, bounded_summary
+       FROM stellar_event_identity
+      WHERE chain_key = $1 AND canonical_key = $2`,
+    [incoming.chainKey, incoming.canonicalKey],
+  );
+  const stored = maybeOne(rows, `stellar event identity ${incoming.canonicalKey}`);
+  if (stored !== null) {
+    existing = {
+      chainKey: incoming.chainKey,
+      canonicalKey: incoming.canonicalKey,
+      eventKind: incoming.eventKind,
+      contract: text(stored, "contract"),
+      eventId: text(stored, "event_id"),
+      ledger: Number(bigintOf(stored, "ledger")),
+      txHash: text(stored, "tx_hash"),
+      payloadDigest: text(stored, "payload_digest"),
+      boundedSummary: (json(stored, "bounded_summary") ?? {}) as Record<string, unknown>,
+    };
+  } else {
+    existing =
+      (await readFallbackMaterializedIdentity(db, incoming, decoded)) ??
+      memoryCache.get(cacheKey) ??
+      null;
+  }
+
+  if (existing === null) {
+    await db.query(
+      `INSERT INTO stellar_event_identity
+         (chain_key, canonical_key, event_kind, contract, event_id, ledger, tx_hash, payload_digest, bounded_summary)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+       ON CONFLICT (chain_key, canonical_key) DO NOTHING`,
+      [
+        incoming.chainKey,
+        incoming.canonicalKey,
+        incoming.eventKind,
+        incoming.contract,
+        incoming.eventId,
+        String(incoming.ledger),
+        incoming.txHash,
+        incoming.payloadDigest,
+        JSON.stringify(incoming.boundedSummary),
+      ],
+    );
+    memoryCache.set(cacheKey, incoming);
+    return { status: "accepted", replay: false };
+  }
+
+  if (existing.payloadDigest === incoming.payloadDigest) {
+    memoryCache.set(cacheKey, existing);
+    return { status: "accepted", replay: true };
+  }
+
+  const detectedAt = new Date();
+  await db.query(
+    `INSERT INTO stellar_event_conflict
+       (chain_key, canonical_key, event_kind, contract,
+        existing_event_id, existing_ledger, existing_tx_hash, existing_payload_digest, existing_summary,
+        conflicting_event_id, conflicting_ledger, conflicting_tx_hash, conflicting_payload_digest, conflicting_summary,
+        detected_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14::jsonb, $15)
+     ON CONFLICT (chain_key, canonical_key, conflicting_payload_digest, conflicting_event_id) DO NOTHING`,
+    [
+      incoming.chainKey,
+      incoming.canonicalKey,
+      incoming.eventKind,
+      incoming.contract,
+      existing.eventId,
+      String(existing.ledger),
+      existing.txHash,
+      existing.payloadDigest,
+      JSON.stringify(existing.boundedSummary),
+      incoming.eventId,
+      String(incoming.ledger),
+      incoming.txHash,
+      incoming.payloadDigest,
+      JSON.stringify(incoming.boundedSummary),
+      detectedAt,
+    ],
+  );
+
+  return {
+    status: "conflict",
+    report: {
+      chainKey: incoming.chainKey,
+      canonicalKey: incoming.canonicalKey,
+      eventKind: incoming.eventKind,
+      contract: incoming.contract,
+      existingEventId: existing.eventId,
+      existingLedger: existing.ledger,
+      existingTxHash: existing.txHash,
+      existingPayloadDigest: existing.payloadDigest,
+      existingSummary: existing.boundedSummary,
+      conflictingEventId: incoming.eventId,
+      conflictingLedger: incoming.ledger,
+      conflictingTxHash: incoming.txHash,
+      conflictingPayloadDigest: incoming.payloadDigest,
+      conflictingSummary: incoming.boundedSummary,
+      detectedAt,
+    },
+  };
+}
+
+export async function readStellarEventConflicts(
+  db: Queryable,
+  chainKey: string,
+): Promise<readonly StellarEventConflictReport[]> {
+  const { rows } = await db.query(
+    `SELECT chain_key, canonical_key, event_kind, contract,
+            existing_event_id, existing_ledger, existing_tx_hash, existing_payload_digest, existing_summary,
+            conflicting_event_id, conflicting_ledger, conflicting_tx_hash, conflicting_payload_digest, conflicting_summary,
+            detected_at
+       FROM stellar_event_conflict
+      WHERE chain_key = $1
+      ORDER BY id ASC`,
+    [chainKey],
+  );
+  return rows.map((row) => ({
+    chainKey: text(row, "chain_key"),
+    canonicalKey: text(row, "canonical_key"),
+    eventKind: text(row, "event_kind"),
+    contract: text(row, "contract"),
+    existingEventId: text(row, "existing_event_id"),
+    existingLedger: Number(bigintOf(row, "existing_ledger")),
+    existingTxHash: text(row, "existing_tx_hash"),
+    existingPayloadDigest: text(row, "existing_payload_digest"),
+    existingSummary: json(row, "existing_summary"),
+    conflictingEventId: text(row, "conflicting_event_id"),
+    conflictingLedger: Number(bigintOf(row, "conflicting_ledger")),
+    conflictingTxHash: text(row, "conflicting_tx_hash"),
+    conflictingPayloadDigest: text(row, "conflicting_payload_digest"),
+    conflictingSummary: json(row, "conflicting_summary"),
+    detectedAt: timestamp(row, "detected_at"),
+  }));
 }
