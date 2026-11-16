@@ -61,6 +61,14 @@ A claim number identifies funds parked by a destination router after an unsucces
 
 One process serializes its Stellar submissions to avoid sequence conflicts. Run only one active keeper signer process, or give replicas separate accounts. The keeper counts confirmations and leaves database claim/delivery changes to indexed events. It does not perform rail second-step delivery or gas top-ups. TTL maintenance covers configured router tokens/routes and recent indexed transfer/claim entries; it is not a guarantee that every adapter or upstream storage entry remains live.
 
+## Worker policy hot reload
+
+Nonsecret worker concurrency, scheduling and freshness limits (`STELLAR_POLL_INTERVAL_MS`, `STELLAR_EVENT_PAGE_SIZE`, `STELLAR_FRESH_WITHIN_LEDGERS`, `EVM_POLL_INTERVAL_MS`, `EVM_LOG_RANGE`, `EVM_FRESH_WITHIN_BLOCKS`, `RAIL_POLL_INTERVAL_MS`, `RAIL_BATCH_SIZE`, `RAIL_RECHECK_AFTER_MS`, `RAIL_MAX_CHECK_FAILURES`, `RAIL_FRESH_BACKLOG_MULTIPLE`, `KEEPER_POLL_INTERVAL_MS`, `KEEPER_CONCURRENCY` and `SHUTDOWN_TIMEOUT_MS`) can be reloaded atomically at runtime through `WorkerPolicyStore.reload()` or by updating `WORKER_POLICY_FILE` and sending `SIGHUP` to `src/main.ts`.
+
+- **Validation and rollback safety:** Every candidate reload runs through the startup schema and range checks first. Any invalid value leaves the previous valid `WorkerPolicySnapshot` and `version` active.
+- **In-flight policy-version boundary:** Each watcher tick (`StellarWatcher`, `EvmWatcher`, `RailPass`) and each BullMQ keeper job captures `policyStore.current()` once at the start of that pass and executes to completion under that exact `policyVersion`. Reloaded intervals, batch limits, concurrency and freshness thresholds apply at the next idle sleep or tick/job boundary without interrupting open transactions.
+- **Deployment trust boundary:** Router contracts, deployment files, start heights, reorg wind-back depths, network mode, RPC/Iris/Axelar provider URLs, enabled worker roles, bind addresses, `DATABASE_URL`, `REDIS_URL` and `KEEPER_STELLAR_SECRET` cannot be replaced by hot reload and require a controlled restart or migration.
+
 ## API and checks
 
 - `GET /health`, `GET /ready`

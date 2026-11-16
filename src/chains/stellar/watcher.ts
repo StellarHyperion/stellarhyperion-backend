@@ -24,6 +24,7 @@
  */
 import type { Logger } from "pino";
 
+import type { WorkerPolicySnapshot } from "../../config/worker-policy.js";
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { completeThrough, endOfLedgerCursor, parseEventCursor } from "./cursor.js";
@@ -73,10 +74,12 @@ export interface StellarWatcherOptions {
   /** The ledger to start a fresh cursor from. */
   readonly startLedger: number;
   readonly pageSize: number;
+  readonly freshWithinLedgers?: number;
   readonly rpc: EventSource;
   readonly db: Transactional;
   readonly logger: Logger;
   readonly maxPagesPerTick?: number;
+  readonly policy?: () => WorkerPolicySnapshot;
 }
 
 export interface WatcherProgress {
@@ -86,6 +89,7 @@ export interface WatcherProgress {
   readonly skipped: number;
   /** How far behind the chain's head this watcher is, in ledgers. */
   readonly behind: number;
+  readonly policyVersion: number;
   readonly at: Date;
 }
 
@@ -121,7 +125,11 @@ export class StellarWatcher {
         detail: "has not completed a pass yet, so nothing it could be asked about is indexed",
       };
     }
-    if (progress.behind > CURRENT_WITHIN_LEDGERS) {
+    const freshWithinLedgers =
+      this.options.policy?.().values.stellarFreshWithinLedgers ??
+      this.options.freshWithinLedgers ??
+      CURRENT_WITHIN_LEDGERS;
+    if (progress.behind > freshWithinLedgers) {
       return {
         name: this.name,
         state: "degraded",
@@ -139,8 +147,11 @@ export class StellarWatcher {
    * One pass. Returns true when it made progress and should be run again immediately, which is how
    * a watcher starting thousands of ledgers back catches up without sleeping between windows.
    */
-  async tick(signal: AbortSignal): Promise<boolean> {
+  async tick(signal: AbortSignal, capturedPolicy?: WorkerPolicySnapshot): Promise<boolean> {
     const { chainKey, router, db, logger } = this.options;
+    const activePolicy = capturedPolicy ?? this.options.policy?.();
+    const policyVersion = activePolicy?.version ?? 1;
+    const pageSize = activePolicy?.values.stellarPageSize ?? this.options.pageSize;
 
     const stored = await readCursor(db, chainKey);
     if (stored !== null && stored.contract !== router) {
@@ -154,7 +165,7 @@ export class StellarWatcher {
     }
 
     const base = stored === null ? this.options.startLedger - 1 : Number(stored.position);
-    const scan = await this.scan(base, stored === null, signal);
+    const scan = await this.scan(base, stored === null, pageSize, signal);
 
     if (scan.oldestLedger > base + 1 && stored !== null) {
       // The retention window moved past where we stopped. Anything between the two is gone from
@@ -173,6 +184,7 @@ export class StellarWatcher {
         decoded: 0,
         skipped: 0,
         behind: Math.max(scan.latestLedger - base, 0),
+        policyVersion,
         at: new Date(),
       };
       return false;
@@ -218,9 +230,24 @@ export class StellarWatcher {
     });
 
     const behind = Math.max(scan.latestLedger - scan.through, 0);
-    this.lastProgress = { ledger: scan.through, decoded, skipped, behind, at: new Date() };
+    this.lastProgress = {
+      ledger: scan.through,
+      decoded,
+      skipped,
+      behind,
+      policyVersion,
+      at: new Date(),
+    };
     logger.info(
-      { chain: chainKey, ledger: scan.through, decoded, skipped, behind, pages: scan.pages },
+      {
+        chain: chainKey,
+        ledger: scan.through,
+        decoded,
+        skipped,
+        behind,
+        pages: scan.pages,
+        policyVersion,
+      },
       "stellar window indexed",
     );
 
@@ -239,6 +266,7 @@ export class StellarWatcher {
   private async scan(
     base: number,
     fresh: boolean,
+    pageSize: number,
     signal: AbortSignal,
   ): Promise<{
     readonly events: readonly RawStellarEvent[];
@@ -247,7 +275,7 @@ export class StellarWatcher {
     readonly oldestLedger: number;
     readonly pages: number;
   }> {
-    const { router, pageSize, logger, chainKey } = this.options;
+    const { router, logger, chainKey } = this.options;
     const maxPages = this.options.maxPagesPerTick ?? MAX_PAGES_PER_TICK;
 
     const events: RawStellarEvent[] = [];

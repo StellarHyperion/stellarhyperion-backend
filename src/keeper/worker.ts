@@ -7,6 +7,7 @@
 import type { Logger } from "pino";
 
 import type { AppConfig } from "../config/config.js";
+import type { WorkerPolicyReader } from "../config/worker-policy.js";
 import type { Transactional } from "../db/pool.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
 import { startKeeperQueue, type KeeperHandle } from "./queue.js";
@@ -21,6 +22,7 @@ export class KeeperWorker implements ReadinessSource {
     private readonly config: AppConfig,
     private readonly db: Transactional,
     private readonly logger: Logger,
+    private readonly policyStore?: WorkerPolicyReader,
   ) {}
 
   readiness(): ReadinessReport {
@@ -57,7 +59,12 @@ export class KeeperWorker implements ReadinessSource {
     this.starting = true;
 
     startKeeperQueue(
-      { db: this.db, config: this.config, logger: this.logger },
+      {
+        db: this.db,
+        config: this.config,
+        logger: this.logger,
+        ...(this.policyStore ? { policyStore: this.policyStore } : {}),
+      },
       this.config.redisUrl,
     )
       .then((handle) => {

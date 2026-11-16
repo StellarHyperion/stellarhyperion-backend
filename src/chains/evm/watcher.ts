@@ -27,6 +27,7 @@
 import type { Logger } from "pino";
 import type { Hex } from "viem";
 
+import type { WorkerPolicySnapshot } from "../../config/worker-policy.js";
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
@@ -58,9 +59,11 @@ export interface EvmWatcherOptions {
   readonly reorgDepth: number;
   /** Blocks per `getLogs` call. Public endpoints reject wide ranges. */
   readonly logRange: number;
+  readonly freshWithinBlocks?: number;
   readonly client: EvmClient;
   readonly db: Transactional;
   readonly logger: Logger;
+  readonly policy?: () => WorkerPolicySnapshot;
 }
 
 export interface EvmProgress {
@@ -72,6 +75,7 @@ export interface EvmProgress {
   /** Blocks between the cursor and the deepest block this watcher will read. */
   readonly behind: number;
   readonly reorgs: number;
+  readonly policyVersion: number;
   readonly at: Date;
 }
 
@@ -109,7 +113,11 @@ export class EvmWatcher {
         detail: "has not completed a pass yet, so nothing it could be asked about is indexed",
       };
     }
-    if (progress.behind > CURRENT_WITHIN_BLOCKS) {
+    const freshWithinBlocks =
+      this.options.policy?.().values.evmFreshWithinBlocks ??
+      this.options.freshWithinBlocks ??
+      CURRENT_WITHIN_BLOCKS;
+    if (progress.behind > freshWithinBlocks) {
       return {
         name: this.name,
         state: "degraded",
@@ -132,8 +140,11 @@ export class EvmWatcher {
    * One pass. Returns true when it made progress and should be run again immediately, which is how
    * a watcher starting from a deployment block months back catches up without sleeping per range.
    */
-  async tick(signal: AbortSignal): Promise<boolean> {
+  async tick(signal: AbortSignal, capturedPolicy?: WorkerPolicySnapshot): Promise<boolean> {
     const { chainKey, router, db, logger, client, confirmations } = this.options;
+    const activePolicy = capturedPolicy ?? this.options.policy?.();
+    const policyVersion = activePolicy?.version ?? 1;
+    const logRange = activePolicy?.values.evmLogRange ?? this.options.logRange;
 
     const stored = await readCursor(db, chainKey);
     if (stored !== null && stored.contract.toLowerCase() !== router.toLowerCase()) {
@@ -167,12 +178,13 @@ export class EvmWatcher {
         head,
         behind: Number(confirmed - (stored?.position ?? this.options.startBlock - 1n)),
         reorgs: this.reorgs,
+        policyVersion,
         at: new Date(),
       };
       return false;
     }
 
-    const to = min(from + BigInt(this.options.logRange) - 1n, confirmed);
+    const to = min(from + BigInt(logRange) - 1n, confirmed);
     const logs = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
 
     // Block timestamps, which `getLogs` does not return and three columns need. One call per block
@@ -236,6 +248,7 @@ export class EvmWatcher {
       head,
       behind,
       reorgs: this.reorgs,
+      policyVersion,
       at: new Date(),
     };
     logger.info(
@@ -246,6 +259,7 @@ export class EvmWatcher {
         written,
         ignored,
         behind,
+        policyVersion,
       },
       "evm range indexed",
     );

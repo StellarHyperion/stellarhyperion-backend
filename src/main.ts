@@ -7,8 +7,9 @@
  * JSON with the whole explanation escaped inside one field.
  */
 import { buildIndexer } from "./chains/runner.js";
-import { loadConfig } from "./config/config.js";
+import { captureProcessLoadOptions, loadConfig } from "./config/config.js";
 import { ConfigError } from "./config/env.js";
+import { createWorkerPolicyStore, installPolicyReloadSignal } from "./config/worker-policy.js";
 import { Database } from "./db/pool.js";
 import { buildServer } from "./http/server.js";
 import { createKeeperRedis } from "./keeper/queue.js";
@@ -17,10 +18,11 @@ import { Shutdown, installSignalHandlers } from "./runtime/shutdown.js";
 
 async function main(): Promise<void> {
   const startedAt = new Date();
+  const initialOptions = captureProcessLoadOptions();
 
   const config = (() => {
     try {
-      return loadConfig();
+      return loadConfig(initialOptions);
     } catch (error) {
       if (error instanceof ConfigError) {
         process.stderr.write(`\n${error.message}\n\n`);
@@ -31,8 +33,18 @@ async function main(): Promise<void> {
   })();
 
   const logger = createLogger(config);
-  const shutdown = new Shutdown(logger, config.shutdownTimeoutMs);
+  const policyStore = createWorkerPolicyStore(config, { initialOptions });
+  const shutdown = new Shutdown(logger, () => policyStore.current().values.shutdownTimeoutMs);
   installSignalHandlers(shutdown, logger);
+  const removePolicySignal = installPolicyReloadSignal(
+    policyStore,
+    logger,
+    captureProcessLoadOptions,
+  );
+  shutdown.add("worker-policy-signal", () => {
+    removePolicySignal();
+    return Promise.resolve();
+  });
 
   const db = Database.open(config.databaseUrl, { applicationName: "hyperion-backend" });
   shutdown.add("postgres", () => db.close());
@@ -46,7 +58,7 @@ async function main(): Promise<void> {
   // Registered between the pool and the server, because shutdown runs in reverse: the server
   // stops accepting requests, the watchers finish the page they are on, and only then does the
   // pool close under them.
-  const indexer = buildIndexer({ config, logger, db });
+  const indexer = buildIndexer({ config, logger, db, policyStore });
   shutdown.add("indexer", () => indexer.stop());
 
   const server = buildServer({
@@ -70,6 +82,8 @@ async function main(): Promise<void> {
       port: config.http.port,
       network: config.network,
       deploymentsFile: config.deploymentsFile,
+      workerPolicyFile: config.workerPolicyFile,
+      policyVersion: policyStore.current().version,
       watchingStellar: config.indexer.stellar?.chain ?? null,
       watchingEvm: config.indexer.evm.map((entry) => entry.chain),
       workers: indexer.workers.map((worker) => worker.name),

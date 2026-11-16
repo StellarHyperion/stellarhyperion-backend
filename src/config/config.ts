@@ -55,6 +55,7 @@ export interface StellarWatchConfig {
   readonly startLedger: number;
   readonly pageSize: number;
   readonly pollIntervalMs: number;
+  readonly freshWithinLedgers: number;
 }
 
 /** Everything the EVM watcher needs, per chain. */
@@ -72,6 +73,7 @@ export interface EvmWatchConfig {
   readonly reorgDepth: number;
   readonly logRange: number;
   readonly pollIntervalMs: number;
+  readonly freshWithinBlocks: number;
 }
 
 /** Everything the rail status pollers need. One per rail that has a status API. */
@@ -84,6 +86,7 @@ export interface RailsConfig {
   readonly batchSize: number;
   readonly recheckAfterMs: number;
   readonly maxCheckFailures: number;
+  readonly freshBacklogMultiple: number;
 }
 
 export interface IndexerConfig {
@@ -100,6 +103,24 @@ export interface KeeperConfig {
   readonly stellarSecret: string | null;
 }
 
+/** Nonsecret worker concurrency, scheduling and freshness limits eligible for atomic hot reload. */
+export interface WorkerPolicyValues {
+  readonly stellarPollIntervalMs: number;
+  readonly stellarPageSize: number;
+  readonly stellarFreshWithinLedgers: number;
+  readonly evmPollIntervalMs: number;
+  readonly evmLogRange: number;
+  readonly evmFreshWithinBlocks: number;
+  readonly railPollIntervalMs: number;
+  readonly railBatchSize: number;
+  readonly railRecheckAfterMs: number;
+  readonly railMaxCheckFailures: number;
+  readonly railFreshBacklogMultiple: number;
+  readonly keeperPollIntervalMs: number;
+  readonly keeperConcurrency: number;
+  readonly shutdownTimeoutMs: number;
+}
+
 export interface AppConfig {
   readonly nodeEnv: NodeEnv;
   readonly logLevel: LogLevel;
@@ -108,10 +129,12 @@ export interface AppConfig {
   readonly redisUrl: string;
   readonly network: NetworkMode;
   readonly deploymentsFile: string;
+  readonly workerPolicyFile: string | null;
   readonly deployments: DeploymentSet;
   readonly indexer: IndexerConfig;
   readonly rails: RailsConfig;
   readonly keeper: KeeperConfig;
+  readonly workerPolicy: WorkerPolicyValues;
   readonly shutdownTimeoutMs: number;
 }
 
@@ -284,6 +307,27 @@ const RAIL_MAX_CHECK_FAILURES: VarSpec = {
     "Consecutive failures before the queue stops offering a transfer. Per transfer, not per rail: one unanswerable transfer must not back off the whole rail.",
 };
 
+const RAIL_FRESH_BACKLOG_MULTIPLE: VarSpec = {
+  name: "RAIL_FRESH_BACKLOG_MULTIPLE",
+  kind: "integer",
+  required: false,
+  fallback: "3",
+  min: 1,
+  max: 100,
+  printable: true,
+  purpose:
+    "How many batches of outstanding rail transfers still count as current before readiness reports degraded.",
+};
+
+const WORKER_POLICY_FILE: VarSpec = {
+  name: "WORKER_POLICY_FILE",
+  kind: "string",
+  required: false,
+  printable: true,
+  purpose:
+    "Optional JSON file holding nonsecret worker concurrency, scheduling and freshness overrides for hot reload.",
+};
+
 const KEEPER_ENABLED: VarSpec = {
   name: "KEEPER_ENABLED",
   kind: "boolean",
@@ -374,6 +418,17 @@ const STELLAR_POLL_INTERVAL_MS: VarSpec = {
   purpose: "Ledgers close in about five seconds, so polling faster mostly asks for nothing.",
 };
 
+const STELLAR_FRESH_WITHIN_LEDGERS: VarSpec = {
+  name: "STELLAR_FRESH_WITHIN_LEDGERS",
+  kind: "integer",
+  required: false,
+  fallback: "5",
+  min: 0,
+  max: 100_000,
+  printable: true,
+  purpose: "How many ledgers behind the head the Stellar watcher can sit and still report ready.",
+};
+
 const EVM_POLL_INTERVAL_MS: VarSpec = {
   name: "EVM_POLL_INTERVAL_MS",
   kind: "integer",
@@ -394,6 +449,18 @@ const EVM_LOG_RANGE: VarSpec = {
   purpose: "Blocks per getLogs call. Public endpoints reject wide ranges.",
 };
 
+const EVM_FRESH_WITHIN_BLOCKS: VarSpec = {
+  name: "EVM_FRESH_WITHIN_BLOCKS",
+  kind: "integer",
+  required: false,
+  fallback: "2",
+  min: 0,
+  max: 100_000,
+  printable: true,
+  purpose:
+    "How many blocks behind the confirmed head an EVM watcher can sit and still report ready.",
+};
+
 const EVM_REORG_DEPTH: VarSpec = {
   name: "EVM_REORG_DEPTH_BLOCKS",
   kind: "integer",
@@ -403,6 +470,23 @@ const EVM_REORG_DEPTH: VarSpec = {
   purpose:
     "How far back the cursor winds when a reorg is found below the confirmation depth. Not a re-read on every pass: ordinary passes trust the cursor, because nothing past the confirmation line is indexed in the first place. Defaults per chain to that chain's own confirmations from the registry.",
 };
+
+export const RELOADABLE_WORKER_POLICY_VARS: ReadonlySet<string> = new Set([
+  STELLAR_POLL_INTERVAL_MS.name,
+  STELLAR_EVENT_PAGE_SIZE.name,
+  STELLAR_FRESH_WITHIN_LEDGERS.name,
+  EVM_POLL_INTERVAL_MS.name,
+  EVM_LOG_RANGE.name,
+  EVM_FRESH_WITHIN_BLOCKS.name,
+  RAIL_POLL_INTERVAL_MS.name,
+  RAIL_BATCH_SIZE.name,
+  RAIL_RECHECK_AFTER_MS.name,
+  RAIL_MAX_CHECK_FAILURES.name,
+  RAIL_FRESH_BACKLOG_MULTIPLE.name,
+  KEEPER_POLL_INTERVAL_MS.name,
+  KEEPER_CONCURRENCY.name,
+  SHUTDOWN_TIMEOUT_MS.name,
+]);
 
 /** `base-sepolia` becomes `BASE_SEPOLIA`, which is what an override variable is named after. */
 export function envSuffixFor(chain: ChainKey): string {
@@ -435,16 +519,41 @@ function rpcUrlsOverrideSpec(chain: ChainKey): VarSpec {
 }
 
 /**
+ * Snapshot current process inputs without reading `process.env` outside this module.
+ *
+ * Used by the `SIGHUP` handler in `main.ts` so hot reload re-reads `WORKER_POLICY_FILE` and
+ * verifies deployment records through `loadConfig` while keeping `process.env` confined here.
+ */
+export function captureProcessLoadOptions(): LoadOptions {
+  return {
+    env: { ...process.env },
+    cwd: process.cwd(),
+  };
+}
+
+/**
  * Read the environment and the deployment record, or explain why not.
  *
  * Throws `ConfigError` listing every variable that needs attention. Deliberately the only place
  * in the process that reads `process.env`.
  */
 export function loadConfig(options: LoadOptions = {}): AppConfig {
-  const env = options.env ?? process.env;
+  const baseEnv = options.env ?? process.env;
   const read = options.readFile ?? ((path: string) => readFileSync(path, "utf8"));
   const cwd = options.cwd ?? process.cwd();
-  const reader = new EnvReader(env);
+  const baseReader = new EnvReader(baseEnv);
+  const rawPolicyFile = baseReader.has(WORKER_POLICY_FILE.name)
+    ? baseReader.string(WORKER_POLICY_FILE)
+    : null;
+  const absolutePolicyFile =
+    rawPolicyFile === null || rawPolicyFile === "" ? null : resolvePath(cwd, rawPolicyFile);
+  const policyOverlay =
+    absolutePolicyFile === null
+      ? null
+      : readWorkerPolicyOverlay(baseReader, read, absolutePolicyFile);
+  const env: Readonly<Record<string, string | undefined>> =
+    policyOverlay === null ? baseEnv : { ...baseEnv, ...policyOverlay };
+  const reader = policyOverlay === null ? baseReader : new EnvReader(env);
 
   const nodeEnv = reader.choice(NODE_ENV);
   const logLevel = reader.choice(LOG_LEVEL);
@@ -465,6 +574,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const railBatchSize = reader.integer(RAIL_BATCH_SIZE);
   const railRecheckAfterMs = reader.integer(RAIL_RECHECK_AFTER_MS);
   const railMaxCheckFailures = reader.integer(RAIL_MAX_CHECK_FAILURES);
+  const railFreshBacklogMultiple = reader.integer(RAIL_FRESH_BACKLOG_MULTIPLE);
 
   const keeperPollIntervalMs = reader.integer(KEEPER_POLL_INTERVAL_MS);
   const keeperConcurrency = reader.integer(KEEPER_CONCURRENCY);
@@ -477,8 +587,10 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     : null;
   const pageSize = reader.integer(STELLAR_EVENT_PAGE_SIZE);
   const stellarPollIntervalMs = reader.integer(STELLAR_POLL_INTERVAL_MS);
+  const stellarFreshWithinLedgers = reader.integer(STELLAR_FRESH_WITHIN_LEDGERS);
   const evmPollIntervalMs = reader.integer(EVM_POLL_INTERVAL_MS);
   const logRange = reader.integer(EVM_LOG_RANGE);
+  const evmFreshWithinBlocks = reader.integer(EVM_FRESH_WITHIN_BLOCKS);
   const reorgDepthOverride = reader.has(EVM_REORG_DEPTH.name)
     ? reader.integer(EVM_REORG_DEPTH)
     : null;
@@ -493,14 +605,19 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     startLedgerOverride,
     pageSize,
     stellarPollIntervalMs,
+    stellarFreshWithinLedgers,
     evmPollIntervalMs,
     logRange,
+    evmFreshWithinBlocks,
     reorgDepthOverride,
     env,
   });
 
   // One throw, after everything has had a chance to complain.
-  reader.finish();
+  baseReader.finish();
+  if (reader !== baseReader) {
+    reader.finish();
+  }
 
   return {
     nodeEnv,
@@ -510,6 +627,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     redisUrl,
     network,
     deploymentsFile: absoluteDeployments,
+    workerPolicyFile: absolutePolicyFile,
     deployments,
     indexer,
     rails: {
@@ -520,6 +638,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       batchSize: railBatchSize,
       recheckAfterMs: railRecheckAfterMs,
       maxCheckFailures: railMaxCheckFailures,
+      freshBacklogMultiple: railFreshBacklogMultiple,
     },
     keeper: {
       enabled: keeperEnabled,
@@ -527,8 +646,78 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       concurrency: keeperConcurrency,
       stellarSecret: keeperStellarSecret,
     },
+    workerPolicy: {
+      stellarPollIntervalMs,
+      stellarPageSize: pageSize,
+      stellarFreshWithinLedgers,
+      evmPollIntervalMs,
+      evmLogRange: logRange,
+      evmFreshWithinBlocks,
+      railPollIntervalMs,
+      railBatchSize,
+      railRecheckAfterMs,
+      railMaxCheckFailures,
+      railFreshBacklogMultiple,
+      keeperPollIntervalMs,
+      keeperConcurrency,
+      shutdownTimeoutMs,
+    },
     shutdownTimeoutMs,
   };
+}
+
+function readWorkerPolicyOverlay(
+  reader: EnvReader,
+  read: (path: string) => string,
+  path: string,
+): Record<string, string> | null {
+  let text: string;
+  try {
+    text = read(path);
+  } catch {
+    reader.reject(WORKER_POLICY_FILE, `cannot be read at ${path}`);
+    return null;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    reader.reject(WORKER_POLICY_FILE, `is not valid JSON: ${messageOf(error)}`);
+    return null;
+  }
+
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    reader.reject(WORKER_POLICY_FILE, "must be a JSON object of nonsecret worker policy variables");
+    return null;
+  }
+
+  const record = parsed as Record<string, unknown>;
+  const forbiddenKeys = Object.keys(record).filter(
+    (key) => !RELOADABLE_WORKER_POLICY_VARS.has(key),
+  );
+  if (forbiddenKeys.length > 0) {
+    reader.reject(
+      WORKER_POLICY_FILE,
+      `names non-reloadable or trust-boundary settings (${forbiddenKeys.join(", ")}); router, provider, role and secret settings require a controlled restart`,
+    );
+    return null;
+  }
+
+  const overlay: Record<string, string> = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (value === undefined || value === null) continue;
+    if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
+      reader.reject(
+        WORKER_POLICY_FILE,
+        `expected scalar string, number or boolean for ${key}, found ${typeof value}`,
+      );
+      return null;
+    }
+    overlay[key] = String(value);
+  }
+
+  return overlay;
 }
 
 const EMPTY_SET: DeploymentSet = { schemaVersion: 1, generatedAt: "", networks: {} };
@@ -581,8 +770,10 @@ interface PlanInput {
   readonly startLedgerOverride: number | null;
   readonly pageSize: number;
   readonly stellarPollIntervalMs: number;
+  readonly stellarFreshWithinLedgers: number;
   readonly evmPollIntervalMs: number;
   readonly logRange: number;
+  readonly evmFreshWithinBlocks: number;
   readonly reorgDepthOverride: number | null;
   readonly env: Readonly<Record<string, string | undefined>>;
 }
@@ -647,6 +838,7 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
         startLedger: input.startLedgerOverride ?? deployment.deployedAt.ledger,
         pageSize: input.pageSize,
         pollIntervalMs: input.stellarPollIntervalMs,
+        freshWithinLedgers: input.stellarFreshWithinLedgers,
       };
       continue;
     }
@@ -683,6 +875,7 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
         reorgDepth: input.reorgDepthOverride ?? chain.confirmations,
         logRange: input.logRange,
         pollIntervalMs: input.evmPollIntervalMs,
+        freshWithinBlocks: input.evmFreshWithinBlocks,
       });
       continue;
     }

@@ -20,6 +20,8 @@
  */
 import type { Logger } from "pino";
 
+import type { WorkerPolicyReader, WorkerPolicySnapshot } from "../config/worker-policy.js";
+
 export interface PollerStats {
   readonly ticks: number;
   readonly lastSuccessAt: Date | null;
@@ -28,31 +30,39 @@ export interface PollerStats {
   readonly lastError: string | null;
   readonly consecutiveFailures: number;
   readonly running: boolean;
+  /** Policy version captured when the currently executing tick began, or null while idle. */
+  readonly inFlightPolicyVersion: number | null;
+  /** Policy version under which the most recent completed tick ran. */
+  readonly lastCompletedPolicyVersion: number | null;
 }
 
 export interface PollerOptions {
   readonly name: string;
-  readonly intervalMs: number;
+  readonly intervalMs: number | (() => number);
   readonly logger: Logger;
+  readonly policyStore?: WorkerPolicyReader;
   /** Ceiling on the backoff wait. Default is thirty times the interval or one minute, whichever is less. */
   readonly maxBackoffMs?: number;
   /**
    * One pass. Returns true when it made progress and should be run again immediately, false when
    * it caught up and the interval should be waited out.
    */
-  readonly tick: (signal: AbortSignal) => Promise<boolean>;
+  readonly tick: (signal: AbortSignal, policy?: WorkerPolicySnapshot) => Promise<boolean>;
 }
 
 export class Poller {
   private readonly controller = new AbortController();
   private loop: Promise<void> | null = null;
   private sleeping: (() => void) | null = null;
+  private rescheduleSleep: ((nextWaitMs: number) => void) | null = null;
 
   private ticks = 0;
   private lastSuccessAt: Date | null = null;
   private lastErrorAt: Date | null = null;
   private lastError: string | null = null;
   private consecutiveFailures = 0;
+  private inFlightPolicyVersion: number | null = null;
+  private lastCompletedPolicyVersion: number | null = null;
 
   constructor(private readonly options: PollerOptions) {}
 
@@ -82,6 +92,8 @@ export class Poller {
       lastError: this.lastError,
       consecutiveFailures: this.consecutiveFailures,
       running: this.loop !== null && !this.isAborted(),
+      inFlightPolicyVersion: this.inFlightPolicyVersion,
+      lastCompletedPolicyVersion: this.lastCompletedPolicyVersion,
     };
   }
 
@@ -96,60 +108,98 @@ export class Poller {
     await this.loop;
   }
 
+  private resolveIntervalMs(): number {
+    const { intervalMs } = this.options;
+    return typeof intervalMs === "function" ? intervalMs() : intervalMs;
+  }
+
   private async run(): Promise<void> {
-    const { logger, name, tick, intervalMs } = this.options;
-    const maxBackoff = this.options.maxBackoffMs ?? Math.min(intervalMs * 30, 60_000);
-
-    while (!this.isAborted()) {
-      let progressed = false;
-      try {
-        progressed = await tick(this.controller.signal);
-        this.ticks += 1;
-        this.lastSuccessAt = new Date();
-        this.consecutiveFailures = 0;
-        this.lastError = null;
-      } catch (error) {
-        if (this.isAborted()) break;
-        this.consecutiveFailures += 1;
-        this.lastErrorAt = new Date();
-        this.lastError = messageOf(error);
-        // Full error at warn for the first few, then the message only. A chain that has been
-        // down for an hour should not be writing a stack trace every four seconds.
-        if (this.consecutiveFailures <= 3) {
-          logger.warn(
-            { err: error, poller: name, failures: this.consecutiveFailures },
-            "poll failed",
-          );
-        } else {
-          logger.warn(
-            { poller: name, failures: this.consecutiveFailures, reason: this.lastError },
-            "poll still failing",
-          );
-        }
+    const { logger, name, tick, policyStore } = this.options;
+    const unsubscribe = policyStore?.subscribe(() => {
+      if (this.consecutiveFailures === 0 && this.rescheduleSleep !== null) {
+        this.rescheduleSleep(this.resolveIntervalMs());
       }
+    });
 
-      if (this.isAborted()) break;
-      if (progressed && this.consecutiveFailures === 0) continue;
+    try {
+      while (!this.isAborted()) {
+        const tickPolicy = policyStore?.current();
+        this.inFlightPolicyVersion = tickPolicy?.version ?? null;
+        let progressed = false;
+        try {
+          progressed = await tick(this.controller.signal, tickPolicy);
+          this.ticks += 1;
+          this.lastSuccessAt = new Date();
+          this.consecutiveFailures = 0;
+          this.lastError = null;
+          this.lastCompletedPolicyVersion = tickPolicy?.version ?? null;
+        } catch (error) {
+          if (this.isAborted()) break;
+          this.consecutiveFailures += 1;
+          this.lastErrorAt = new Date();
+          this.lastError = messageOf(error);
+          // Full error at warn for the first few, then the message only. A chain that has been
+          // down for an hour should not be writing a stack trace every four seconds.
+          if (this.consecutiveFailures <= 3) {
+            logger.warn(
+              { err: error, poller: name, failures: this.consecutiveFailures },
+              "poll failed",
+            );
+          } else {
+            logger.warn(
+              { poller: name, failures: this.consecutiveFailures, reason: this.lastError },
+              "poll still failing",
+            );
+          }
+        } finally {
+          this.inFlightPolicyVersion = null;
+        }
 
-      const wait =
-        this.consecutiveFailures === 0
-          ? intervalMs
-          : Math.min(intervalMs * 2 ** (this.consecutiveFailures - 1), maxBackoff);
-      await this.sleep(wait);
+        if (this.isAborted()) break;
+        if (progressed && this.consecutiveFailures === 0) continue;
+
+        const intervalMs = this.resolveIntervalMs();
+        const maxBackoff = this.options.maxBackoffMs ?? Math.min(intervalMs * 30, 60_000);
+        const wait =
+          this.consecutiveFailures === 0
+            ? intervalMs
+            : Math.min(intervalMs * 2 ** (this.consecutiveFailures - 1), maxBackoff);
+        await this.sleep(wait);
+      }
+    } finally {
+      unsubscribe?.();
     }
   }
 
   /** Interruptible, so shutdown does not have to wait out a sixty second backoff. */
   private sleep(ms: number): Promise<void> {
     return new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
+      const startedAt = Date.now();
+      let timer = setTimeout(() => {
         this.sleeping = null;
+        this.rescheduleSleep = null;
         resolve();
       }, ms);
       this.sleeping = () => {
         clearTimeout(timer);
         this.sleeping = null;
+        this.rescheduleSleep = null;
         resolve();
+      };
+      this.rescheduleSleep = (nextWaitMs: number) => {
+        const remaining = nextWaitMs - (Date.now() - startedAt);
+        clearTimeout(timer);
+        if (remaining <= 0) {
+          this.sleeping = null;
+          this.rescheduleSleep = null;
+          resolve();
+          return;
+        }
+        timer = setTimeout(() => {
+          this.sleeping = null;
+          this.rescheduleSleep = null;
+          resolve();
+        }, remaining);
       };
     });
   }

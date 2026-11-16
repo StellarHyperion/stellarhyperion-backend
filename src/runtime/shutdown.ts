@@ -24,7 +24,7 @@ export class Shutdown {
 
   constructor(
     private readonly logger: Logger,
-    private readonly budgetMs: number,
+    private readonly budgetMs: number | (() => number),
   ) {}
 
   /** Register a step. Later registrations shut down first. */
@@ -50,10 +50,11 @@ export class Shutdown {
 
   private async execute(reason: string): Promise<void> {
     const startedAt = Date.now();
+    const budgetMs = typeof this.budgetMs === "function" ? this.budgetMs() : this.budgetMs;
     this.logger.info({ reason, steps: this.steps.length }, "shutting down");
 
     for (const step of [...this.steps].reverse()) {
-      const remaining = this.budgetMs - (Date.now() - startedAt);
+      const remaining = budgetMs - (Date.now() - startedAt);
       if (remaining <= 0) {
         this.logger.warn({ step: step.name }, "shutdown budget spent, skipping remaining steps");
         break;

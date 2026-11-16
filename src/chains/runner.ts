@@ -20,8 +20,9 @@ import type {
   RailsConfig,
   StellarWatchConfig,
 } from "../config/config.js";
+import type { WorkerPolicyReader, WorkerPolicySnapshot } from "../config/worker-policy.js";
 import type { Transactional } from "../db/pool.js";
-import { Poller } from "../runtime/poller.js";
+import { Poller, type PollerStats } from "../runtime/poller.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
 import { fixedReadiness } from "../runtime/readiness.js";
 import { RouteKind } from "@hyperion/protocol";
@@ -63,7 +64,7 @@ export interface IndexerHandle {
 /** One pass is one `tick`, and the component reports its own health. */
 interface Pass extends ReadinessSource {
   readonly name: string;
-  tick(signal: AbortSignal): Promise<boolean>;
+  tick(signal: AbortSignal, policy?: WorkerPolicySnapshot): Promise<boolean>;
 }
 
 /**
@@ -78,19 +79,25 @@ export class PolledWorker implements Worker {
 
   constructor(
     private readonly pass: Pass,
-    intervalMs: number,
+    intervalMs: number | (() => number),
     logger: Logger,
+    policyStore?: WorkerPolicyReader,
   ) {
     this.poller = new Poller({
       name: pass.name,
       intervalMs,
       logger,
-      tick: (signal) => pass.tick(signal),
+      ...(policyStore ? { policyStore } : {}),
+      tick: (signal, policy) => pass.tick(signal, policy),
     });
   }
 
   get name(): string {
     return this.pass.name;
+  }
+
+  get stats(): PollerStats {
+    return this.poller.stats;
   }
 
   start(): void {
@@ -118,6 +125,7 @@ export interface BuildIndexerDeps {
   readonly config: AppConfig;
   readonly logger: Logger;
   readonly db: Transactional;
+  readonly policyStore?: WorkerPolicyReader;
 }
 
 /**
@@ -129,7 +137,7 @@ export interface BuildIndexerDeps {
  * before the pollers are loose.
  */
 export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
-  const { config, logger, db } = deps;
+  const { config, logger, db, policyStore } = deps;
 
   if (!config.indexer.enabled) {
     return {
@@ -150,7 +158,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   const extra: ReadinessSource[] = [];
 
   if (config.indexer.stellar !== null) {
-    workers.push(stellarWorker(config.indexer.stellar, db, logger));
+    workers.push(stellarWorker(config.indexer.stellar, db, logger, policyStore));
   } else {
     logger.warn("the deployment record has no Stellar router, so nothing is watching Stellar");
   }
@@ -158,7 +166,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // One per chain in the record. Each carries its own confirmations from the registry, which is
   // the honest way to treat one block on Arc and twelve on Ethereum as the same kind of fact.
   for (const chain of config.indexer.evm) {
-    workers.push(evmWorker(chain, db, logger));
+    workers.push(evmWorker(chain, db, logger, policyStore));
   }
 
   // Counted before the rail pollers join the list, because the two questions are different. "Is
@@ -171,7 +179,14 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // They are not conditional on a router being watched: a transfer indexed by a previous run is
   // still waiting on its rail whether or not this replica is watching the chain it left.
   if (config.rails.enabled) {
-    for (const worker of railWorkers(config.rails, config.network, db, logger, config)) {
+    for (const worker of railWorkers(
+      config.rails,
+      config.network,
+      db,
+      logger,
+      config,
+      policyStore,
+    )) {
       workers.push(worker);
     }
   } else {
@@ -186,7 +201,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
 
   // The keeper submits Stellar TTL maintenance and claim settlement through BullMQ.
   if (config.keeper.enabled) {
-    workers.push(new KeeperWorker(config, db, logger));
+    workers.push(new KeeperWorker(config, db, logger, policyStore));
   } else {
     extra.push(
       fixedReadiness(
@@ -242,6 +257,7 @@ function railWorkers(
   db: Transactional,
   logger: Logger,
   appConfig: AppConfig,
+  policyStore?: WorkerPolicyReader,
 ): readonly Worker[] {
   const clients: readonly { readonly route: RouteKind; readonly client: RailClient }[] = [
     {
@@ -272,12 +288,22 @@ function railWorkers(
       batchSize: config.batchSize,
       recheckAfterMs: config.recheckAfterMs,
       maxCheckFailures: config.maxCheckFailures,
+      freshBacklogMultiple: config.freshBacklogMultiple,
+      ...(policyStore ? { policy: () => policyStore.current() } : {}),
     });
-    return new PolledWorker(pass, config.pollIntervalMs, child);
+    const intervalMs = policyStore
+      ? () => policyStore.current().values.railPollIntervalMs
+      : config.pollIntervalMs;
+    return new PolledWorker(pass, intervalMs, child, policyStore);
   });
 }
 
-function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): Worker {
+function evmWorker(
+  config: EvmWatchConfig,
+  db: Transactional,
+  logger: Logger,
+  policyStore?: WorkerPolicyReader,
+): Worker {
   const child = logger.child({ chain: config.chain, chainId: config.chainId });
   const watcher = new EvmWatcher({
     chainKey: config.chain,
@@ -287,23 +313,38 @@ function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): W
     confirmations: config.confirmations,
     reorgDepth: config.reorgDepth,
     logRange: config.logRange,
+    freshWithinBlocks: config.freshWithinBlocks,
     client: viemClient(config.rpcUrls, { logger: child }),
     db,
     logger: child,
+    ...(policyStore ? { policy: () => policyStore.current() } : {}),
   });
-  return new PolledWorker(watcher, config.pollIntervalMs, child);
+  const intervalMs = policyStore
+    ? () => policyStore.current().values.evmPollIntervalMs
+    : config.pollIntervalMs;
+  return new PolledWorker(watcher, intervalMs, child, policyStore);
 }
 
-function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Logger): Worker {
+function stellarWorker(
+  config: StellarWatchConfig,
+  db: Transactional,
+  logger: Logger,
+  policyStore?: WorkerPolicyReader,
+): Worker {
   const child = logger.child({ chain: config.chain });
   const watcher = new StellarWatcher({
     chainKey: config.chain,
     router: config.routerContractId,
     startLedger: config.startLedger,
     pageSize: config.pageSize,
+    freshWithinLedgers: config.freshWithinLedgers,
     rpc: new StellarRpc(config.rpcUrl),
     db,
     logger: child,
+    ...(policyStore ? { policy: () => policyStore.current() } : {}),
   });
-  return new PolledWorker(watcher, config.pollIntervalMs, child);
+  const intervalMs = policyStore
+    ? () => policyStore.current().values.stellarPollIntervalMs
+    : config.pollIntervalMs;
+  return new PolledWorker(watcher, intervalMs, child, policyStore);
 }

@@ -18,6 +18,8 @@ export interface KeeperHandle {
   readonly queue: Queue;
   readonly worker: Worker<unknown, KeeperJobResult>;
   readonly redis: Redis;
+  readonly activePolicyVersion: () => number;
+  readonly inFlightPolicyVersions: () => readonly number[];
   close(): Promise<void>;
 }
 
@@ -33,7 +35,7 @@ export async function startKeeperQueue(
   ctx: KeeperContext,
   redisUrl: string,
 ): Promise<KeeperHandle> {
-  const { config, logger } = ctx;
+  const { config, logger, policyStore } = ctx;
   const redis = createKeeperRedis(redisUrl);
   await redis.connect();
 
@@ -41,31 +43,57 @@ export async function startKeeperQueue(
     connection: redis,
   });
 
+  const initialPolicy = policyStore?.current();
+  let scheduledEveryMs = initialPolicy?.values.keeperPollIntervalMs ?? config.keeper.pollIntervalMs;
+  const inFlight = new Map<string, number>();
+
   const worker = new Worker<unknown, KeeperJobResult, string>(
     KEEPER_QUEUE_NAME,
     async (job) => {
-      logger.info({ jobName: job.name, jobId: job.id }, "processing keeper job");
-      switch (job.name as KeeperJobName) {
-        case "ttl-bump": {
-          const result = await processTtlBump(ctx, job.data as object);
-          return { kind: "ttl-bump", result };
+      // Policy snapshot is captured once at the job boundary so an in-flight job finishes
+      // under the policy version that was active when it started.
+      const capturedPolicy = policyStore?.current();
+      const policyVersion = capturedPolicy?.version ?? 1;
+      const jobKey = `${job.name}:${job.id ?? "unassigned"}`;
+      inFlight.set(jobKey, policyVersion);
+
+      try {
+        logger.info({ jobName: job.name, jobId: job.id, policyVersion }, "processing keeper job");
+        switch (job.name as KeeperJobName) {
+          case "ttl-bump": {
+            const result = await processTtlBump(ctx, job.data as object);
+            return {
+              kind: "ttl-bump",
+              result: { ...result, policyVersion },
+              policyVersion,
+            };
+          }
+          case "claim-settlement": {
+            const result = await processClaimSettlement(ctx, job.data as object);
+            return {
+              kind: "claim-settlement",
+              result: { ...result, policyVersion },
+              policyVersion,
+            };
+          }
+          default:
+            throw new Error(`unknown keeper job name: ${job.name}`);
         }
-        case "claim-settlement": {
-          const result = await processClaimSettlement(ctx, job.data as object);
-          return { kind: "claim-settlement", result };
-        }
-        default:
-          throw new Error(`unknown keeper job name: ${job.name}`);
+      } finally {
+        inFlight.delete(jobKey);
       }
     },
     {
       connection: createKeeperRedis(redisUrl),
-      concurrency: config.keeper.concurrency,
+      concurrency: initialPolicy?.values.keeperConcurrency ?? config.keeper.concurrency,
     },
   );
 
   worker.on("completed", (job, result) => {
-    logger.info({ jobName: job.name, jobId: job.id, kind: result.kind }, "keeper job completed");
+    logger.info(
+      { jobName: job.name, jobId: job.id, kind: result.kind, policyVersion: result.policyVersion },
+      "keeper job completed",
+    );
   });
 
   worker.on("failed", (job, error) => {
@@ -73,21 +101,51 @@ export async function startKeeperQueue(
   });
 
   // Schedule repeatable jobs for the two Stellar tasks
-  const every = config.keeper.pollIntervalMs;
-  await queue.upsertJobScheduler("repeat:ttl-bump", { every }, { name: "ttl-bump" });
+  await queue.upsertJobScheduler(
+    "repeat:ttl-bump",
+    { every: scheduledEveryMs },
+    { name: "ttl-bump" },
+  );
   await queue.upsertJobScheduler(
     "repeat:claim-settlement",
-    { every },
+    { every: scheduledEveryMs },
     { name: "claim-settlement" },
   );
   await queue.removeJobScheduler("repeat:rail-second-step");
   await queue.removeJobScheduler("repeat:gas-topup");
 
+  const unsubscribe = policyStore?.subscribe((next) => {
+    worker.concurrency = next.values.keeperConcurrency;
+    if (next.values.keeperPollIntervalMs !== scheduledEveryMs) {
+      scheduledEveryMs = next.values.keeperPollIntervalMs;
+      void Promise.all([
+        queue.upsertJobScheduler(
+          "repeat:ttl-bump",
+          { every: scheduledEveryMs },
+          { name: "ttl-bump" },
+        ),
+        queue.upsertJobScheduler(
+          "repeat:claim-settlement",
+          { every: scheduledEveryMs },
+          { name: "claim-settlement" },
+        ),
+      ]).catch((err: unknown) => {
+        logger.error(
+          { err, policyVersion: next.version },
+          "failed to update keeper repeatable job schedule after policy reload",
+        );
+      });
+    }
+  });
+
   return {
     queue,
     worker,
     redis,
+    activePolicyVersion: () => policyStore?.current().version ?? 1,
+    inFlightPolicyVersions: () => [...inFlight.values()],
     close: async () => {
+      unsubscribe?.();
       await worker.close();
       await queue.close();
       redis.disconnect();

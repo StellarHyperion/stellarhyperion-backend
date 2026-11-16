@@ -18,6 +18,7 @@
  * second would spend those five minutes refreshing the block.
  */
 import type { AppConfig } from "../config/config.js";
+import type { WorkerPolicySnapshot } from "../config/worker-policy.js";
 import { verifyItsDelivery } from "./axelar/delivery.js";
 import { verifyCctpDelivery } from "./cctp/delivery.js";
 import type { Logger } from "pino";
@@ -46,8 +47,10 @@ export interface RailPassOptions {
   /** Don't re-check a transfer sooner than this, so one stuck row cannot starve the queue. */
   readonly recheckAfterMs: number;
   readonly maxCheckFailures: number;
+  readonly freshBacklogMultiple?: number;
   readonly now?: () => Date;
   readonly config?: AppConfig;
+  readonly policy?: () => WorkerPolicySnapshot;
 }
 
 export interface RailProgress {
@@ -55,6 +58,7 @@ export interface RailProgress {
   readonly settled: number;
   readonly failures: number;
   readonly outstanding: number;
+  readonly policyVersion: number;
   readonly at: Date;
 }
 
@@ -89,12 +93,18 @@ export class RailPass {
         detail: "has not completed a pass yet, so no transfer's rail status is known",
       };
     }
-    const ceiling = this.options.batchSize * BACKLOG_MULTIPLE_BEFORE_DEGRADED;
+    const activePolicy = this.options.policy?.();
+    const batchSize = activePolicy?.values.railBatchSize ?? this.options.batchSize;
+    const backlogMultiple =
+      activePolicy?.values.railFreshBacklogMultiple ??
+      this.options.freshBacklogMultiple ??
+      BACKLOG_MULTIPLE_BEFORE_DEGRADED;
+    const ceiling = batchSize * backlogMultiple;
     if (progress.outstanding > ceiling) {
       return {
         name: this.name,
         state: "degraded",
-        detail: `${String(progress.outstanding)} transfers are waiting on this rail, which is more than ${String(BACKLOG_MULTIPLE_BEFORE_DEGRADED)} passes' worth`,
+        detail: `${String(progress.outstanding)} transfers are waiting on this rail, which is more than ${String(backlogMultiple)} passes' worth`,
       };
     }
     return {
@@ -108,8 +118,14 @@ export class RailPass {
   }
 
   /** One pass. Returns true when it filled a batch, which means there is more behind it. */
-  async tick(signal: AbortSignal): Promise<boolean> {
-    const { db, logger, batchSize, client } = this.options;
+  async tick(signal: AbortSignal, capturedPolicy?: WorkerPolicySnapshot): Promise<boolean> {
+    const { db, logger, client } = this.options;
+    const activePolicy = capturedPolicy ?? this.options.policy?.();
+    const policyVersion = activePolicy?.version ?? 1;
+    const batchSize = activePolicy?.values.railBatchSize ?? this.options.batchSize;
+    const recheckAfterMs = activePolicy?.values.railRecheckAfterMs ?? this.options.recheckAfterMs;
+    const maxCheckFailures =
+      activePolicy?.values.railMaxCheckFailures ?? this.options.maxCheckFailures;
 
     const cooldown = this.cooldownUntil;
     if (cooldown !== null && cooldown > this.now()) return false;
@@ -118,8 +134,8 @@ export class RailPass {
     const queue = await pendingForRail(db, {
       route: this.options.route,
       limit: batchSize,
-      notCheckedSince: new Date(this.now().getTime() - this.options.recheckAfterMs),
-      maxCheckFailures: this.options.maxCheckFailures,
+      notCheckedSince: new Date(this.now().getTime() - recheckAfterMs),
+      maxCheckFailures,
     });
 
     let checked = 0;
@@ -145,16 +161,23 @@ export class RailPass {
         // Everything else is this transfer's problem, recorded on its own row so one unanswerable
         // transfer cannot back off the rest of the queue.
         failures += 1;
-        await this.recordFailure(transfer, error);
+        await this.recordFailure(transfer, error, maxCheckFailures);
       }
     }
 
     const outstanding = await outstandingForRail(db, this.options.route);
-    this.lastProgress = { checked, settled, failures, outstanding, at: this.now() };
+    this.lastProgress = {
+      checked,
+      settled,
+      failures,
+      outstanding,
+      policyVersion,
+      at: this.now(),
+    };
 
     if (checked > 0 || failures > 0) {
       logger.info(
-        { rail: client.rail, checked, settled, failures, outstanding },
+        { rail: client.rail, checked, settled, failures, outstanding, policyVersion },
         "rail statuses refreshed",
       );
     }
@@ -230,12 +253,16 @@ export class RailPass {
     return isTerminal(report.status);
   }
 
-  private async recordFailure(transfer: PendingTransfer, error: unknown): Promise<void> {
+  private async recordFailure(
+    transfer: PendingTransfer,
+    error: unknown,
+    maxCheckFailures: number,
+  ): Promise<void> {
     const failures = transfer.checkFailures + 1;
     const reason = error instanceof Error ? error.message : String(error);
     const permanent = error instanceof RailError && error.kind === "permanent";
 
-    if (permanent || failures >= this.options.maxCheckFailures) {
+    if (permanent || failures >= maxCheckFailures) {
       // Said out loud, because the queue is about to stop offering this transfer and a transfer
       // that quietly stops being chased is the thing somebody notices a week later.
       this.options.logger.error(
