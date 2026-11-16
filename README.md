@@ -63,11 +63,13 @@ One process serializes its Stellar submissions to avoid sequence conflicts. Run 
 
 ## API and checks
 
-- `GET /health`, `GET /ready`
+- `GET /health`, `GET /ready`, `GET /v1/config`
 - `GET /v1/transfers`, with sender/recipient/chain/route/search/limit/offset filters
 - `GET /v1/transfers/by-tx/:txHash`, `GET /v1/transfers/:originChain/:nonce`
 - `GET /v1/claims`, `GET /v1/claims/:chain/:claimId`
 - `GET /v1/routes/health`, `GET /v1/metrics`
+
+`GET /v1/config` (or `node dist/main.js --print-config`) exposes nonsecret effective settings, provenance (`default`, `env`, `deployment`, `registry`), conflicting or shadowed override warnings, selected deployment revision metadata, and a canonical `effectiveDigest` while excluding raw secrets and credential-bearing URL components.
 
 `npm run check` runs formatting, lint, type checking and tests. Schema/API regressions execute repository migrations in embedded PostgreSQL (PGlite). The full PostgreSQL integration suite requires `TEST_DATABASE_URL`; it is skipped when unset. Use `npm run build` for emitted production code.
 

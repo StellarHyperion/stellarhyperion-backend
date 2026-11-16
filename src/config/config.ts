@@ -29,6 +29,8 @@ import {
 
 import type { EnumSpec, VarSpec } from "./env.js";
 import { EnvReader } from "./env.js";
+import type { ConfigProvenanceReport } from "./provenance.js";
+import { buildConfigProvenanceReport } from "./provenance.js";
 
 /**
  * Axelar's status API, per network.
@@ -113,6 +115,7 @@ export interface AppConfig {
   readonly rails: RailsConfig;
   readonly keeper: KeeperConfig;
   readonly shutdownTimeoutMs: number;
+  readonly provenance: ConfigProvenanceReport;
 }
 
 /** Injected so the unit suite can hand over a record without touching a disk or a process. */
@@ -502,6 +505,39 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   // One throw, after everything has had a chance to complain.
   reader.finish();
 
+  const rails: RailsConfig = {
+    enabled: railsEnabled,
+    irisUrl: irisOverride === "" ? IRIS_API[network] : irisOverride,
+    axelarUrl: axelarOverride === "" ? AXELARSCAN_API[network] : axelarOverride,
+    pollIntervalMs: railPollIntervalMs,
+    batchSize: railBatchSize,
+    recheckAfterMs: railRecheckAfterMs,
+    maxCheckFailures: railMaxCheckFailures,
+  };
+
+  const keeper: KeeperConfig = {
+    enabled: keeperEnabled,
+    pollIntervalMs: keeperPollIntervalMs,
+    concurrency: keeperConcurrency,
+    stellarSecret: keeperStellarSecret,
+  };
+
+  const provenance = buildConfigProvenanceReport({
+    env,
+    reader,
+    nodeEnv,
+    logLevel,
+    http: { host, port },
+    network,
+    deployments,
+    indexer,
+    rails,
+    keeper,
+    shutdownTimeoutMs,
+    hasDatabaseUrl: databaseUrl !== "",
+    hasRedisUrl: redisUrl !== "",
+  });
+
   return {
     nodeEnv,
     logLevel,
@@ -512,22 +548,10 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     deploymentsFile: absoluteDeployments,
     deployments,
     indexer,
-    rails: {
-      enabled: railsEnabled,
-      irisUrl: irisOverride === "" ? IRIS_API[network] : irisOverride,
-      axelarUrl: axelarOverride === "" ? AXELARSCAN_API[network] : axelarOverride,
-      pollIntervalMs: railPollIntervalMs,
-      batchSize: railBatchSize,
-      recheckAfterMs: railRecheckAfterMs,
-      maxCheckFailures: railMaxCheckFailures,
-    },
-    keeper: {
-      enabled: keeperEnabled,
-      pollIntervalMs: keeperPollIntervalMs,
-      concurrency: keeperConcurrency,
-      stellarSecret: keeperStellarSecret,
-    },
+    rails,
+    keeper,
     shutdownTimeoutMs,
+    provenance,
   };
 }
 

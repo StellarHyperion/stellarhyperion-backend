@@ -20,6 +20,14 @@ async function getApp(): Promise<FastifyInstance> {
 
   const config = loadConfig();
   const logger = createLogger(config);
+  logger.info(
+    {
+      configDigest: config.provenance.effectiveDigest,
+      deploymentGeneratedAt: config.provenance.deploymentRevision.generatedAt,
+      conflictingOverrides: config.provenance.conflictingOverrides.length,
+    },
+    "initialized serverless configuration",
+  );
   const startedAt = new Date();
 
   const db = Database.open(config.databaseUrl, {

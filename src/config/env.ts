@@ -96,8 +96,11 @@ function renderFaults(faults: readonly ConfigFault[]): string {
  * caller never gets to use, because `finish()` throws before the config object escapes. That
  * keeps the call sites readable: no option types, no early returns, one throw at the end.
  */
+export type RawValueOrigin = "env" | "default" | "unset";
+
 export class EnvReader {
   private readonly faults: ConfigFault[] = [];
+  private readonly origins = new Map<string, RawValueOrigin>();
 
   constructor(private readonly source: Readonly<Record<string, string | undefined>>) {}
 
@@ -105,6 +108,14 @@ export class EnvReader {
   has(name: string): boolean {
     const raw = this.source[name];
     return raw !== undefined && raw.trim().length > 0;
+  }
+
+  /** Where a variable's value came from during parsing, without retaining the raw string. */
+  originOf(spec: VarSpec | string): RawValueOrigin {
+    const name = typeof spec === "string" ? spec : spec.name;
+    const recorded = this.origins.get(name);
+    if (recorded !== undefined) return recorded;
+    return this.has(name) ? "env" : "unset";
   }
 
   string(spec: VarSpec): string {
@@ -274,8 +285,15 @@ export class EnvReader {
   private raw(spec: VarSpec): string | null {
     const present = this.source[spec.name];
     const trimmed = present?.trim();
-    if (trimmed !== undefined && trimmed.length > 0) return trimmed;
-    if (spec.fallback !== undefined) return spec.fallback;
+    if (trimmed !== undefined && trimmed.length > 0) {
+      this.origins.set(spec.name, "env");
+      return trimmed;
+    }
+    if (spec.fallback !== undefined) {
+      this.origins.set(spec.name, "default");
+      return spec.fallback;
+    }
+    this.origins.set(spec.name, "unset");
     if (spec.required) {
       this.record(spec, "not set, and there is no sensible default for it");
     }

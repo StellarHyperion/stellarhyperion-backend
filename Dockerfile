@@ -22,4 +22,5 @@ COPY package.json ./
 COPY migrations ./migrations
 COPY deployments/testnet.json ./deployments/testnet.json
 USER node
+# Run `node dist/main.js --print-config` to inspect sanitized effective settings and provenance.
 CMD ["sh", "-c", "npm run migrate:up && exec node dist/main.js"]

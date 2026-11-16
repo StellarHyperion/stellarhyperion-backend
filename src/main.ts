@@ -30,6 +30,11 @@ async function main(): Promise<void> {
     }
   })();
 
+  if (process.argv.includes("--print-config")) {
+    process.stdout.write(`${JSON.stringify(config.provenance, null, 2)}\n`);
+    return;
+  }
+
   const logger = createLogger(config);
   const shutdown = new Shutdown(logger, config.shutdownTimeoutMs);
   installSignalHandlers(shutdown, logger);
@@ -69,7 +74,9 @@ async function main(): Promise<void> {
       host: config.http.host,
       port: config.http.port,
       network: config.network,
-      deploymentsFile: config.deploymentsFile,
+      configDigest: config.provenance.effectiveDigest,
+      deploymentGeneratedAt: config.provenance.deploymentRevision.generatedAt,
+      conflictingOverrides: config.provenance.conflictingOverrides.length,
       watchingStellar: config.indexer.stellar?.chain ?? null,
       watchingEvm: config.indexer.evm.map((entry) => entry.chain),
       workers: indexer.workers.map((worker) => worker.name),
