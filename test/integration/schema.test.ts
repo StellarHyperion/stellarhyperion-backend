@@ -11,6 +11,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import { runMigrationPreflight } from "../../src/db/migration-preflight.js";
 import { Database } from "../../src/db/pool.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
@@ -334,5 +335,14 @@ suite("maintenance and pruning", () => {
     expect(ids).not.toContain(999991);
     expect(ids).toContain(999992);
     expect(ids).toContain(999993);
+  });
+
+  it("produces reversible preflight reports against the migrated PostgreSQL schema", async () => {
+    const report = await runMigrationPreflight(db);
+    expect(report.migrations.length).toBeGreaterThanOrEqual(3);
+    for (const mig of report.migrations) {
+      expect(mig.feasibility).toBe("reversible_schema");
+    }
+    expect(report.activeLocks).toEqual([]);
   });
 });
