@@ -29,9 +29,10 @@ export interface FormattedRouteHealth {
 export function registerRouteHealthRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
 
-  app.get("/v1/routes/health", async (_request, reply: FastifyReply) => {
+  app.get("/v1/routes/health", async (request, reply: FastifyReply) => {
     // Return latest sample per (origin_chain, destination_chain, route, token)
-    const { rows } = await db.query(
+    const { rows } = await request.readBudget.query(
+      db,
       `SELECT DISTINCT ON (origin_chain, destination_chain, route, token)
               origin_chain,
               destination_chain,

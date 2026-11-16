@@ -123,5 +123,14 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     expect(response.json().destination.decimals).toBe(6);
     expect(response.json().destination.symbol).toBe("USDC");
     expect(response.json().origin.netAmount).toBe("9970000");
+    expect(response.headers["x-request-budget-ms"]).toBe("5000");
+
+    const narrowed = await app.inject({
+      method: "GET",
+      url: "/v1/transfers",
+      headers: { "x-request-timeout-ms": "250" },
+    });
+    expect(narrowed.statusCode).toBe(200);
+    expect(narrowed.headers["x-request-budget-ms"]).toBe("250");
   });
 });

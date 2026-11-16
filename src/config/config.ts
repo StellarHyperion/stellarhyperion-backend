@@ -103,7 +103,11 @@ export interface KeeperConfig {
 export interface AppConfig {
   readonly nodeEnv: NodeEnv;
   readonly logLevel: LogLevel;
-  readonly http: { readonly host: string; readonly port: number };
+  readonly http: {
+    readonly host: string;
+    readonly port: number;
+    readonly readTimeoutMs: number;
+  };
   readonly databaseUrl: string;
   readonly redisUrl: string;
   readonly network: NetworkMode;
@@ -161,6 +165,17 @@ const HTTP_PORT: VarSpec = {
   max: 65_535,
   printable: true,
   purpose: "The port the API listens on.",
+};
+
+const HTTP_READ_TIMEOUT_MS: VarSpec = {
+  name: "HTTP_READ_TIMEOUT_MS",
+  kind: "integer",
+  required: false,
+  fallback: "5000",
+  min: 50,
+  max: 60_000,
+  printable: true,
+  purpose: "Per-request deadline in milliseconds for public API database reads.",
 };
 
 const DATABASE_URL: VarSpec = {
@@ -450,6 +465,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const logLevel = reader.choice(LOG_LEVEL);
   const host = reader.string(HTTP_HOST);
   const port = reader.integer(HTTP_PORT);
+  const readTimeoutMs = reader.integer(HTTP_READ_TIMEOUT_MS);
   const databaseUrl = reader.url(DATABASE_URL);
   const keeperEnabled = reader.boolean(KEEPER_ENABLED);
   const redisUrl = reader.url({ ...REDIS_URL, required: keeperEnabled });
@@ -505,7 +521,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   return {
     nodeEnv,
     logLevel,
-    http: { host, port },
+    http: { host, port, readTimeoutMs },
     databaseUrl,
     redisUrl,
     network,

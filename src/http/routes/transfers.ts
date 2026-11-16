@@ -12,6 +12,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import type { RequestReadBudget } from "../request-budget.js";
 import type { ServerDeps } from "../server.js";
 
 export type TransferLifecycleStage =
@@ -236,8 +237,11 @@ function isDeliveryFinalized(transfer: FormattedTransfer): boolean {
 export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
 
-  const queryTransferById = async (id: string): Promise<FormattedTransfer | null> => {
-    const { rows } = await db.query(`${TRANSFER_QUERY} WHERE t.id = $1 LIMIT 1`, [id]);
+  const queryTransferById = async (
+    id: string,
+    budget: RequestReadBudget,
+  ): Promise<FormattedTransfer | null> => {
+    const { rows } = await budget.query(db, `${TRANSFER_QUERY} WHERE t.id = $1 LIMIT 1`, [id]);
     const row = rows[0];
     return row !== undefined ? formatRow(row, deps.config) : null;
   };
@@ -250,7 +254,8 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       reply: FastifyReply,
     ) => {
       const { originChain, nonce } = request.params;
-      const { rows } = await db.query(
+      const { rows } = await request.readBudget.query(
+        db,
         `${TRANSFER_QUERY} WHERE t.origin_chain = $1 AND t.nonce = $2 LIMIT 1`,
         [originChain, nonce],
       );
@@ -272,7 +277,8 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     "/v1/transfers/by-tx/:txHash",
     async (request: FastifyRequest<{ Params: { txHash: string } }>, reply: FastifyReply) => {
       const { txHash } = request.params;
-      const { rows } = await db.query(
+      const { rows } = await request.readBudget.query(
+        db,
         `${TRANSFER_QUERY} WHERE t.origin_tx = $1 OR d.destination_tx = $1 LIMIT 1`,
         [txHash],
       );
@@ -298,7 +304,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     reply: FastifyReply,
   ) => {
     const { id } = request.params;
-    const initial = await queryTransferById(id);
+    const initial = await queryTransferById(id, request.readBudget);
     if (initial === null) {
       return reply.code(404).send({
         error: "not_found",
@@ -306,6 +312,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       });
     }
 
+    request.readBudget.enterStreamingMode();
     reply.hijack();
     reply.raw.writeHead(200, {
       "Content-Type": "text/event-stream",
@@ -353,6 +360,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       if (heartbeatTimer !== null) {
         clearInterval(heartbeatTimer);
       }
+      request.readBudget.dispose();
     };
 
     request.raw.on("close", cleanup);
@@ -367,7 +375,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         }
 
         try {
-          const current = await queryTransferById(id);
+          const current = await queryTransferById(id, request.readBudget);
           if (current === null) return;
 
           const currentSerialized = JSON.stringify(current);
@@ -405,7 +413,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     reply: FastifyReply,
   ) => {
     const { id } = request.params;
-    const transfer = await queryTransferById(id);
+    const transfer = await queryTransferById(id, request.readBudget);
     if (transfer === null) {
       return reply.code(404).send({
         error: "not_found",
@@ -480,7 +488,8 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       params.push(parsedOffset);
       const offsetClause = `OFFSET $${String(params.length)}`;
 
-      const { rows } = await db.query(
+      const { rows } = await request.readBudget.query(
+        db,
         `${TRANSFER_QUERY} ${whereClause} ORDER BY t.id DESC ${limitClause} ${offsetClause}`,
         params,
       );

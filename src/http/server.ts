@@ -5,8 +5,9 @@ import type { Logger } from "pino";
 import rateLimit from "@fastify/rate-limit";
 
 import type { AppConfig } from "../config/config.js";
-import type { Database } from "../db/pool.js";
+import { QueryBudgetExceededError, QueryCancelledError, type Database } from "../db/pool.js";
 import type { BullMQWorkerState, RedisPingable, ReadinessSource } from "../runtime/readiness.js";
+import { registerRequestBudgets } from "./request-budget.js";
 import { registerClaimRoutes } from "./routes/claims.js";
 import { registerHealthRoutes } from "./routes/health.js";
 import { registerMetricsRoutes } from "./routes/metrics.js";
@@ -23,6 +24,8 @@ export interface ServerDeps {
   readonly readiness: readonly ReadinessSource[];
   /** Set at boot so `/health` can report how long the process has been up. */
   readonly startedAt?: Date;
+  /** Optional override for public read deadline budget in milliseconds. */
+  readonly readBudgetMs?: number;
 }
 
 export function buildServer(deps: ServerDeps): FastifyInstance {
@@ -52,9 +55,14 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   app.addHook("onRequest", async (_request, reply) => {
     reply.header("Access-Control-Allow-Origin", "*");
     reply.header("Access-Control-Allow-Methods", "GET, OPTIONS");
-    reply.header("Access-Control-Allow-Headers", "Accept, Content-Type");
+    reply.header("Access-Control-Allow-Headers", "Accept, Content-Type, X-Request-Timeout-Ms");
+    reply.header("Access-Control-Expose-Headers", "X-Request-Budget-Ms, Retry-After");
   });
   app.options("/*", async (_request, reply) => reply.code(204).send());
+
+  registerRequestBudgets(app, {
+    defaultBudgetMs: deps.readBudgetMs ?? deps.config.http.readTimeoutMs,
+  });
 
   void app.register(rateLimit, {
     max: 120,
@@ -81,6 +89,29 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   app.setErrorHandler((error: FastifyError, request, reply) => {
+    const rawError: unknown = error;
+    if (rawError instanceof QueryCancelledError || request.readBudget.isClientDisconnected()) {
+      request.log.debug({ err: error }, "public read cancelled after client disconnect");
+      if (!reply.sent && !reply.raw.writableEnded && !reply.raw.destroyed) {
+        void reply.code(499).send({
+          error: "client_closed_request",
+          message: "client disconnected before read completed",
+          requestId: request.id,
+        });
+      }
+      return;
+    }
+
+    if (rawError instanceof QueryBudgetExceededError) {
+      request.log.warn({ err: error }, "public read exceeded request budget");
+      void reply.header("Retry-After", "1").code(504).send({
+        error: "request_timeout",
+        message: "public read exceeded request budget",
+        requestId: request.id,
+      });
+      return;
+    }
+
     const status = error.statusCode ?? 500;
     // The log gets the error, the response does not. An internal error message is the kind of
     // thing that carries a table name, a file path or, on a bad day, a connection string.
