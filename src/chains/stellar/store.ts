@@ -13,7 +13,16 @@
 import { ROUTE_KINDS } from "@hyperion/protocol";
 
 import type { Queryable } from "../../db/pool.js";
-import { bigintOf, maybeOne, text, textOrNull, timestampOrNull } from "../../db/rows.js";
+import {
+  bigintOf,
+  bigintOrNull,
+  maybeOne,
+  text,
+  textOrNull,
+  timestamp,
+  timestampOrNull,
+} from "../../db/rows.js";
+import { ledgerSpanCount, unreconciledStartLedger } from "./cursor.js";
 import type { Position } from "../writers.js";
 import {
   settleAction,
@@ -287,4 +296,190 @@ export async function recordRouteConfigured(
     blocker: event.enabled ? 0 : 2,
     flowAvailable: null,
   });
+}
+
+export type HistoryGapStatus = "open" | "reconciling" | "closed";
+
+export interface StellarHistoryGap {
+  readonly id: bigint;
+  readonly chainKey: string;
+  readonly contract: string;
+  readonly fromLedger: bigint;
+  readonly toLedger: bigint;
+  readonly reconciledThrough: bigint | null;
+  readonly status: HistoryGapStatus;
+  readonly reason: string;
+  readonly detectedAt: Date;
+  readonly reconciledAt: Date | null;
+}
+
+export interface HistoryCoverageSummary {
+  readonly complete: boolean;
+  readonly openGaps: number;
+  readonly reconcilingGaps: number;
+  readonly closedGaps: number;
+  readonly missingLedgers: bigint;
+  readonly gaps: readonly StellarHistoryGap[];
+}
+
+const GAP_STATUSES: readonly HistoryGapStatus[] = ["open", "reconciling", "closed"];
+
+function parseGapStatus(raw: string): HistoryGapStatus {
+  if ((GAP_STATUSES as readonly string[]).includes(raw)) {
+    return raw as HistoryGapStatus;
+  }
+  throw new Error(`stellar_history_gap.status holds unexpected value ${raw}`);
+}
+
+function mapHistoryGapRow(row: Record<string, unknown>): StellarHistoryGap {
+  return {
+    id: bigintOf(row, "id"),
+    chainKey: text(row, "chain_key"),
+    contract: text(row, "contract"),
+    fromLedger: bigintOf(row, "from_ledger"),
+    toLedger: bigintOf(row, "to_ledger"),
+    reconciledThrough: bigintOrNull(row, "reconciled_through"),
+    status: parseGapStatus(text(row, "status")),
+    reason: text(row, "reason"),
+    detectedAt: timestamp(row, "detected_at"),
+    reconciledAt: timestampOrNull(row, "reconciled_at"),
+  };
+}
+
+export function remainingGapLedgers(
+  gap: Pick<StellarHistoryGap, "fromLedger" | "toLedger" | "reconciledThrough" | "status">,
+): bigint {
+  if (gap.status === "closed") return 0n;
+  const start = unreconciledStartLedger(gap.fromLedger, gap.reconciledThrough);
+  return ledgerSpanCount(start, gap.toLedger);
+}
+
+export async function recordHistoryGap(
+  db: Queryable,
+  gap: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly fromLedger: bigint;
+    readonly toLedger: bigint;
+    readonly reason: string;
+  },
+): Promise<void> {
+  if (gap.fromLedger < 0n || gap.toLedger < gap.fromLedger) {
+    throw new RangeError(
+      `history gap bounds must satisfy 0 <= fromLedger <= toLedger, got ${gap.fromLedger.toString()}..${gap.toLedger.toString()}`,
+    );
+  }
+  await db.query(
+    `INSERT INTO stellar_history_gap
+       (chain_key, contract, from_ledger, to_ledger, status, reason)
+     VALUES ($1, $2, $3, $4, 'open', $5)
+     ON CONFLICT (chain_key, contract, from_ledger, to_ledger) DO UPDATE
+       SET reason = EXCLUDED.reason,
+           updated_at = now()
+     WHERE stellar_history_gap.status <> 'closed'`,
+    [gap.chainKey, gap.contract, gap.fromLedger.toString(), gap.toLedger.toString(), gap.reason],
+  );
+}
+
+export async function listHistoryGaps(
+  db: Queryable,
+  options: {
+    readonly chainKey?: string;
+    readonly contract?: string;
+    readonly includeClosed?: boolean;
+  } = {},
+): Promise<readonly StellarHistoryGap[]> {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+
+  if (options.chainKey !== undefined) {
+    params.push(options.chainKey);
+    clauses.push(`chain_key = $${String(params.length)}`);
+  }
+  if (options.contract !== undefined) {
+    params.push(options.contract);
+    clauses.push(`contract = $${String(params.length)}`);
+  }
+  if (options.includeClosed !== true) {
+    clauses.push(`status <> 'closed'`);
+  }
+
+  const whereSql = clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`;
+  const { rows } = await db.query(
+    `SELECT id, chain_key, contract, from_ledger, to_ledger, reconciled_through,
+            status, reason, detected_at, reconciled_at
+       FROM stellar_history_gap
+       ${whereSql}
+      ORDER BY chain_key, from_ledger, to_ledger`,
+    params,
+  );
+  return rows.map(mapHistoryGapRow);
+}
+
+export async function summarizeHistoryCoverage(
+  db: Queryable,
+  options: { readonly chainKey?: string; readonly contract?: string } = {},
+): Promise<HistoryCoverageSummary> {
+  const gaps = await listHistoryGaps(db, { ...options, includeClosed: true });
+  let openGaps = 0;
+  let reconcilingGaps = 0;
+  let closedGaps = 0;
+  let missingLedgers = 0n;
+
+  for (const gap of gaps) {
+    if (gap.status === "open") {
+      openGaps += 1;
+      missingLedgers += remainingGapLedgers(gap);
+    } else if (gap.status === "reconciling") {
+      reconcilingGaps += 1;
+      missingLedgers += remainingGapLedgers(gap);
+    } else {
+      closedGaps += 1;
+    }
+  }
+
+  return {
+    complete: openGaps === 0 && reconcilingGaps === 0,
+    openGaps,
+    reconcilingGaps,
+    closedGaps,
+    missingLedgers,
+    gaps,
+  };
+}
+
+export async function advanceOrCloseHistoryGap(
+  db: Queryable,
+  gap: Pick<StellarHistoryGap, "id" | "fromLedger" | "toLedger">,
+  completedThrough: bigint,
+  reconciledAt?: Date,
+): Promise<HistoryGapStatus> {
+  if (completedThrough >= gap.toLedger) {
+    await db.query(
+      `UPDATE stellar_history_gap
+          SET status = 'closed',
+              reconciled_through = $2,
+              reconciled_at = COALESCE($3, now()),
+              updated_at = now()
+        WHERE id = $1`,
+      [gap.id.toString(), gap.toLedger.toString(), reconciledAt ?? null],
+    );
+    return "closed";
+  }
+
+  if (completedThrough >= gap.fromLedger) {
+    await db.query(
+      `UPDATE stellar_history_gap
+          SET status = 'reconciling',
+              reconciled_through = GREATEST(
+                COALESCE(reconciled_through, from_ledger),
+                $2::numeric(20, 0)
+              ),
+              reconciled_at = NULL,
+              updated_at = now()
+        WHERE id = $1 AND status <> 'closed'`,
+      [gap.id.toString(), completedThrough.toString()],
+    );
+  }
+  return "reconciling";
 }

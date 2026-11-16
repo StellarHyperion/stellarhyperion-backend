@@ -61,6 +61,7 @@ suite("the schema", () => {
       "pending_claim",
       "rail_attestation",
       "route_health",
+      "stellar_history_gap",
     ]) {
       expect(names, `${table} is missing; has the migration run`).toContain(table);
     }

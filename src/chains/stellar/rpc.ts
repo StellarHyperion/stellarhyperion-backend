@@ -9,14 +9,49 @@
  * which call is failing rather than just that something is.
  */
 
+export interface RetentionWindow {
+  readonly oldestLedger: number;
+  readonly latestLedger: number;
+}
+
+/**
+ * Extract the node's advertised `[oldestLedger, latestLedger]` retention interval from a Soroban
+ * RPC out-of-range refusal message (for example: `startLedger must be within the ledger range:
+ * 4873028 - 4993987`).
+ */
+export function parseRetentionWindow(message: string): RetentionWindow | null {
+  if (!/ledger range|must be within|retention/i.test(message)) {
+    return null;
+  }
+  const match = /(\d+)\s*(?:-|to|\.\.)\s*(\d+)/i.exec(message);
+  if (match === null) return null;
+  const oldest = Number(match[1]);
+  const latest = Number(match[2]);
+  if (
+    !Number.isSafeInteger(oldest) ||
+    !Number.isSafeInteger(latest) ||
+    oldest <= 0 ||
+    latest < oldest
+  ) {
+    return null;
+  }
+  return { oldestLedger: oldest, latestLedger: latest };
+}
+
 export class StellarRpcError extends Error {
+  readonly retentionWindow: RetentionWindow | null;
+
   constructor(
     readonly method: string,
     reason: string,
     readonly retryable: boolean,
+    retentionWindow?: RetentionWindow | null,
   ) {
-    super(`${method}: ${reason}`);
+    const cleanReason = sanitizeRpcReason(reason);
+    super(`${method}: ${cleanReason}`);
     this.name = "StellarRpcError";
+    this.retentionWindow =
+      retentionWindow === undefined ? parseRetentionWindow(cleanReason) : retentionWindow;
   }
 }
 
@@ -63,10 +98,12 @@ interface RpcResponse {
  */
 export interface EventSource {
   events(query: EventsQuery, signal?: AbortSignal): Promise<EventsPage>;
+  latestLedger?(signal?: AbortSignal): Promise<LatestLedger>;
 }
 
 export interface StellarRpcOptions {
   readonly timeoutMs?: number;
+  readonly fetchFn?: typeof globalThis.fetch;
 }
 
 export class StellarRpc {
@@ -142,8 +179,9 @@ export class StellarRpc {
     const combined = signal === undefined ? timeout : AbortSignal.any([signal, timeout]);
 
     let response: Response;
+    const fetchImpl = this.options.fetchFn ?? fetch;
     try {
-      response = await fetch(this.url, {
+      response = await fetchImpl(this.url, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
@@ -184,4 +222,16 @@ export class StellarRpc {
 
 function describe(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+function sanitizeRpcReason(reason: string): string {
+  return reason
+    .replace(/https?:\/\/[^\s"'<>]+/gi, (raw) => {
+      try {
+        return new URL(raw).origin;
+      } catch {
+        return "[redacted-rpc-url]";
+      }
+    })
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, "$1 [REDACTED]");
 }

@@ -20,6 +20,12 @@ export interface ReadinessReport {
   readonly state: ReadinessState;
   /** One sentence a human can act on. Never a stack trace and never a connection string. */
   readonly detail: string;
+  /** True when the live cursor is within the current lag threshold of the chain head. */
+  readonly cursorFresh?: boolean;
+  /** True when no historical ledger gap remains open or reconciling for this chain. */
+  readonly historyComplete?: boolean;
+  /** Count of open or reconciling historical gaps recorded for this chain. */
+  readonly openHistoryGaps?: number;
 }
 
 export interface ReadinessSource {

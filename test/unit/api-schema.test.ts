@@ -43,6 +43,7 @@ beforeAll(async () => {
     "1790900000000_initial-schema.sql",
     "1791000000000_cursor-block-hash.sql",
     "1791100000000_cursor-autovacuum-tuning.sql",
+    "1791200000000_stellar-history-gaps.sql",
   ]) {
     const sql = readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8").split(
       "-- Down Migration",
@@ -86,6 +87,41 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     expect(response.statusCode).toBe(200);
     expect(response.json().cursors[0].block).toBe("123");
     expect(response.json().cursors[0].hash).toBeNull();
+    expect(response.json().cursors[0].historyComplete).toBe(true);
+    expect(response.json().historyCoverage.complete).toBe(true);
+  });
+
+  it("distinguishes a caught-up cursor from incomplete historical coverage in metrics", async () => {
+    await pg.query(
+      `INSERT INTO stellar_history_gap (chain_key, contract, from_ledger, to_ledger, status, reason)
+       VALUES ('stellar-testnet', 'Crouter', 50, 99, 'open', 'rpc_retention_window')`,
+    );
+    try {
+      const degraded = await app.inject("/v1/metrics");
+      expect(degraded.statusCode).toBe(200);
+      const body = degraded.json();
+      expect(body.cursors[0].block).toBe("123");
+      expect(body.cursors[0].historyComplete).toBe(false);
+      expect(body.cursors[0].openHistoryGaps).toBe(1);
+      expect(body.cursors[0].missingLedgers).toBe("50");
+      expect(body.historyCoverage.complete).toBe(false);
+      expect(body.historyCoverage.openGaps).toBe(1);
+      expect(body.historyCoverage.missingLedgers).toBe("50");
+
+      await pg.query(
+        `UPDATE stellar_history_gap
+            SET status = 'closed', reconciled_through = 99, reconciled_at = now()
+          WHERE chain_key = 'stellar-testnet' AND from_ledger = 50`,
+      );
+      const reconciled = await app.inject("/v1/metrics");
+      expect(reconciled.statusCode).toBe(200);
+      expect(reconciled.json().cursors[0].historyComplete).toBe(true);
+      expect(reconciled.json().historyCoverage.complete).toBe(true);
+      expect(reconciled.json().historyCoverage.closedGaps).toBe(1);
+      expect(reconciled.json().historyCoverage.missingLedgers).toBe("0");
+    } finally {
+      await pg.query("DELETE FROM stellar_history_gap WHERE chain_key = 'stellar-testnet'");
+    }
   });
 
   it("renders EVM recipient words as actual addresses for wallet and explorer links", async () => {

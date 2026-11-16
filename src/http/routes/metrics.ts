@@ -1,13 +1,38 @@
 /**
  * Metrics REST API endpoint.
  *
- * Provides system-level counts and watcher health statistics for monitoring and dashboards.
+ * Provides system-level counts, watcher cursor freshness, and historical coverage completeness
+ * for monitoring and dashboards.
  */
 import type { FastifyInstance, FastifyReply } from "fastify";
 
+import {
+  remainingGapLedgers,
+  summarizeHistoryCoverage,
+  type HistoryCoverageSummary,
+} from "../../chains/stellar/store.js";
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import type { ReadinessReport } from "../../runtime/readiness.js";
 import type { ServerDeps } from "../server.js";
+
+const EMPTY_COVERAGE: HistoryCoverageSummary = {
+  complete: true,
+  openGaps: 0,
+  reconcilingGaps: 0,
+  closedGaps: 0,
+  missingLedgers: 0n,
+  gaps: [],
+};
+
+function isUndefinedTableError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "42P01"
+  );
+}
 
 export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
@@ -45,16 +70,56 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       railStatusCounts[text(row, "status")] = integer(row, "count");
     }
 
-    // 5. Watcher cursor positions
+    // 5. Historical coverage gaps
+    let coverage: HistoryCoverageSummary = EMPTY_COVERAGE;
+    try {
+      coverage = await summarizeHistoryCoverage(db);
+    } catch (error) {
+      if (!isUndefinedTableError(error)) {
+        throw error;
+      }
+    }
+
+    const readinessByChain = new Map<string, ReadinessReport>();
+    for (const source of deps.readiness) {
+      try {
+        const report = await source.readiness();
+        readinessByChain.set(report.name, report);
+      } catch {
+        // Ignore readiness source errors here; /ready reports them explicitly.
+      }
+    }
+
+    // 6. Watcher cursor positions + per-chain completeness
     const cursorResult = await db.query(
       "SELECT chain_key, last_processed AS cursor_block, last_processed_hash AS cursor_hash, updated_at FROM indexer_cursor",
     );
-    const cursors = cursorResult.rows.map((row) => ({
-      chain: text(row, "chain_key"),
-      block: text(row, "cursor_block"),
-      hash: textOrNull(row, "cursor_hash"),
-      updatedAt: new Date(row.updated_at as string | number | Date).toISOString(),
-    }));
+    const cursors = cursorResult.rows.map((row) => {
+      const chain = text(row, "chain_key");
+      const chainGaps = coverage.gaps.filter(
+        (gap) => gap.chainKey === chain && gap.status !== "closed",
+      );
+      let chainMissing = 0n;
+      for (const gap of chainGaps) {
+        chainMissing += remainingGapLedgers(gap);
+      }
+      const readiness = readinessByChain.get(chain);
+      const cursorFresh =
+        readiness === undefined
+          ? null
+          : (readiness.cursorFresh ?? (readiness.state === "ready" ? true : false));
+
+      return {
+        chain,
+        block: text(row, "cursor_block"),
+        hash: textOrNull(row, "cursor_hash"),
+        updatedAt: new Date(row.updated_at as string | number | Date).toISOString(),
+        cursorFresh,
+        historyComplete: chainGaps.length === 0,
+        openHistoryGaps: chainGaps.length,
+        missingLedgers: chainMissing.toString(),
+      };
+    });
 
     return reply.send({
       service: "hyperion-backend",
@@ -67,6 +132,27 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       claims,
       railAttestations: railStatusCounts,
       cursors,
+      historyCoverage: {
+        complete: coverage.complete,
+        openGaps: coverage.openGaps,
+        reconcilingGaps: coverage.reconcilingGaps,
+        closedGaps: coverage.closedGaps,
+        missingLedgers: coverage.missingLedgers.toString(),
+        gaps: coverage.gaps.map((gap) => ({
+          id: gap.id.toString(),
+          chain: gap.chainKey,
+          contract: gap.contract,
+          fromLedger: gap.fromLedger.toString(),
+          toLedger: gap.toLedger.toString(),
+          reconciledThrough:
+            gap.reconciledThrough === null ? null : gap.reconciledThrough.toString(),
+          missingLedgers: remainingGapLedgers(gap).toString(),
+          status: gap.status,
+          reason: gap.reason,
+          detectedAt: gap.detectedAt.toISOString(),
+          reconciledAt: gap.reconciledAt === null ? null : gap.reconciledAt.toISOString(),
+        })),
+      },
     });
   });
 }

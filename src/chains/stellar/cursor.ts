@@ -110,3 +110,27 @@ export function parseEventCursor(cursor: string): CursorPosition {
 export function completeThrough(position: CursorPosition): number {
   return position.completesLedger ? position.ledger : position.ledger - 1;
 }
+
+/**
+ * Inclusive ledger count across `[fromLedger, toLedger]`.
+ *
+ * Returns `0n` when `toLedger < fromLedger` so callers computing remaining gap widths never report
+ * negative missing-ledger counts.
+ */
+export function ledgerSpanCount(fromLedger: bigint, toLedger: bigint): bigint {
+  if (toLedger < fromLedger) return 0n;
+  return toLedger - fromLedger + 1n;
+}
+
+/**
+ * First ledger still needing reconciliation inside a gap `[fromLedger, toLedger]`.
+ */
+export function unreconciledStartLedger(
+  fromLedger: bigint,
+  reconciledThrough: bigint | null,
+): bigint {
+  if (reconciledThrough === null || reconciledThrough < fromLedger) {
+    return fromLedger;
+  }
+  return reconciledThrough + 1n;
+}

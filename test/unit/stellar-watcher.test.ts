@@ -6,11 +6,22 @@
  * even when it finds nothing, a page and the cursor advance commit together, and a cursor is never
  * reused across routers.
  */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+import { PGlite } from "@electric-sql/pglite";
+import { AddressKind, encodeStellarAddress } from "@hyperion/protocol";
 import { describe, expect, it } from "vitest";
 
 import { endOfLedgerCursor } from "../../src/chains/stellar/cursor.js";
 import type { RawStellarEvent } from "../../src/chains/stellar/events.js";
+import { StellarRpcError } from "../../src/chains/stellar/rpc.js";
+import { listHistoryGaps, summarizeHistoryCoverage } from "../../src/chains/stellar/store.js";
 import { StellarWatcher } from "../../src/chains/stellar/watcher.js";
+import { loadConfig } from "../../src/config/config.js";
+import type { Database, Queryable, Transactional } from "../../src/db/pool.js";
+import { buildServer } from "../../src/http/server.js";
+import { completeEnv } from "../helpers.js";
 import {
   FakeRpc,
   LIVE_ROUTER,
@@ -342,5 +353,327 @@ describe("gaps it cannot close", () => {
 
     const warnings = lines.filter((line) => line.message.includes("running ahead of the indexer"));
     expect(warnings).toHaveLength(1);
+  });
+});
+
+function bridgeOutEvent(params: {
+  readonly ledger: number;
+  readonly nonce: bigint;
+  readonly grossAmount: bigint;
+  readonly fee: bigint;
+  readonly netAmount: bigint;
+  readonly txHash: string;
+}): RawStellarEvent {
+  const sender = encodeStellarAddress(AddressKind.Account, new Uint8Array(32).fill(0x21));
+  const token = encodeStellarAddress(AddressKind.Contract, new Uint8Array(32).fill(0x31));
+  return syntheticEvent({
+    ledger: params.ledger,
+    txHash: params.txHash,
+    topicJson: [{ symbol: "hyperion" }, { symbol: "out" }],
+    valueJson: {
+      map: [
+        {
+          key: { symbol: "transfer" },
+          val: {
+            map: [
+              { key: { symbol: "created_at" }, val: { u64: "1790900100" } },
+              { key: { symbol: "created_ledger" }, val: { u32: params.ledger } },
+              {
+                key: { symbol: "destination" },
+                val: {
+                  bytes: "0000000000000000000000006ef8032ffe4943f27388172549f6700f18bb8b38",
+                },
+              },
+              { key: { symbol: "destination_chain" }, val: { string: "sepolia" } },
+              { key: { symbol: "fee" }, val: { i128: params.fee.toString() } },
+              { key: { symbol: "gross_amount" }, val: { i128: params.grossAmount.toString() } },
+              { key: { symbol: "net_amount" }, val: { i128: params.netAmount.toString() } },
+              { key: { symbol: "nonce" }, val: { u64: params.nonce.toString() } },
+              { key: { symbol: "route" }, val: { u32: 0 } },
+              { key: { symbol: "sender" }, val: { address: sender } },
+              { key: { symbol: "token" }, val: { address: token } },
+            ],
+          },
+        },
+      ],
+    },
+  });
+}
+
+async function openMigratedPglite(): Promise<{
+  readonly pg: PGlite;
+  readonly db: Transactional & Database;
+}> {
+  const pg = new PGlite();
+  for (const name of [
+    "1790900000000_initial-schema.sql",
+    "1791000000000_cursor-block-hash.sql",
+    "1791100000000_cursor-autovacuum-tuning.sql",
+    "1791200000000_stellar-history-gaps.sql",
+  ]) {
+    const migrationPath = fileURLToPath(new URL(`../../migrations/${name}`, import.meta.url));
+    const sql = readFileSync(migrationPath, "utf8").split("-- Down Migration")[0] ?? "";
+    await pg.exec(sql);
+  }
+
+  const runQuery = async (sql: string, params: readonly unknown[] = []) => {
+    const result = await pg.query(sql, [...params]);
+    const int8 = result.fields
+      .filter((field) => field.dataTypeID === 20)
+      .map((field) => field.name);
+    const rows = result.rows.map((raw) => {
+      const row = { ...(raw as Record<string, unknown>) };
+      for (const column of int8) {
+        const value = row[column];
+        if (typeof value === "number" || typeof value === "bigint") row[column] = String(value);
+      }
+      return row;
+    });
+    return { rows, rowCount: result.affectedRows ?? result.rows.length };
+  };
+
+  const db = {
+    query: runQuery,
+    ping: async () => {
+      await pg.query("SELECT 1");
+    },
+    transaction: async <T>(work: (tx: Queryable) => Promise<T>): Promise<T> => {
+      await pg.query("BEGIN");
+      try {
+        const value = await work({ query: runQuery });
+        await pg.query("COMMIT");
+        return value;
+      } catch (error) {
+        await pg.query("ROLLBACK");
+        throw error;
+      }
+    },
+  };
+
+  return { pg, db: db as unknown as Transactional & Database };
+}
+
+describe("durable Stellar history-gap tracking and reconciliation", () => {
+  it("creates an explicit bounded gap record when the RPC refuses an out-of-retention range", async () => {
+    const { watcher, db } = harness({ startLedger: 4_990_000, latestLedger: 4_994_000 });
+    db.cursorRow = cursorRow(4_000_000);
+
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(/ledger range/);
+
+    const gapInserts = db.matching("INSERT INTO stellar_history_gap");
+    expect(gapInserts).toHaveLength(1);
+    // FakeRpc retention is 120,960 ledgers behind 4,994,000 => oldest retained ledger is 4,873,040.
+    // Bounded missing interval is [4,000,001, 4,873,039].
+    expect(gapInserts[0]?.params).toEqual([
+      CHAIN,
+      LIVE_ROUTER,
+      "4000001",
+      "4873039",
+      "rpc_retention_refused",
+    ]);
+    expect(watcher.readiness().historyComplete).toBe(false);
+    expect(watcher.readiness().openHistoryGaps).toBe(1);
+  });
+
+  it("redacts RPC credentials and query tokens from StellarRpcError messages", () => {
+    const err = new StellarRpcError(
+      "getEvents",
+      "upstream failed at https://ops:secretPass@soroban-rpc.example.invalid/v2/secretKey?token=abc Authorization: Bearer secretJwt",
+      true,
+    );
+    expect(err.message).toContain("https://soroban-rpc.example.invalid");
+    expect(err.message).not.toContain("secretPass");
+    expect(err.message).not.toContain("secretKey");
+    expect(err.message).not.toContain("token=abc");
+    expect(err.message).not.toContain("secretJwt");
+  });
+
+  it("distinguishes caught-up cursor freshness from complete coverage and closes gaps via idempotent backfill", async () => {
+    const { pg, db } = await openMigratedPglite();
+    try {
+      const { logger } = capturingLogger();
+
+      // Seed cursor at ledger 4,800,000 while live RPC head is 4,994,000 (oldest retained = 4,873,040).
+      await db.query(
+        `INSERT INTO indexer_cursor (chain_key, family, contract, last_processed)
+         VALUES ($1, 'stellar', $2, 4800000)`,
+        [CHAIN, LIVE_ROUTER],
+      );
+
+      const liveTransfer = bridgeOutEvent({
+        ledger: 4_993_999,
+        nonce: 18_446_744_073_709_551_610n,
+        grossAmount: 250_000_000_000_000_000_001n,
+        fee: 1_000_000_000_000_000n,
+        netAmount: 249_999_000_000_000_000_001n,
+        txHash: "live-tx-hash-4993999",
+      });
+      const liveRpc = new FakeRpc({
+        events: [liveTransfer],
+        latestLedger: 4_994_000,
+      });
+
+      const watcher = new StellarWatcher({
+        chainKey: CHAIN,
+        router: LIVE_ROUTER,
+        startLedger: 4_800_000,
+        pageSize: 200,
+        rpc: liveRpc,
+        db,
+        logger,
+        advancePastRetentionGap: true,
+      });
+
+      // Catch live watcher all the way up to 4,994,000.
+      while (await watcher.tick(AbortSignal.timeout(5_000))) {
+        // advance windows until caught up
+      }
+      expect(watcher.progress?.ledger).toBe(4_994_000);
+      expect(watcher.progress?.behind).toBe(0);
+
+      // Verify explicit bounded gap [4,800,001, 4,873,039] in Postgres.
+      const openGaps = await listHistoryGaps(db, { chainKey: CHAIN, contract: LIVE_ROUTER });
+      expect(openGaps).toHaveLength(1);
+      expect(openGaps[0]?.fromLedger).toBe(4_800_001n);
+      expect(openGaps[0]?.toLedger).toBe(4_873_039n);
+      expect(openGaps[0]?.status).toBe("open");
+
+      // API readiness and /v1/metrics must distinguish caught-up cursor from incomplete history.
+      const config = loadConfig({ env: completeEnv({ KEEPER_ENABLED: "false" }) });
+      const app = buildServer({
+        config,
+        logger,
+        db,
+        readiness: [watcher],
+        redis: { ping: () => Promise.resolve("PONG") },
+      });
+      await app.ready();
+
+      try {
+        const readyBefore = await app.inject("/ready");
+        expect(readyBefore.statusCode).toBe(200);
+        const readyCheckBefore = (readyBefore.json().checks as Record<string, unknown>[]).find(
+          (check) => check.name === CHAIN,
+        );
+        expect(readyCheckBefore).toMatchObject({
+          name: CHAIN,
+          state: "degraded",
+          cursorFresh: true,
+          historyComplete: false,
+          openHistoryGaps: 1,
+        });
+
+        const metricsBefore = await app.inject("/v1/metrics");
+        expect(metricsBefore.statusCode).toBe(200);
+        const metricsJsonBefore = metricsBefore.json();
+        expect(metricsJsonBefore.cursors[0]).toMatchObject({
+          chain: CHAIN,
+          block: "4994000",
+          cursorFresh: true,
+          historyComplete: false,
+          openHistoryGaps: 1,
+          missingLedgers: "73039",
+        });
+        expect(metricsJsonBefore.historyCoverage.complete).toBe(false);
+        expect(metricsJsonBefore.historyCoverage.openGaps).toBe(1);
+
+        // Archive provider holds missed transfers inside [4,800,001, 4,873,039].
+        const missedTransferA = bridgeOutEvent({
+          ledger: 4_810_005,
+          nonce: 9_007_199_254_740_993n,
+          grossAmount: 50_000_000n,
+          fee: 150_000n,
+          netAmount: 49_850_000n,
+          txHash: "archive-tx-a",
+        });
+        const missedTransferB = bridgeOutEvent({
+          ledger: 4_873_039,
+          nonce: 9_007_199_254_740_994n,
+          grossAmount: 75_000_000n,
+          fee: 225_000n,
+          netAmount: 74_775_000n,
+          txHash: "archive-tx-b",
+        });
+        const archiveRpc = {
+          events(query: { startLedger?: number; cursor?: string; limit: number }) {
+            const inner = new FakeRpc({
+              events: [missedTransferA, missedTransferB, liveTransfer],
+              latestLedger: 4_890_000,
+            });
+            return inner.events({
+              contractIds: [LIVE_ROUTER],
+              limit: query.limit,
+              ...(query.startLedger === undefined ? {} : { startLedger: query.startLedger }),
+              ...(query.cursor === undefined ? {} : { cursor: query.cursor }),
+            });
+          },
+        };
+
+        const reconcileResults = await watcher.reconcileHistoryGaps(
+          archiveRpc,
+          AbortSignal.timeout(5_000),
+        );
+        expect(reconcileResults).toHaveLength(1);
+        expect(reconcileResults[0]?.status).toBe("closed");
+        expect(reconcileResults[0]?.completedThrough).toBe(4_873_039n);
+        expect(reconcileResults[0]?.decoded).toBe(2);
+
+        // Re-running reconciliation against overlapping events produces zero duplicate rows.
+        const secondPass = await watcher.reconcileHistoryGaps(
+          archiveRpc,
+          AbortSignal.timeout(5_000),
+        );
+        expect(secondPass).toEqual([]);
+
+        const transfers = await db.query(
+          "SELECT nonce::text AS nonce, net_amount::text AS net_amount FROM outbound_transfer ORDER BY origin_block",
+        );
+        expect(transfers.rows).toEqual([
+          { nonce: "9007199254740993", net_amount: "49850000" },
+          { nonce: "9007199254740994", net_amount: "74775000" },
+          { nonce: "18446744073709551610", net_amount: "249999000000000000001" },
+        ]);
+
+        // Live cursor remains at 4,994,000 (not rewound by backfill).
+        const cursorAfter = await db.query(
+          "SELECT last_processed::text AS pos FROM indexer_cursor WHERE chain_key = $1",
+          [CHAIN],
+        );
+        expect(cursorAfter.rows[0]?.pos).toBe("4994000");
+
+        const summaryAfter = await summarizeHistoryCoverage(db, { chainKey: CHAIN });
+        expect(summaryAfter.complete).toBe(true);
+        expect(summaryAfter.openGaps).toBe(0);
+        expect(summaryAfter.closedGaps).toBe(1);
+
+        const readyAfter = await app.inject("/ready");
+        const readyCheckAfter = (readyAfter.json().checks as Record<string, unknown>[]).find(
+          (check) => check.name === CHAIN,
+        );
+        expect(readyCheckAfter).toMatchObject({
+          name: CHAIN,
+          state: "ready",
+          cursorFresh: true,
+          historyComplete: true,
+          openHistoryGaps: 0,
+        });
+
+        const metricsAfter = await app.inject("/v1/metrics");
+        expect(metricsAfter.json().cursors[0]).toMatchObject({
+          chain: CHAIN,
+          block: "4994000",
+          cursorFresh: true,
+          historyComplete: true,
+          openHistoryGaps: 0,
+          missingLedgers: "0",
+        });
+        expect(metricsAfter.json().historyCoverage.complete).toBe(true);
+        expect(metricsAfter.json().historyCoverage.closedGaps).toBe(1);
+      } finally {
+        await app.close();
+      }
+    } finally {
+      await pg.close();
+    }
   });
 });

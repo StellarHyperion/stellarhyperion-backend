@@ -3,15 +3,16 @@
  *
  * The correctness claim is narrow and worth stating exactly, because the useful version of it is
  * not the obvious one. After any crash, at any point, the database holds every event up to the
- * cursor, possibly some events after it, and no event twice. The cursor is a lower bound on
- * completeness rather than a high water mark.
+ * cursor, possibly some events after it, and no event twice, except for any unavailable ledger
+ * intervals explicitly recorded in `stellar_history_gap`.
  *
  * All three parts earn their keep. "Every event up to the cursor" holds because a page of events
  * and the cursor advance past it are one transaction. "Possibly some after it" is the honest
  * description of a page that stopped partway through a ledger: those events are real and final, so
  * they are written rather than thrown away, and the cursor stays at the last ledger that is
  * provably whole. "No event twice" holds because every insert is an upsert on a natural key, which
- * is what makes re-reading a ledger after a restart a no-op rather than a duplicate.
+ * is what makes re-reading a ledger after a restart or archive backfill a no-op rather than a
+ * duplicate.
  *
  * What it does not claim is a reorg story, and that is not an omission. Stellar has deterministic
  * finality: a closed ledger is closed. There is no equivalent of the window the EVM watcher has to
@@ -26,11 +27,19 @@ import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
-import { completeThrough, endOfLedgerCursor, parseEventCursor } from "./cursor.js";
-import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
-import type { EventSource, EventsQuery } from "./rpc.js";
-import { StellarRpcError } from "./rpc.js";
 import {
+  completeThrough,
+  endOfLedgerCursor,
+  ledgerSpanCount,
+  parseEventCursor,
+  unreconciledStartLedger,
+} from "./cursor.js";
+import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
+import type { EventSource, EventsQuery, RetentionWindow } from "./rpc.js";
+import { StellarRpcError, parseRetentionWindow } from "./rpc.js";
+import {
+  advanceOrCloseHistoryGap,
+  listHistoryGaps,
   readCursor,
   recordActionQueued,
   recordActionSettled,
@@ -38,11 +47,15 @@ import {
   recordBridgeOut,
   recordClaimParked,
   recordClaimSettled,
+  recordHistoryGap,
   recordPauseSet,
   recordRouteConfigured,
   recordTokenRegistered,
+  remainingGapLedgers,
   writeCursor,
   type EventContext,
+  type HistoryGapStatus,
+  type StellarHistoryGap,
 } from "./store.js";
 
 /**
@@ -77,6 +90,12 @@ export interface StellarWatcherOptions {
   readonly db: Transactional;
   readonly logger: Logger;
   readonly maxPagesPerTick?: number;
+  /**
+   * When true, a retention refusal records the missing `[expected, oldestLedger - 1]` interval in
+   * `stellar_history_gap` and resumes live indexing from `oldestLedger` while keeping historical
+   * coverage marked incomplete until archive backfill closes the gap.
+   */
+  readonly advancePastRetentionGap?: boolean;
 }
 
 export interface WatcherProgress {
@@ -87,12 +106,42 @@ export interface WatcherProgress {
   /** How far behind the chain's head this watcher is, in ledgers. */
   readonly behind: number;
   readonly at: Date;
+  readonly historyComplete?: boolean;
+  readonly openGaps?: number;
+}
+
+export interface ReconcileHistoryGapOptions {
+  readonly gap: StellarHistoryGap;
+  readonly rpc: EventSource;
+  readonly db: Transactional;
+  readonly logger: Logger;
+  readonly pageSize?: number;
+  readonly maxPagesPerWindow?: number;
+}
+
+export interface ReconcileHistoryGapResult {
+  readonly gapId: bigint;
+  readonly status: HistoryGapStatus;
+  readonly completedThrough: bigint;
+  readonly decoded: number;
+  readonly skipped: number;
+}
+
+interface LocalGapBounds {
+  readonly fromLedger: bigint;
+  readonly toLedger: bigint;
+}
+
+function gapKey(fromLedger: bigint, toLedger: bigint): string {
+  return `${fromLedger.toString()}:${toLedger.toString()}`;
 }
 
 export class StellarWatcher {
   private lastProgress: WatcherProgress | null = null;
   /** Tags seen once and logged once. A contract ahead of this build should not be a log flood. */
   private readonly reportedUnknown = new Set<string>();
+  private readonly localOpenGaps = new Map<string, LocalGapBounds>();
+  private dbOpenGaps: readonly StellarHistoryGap[] = [];
 
   constructor(private readonly options: StellarWatcherOptions) {}
 
@@ -107,18 +156,26 @@ export class StellarWatcher {
   /**
    * Readiness from cached state, never from a network call.
    *
-   * Degraded at worst, never down, and that is a deliberate ceiling rather than optimism. `/ready`
-   * takes the worst report in the process, and one chain being unreachable is not a reason to stop
-   * answering questions about the chains that are reachable. A watcher that cannot read its chain
-   * is something to alert on; taking the replica out of rotation would only move the outage.
+   * Distinguishes live cursor freshness (`cursorFresh`) from historical coverage completeness
+   * (`historyComplete`). A watcher that caught up to the head after a retention gap has a fresh
+   * cursor and incomplete history, so it reports `degraded` until backfill closes the gap.
    */
   readiness(): ReadinessReport {
     const progress = this.lastProgress;
+    const gapSummary = this.openGapSummary();
+    const historyComplete = gapSummary.openGapCount === 0;
+
     if (progress === null) {
+      const detail = historyComplete
+        ? "has not completed a pass yet, so nothing it could be asked about is indexed"
+        : `has not completed a pass yet and has ${String(gapSummary.openGapCount)} open history gap(s) covering ${gapSummary.missingLedgers.toString()} missing ledgers`;
       return {
         name: this.name,
         state: "degraded",
-        detail: "has not completed a pass yet, so nothing it could be asked about is indexed",
+        detail,
+        cursorFresh: false,
+        historyComplete,
+        openHistoryGaps: gapSummary.openGapCount,
       };
     }
     if (progress.behind > CURRENT_WITHIN_LEDGERS) {
@@ -126,12 +183,28 @@ export class StellarWatcher {
         name: this.name,
         state: "degraded",
         detail: `${String(progress.behind)} ledgers behind the head at ledger ${String(progress.ledger)}, so a recent transfer may not be recorded yet`,
+        cursorFresh: false,
+        historyComplete,
+        openHistoryGaps: gapSummary.openGapCount,
+      };
+    }
+    if (!historyComplete) {
+      return {
+        name: this.name,
+        state: "degraded",
+        detail: `current at ledger ${String(progress.ledger)}, but historical coverage is incomplete (${String(gapSummary.openGapCount)} open gap(s) across ${gapSummary.missingLedgers.toString()} ledgers)`,
+        cursorFresh: true,
+        historyComplete: false,
+        openHistoryGaps: gapSummary.openGapCount,
       };
     }
     return {
       name: this.name,
       state: "ready",
       detail: `current at ledger ${String(progress.ledger)}`,
+      cursorFresh: true,
+      historyComplete: true,
+      openHistoryGaps: 0,
     };
   }
 
@@ -144,36 +217,97 @@ export class StellarWatcher {
 
     const stored = await readCursor(db, chainKey);
     if (stored !== null && stored.contract !== router) {
-      // A different router at a different address shares no history with this cursor. Carrying it
-      // over would skip everything the new deployment has ever done, and it would do it silently,
-      // which is the worst available outcome. Stopping is the only honest move.
       throw new Error(
         `the cursor for ${chainKey} was written for router ${stored.contract} and this process is watching ${router}. ` +
           "A redeployed router needs its cursor reset rather than reused.",
       );
     }
 
-    const base = stored === null ? this.options.startLedger - 1 : Number(stored.position);
-    const scan = await this.scan(base, stored === null, signal);
+    await this.refreshOpenGaps();
 
-    if (scan.oldestLedger > base + 1 && stored !== null) {
-      // The retention window moved past where we stopped. Anything between the two is gone from
-      // this node, and carrying on from the window edge would leave a hole nothing ever reports.
+    const base = stored === null ? this.options.startLedger - 1 : Number(stored.position);
+    const expectedFirst = base + 1;
+
+    let scan: {
+      readonly events: readonly RawStellarEvent[];
+      readonly through: number;
+      readonly latestLedger: number;
+      readonly oldestLedger: number;
+      readonly pages: number;
+    };
+
+    try {
+      scan = await this.scan(base, stored === null, this.options.startLedger, signal);
+    } catch (error) {
+      const window = await this.detectRetentionGap(error, expectedFirst, signal);
+      if (window !== null && window.oldestLedger > expectedFirst) {
+        const fromLedger = BigInt(expectedFirst);
+        const toLedger = BigInt(window.oldestLedger - 1);
+        await recordHistoryGap(db, {
+          chainKey,
+          contract: router,
+          fromLedger,
+          toLedger,
+          reason: "rpc_retention_refused",
+        });
+        this.rememberGap(fromLedger, toLedger);
+        await this.refreshOpenGaps();
+
+        if (this.options.advancePastRetentionGap === true) {
+          logger.warn(
+            {
+              chain: chainKey,
+              fromLedger: fromLedger.toString(),
+              toLedger: toLedger.toString(),
+              resumingAt: window.oldestLedger,
+            },
+            "persisted unavailable ledger gap and advancing live watcher to retention edge",
+          );
+          scan = await this.scan(window.oldestLedger - 1, true, window.oldestLedger, signal);
+        } else {
+          throw error;
+        }
+      } else {
+        throw error;
+      }
+    }
+
+    const slidingGap =
+      scan.oldestLedger > expectedFirst
+        ? {
+            fromLedger: BigInt(expectedFirst),
+            toLedger: BigInt(scan.oldestLedger - 1),
+          }
+        : null;
+
+    if (slidingGap !== null) {
       logger.error(
-        { chain: chainKey, from: base + 1, oldestLedger: scan.oldestLedger },
+        { chain: chainKey, from: expectedFirst, oldestLedger: scan.oldestLedger },
         "fell behind the rpc retention window; ledgers between the cursor and the oldest retained ledger were never read",
       );
     }
 
     if (scan.through <= base && scan.events.length === 0) {
-      // No window crossed and nothing read. Report where we still are so readiness keeps telling
-      // the truth about the lag rather than going quiet.
+      if (slidingGap !== null) {
+        await recordHistoryGap(db, {
+          chainKey,
+          contract: router,
+          fromLedger: slidingGap.fromLedger,
+          toLedger: slidingGap.toLedger,
+          reason: "rpc_retention_window",
+        });
+        this.rememberGap(slidingGap.fromLedger, slidingGap.toLedger);
+        await this.refreshOpenGaps();
+      }
+      const gapSummary = this.openGapSummary();
       this.lastProgress = {
         ledger: base,
         decoded: 0,
         skipped: 0,
         behind: Math.max(scan.latestLedger - base, 0),
         at: new Date(),
+        historyComplete: gapSummary.openGapCount === 0,
+        openGaps: gapSummary.openGapCount,
       };
       return false;
     }
@@ -185,14 +319,20 @@ export class StellarWatcher {
       if (raw.ledger <= scan.through) closedAt = new Date(raw.ledgerClosedAt);
     }
 
-    // One transaction for the page and the cursor. This is the restart guarantee, and splitting it
-    // would turn every crash into either a lost page or a duplicated one.
+    // One transaction for the page, any newly observed retention gap, and the cursor.
     await db.transaction(async (tx: Queryable) => {
+      if (slidingGap !== null) {
+        await recordHistoryGap(tx, {
+          chainKey,
+          contract: router,
+          fromLedger: slidingGap.fromLedger,
+          toLedger: slidingGap.toLedger,
+          reason: "rpc_retention_window",
+        });
+      }
+
       for (const raw of scan.events) {
         if (raw.type !== "contract" || raw.inSuccessfulContractCall === false) {
-          // getEvents no longer returns the deprecated success flag (RPC30).
-          // Diagnostic events are excluded by current RPC; retain legacy explicit-failure checks.
-          // https://github.com/stellar/stellar-rpc/releases/tag/v30.0.0
           skipped += 1;
           continue;
         }
@@ -202,7 +342,7 @@ export class StellarWatcher {
           txHash: raw.txHash,
           closedAt: new Date(raw.ledgerClosedAt),
         };
-        if (await this.apply(tx, context, raw)) decoded += 1;
+        if (await applyStellarEvent(tx, context, raw, logger, this.reportedUnknown)) decoded += 1;
         else skipped += 1;
       }
 
@@ -212,33 +352,173 @@ export class StellarWatcher {
         contract: router,
         position: BigInt(scan.through),
         observedAt: closedAt,
-        // Nothing to record: a closed ledger cannot be replaced by a different one.
         hash: null,
       });
     });
 
+    if (slidingGap !== null) {
+      this.rememberGap(slidingGap.fromLedger, slidingGap.toLedger);
+      await this.refreshOpenGaps();
+    }
+
+    const gapSummary = this.openGapSummary();
     const behind = Math.max(scan.latestLedger - scan.through, 0);
-    this.lastProgress = { ledger: scan.through, decoded, skipped, behind, at: new Date() };
+    this.lastProgress = {
+      ledger: scan.through,
+      decoded,
+      skipped,
+      behind,
+      at: new Date(),
+      historyComplete: gapSummary.openGapCount === 0,
+      openGaps: gapSummary.openGapCount,
+    };
     logger.info(
-      { chain: chainKey, ledger: scan.through, decoded, skipped, behind, pages: scan.pages },
+      {
+        chain: chainKey,
+        ledger: scan.through,
+        decoded,
+        skipped,
+        behind,
+        pages: scan.pages,
+        openGaps: gapSummary.openGapCount,
+      },
       "stellar window indexed",
     );
 
-    // Behind the head means there is another window waiting, so say we progressed and let the
-    // poller come straight back rather than sleeping out the interval mid-backfill.
     return behind > 0;
   }
 
   /**
+   * Reconcile all open or partially reconciled history gaps for this watcher's chain and router
+   * using an archive-capable `EventSource`, without rewinding live `indexer_cursor` progress.
+   */
+  async reconcileHistoryGaps(
+    archiveRpc: EventSource,
+    signal: AbortSignal,
+  ): Promise<readonly ReconcileHistoryGapResult[]> {
+    const gaps = await listHistoryGaps(this.options.db, {
+      chainKey: this.options.chainKey,
+      contract: this.options.router,
+      includeClosed: false,
+    });
+    const results: ReconcileHistoryGapResult[] = [];
+    for (const gap of gaps) {
+      if (signal.aborted) break;
+      const res = await reconcileHistoryGap(
+        {
+          gap,
+          rpc: archiveRpc,
+          db: this.options.db,
+          logger: this.options.logger,
+          pageSize: this.options.pageSize,
+          ...(this.options.maxPagesPerTick === undefined
+            ? {}
+            : { maxPagesPerWindow: this.options.maxPagesPerTick }),
+        },
+        signal,
+      );
+      if (res.status === "closed") {
+        this.localOpenGaps.delete(gapKey(gap.fromLedger, gap.toLedger));
+      }
+      results.push(res);
+    }
+    await this.refreshOpenGaps();
+    if (this.lastProgress !== null) {
+      const gapSummary = this.openGapSummary();
+      this.lastProgress = {
+        ...this.lastProgress,
+        historyComplete: gapSummary.openGapCount === 0,
+        openGaps: gapSummary.openGapCount,
+      };
+    }
+    return results;
+  }
+
+  private rememberGap(fromLedger: bigint, toLedger: bigint): void {
+    this.localOpenGaps.set(gapKey(fromLedger, toLedger), { fromLedger, toLedger });
+  }
+
+  private async refreshOpenGaps(): Promise<void> {
+    const rows = await listHistoryGaps(this.options.db, {
+      chainKey: this.options.chainKey,
+      contract: this.options.router,
+      includeClosed: false,
+    });
+    this.dbOpenGaps = rows;
+    if (rows.length > 0) {
+      this.localOpenGaps.clear();
+      for (const row of rows) {
+        this.localOpenGaps.set(gapKey(row.fromLedger, row.toLedger), {
+          fromLedger: row.fromLedger,
+          toLedger: row.toLedger,
+        });
+      }
+    }
+  }
+
+  private openGapSummary(): { readonly openGapCount: number; readonly missingLedgers: bigint } {
+    if (this.dbOpenGaps.length > 0) {
+      let missingLedgers = 0n;
+      for (const gap of this.dbOpenGaps) {
+        missingLedgers += remainingGapLedgers(gap);
+      }
+      return { openGapCount: this.dbOpenGaps.length, missingLedgers };
+    }
+    let missingLedgers = 0n;
+    for (const gap of this.localOpenGaps.values()) {
+      missingLedgers += ledgerSpanCount(gap.fromLedger, gap.toLedger);
+    }
+    return { openGapCount: this.localOpenGaps.size, missingLedgers };
+  }
+
+  private async detectRetentionGap(
+    error: unknown,
+    expectedFirst: number,
+    signal: AbortSignal,
+  ): Promise<RetentionWindow | null> {
+    if (!(error instanceof StellarRpcError) || error.retryable) {
+      return null;
+    }
+    if (error.retentionWindow !== null) {
+      return error.retentionWindow;
+    }
+    const parsed = parseRetentionWindow(error.message);
+    if (parsed !== null) {
+      return parsed;
+    }
+    if (!/ledger range|must be within|retention/i.test(error.message)) {
+      return null;
+    }
+    if (typeof this.options.rpc.latestLedger === "function") {
+      try {
+        const head = await this.options.rpc.latestLedger(signal);
+        if (head.sequence > expectedFirst) {
+          const probe = await this.options.rpc.events(
+            {
+              startLedger: head.sequence,
+              contractIds: [this.options.router],
+              limit: 1,
+            },
+            signal,
+          );
+          if (probe.oldestLedger > 0 && probe.latestLedger >= probe.oldestLedger) {
+            return { oldestLedger: probe.oldestLedger, latestLedger: probe.latestLedger };
+          }
+        }
+      } catch {
+        // Preserve the original retention error when fallback probing fails.
+      }
+    }
+    return null;
+  }
+
+  /**
    * Read forward from `base` until a whole ledger has been crossed.
-   *
-   * Normally one request. The loop exists for the one case a ledger based cursor cannot describe
-   * on its own: a full page landing entirely inside a single ledger, where stopping would advance
-   * the cursor to the ledger before and read the same page again forever.
    */
   private async scan(
     base: number,
     fresh: boolean,
+    initialStartLedger: number,
     signal: AbortSignal,
   ): Promise<{
     readonly events: readonly RawStellarEvent[];
@@ -255,10 +535,8 @@ export class StellarWatcher {
     let latestLedger = 0;
     let oldestLedger = 0;
     let pages = 0;
-    // A fresh cursor starts by ledger. Everything after resumes from a cursor, which is the only
-    // account of where the previous scan actually stopped.
     let pagination: Pick<EventsQuery, "startLedger" | "cursor"> = fresh
-      ? { startLedger: this.options.startLedger }
+      ? { startLedger: initialStartLedger }
       : { cursor: endOfLedgerCursor(base) };
 
     while (pages < maxPages) {
@@ -272,7 +550,6 @@ export class StellarWatcher {
       oldestLedger = page.oldestLedger;
 
       if (page.cursor === null) {
-        // Not something the live RPC does, and bailing is still better than inventing a position.
         logger.warn(
           { chain: chainKey, pages },
           "the rpc returned a page with no cursor, so this pass cannot say what it finished reading",
@@ -285,7 +562,6 @@ export class StellarWatcher {
         through = candidate;
         break;
       }
-      // Still inside one ledger. Keep pulling with the RPC's own cursor until it is drained.
       pagination = { cursor: page.cursor };
     }
 
@@ -304,8 +580,6 @@ export class StellarWatcher {
       return await this.options.rpc.events(query, signal);
     } catch (error) {
       if (error instanceof StellarRpcError && !error.retryable) {
-        // Almost always the start ledger or the cursor having fallen out of the node's retention
-        // window. Said plainly, because the fix is an archive source rather than another retry.
         this.options.logger.error(
           { err: error, chain: this.options.chainKey },
           "the rpc refused this range permanently; the watcher cannot close this gap from here",
@@ -314,77 +588,204 @@ export class StellarWatcher {
       throw error;
     }
   }
+}
 
-  private async apply(
-    tx: Queryable,
-    context: EventContext,
-    raw: RawStellarEvent,
-  ): Promise<boolean> {
-    const event = decodeStellarEvent(raw);
+/**
+ * Replay an unavailable ledger interval from an archive-capable `EventSource` into the canonical
+ * event tables and close the gap once `gap.toLedger` is durably covered.
+ *
+ * Uses the exact same idempotent `ON CONFLICT` writers as live ingestion and never rewinds
+ * `indexer_cursor`, so replaying overlapping or already-seen ledgers never duplicates transfers.
+ */
+export async function reconcileHistoryGap(
+  options: ReconcileHistoryGapOptions,
+  signal: AbortSignal,
+): Promise<ReconcileHistoryGapResult> {
+  const { gap, rpc, db, logger } = options;
+  const pageSize = options.pageSize ?? 200;
+  const maxPagesPerWindow = options.maxPagesPerWindow ?? MAX_PAGES_PER_TICK;
+  const reportedUnknown = new Set<string>();
 
-    switch (event.kind) {
-      case "bridgeOut":
-        await recordBridgeOut(tx, context, event.data);
-        return true;
-      case "bridgeIn":
-        await recordBridgeIn(tx, context, event.data);
-        return true;
-      case "claimParked":
-        await recordClaimParked(tx, context, event.data);
-        return true;
-      case "claimSettled": {
-        const matched = await recordClaimSettled(tx, context, event.data);
-        if (!matched) {
-          // A settlement for a claim never seen parked. The park event is older than the retention
-          // window, and inventing a row from a settlement would record a claim with no origin.
-          this.options.logger.warn(
-            { chain: context.chainKey, claimId: event.data.claimId.toString() },
-            "settlement for a claim this indexer never saw parked",
-          );
-        }
-        return matched;
+  if (gap.status === "closed") {
+    return {
+      gapId: gap.id,
+      status: "closed",
+      completedThrough: gap.toLedger,
+      decoded: 0,
+      skipped: 0,
+    };
+  }
+
+  const targetLedger = Number(gap.toLedger);
+  let nextLedger = Number(unreconciledStartLedger(gap.fromLedger, gap.reconciledThrough));
+  let completedThrough = gap.reconciledThrough ?? gap.fromLedger - 1n;
+  let status: HistoryGapStatus = gap.status;
+  let totalDecoded = 0;
+  let totalSkipped = 0;
+
+  while (nextLedger <= targetLedger && !signal.aborted) {
+    const windowEvents: RawStellarEvent[] = [];
+    let pagination: Pick<EventsQuery, "startLedger" | "cursor"> = { startLedger: nextLedger };
+    let pages = 0;
+    let windowThrough = nextLedger - 1;
+
+    while (pages < maxPagesPerWindow) {
+      const page = await rpc.events(
+        { ...pagination, contractIds: [gap.contract], limit: pageSize },
+        signal,
+      );
+      pages += 1;
+
+      if (page.oldestLedger > nextLedger) {
+        throw new StellarRpcError(
+          "getEvents",
+          `archive provider oldestLedger ${String(page.oldestLedger)} exceeds gap start ${String(nextLedger)}`,
+          false,
+        );
       }
-      case "actionQueued":
-        await recordActionQueued(tx, context, event.data, raw.valueJson);
-        return true;
-      case "actionExecuted":
-        await recordActionSettled(tx, context, event.data, "executed");
-        return true;
-      case "actionCancelled":
-        await recordActionSettled(tx, context, event.data, "cancelled");
-        return true;
-      case "tokenRegistered":
-        await recordTokenRegistered(tx, context, event.data);
-        return true;
-      case "pauseSet":
-        // A pause is router wide and there is no table for it, so it is recorded as every rail
-        // becoming unavailable for the reason the router would give. That is not a cosmetic
-        // mapping: a pause is the one operational state somebody needs to see in the same place
-        // they look at route health, rather than in a log they have to go and find.
-        await recordPauseSet(tx, context, event.data);
-        return true;
-      case "routeConfigured":
-        // The sample needs a token and this event names none, so it is attributed to the chain
-        // itself. A route being on or off is a property of the router, not of one asset.
-        await recordRouteConfigured(tx, context, event.data, context.chainKey);
-        return true;
-      case "ignored":
-        return false;
-      case "unknown":
-        if (!this.reportedUnknown.has(event.tag)) {
-          this.reportedUnknown.add(event.tag);
-          this.options.logger.warn(
-            { chain: context.chainKey, tag: event.tag },
-            "the router emitted an event tag this build does not know; it is running ahead of the indexer",
-          );
-        }
-        return false;
-      default:
-        // Unreachable while the switch covers the union, and the point is that it stops compiling
-        // the moment a new event kind is added without a case here. An indexer that silently drops
-        // a kind somebody added last week is the failure this line exists to prevent.
-        return assertNever(event);
+
+      windowEvents.push(...(page.events as readonly RawStellarEvent[]));
+      if (page.cursor === null) {
+        throw new StellarRpcError(
+          "getEvents",
+          "archive provider returned a page with no cursor during gap backfill",
+          true,
+        );
+      }
+
+      const candidate = completeThrough(parseEventCursor(page.cursor));
+      if (candidate >= nextLedger) {
+        windowThrough = Math.min(candidate, targetLedger);
+        break;
+      }
+      pagination = { cursor: page.cursor };
     }
+
+    if (windowThrough < nextLedger) {
+      throw new Error(
+        `ledger ${String(nextLedger)} exceeded ${String(maxPagesPerWindow)} pages during gap backfill`,
+      );
+    }
+
+    const boundedEvents = windowEvents.filter(
+      (raw) => raw.ledger >= nextLedger && raw.ledger <= windowThrough,
+    );
+
+    let windowDecoded = 0;
+    let windowSkipped = 0;
+    const completedBigInt = BigInt(windowThrough);
+
+    await db.transaction(async (tx: Queryable) => {
+      for (const raw of boundedEvents) {
+        if (raw.type !== "contract" || raw.inSuccessfulContractCall === false) {
+          windowSkipped += 1;
+          continue;
+        }
+        const context: EventContext = {
+          chainKey: gap.chainKey,
+          ledger: raw.ledger,
+          txHash: raw.txHash,
+          closedAt: new Date(raw.ledgerClosedAt),
+        };
+        if (await applyStellarEvent(tx, context, raw, logger, reportedUnknown)) {
+          windowDecoded += 1;
+        } else {
+          windowSkipped += 1;
+        }
+      }
+
+      status = await advanceOrCloseHistoryGap(tx, gap, completedBigInt);
+    });
+
+    totalDecoded += windowDecoded;
+    totalSkipped += windowSkipped;
+    completedThrough = completedBigInt;
+    nextLedger = windowThrough + 1;
+  }
+
+  logger.info(
+    {
+      chain: gap.chainKey,
+      gapId: gap.id.toString(),
+      fromLedger: gap.fromLedger.toString(),
+      toLedger: gap.toLedger.toString(),
+      completedThrough: completedThrough.toString(),
+      status,
+      decoded: totalDecoded,
+      skipped: totalSkipped,
+    },
+    "stellar history gap reconciliation pass finished",
+  );
+
+  return {
+    gapId: gap.id,
+    status,
+    completedThrough,
+    decoded: totalDecoded,
+    skipped: totalSkipped,
+  };
+}
+
+async function applyStellarEvent(
+  tx: Queryable,
+  context: EventContext,
+  raw: RawStellarEvent,
+  logger: Logger,
+  reportedUnknown: Set<string>,
+): Promise<boolean> {
+  const event = decodeStellarEvent(raw);
+
+  switch (event.kind) {
+    case "bridgeOut":
+      await recordBridgeOut(tx, context, event.data);
+      return true;
+    case "bridgeIn":
+      await recordBridgeIn(tx, context, event.data);
+      return true;
+    case "claimParked":
+      await recordClaimParked(tx, context, event.data);
+      return true;
+    case "claimSettled": {
+      const matched = await recordClaimSettled(tx, context, event.data);
+      if (!matched) {
+        logger.warn(
+          { chain: context.chainKey, claimId: event.data.claimId.toString() },
+          "settlement for a claim this indexer never saw parked",
+        );
+      }
+      return matched;
+    }
+    case "actionQueued":
+      await recordActionQueued(tx, context, event.data, raw.valueJson);
+      return true;
+    case "actionExecuted":
+      await recordActionSettled(tx, context, event.data, "executed");
+      return true;
+    case "actionCancelled":
+      await recordActionSettled(tx, context, event.data, "cancelled");
+      return true;
+    case "tokenRegistered":
+      await recordTokenRegistered(tx, context, event.data);
+      return true;
+    case "pauseSet":
+      await recordPauseSet(tx, context, event.data);
+      return true;
+    case "routeConfigured":
+      await recordRouteConfigured(tx, context, event.data, context.chainKey);
+      return true;
+    case "ignored":
+      return false;
+    case "unknown":
+      if (!reportedUnknown.has(event.tag)) {
+        reportedUnknown.add(event.tag);
+        logger.warn(
+          { chain: context.chainKey, tag: event.tag },
+          "the router emitted an event tag this build does not know; it is running ahead of the indexer",
+        );
+      }
+      return false;
+    default:
+      return assertNever(event);
   }
 }
 
