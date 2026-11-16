@@ -15,6 +15,7 @@
  */
 import type { FastifyInstance } from "fastify";
 
+import { buildDiagnosticsRevision } from "../../diagnostics/bundle.js";
 import type { ServerDeps } from "../server.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { checkRedisHealth, worstOf } from "../../runtime/readiness.js";
@@ -63,6 +64,8 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
       status: state,
       meaning: READINESS_MEANING,
       network: deps.config.network,
+      observedAt: new Date().toISOString(),
+      revision: buildDiagnosticsRevision(deps.config),
       indexer: deps.config.indexer.enabled ? "enabled" : "disabled",
       checks,
     });

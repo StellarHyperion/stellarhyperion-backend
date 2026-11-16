@@ -197,3 +197,9 @@ export class ReadinessRegistry {
     return { state: worstOf(checks), checks };
   }
 }
+
+export function probeStatusToReadinessState(status: "ok" | "degraded" | "failed"): ReadinessState {
+  if (status === "ok") return "ready";
+  if (status === "degraded") return "degraded";
+  return "down";
+}

@@ -120,6 +120,18 @@ export interface BuildIndexerDeps {
   readonly db: Transactional;
 }
 
+/** Chain keys configured for active router watching in this deployment record. */
+export function configuredWatchedChains(config: AppConfig): readonly string[] {
+  const chains: string[] = [];
+  if (config.indexer.stellar !== null) {
+    chains.push(config.indexer.stellar.chain);
+  }
+  for (const evm of config.indexer.evm) {
+    chains.push(evm.chain);
+  }
+  return chains;
+}
+
 /**
  * Decide what this process will watch, without yet watching it.
  *

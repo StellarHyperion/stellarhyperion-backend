@@ -3,10 +3,11 @@
  *
  * Provides system-level counts and watcher health statistics for monitoring and dashboards.
  */
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import { buildDiagnosticsRevision, generateDiagnosticsBundle } from "../../diagnostics/bundle.js";
 import type { ServerDeps } from "../server.js";
 
 export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): void {
@@ -59,6 +60,8 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
     return reply.send({
       service: "hyperion-backend",
       network: deps.config.network,
+      observedAt: new Date().toISOString(),
+      revision: buildDiagnosticsRevision(deps.config),
       uptimeSeconds: Math.floor((Date.now() - startedAt.getTime()) / 1000),
       transfers: {
         totalOutbound,
@@ -68,5 +71,16 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       railAttestations: railStatusCounts,
       cursors,
     });
+  });
+
+  app.get("/v1/diagnostics", async (request: FastifyRequest, reply: FastifyReply) => {
+    const bundle = await generateDiagnosticsBundle({
+      config: deps.config,
+      db,
+      readiness: deps.readiness,
+      redis: deps.redis,
+      requestHeaders: request.headers,
+    });
+    return reply.send(bundle);
   });
 }

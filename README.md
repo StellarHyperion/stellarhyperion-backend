@@ -67,7 +67,9 @@ One process serializes its Stellar submissions to avoid sequence conflicts. Run 
 - `GET /v1/transfers`, with sender/recipient/chain/route/search/limit/offset filters
 - `GET /v1/transfers/by-tx/:txHash`, `GET /v1/transfers/:originChain/:nonce`
 - `GET /v1/claims`, `GET /v1/claims/:chain/:claimId`
-- `GET /v1/routes/health`, `GET /v1/metrics`
+- `GET /v1/routes/health`, `GET /v1/metrics`, `GET /v1/diagnostics`
+
+Run `npm run build && npm run diagnostics` (or `node --env-file=.env dist/diagnostics/bundle.js --output bundle.json`) to generate a read-only, credential-free operational snapshot covering configuration, migrated schema tables, persisted worker cursor freshness, and cross-chain proof backlog.
 
 `npm run check` runs formatting, lint, type checking and tests. Schema/API regressions execute repository migrations in embedded PostgreSQL (PGlite). The full PostgreSQL integration suite requires `TEST_DATABASE_URL`; it is skipped when unset. Use `npm run build` for emitted production code.
 
