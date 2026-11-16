@@ -22,6 +22,8 @@
  * in this window", not "nothing left to read", and a watcher that confuses the two re-reads one
  * window forever and never arrives.
  */
+import { randomUUID } from "node:crypto";
+
 import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../../db/pool.js";
@@ -31,7 +33,9 @@ import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
 import type { EventSource, EventsQuery } from "./rpc.js";
 import { StellarRpcError } from "./rpc.js";
 import {
+  acquireOrRenewWatcherLease,
   readCursor,
+  readWatcherLease,
   recordActionQueued,
   recordActionSettled,
   recordBridgeIn,
@@ -42,6 +46,7 @@ import {
   recordRouteConfigured,
   recordTokenRegistered,
   writeCursor,
+  WatcherLeaseLostError,
   type EventContext,
 } from "./store.js";
 
@@ -77,6 +82,8 @@ export interface StellarWatcherOptions {
   readonly db: Transactional;
   readonly logger: Logger;
   readonly maxPagesPerTick?: number;
+  readonly leaseTtlMs?: number;
+  readonly holderId?: string;
 }
 
 export interface WatcherProgress {
@@ -93,8 +100,12 @@ export class StellarWatcher {
   private lastProgress: WatcherProgress | null = null;
   /** Tags seen once and logged once. A contract ahead of this build should not be a log flood. */
   private readonly reportedUnknown = new Set<string>();
+  readonly holderId: string;
+  private currentFenceToken: bigint | null = null;
 
-  constructor(private readonly options: StellarWatcherOptions) {}
+  constructor(private readonly options: StellarWatcherOptions) {
+    this.holderId = options.holderId ?? randomUUID();
+  }
 
   get name(): string {
     return this.options.chainKey;
@@ -141,6 +152,21 @@ export class StellarWatcher {
    */
   async tick(signal: AbortSignal): Promise<boolean> {
     const { chainKey, router, db, logger } = this.options;
+    const leaseTtlMs = this.options.leaseTtlMs ?? 30_000;
+
+    const currentLease = await readWatcherLease(db, chainKey, router);
+    const now = new Date();
+    if (
+      currentLease !== null &&
+      currentLease.holderId !== this.holderId &&
+      currentLease.expiresAt.getTime() > now.getTime()
+    ) {
+      logger.info(
+        { chain: chainKey, holder: this.holderId, activeHolder: currentLease.holderId },
+        "watcher lease held by another worker; skipping pass",
+      );
+      return false;
+    }
 
     const stored = await readCursor(db, chainKey);
     if (stored !== null && stored.contract !== router) {
@@ -188,6 +214,19 @@ export class StellarWatcher {
     // One transaction for the page and the cursor. This is the restart guarantee, and splitting it
     // would turn every crash into either a lost page or a duplicated one.
     await db.transaction(async (tx: Queryable) => {
+      const lease = await acquireOrRenewWatcherLease(tx, {
+        chainKey,
+        contract: router,
+        holderId: this.holderId,
+        leaseTtlMs,
+      });
+      if (!lease.acquired) {
+        throw new WatcherLeaseLostError(
+          `watcher lease for ${chainKey}/${router} is held by another worker`,
+        );
+      }
+      this.currentFenceToken = lease.fenceToken;
+
       for (const raw of scan.events) {
         if (raw.type !== "contract" || raw.inSuccessfulContractCall === false) {
           // getEvents no longer returns the deprecated success flag (RPC30).

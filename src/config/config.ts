@@ -55,6 +55,8 @@ export interface StellarWatchConfig {
   readonly startLedger: number;
   readonly pageSize: number;
   readonly pollIntervalMs: number;
+  /** Expiring database lease duration in milliseconds for watcher ownership coordination. */
+  readonly leaseTtlMs: number;
 }
 
 /** Everything the EVM watcher needs, per chain. */
@@ -374,6 +376,18 @@ const STELLAR_POLL_INTERVAL_MS: VarSpec = {
   purpose: "Ledgers close in about five seconds, so polling faster mostly asks for nothing.",
 };
 
+const STELLAR_WATCHER_LEASE_TTL_MS: VarSpec = {
+  name: "STELLAR_WATCHER_LEASE_TTL_MS",
+  kind: "integer",
+  required: false,
+  fallback: "30000",
+  min: 1_000,
+  max: 300_000,
+  printable: true,
+  purpose:
+    "Duration in milliseconds of the database-backed Stellar watcher ownership lease before a crashed holder loses ownership.",
+};
+
 const EVM_POLL_INTERVAL_MS: VarSpec = {
   name: "EVM_POLL_INTERVAL_MS",
   kind: "integer",
@@ -477,6 +491,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     : null;
   const pageSize = reader.integer(STELLAR_EVENT_PAGE_SIZE);
   const stellarPollIntervalMs = reader.integer(STELLAR_POLL_INTERVAL_MS);
+  const stellarLeaseTtlMs = reader.integer(STELLAR_WATCHER_LEASE_TTL_MS);
   const evmPollIntervalMs = reader.integer(EVM_POLL_INTERVAL_MS);
   const logRange = reader.integer(EVM_LOG_RANGE);
   const reorgDepthOverride = reader.has(EVM_REORG_DEPTH.name)
@@ -493,6 +508,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     startLedgerOverride,
     pageSize,
     stellarPollIntervalMs,
+    stellarLeaseTtlMs,
     evmPollIntervalMs,
     logRange,
     reorgDepthOverride,
@@ -581,6 +597,7 @@ interface PlanInput {
   readonly startLedgerOverride: number | null;
   readonly pageSize: number;
   readonly stellarPollIntervalMs: number;
+  readonly stellarLeaseTtlMs: number;
   readonly evmPollIntervalMs: number;
   readonly logRange: number;
   readonly reorgDepthOverride: number | null;
@@ -647,6 +664,7 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
         startLedger: input.startLedgerOverride ?? deployment.deployedAt.ledger,
         pageSize: input.pageSize,
         pollIntervalMs: input.stellarPollIntervalMs,
+        leaseTtlMs: input.stellarLeaseTtlMs,
       };
       continue;
     }

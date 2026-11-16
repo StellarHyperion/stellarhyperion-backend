@@ -304,6 +304,7 @@ function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Lo
     rpc: new StellarRpc(config.rpcUrl),
     db,
     logger: child,
+    leaseTtlMs: config.leaseTtlMs,
   });
   return new PolledWorker(watcher, config.pollIntervalMs, child);
 }

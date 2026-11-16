@@ -288,3 +288,176 @@ export async function recordRouteConfigured(
     flowAvailable: null,
   });
 }
+
+/** Error raised when a watcher loses database lease ownership before committing. */
+export class WatcherLeaseLostError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WatcherLeaseLostError";
+  }
+}
+
+export interface WatcherLeaseResult {
+  readonly acquired: boolean;
+  readonly fenceToken: bigint;
+  readonly expiresAt: Date;
+}
+
+export interface WatcherLeaseSummary {
+  readonly holderId: string;
+  readonly fenceToken: bigint;
+  readonly expiresAt: Date;
+}
+
+/** Read the current watcher lease row for chain and router, if present. */
+export async function readWatcherLease(
+  db: Queryable,
+  chainKey: string,
+  contract: string,
+): Promise<WatcherLeaseSummary | null> {
+  const { rows } = await db.query(
+    `SELECT holder_id, fence_token, expires_at
+       FROM stellar_watcher_lease
+      WHERE chain_key = $1 AND contract = $2`,
+    [chainKey, contract],
+  );
+  const row = maybeOne(rows, `lease for ${chainKey}`);
+  if (row === null) return null;
+  return {
+    holderId: text(row, "holder_id"),
+    fenceToken: bigintOf(row, "fence_token"),
+    expiresAt: timestampOrNull(row, "expires_at") ?? new Date(0),
+  };
+}
+
+/**
+ * Acquire or renew the expiring database lease for a Stellar watcher.
+ *
+ * If unassigned, the lease is created with fence token 1.
+ * If held by the same worker, its expiry is refreshed without modifying fence token.
+ * If previously held by another worker whose expiry passed, ownership is transferred and fence token increments.
+ * If held by another worker whose expiry is still active, acquisition returns false.
+ */
+export async function acquireOrRenewWatcherLease(
+  db: Queryable,
+  options: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly holderId: string;
+    readonly leaseTtlMs: number;
+    readonly now?: Date;
+  },
+): Promise<WatcherLeaseResult> {
+  const now = options.now ?? new Date();
+  const expiresAt = new Date(now.getTime() + options.leaseTtlMs);
+
+  const { rows } = await db.query(
+    `SELECT holder_id, fence_token, expires_at
+       FROM stellar_watcher_lease
+      WHERE chain_key = $1 AND contract = $2`,
+    [options.chainKey, options.contract],
+  );
+
+  const existing = maybeOne(rows, `lease for ${options.chainKey}`);
+  if (existing === null) {
+    const insertRes = await db.query(
+      `INSERT INTO stellar_watcher_lease
+         (chain_key, contract, holder_id, fence_token, acquired_at, renewed_at, expires_at)
+       VALUES ($1, $2, $3, 1, $4, $4, $5)
+       ON CONFLICT (chain_key, contract) DO NOTHING
+       RETURNING fence_token, expires_at`,
+      [options.chainKey, options.contract, options.holderId, now, expiresAt],
+    );
+    const inserted = insertRes.rows[0];
+    if (inserted !== undefined) {
+      return {
+        acquired: true,
+        fenceToken: bigintOf(inserted, "fence_token"),
+        expiresAt,
+      };
+    }
+    return acquireOrRenewWatcherLease(db, options);
+  }
+
+  const currentHolder = text(existing, "holder_id");
+  const fence = bigintOf(existing, "fence_token");
+  const currentExpiry = timestampOrNull(existing, "expires_at") ?? new Date(0);
+
+  if (currentHolder === options.holderId) {
+    await db.query(
+      `UPDATE stellar_watcher_lease
+          SET renewed_at = $1, expires_at = $2
+        WHERE chain_key = $3 AND contract = $4 AND holder_id = $5`,
+      [now, expiresAt, options.chainKey, options.contract, options.holderId],
+    );
+    return { acquired: true, fenceToken: fence, expiresAt };
+  }
+
+  if (currentExpiry.getTime() <= now.getTime()) {
+    const updateRes = await db.query(
+      `UPDATE stellar_watcher_lease
+          SET holder_id = $1,
+              fence_token = fence_token + 1,
+              acquired_at = $2,
+              renewed_at = $2,
+              expires_at = $3
+        WHERE chain_key = $4 AND contract = $5 AND expires_at <= $2
+        RETURNING fence_token, expires_at`,
+      [options.holderId, now, expiresAt, options.chainKey, options.contract],
+    );
+    const updated = updateRes.rows[0];
+    if (updated !== undefined) {
+      return {
+        acquired: true,
+        fenceToken: bigintOf(updated, "fence_token"),
+        expiresAt,
+      };
+    }
+  }
+
+  return { acquired: false, fenceToken: fence, expiresAt: currentExpiry };
+}
+
+/**
+ * Enforce that the active transaction holds valid lease ownership.
+ * Aborts and throws WatcherLeaseLostError if the lease expired or ownership changed.
+ */
+export async function enforceWatcherLease(
+  db: Queryable,
+  options: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly holderId: string;
+    readonly fenceToken: bigint;
+    readonly leaseTtlMs: number;
+    readonly now?: Date;
+  },
+): Promise<void> {
+  const now = options.now ?? new Date();
+  const expiresAt = new Date(now.getTime() + options.leaseTtlMs);
+
+  const { rows } = await db.query(
+    `UPDATE stellar_watcher_lease
+        SET renewed_at = $1, expires_at = $2
+      WHERE chain_key = $3
+        AND contract = $4
+        AND holder_id = $5
+        AND fence_token = $6
+        AND expires_at > $1
+      RETURNING fence_token`,
+    [
+      now,
+      expiresAt,
+      options.chainKey,
+      options.contract,
+      options.holderId,
+      options.fenceToken.toString(),
+    ],
+  );
+
+  if (rows.length === 0) {
+    throw new WatcherLeaseLostError(
+      `watcher lease for ${options.chainKey}/${options.contract} lost by holder ${options.holderId}`,
+    );
+  }
+}

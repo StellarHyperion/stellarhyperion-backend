@@ -40,9 +40,12 @@ function harness(
     readonly latestLedger?: number;
     readonly maxPagesPerTick?: number;
     readonly oldestLedger?: number;
+    readonly db?: RecordingDb;
+    readonly holderId?: string;
+    readonly leaseTtlMs?: number;
   } = {},
 ): Harness {
-  const db = new RecordingDb();
+  const db = options.db ?? new RecordingDb();
   const startLedger = options.startLedger ?? FIRST_EVENT_LEDGER;
   const rpc = new FakeRpc({
     events: options.events ?? [],
@@ -61,6 +64,8 @@ function harness(
     db,
     logger,
     ...(options.maxPagesPerTick === undefined ? {} : { maxPagesPerTick: options.maxPagesPerTick }),
+    ...(options.holderId === undefined ? {} : { holderId: options.holderId }),
+    ...(options.leaseTtlMs === undefined ? {} : { leaseTtlMs: options.leaseTtlMs }),
   });
   return { watcher, db, rpc, lines };
 }
@@ -342,5 +347,85 @@ describe("gaps it cannot close", () => {
 
     const warnings = lines.filter((line) => line.message.includes("running ahead of the indexer"));
     expect(warnings).toHaveLength(1);
+  });
+});
+
+describe("database leases for watcher ownership", () => {
+  it("only allows one lease holder to commit a watcher cursor at a time", async () => {
+    const sharedDb = new RecordingDb();
+    const workerA = harness({
+      db: sharedDb,
+      holderId: "worker-a",
+      leaseTtlMs: 30_000,
+      startLedger: FIRST_EVENT_LEDGER,
+    });
+    const workerB = harness({
+      db: sharedDb,
+      holderId: "worker-b",
+      leaseTtlMs: 30_000,
+      startLedger: FIRST_EVENT_LEDGER,
+    });
+
+    const progressedA = await workerA.watcher.tick(AbortSignal.timeout(5_000));
+    expect(progressedA).toBe(true);
+    expect(sharedDb.commits).toHaveLength(1);
+
+    const progressedB = await workerB.watcher.tick(AbortSignal.timeout(5_000));
+    expect(progressedB).toBe(false);
+    expect(sharedDb.commits).toHaveLength(1);
+    expect(workerB.lines.some((l) => l.message.includes("held by another worker"))).toBe(true);
+  });
+
+  it("transfers ownership when a crashed holder lease has expired", async () => {
+    const sharedDb = new RecordingDb();
+    const workerA = harness({
+      db: sharedDb,
+      holderId: "worker-a",
+      leaseTtlMs: 1_000,
+      startLedger: FIRST_EVENT_LEDGER,
+    });
+    await workerA.watcher.tick(AbortSignal.timeout(5_000));
+    expect(sharedDb.leases.get(`${CHAIN}/${LIVE_ROUTER}`)?.holder_id).toBe("worker-a");
+
+    const lease = sharedDb.leases.get(`${CHAIN}/${LIVE_ROUTER}`);
+    if (lease) {
+      lease.expires_at = new Date(Date.now() - 5_000);
+    }
+
+    const workerB = harness({
+      db: sharedDb,
+      holderId: "worker-b",
+      leaseTtlMs: 30_000,
+      startLedger: FIRST_EVENT_LEDGER,
+    });
+    const progressedB = await workerB.watcher.tick(AbortSignal.timeout(5_000));
+    expect(progressedB).toBe(true);
+    const updated = sharedDb.leases.get(`${CHAIN}/${LIVE_ROUTER}`);
+    expect(updated?.holder_id).toBe("worker-b");
+    expect(updated?.fence_token).toBe("2");
+  });
+
+  it("aborts work before cursor write if lease ownership is lost before commit", async () => {
+    const sharedDb = new RecordingDb();
+    const workerA = harness({
+      db: sharedDb,
+      holderId: "worker-a",
+      leaseTtlMs: 30_000,
+      startLedger: FIRST_EVENT_LEDGER,
+    });
+
+    sharedDb.leases.set(`${CHAIN}/${LIVE_ROUTER}`, {
+      chain_key: CHAIN,
+      contract: LIVE_ROUTER,
+      holder_id: "worker-b",
+      fence_token: "5",
+      acquired_at: new Date(),
+      renewed_at: new Date(),
+      expires_at: new Date(Date.now() + 60_000),
+    });
+
+    const progressed = await workerA.watcher.tick(AbortSignal.timeout(5_000));
+    expect(progressed).toBe(false);
+    expect(sharedDb.commits).toHaveLength(0);
   });
 });

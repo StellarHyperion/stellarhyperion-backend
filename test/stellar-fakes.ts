@@ -171,6 +171,16 @@ export interface RecordedQuery {
   readonly transaction: number | null;
 }
 
+export interface FakeLeaseRow {
+  chain_key: string;
+  contract: string;
+  holder_id: string;
+  fence_token: string;
+  acquired_at: Date;
+  renewed_at: Date;
+  expires_at: Date;
+}
+
 /**
  * A database that answers the cursor read and remembers everything else.
  *
@@ -183,6 +193,7 @@ export class RecordingDb implements Transactional {
   readonly commits: number[] = [];
   readonly rollbacks: number[] = [];
   cursorRow: Record<string, unknown> | null = null;
+  readonly leases = new Map<string, FakeLeaseRow>();
   /** Set to make every statement inside the next transaction throw. */
   failInTransaction: Error | null = null;
 
@@ -199,6 +210,82 @@ export class RecordingDb implements Transactional {
         rows: this.cursorRow === null ? [] : [this.cursorRow],
         rowCount: 1,
       });
+    }
+    if (text.includes("FROM stellar_watcher_lease")) {
+      const key = `${String(params[0])}/${String(params[1])}`;
+      const found = this.leases.get(key);
+      return Promise.resolve({
+        rows: found ? [{ ...found }] : [],
+        rowCount: found ? 1 : 0,
+      });
+    }
+    if (text.includes("INSERT INTO stellar_watcher_lease")) {
+      const key = `${String(params[0])}/${String(params[1])}`;
+      if (this.leases.has(key)) {
+        return Promise.resolve({ rows: [], rowCount: 0 });
+      }
+      const row: FakeLeaseRow = {
+        chain_key: String(params[0]),
+        contract: String(params[1]),
+        holder_id: String(params[2]),
+        fence_token: "1",
+        acquired_at: params[3] as Date,
+        renewed_at: params[3] as Date,
+        expires_at: params[4] as Date,
+      };
+      this.leases.set(key, row);
+      return Promise.resolve({
+        rows: [{ fence_token: row.fence_token, expires_at: row.expires_at }],
+        rowCount: 1,
+      });
+    }
+    if (text.includes("UPDATE stellar_watcher_lease")) {
+      if (text.includes("AND fence_token = $6")) {
+        const key = `${String(params[2])}/${String(params[3])}`;
+        const row = this.leases.get(key);
+        const now = params[0] as Date;
+        if (
+          row &&
+          row.holder_id === params[4] &&
+          row.fence_token === String(params[5]) &&
+          row.expires_at.getTime() > now.getTime()
+        ) {
+          row.renewed_at = now;
+          row.expires_at = params[1] as Date;
+          return Promise.resolve({ rows: [{ fence_token: row.fence_token }], rowCount: 1 });
+        }
+        return Promise.resolve({ rows: [], rowCount: 0 });
+      }
+      if (text.includes("expires_at <= $2")) {
+        const key = `${String(params[3])}/${String(params[4])}`;
+        const row = this.leases.get(key);
+        const now = params[1] as Date;
+        if (row && row.expires_at.getTime() <= now.getTime()) {
+          row.holder_id = String(params[0]);
+          row.fence_token = (BigInt(row.fence_token) + 1n).toString();
+          row.acquired_at = now;
+          row.renewed_at = now;
+          row.expires_at = params[2] as Date;
+          return Promise.resolve({
+            rows: [{ fence_token: row.fence_token, expires_at: row.expires_at }],
+            rowCount: 1,
+          });
+        }
+        return Promise.resolve({ rows: [], rowCount: 0 });
+      }
+      if (text.includes("holder_id = $5")) {
+        const key = `${String(params[2])}/${String(params[3])}`;
+        const row = this.leases.get(key);
+        if (row && row.holder_id === params[4]) {
+          row.renewed_at = params[0] as Date;
+          row.expires_at = params[1] as Date;
+          return Promise.resolve({
+            rows: [{ fence_token: row.fence_token, expires_at: row.expires_at }],
+            rowCount: 1,
+          });
+        }
+        return Promise.resolve({ rows: [], rowCount: 0 });
+      }
     }
     // Zero rows affected, which is what makes `recordClaimSettled` report an unmatched settlement.
     return Promise.resolve({ rows: [], rowCount: 0 });
