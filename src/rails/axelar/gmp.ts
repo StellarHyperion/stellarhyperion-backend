@@ -1,6 +1,7 @@
 /** Axelar status lookup uses the API root and a searchGMP JSON method. */
 import type {
   AttestationStatus,
+  AxelarCandidateIssue,
   PendingTransfer,
   RailClient,
   RailLookup,
@@ -176,23 +177,50 @@ export class AxelarGmpClient implements RailClient {
     if (FATAL_FLAGS.some((flag) => row[flag] === true)) mapped = "failed";
 
     const words = [status, simplified, ...flags].filter((part): part is string => part !== null);
+    const rawTxHash =
+      typeof row.executed?.transactionHash === "string" ? row.executed.transactionHash : null;
+    const rawCommandId = typeof row.command_id === "string" ? row.command_id : null;
+    const validTxHash =
+      rawTxHash !== null && /^0x[0-9a-fA-F]{64}$/.test(rawTxHash)
+        ? (rawTxHash as `0x${string}`)
+        : null;
+    const validCommandId =
+      rawCommandId !== null && /^0x[0-9a-fA-F]{64}$/.test(rawCommandId)
+        ? (rawCommandId as `0x${string}`)
+        : null;
+
+    let candidateIssue: AxelarCandidateIssue | undefined;
+    if (status === "executed" && (validTxHash === null || validCommandId === null)) {
+      const reason =
+        rawTxHash === null
+          ? "missing_execution_tx"
+          : validTxHash === null
+            ? "invalid_execution_tx"
+            : rawCommandId === null
+              ? "missing_command_id"
+              : "invalid_command_id";
+      candidateIssue = {
+        reason,
+        observedTxHash: boundGmpId(rawTxHash),
+        observedCommandId: boundGmpId(rawCommandId),
+      };
+    }
+
     return {
       status: mapped,
       railStatus: words.join("/"),
       // The message id, because that is what Axelar's support asks for.
       reference: typeof row.message_id === "string" ? row.message_id : null,
       attestedAt: stampOf(row.approved) ?? stampOf(row.executed),
-      ...(typeof row.executed?.transactionHash === "string" &&
-      /^0x[0-9a-fA-F]{64}$/.test(row.executed.transactionHash) &&
-      typeof row.command_id === "string" &&
-      /^0x[0-9a-fA-F]{64}$/.test(row.command_id)
+      ...(validTxHash !== null && validCommandId !== null
         ? {
             execution: {
-              txHash: row.executed.transactionHash as `0x${string}`,
-              commandId: row.command_id as `0x${string}`,
+              txHash: validTxHash,
+              commandId: validCommandId,
             },
           }
         : {}),
+      ...(candidateIssue !== undefined ? { candidateIssue } : {}),
     };
   }
 
@@ -232,4 +260,11 @@ export { MAPPING as AXELAR_STATUS_MAPPING, FATAL_FLAGS, RECOVERABLE_FLAGS };
 
 function normalized(value: unknown): string {
   return typeof value === "string" ? value.toLowerCase().replace(/^0x/, "") : "";
+}
+
+function boundGmpId(value: string | null): string | null {
+  if (value === null) return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || /^https?:\/\//i.test(trimmed)) return null;
+  return trimmed.replace(/[^0-9a-zA-Z:_-]/g, "").slice(0, 140) || null;
 }

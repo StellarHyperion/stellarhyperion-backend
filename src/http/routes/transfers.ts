@@ -11,7 +11,7 @@ import type { AppConfig } from "../../config/config.js";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
-import { integer, text, textOrNull } from "../../db/rows.js";
+import { bigintOrNull, integer, text, textOrNull, timestamp } from "../../db/rows.js";
 import type { ServerDeps } from "../server.js";
 
 export type TransferLifecycleStage =
@@ -23,6 +23,18 @@ export type TransferLifecycleStage =
   | "parked"
   | "settled"
   | "failed";
+
+export interface FormattedVerificationDiagnostic {
+  readonly disposition: "unavailable" | "mismatch";
+  readonly category: string;
+  readonly candidateTxHash: string | null;
+  readonly candidateCommandId: string | null;
+  readonly candidateBlock: string | null;
+  readonly expectedValue: string | null;
+  readonly observedValue: string | null;
+  readonly occurrences: number;
+  readonly lastObservedAt: string;
+}
 
 export interface FormattedTransfer {
   readonly id: string;
@@ -65,6 +77,7 @@ export interface FormattedTransfer {
     readonly id: string;
     readonly settled: boolean;
   } | null;
+  readonly verificationDiagnostic?: FormattedVerificationDiagnostic | null | undefined;
 }
 
 function deriveStage(
@@ -130,6 +143,22 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
   const railStatus = textOrNull(row, "attestation_status");
 
   const stage = deriveStage(delivered, hasClaim, claimSettled, railStatus);
+  const diagDisposition = textOrNull(row, "its_diag_disposition");
+  const diagBlock = bigintOrNull(row, "its_diag_block");
+  const verificationDiagnostic: FormattedVerificationDiagnostic | null =
+    diagDisposition === "unavailable" || diagDisposition === "mismatch"
+      ? {
+          disposition: diagDisposition,
+          category: text(row, "its_diag_category"),
+          candidateTxHash: textOrNull(row, "its_diag_candidate_tx"),
+          candidateCommandId: textOrNull(row, "its_diag_candidate_command_id"),
+          candidateBlock: diagBlock === null ? null : diagBlock.toString(),
+          expectedValue: textOrNull(row, "its_diag_expected_value"),
+          observedValue: textOrNull(row, "its_diag_observed_value"),
+          occurrences: integer(row, "its_diag_occurrences"),
+          lastObservedAt: timestamp(row, "its_diag_last_observed_at").toISOString(),
+        }
+      : null;
 
   return {
     id: text(row, "id"),
@@ -181,6 +210,7 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
           settled: claimSettled,
         }
       : null,
+    verificationDiagnostic,
   };
 }
 
@@ -211,6 +241,15 @@ const TRANSFER_QUERY = `
          d.token AS received_token,
          d.amount AS received_amount,
          d.observed_at AS delivered_at,
+         vd.disposition AS its_diag_disposition,
+         vd.category AS its_diag_category,
+         vd.candidate_tx AS its_diag_candidate_tx,
+         vd.candidate_command_id AS its_diag_candidate_command_id,
+         vd.candidate_block AS its_diag_block,
+         vd.expected_value AS its_diag_expected_value,
+         vd.observed_value AS its_diag_observed_value,
+         vd.occurrences AS its_diag_occurrences,
+         vd.last_observed_at AS its_diag_last_observed_at,
          c.claim_id,
          c.settled AS claim_settled
     FROM outbound_transfer t
@@ -220,6 +259,7 @@ const TRANSFER_QUERY = `
      AND d.route = t.route
      AND d.source_chain = t.origin_chain
      AND d.source_nonce = t.nonce
+    LEFT JOIN its_verification_diagnostic vd ON vd.transfer_id = t.id
     LEFT JOIN pending_claim c
       ON c.chain = t.destination_chain
      AND c.route = t.route

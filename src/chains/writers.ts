@@ -341,6 +341,22 @@ export interface AttestationRow {
   readonly lastError: string | null;
 }
 
+export interface ItsVerificationDiagnosticRow {
+  readonly transferId: bigint;
+  readonly destinationChain: string;
+  readonly route: number;
+  readonly sourceChain: string;
+  readonly sourceNonce: bigint;
+  readonly disposition: "unavailable" | "mismatch";
+  readonly category: string;
+  readonly candidateTx: string | null;
+  readonly candidateCommandId: string | null;
+  readonly candidateBlock: bigint | null;
+  readonly expectedValue: string | null;
+  readonly observedValue: string | null;
+  readonly observedAt: Date;
+}
+
 export async function writeAttestation(db: Queryable, row: AttestationRow): Promise<void> {
   await db.query(
     `INSERT INTO rail_attestation
@@ -371,4 +387,62 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
       row.lastError,
     ],
   );
+}
+
+export async function writeItsVerificationDiagnostic(
+  db: Queryable,
+  row: ItsVerificationDiagnosticRow,
+): Promise<void> {
+  await db.query(
+    `INSERT INTO its_verification_diagnostic
+       (transfer_id, destination_chain, route, source_chain, source_nonce, disposition, category,
+        candidate_tx, candidate_command_id, candidate_block, expected_value, observed_value,
+        occurrences, first_observed_at, last_observed_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 1, $13, $13)
+     ON CONFLICT (transfer_id) DO UPDATE
+       SET disposition = EXCLUDED.disposition,
+           category = EXCLUDED.category,
+           candidate_tx = EXCLUDED.candidate_tx,
+           candidate_command_id = EXCLUDED.candidate_command_id,
+           candidate_block = EXCLUDED.candidate_block,
+           expected_value = EXCLUDED.expected_value,
+           observed_value = EXCLUDED.observed_value,
+           occurrences = CASE
+             WHEN its_verification_diagnostic.category = EXCLUDED.category
+               AND its_verification_diagnostic.disposition = EXCLUDED.disposition
+             THEN its_verification_diagnostic.occurrences + 1
+             ELSE 1
+           END,
+           first_observed_at = CASE
+             WHEN its_verification_diagnostic.category = EXCLUDED.category
+               AND its_verification_diagnostic.disposition = EXCLUDED.disposition
+             THEN its_verification_diagnostic.first_observed_at
+             ELSE EXCLUDED.first_observed_at
+           END,
+           last_observed_at = EXCLUDED.last_observed_at`,
+    [
+      row.transferId.toString(),
+      row.destinationChain,
+      row.route,
+      row.sourceChain,
+      row.sourceNonce.toString(),
+      row.disposition,
+      row.category,
+      row.candidateTx,
+      row.candidateCommandId,
+      row.candidateBlock === null ? null : row.candidateBlock.toString(),
+      row.expectedValue,
+      row.observedValue,
+      row.observedAt,
+    ],
+  );
+}
+
+export async function clearItsVerificationDiagnostic(
+  db: Queryable,
+  transferId: bigint,
+): Promise<void> {
+  await db.query("DELETE FROM its_verification_diagnostic WHERE transfer_id = $1", [
+    transferId.toString(),
+  ]);
 }
