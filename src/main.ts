@@ -13,6 +13,7 @@ import { Database } from "./db/pool.js";
 import { buildServer } from "./http/server.js";
 import { createKeeperRedis } from "./keeper/queue.js";
 import { createLogger } from "./logging/logger.js";
+import { RolloutCoordinator } from "./runtime/rollout.js";
 import { Shutdown, installSignalHandlers } from "./runtime/shutdown.js";
 
 async function main(): Promise<void> {
@@ -43,32 +44,55 @@ async function main(): Promise<void> {
       await redis.quit();
     });
 
-  // Registered between the pool and the server, because shutdown runs in reverse: the server
-  // stops accepting requests, the watchers finish the page they are on, and only then does the
-  // pool close under them.
-  const indexer = buildIndexer({ config, logger, db });
-  shutdown.add("indexer", () => indexer.stop());
+  const rollout = new RolloutCoordinator({
+    db,
+    instanceId: config.rollout.instanceId,
+    leaseTtlMs: config.rollout.leaseTtlMs,
+    drainGraceMs: config.rollout.drainGraceMs,
+    logger,
+  });
+
+  const indexer = buildIndexer({ config, logger, db, rollout });
 
   const server = buildServer({
     config,
     logger,
     db,
     ...(redis ? { redis } : {}),
+    rollout,
     readiness: indexer.readiness,
     startedAt,
   });
-  // Registered before listen so a failed listen still closes what is already open.
+  // Shutdown executes in reverse registration order:
+  // 1. rollout-drain marks /ready 503 while HTTP keeps answering probes, waits drainGraceMs,
+  //    stops background watchers, fences off stale writes and releases rollout leases in Postgres.
+  // 2. http closes the Fastify listener.
+  // 3. redis and postgres close after all workers and HTTP handlers have drained.
   shutdown.add("http", () => server.close());
+  shutdown.add("rollout-drain", async () => {
+    await rollout.drainAndRelease("shutdown", () => indexer.stop());
+  });
 
   await server.listen({ host: config.http.host, port: config.http.port });
-  // After listen, so the probes are answering before the first page is read. A watcher that
-  // starts first makes its initial RPC calls while nothing can report on them.
+  const admission = await rollout.admitSchema();
+  if (!admission.admitted) {
+    logger.error(
+      { instanceId: rollout.instanceId, missingTables: admission.missingTables },
+      admission.detail,
+    );
+    await shutdown.run("schema-admission-failed");
+    process.exit(1);
+  }
+
+  // Start background watchers only after PostgreSQL schema admission succeeds; each watcher pass
+  // acquires its distributed rollout lease before reading or advancing shared cursors.
   indexer.start();
   logger.info(
     {
       host: config.http.host,
       port: config.http.port,
       network: config.network,
+      instanceId: rollout.instanceId,
       deploymentsFile: config.deploymentsFile,
       watchingStellar: config.indexer.stellar?.chain ?? null,
       watchingEvm: config.indexer.evm.map((entry) => entry.chain),

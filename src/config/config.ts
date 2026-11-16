@@ -11,6 +11,7 @@
  * cast. That is the point of the shared package: there is one description of where Hyperion is
  * deployed, one validator for it, and the backend is not allowed its own opinion.
  */
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 
@@ -100,6 +101,12 @@ export interface KeeperConfig {
   readonly stellarSecret: string | null;
 }
 
+export interface RolloutConfig {
+  readonly instanceId: string;
+  readonly leaseTtlMs: number;
+  readonly drainGraceMs: number;
+}
+
 export interface AppConfig {
   readonly nodeEnv: NodeEnv;
   readonly logLevel: LogLevel;
@@ -112,6 +119,7 @@ export interface AppConfig {
   readonly indexer: IndexerConfig;
   readonly rails: RailsConfig;
   readonly keeper: KeeperConfig;
+  readonly rollout: RolloutConfig;
   readonly shutdownTimeoutMs: number;
 }
 
@@ -333,6 +341,39 @@ const SHUTDOWN_TIMEOUT_MS: VarSpec = {
   purpose: "How long shutdown waits for in-flight work before it stops waiting.",
 };
 
+const CONTAINER_INSTANCE_ID: VarSpec = {
+  name: "CONTAINER_INSTANCE_ID",
+  kind: "string",
+  required: false,
+  printable: true,
+  purpose:
+    "Unique container instance identifier used to coordinate watcher rollout leases. Generated automatically when omitted.",
+};
+
+const ROLLOUT_LEASE_TTL_MS: VarSpec = {
+  name: "ROLLOUT_LEASE_TTL_MS",
+  kind: "integer",
+  required: false,
+  fallback: "20000",
+  min: 2000,
+  max: 300_000,
+  printable: true,
+  purpose:
+    "Lease TTL in milliseconds for shared watcher cursor ownership before a replacement container takes over from an unresponsive peer.",
+};
+
+const ROLLOUT_DRAIN_GRACE_MS: VarSpec = {
+  name: "ROLLOUT_DRAIN_GRACE_MS",
+  kind: "integer",
+  required: false,
+  fallback: "0",
+  min: 0,
+  max: 120_000,
+  printable: true,
+  purpose:
+    "Optional pre-stop readiness drain delay in milliseconds after SIGTERM so load balancers observe 503 on /ready before HTTP listener closure.",
+};
+
 const STELLAR_RPC_URL: VarSpec = {
   name: "STELLAR_RPC_URL",
   kind: "url",
@@ -457,6 +498,13 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const deploymentsPath = reader.string(DEPLOYMENTS_FILE);
   const indexerEnabled = reader.boolean(INDEXER_ENABLED);
   const shutdownTimeoutMs = reader.integer(SHUTDOWN_TIMEOUT_MS);
+  const rawInstanceId = reader.string(CONTAINER_INSTANCE_ID);
+  const containerInstanceId =
+    rawInstanceId === ""
+      ? `container-${String(process.pid)}-${randomUUID().slice(0, 8)}`
+      : rawInstanceId;
+  const rolloutLeaseTtlMs = reader.integer(ROLLOUT_LEASE_TTL_MS);
+  const rolloutDrainGraceMs = reader.integer(ROLLOUT_DRAIN_GRACE_MS);
 
   const railsEnabled = reader.boolean(RAILS_ENABLED);
   const irisOverride = reader.url(IRIS_API_URL);
@@ -526,6 +574,11 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       pollIntervalMs: keeperPollIntervalMs,
       concurrency: keeperConcurrency,
       stellarSecret: keeperStellarSecret,
+    },
+    rollout: {
+      instanceId: containerInstanceId,
+      leaseTtlMs: rolloutLeaseTtlMs,
+      drainGraceMs: rolloutDrainGraceMs,
     },
     shutdownTimeoutMs,
   };

@@ -57,6 +57,7 @@ suite("the schema", () => {
       "admin_action",
       "inbound_delivery",
       "indexer_cursor",
+      "indexer_rollout_lease",
       "outbound_transfer",
       "pending_claim",
       "rail_attestation",
@@ -64,6 +65,15 @@ suite("the schema", () => {
     ]) {
       expect(names, `${table} is missing; has the migration run`).toContain(table);
     }
+  });
+
+  it("enforces positive fence tokens on indexer_rollout_lease", async () => {
+    await expect(
+      db.query(
+        `INSERT INTO public.indexer_rollout_lease (lease_key, holder_id, fence_token, expires_at)
+         VALUES ('watcher:test-invalid', 'pod-a', 0, now() + INTERVAL '20 seconds')`,
+      ),
+    ).rejects.toSatisfy((error: unknown) => codeOf(error) === CHECK_VIOLATION);
   });
 
   it("holds a u64 that bigint cannot", async () => {

@@ -18,9 +18,13 @@ import type { FastifyInstance } from "fastify";
 import type { ServerDeps } from "../server.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { checkRedisHealth, worstOf } from "../../runtime/readiness.js";
+import { verifySchemaAdmission } from "../../runtime/rollout.js";
 
 const LIVENESS_MEANING =
   "This process is running and answering. It says nothing about Postgres or the chains. Use /ready for that.";
+
+const STARTUP_MEANING =
+  "This container has completed startup and verified required PostgreSQL schema admission. A 503 here means keep probing during startup or abort rollout admission.";
 
 const READINESS_MEANING =
   "This process can do its job: Postgres and Redis answer and every watcher is current. A 503 here means take this replica out of rotation, not restart it.";
@@ -34,10 +38,75 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
     service: "hyperion-backend",
     network: deps.config.network,
     uptimeSeconds: Math.floor((Date.now() - startedAt.getTime()) / 1000),
+    ...(deps.rollout !== undefined
+      ? {
+          rolloutPhase: deps.rollout.phase,
+          instanceId: deps.rollout.instanceId,
+        }
+      : {}),
   }));
+
+  app.get("/startup", async (_request, reply) => {
+    if (deps.rollout !== undefined) {
+      const report = deps.rollout.startupReport();
+      return reply.code(report.httpStatus).send({
+        status: report.status,
+        meaning: STARTUP_MEANING,
+        service: "hyperion-backend",
+        network: deps.config.network,
+        instanceId: report.instanceId,
+        phase: report.phase,
+        detail: report.detail,
+        missingTables: report.missingTables,
+      });
+    }
+
+    let code: 200 | 503 = 503;
+    let payload: {
+      readonly status: "admitted" | "failed";
+      readonly meaning: string;
+      readonly service: string;
+      readonly network: ServerDeps["config"]["network"];
+      readonly instanceId: string;
+      readonly phase: "admitted" | "failed";
+      readonly detail: string;
+      readonly missingTables: readonly string[];
+    };
+
+    try {
+      const schema = await verifySchemaAdmission(deps.db);
+      code = schema.admitted ? 200 : 503;
+      payload = {
+        status: schema.admitted ? "admitted" : "failed",
+        meaning: STARTUP_MEANING,
+        service: "hyperion-backend",
+        network: deps.config.network,
+        instanceId: deps.config.rollout.instanceId,
+        phase: schema.admitted ? "admitted" : "failed",
+        detail: schema.detail,
+        missingTables: schema.missingTables,
+      };
+    } catch (error) {
+      payload = {
+        status: "failed",
+        meaning: STARTUP_MEANING,
+        service: "hyperion-backend",
+        network: deps.config.network,
+        instanceId: deps.config.rollout.instanceId,
+        phase: "failed",
+        detail: `schema admission check failed: ${messageOf(error)}`,
+        missingTables: [],
+      };
+    }
+
+    return reply.code(code).send(payload);
+  });
 
   app.get("/ready", async (_request, reply) => {
     const checks: ReadinessReport[] = [await checkDatabase(deps), await checkRedis(deps)];
+    if (deps.rollout !== undefined) {
+      checks.push(deps.rollout.readiness());
+    }
 
     for (const source of deps.readiness) {
       try {

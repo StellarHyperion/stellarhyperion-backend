@@ -63,11 +63,21 @@ One process serializes its Stellar submissions to avoid sequence conflicts. Run 
 
 ## API and checks
 
-- `GET /health`, `GET /ready`
+- `GET /health`, `GET /startup`, `GET /ready`
 - `GET /v1/transfers`, with sender/recipient/chain/route/search/limit/offset filters
 - `GET /v1/transfers/by-tx/:txHash`, `GET /v1/transfers/:originChain/:nonce`
 - `GET /v1/claims`, `GET /v1/claims/:chain/:claimId`
 - `GET /v1/routes/health`, `GET /v1/metrics`
+
+### Container rollout probes and graceful drain
+
+Continuous container deployments separate liveness, startup schema admission and rollout readiness:
+
+- `GET /health` is process liveness only (`200` while the Node event loop answers, including during `SIGTERM` drain so orchestrators do not force-kill an in-flight transaction).
+- `GET /startup` verifies required PostgreSQL schema tables (`200` once admitted, `503` while starting, draining or missing migrations).
+- `GET /ready` checks PostgreSQL, Redis, rollout admission and background watchers (`503` before schema admission and immediately upon `SIGTERM` drain so load balancers shed traffic before listener closure).
+
+During rolling restarts, each background chain watcher and rail poller acquires a distributed lease with a monotonic `fence_token` in `indexer_rollout_lease` (`CONTAINER_INSTANCE_ID`, `ROLLOUT_LEASE_TTL_MS`). Standby containers wait without polling or advancing shared `indexer_cursor` rows until the retiring container completes its `SIGTERM` drain (`ROLLOUT_DRAIN_GRACE_MS`, `SHUTDOWN_TIMEOUT_MS`) and releases its leases, or until an unresponsive peer's lease expires. Every page transaction re-verifies its active `fence_token` before commit so a stalled container rolls back rather than overwriting newer cursor progress.
 
 `npm run check` runs formatting, lint, type checking and tests. Schema/API regressions execute repository migrations in embedded PostgreSQL (PGlite). The full PostgreSQL integration suite requires `TEST_DATABASE_URL`; it is skipped when unset. Use `npm run build` for emitted production code.
 
