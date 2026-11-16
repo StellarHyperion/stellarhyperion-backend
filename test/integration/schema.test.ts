@@ -55,6 +55,7 @@ suite("the schema", () => {
     const names = rows.map((row) => String(row.table_name));
     for (const table of [
       "admin_action",
+      "history_integrity_digest",
       "inbound_delivery",
       "indexer_cursor",
       "outbound_transfer",
@@ -334,5 +335,48 @@ suite("maintenance and pruning", () => {
     expect(ids).not.toContain(999991);
     expect(ids).toContain(999992);
     expect(ids).toContain(999993);
+  });
+});
+
+suite("history integrity digests", () => {
+  let db: Database;
+
+  beforeAll(() => {
+    db = Database.open(CONNECTION ?? "", { applicationName: "hyperion-schema-test" });
+  });
+
+  afterAll(async () => {
+    await db.query("DELETE FROM public.history_integrity_digest WHERE chain_key = 'digest-test'");
+    await db.query("DELETE FROM public.outbound_transfer WHERE origin_chain = 'digest-test'");
+    await db.close();
+  });
+
+  it("records and verifies range digests with u64 and uint256 exactness", async () => {
+    await db.query(
+      `INSERT INTO public.outbound_transfer
+         (origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
+          destination_chain, destination, origin_block, origin_tx)
+       VALUES ('digest-test', 0, $1::numeric, '0xsender', '0xtoken', $2::numeric, 0, $2::numeric,
+               'stellar-testnet', 'GA5ZYIIV', 500, '0xdigest-tx-1')`,
+      [U64_MAX, U256_MAX],
+    );
+
+    const recorded = await db.recordHistoryDigest({
+      chainKey: "digest-test",
+      recordKind: "outbound_transfer",
+      rangeStart: 500n,
+      rangeEnd: 500n,
+    });
+    expect(recorded.rowCount).toBe(1n);
+    expect(recorded.digestHex).toMatch(/^0x[0-9a-f]{64}$/);
+
+    const verified = await db.verifyHistoryDigest({
+      chainKey: "digest-test",
+      recordKind: "outbound_transfer",
+      rangeStart: 500n,
+      rangeEnd: 500n,
+    });
+    expect(verified.matches).toBe(true);
+    expect(verified.reason).toBe("matched");
   });
 });

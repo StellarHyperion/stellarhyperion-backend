@@ -101,6 +101,56 @@ export function json(row: Row, column: string): unknown {
   return row[column] ?? null;
 }
 
+export const HISTORY_DIGEST_KINDS = [
+  "outbound_transfer",
+  "inbound_delivery",
+  "pending_claim",
+  "admin_action",
+  "chain_range",
+] as const;
+
+export type HistoryDigestKind = (typeof HISTORY_DIGEST_KINDS)[number];
+
+export function isHistoryDigestKind(value: string): value is HistoryDigestKind {
+  return (HISTORY_DIGEST_KINDS as readonly string[]).includes(value);
+}
+
+export interface HistoryIntegrityDigestRow {
+  readonly chainKey: string;
+  readonly recordKind: HistoryDigestKind;
+  readonly rangeStart: bigint;
+  readonly rangeEnd: bigint;
+  readonly rowCount: bigint;
+  readonly digestAlgorithm: "sha256";
+  readonly digestHex: `0x${string}`;
+  readonly computedAt: Date;
+}
+
+export function readHistoryIntegrityDigestRow(row: Row): HistoryIntegrityDigestRow {
+  const kindRaw = text(row, "record_kind");
+  if (!isHistoryDigestKind(kindRaw)) {
+    throw new RowError("record_kind", `is not a supported digest kind: ${kindRaw}`);
+  }
+  const algorithm = text(row, "digest_algorithm");
+  if (algorithm !== "sha256") {
+    throw new RowError("digest_algorithm", `is not sha256: ${algorithm}`);
+  }
+  const digestHex = text(row, "digest_hex");
+  if (!/^0x[0-9a-f]{64}$/.test(digestHex)) {
+    throw new RowError("digest_hex", `is not a lowercase 32-byte hex digest: ${digestHex}`);
+  }
+  return {
+    chainKey: text(row, "chain_key"),
+    recordKind: kindRaw,
+    rangeStart: bigintOf(row, "range_start"),
+    rangeEnd: bigintOf(row, "range_end"),
+    rowCount: bigintOf(row, "row_count"),
+    digestAlgorithm: "sha256",
+    digestHex: digestHex as `0x${string}`,
+    computedAt: timestamp(row, "computed_at"),
+  };
+}
+
 /** Exactly one row, or a message saying how many there were. */
 export function one(rows: readonly Row[], what: string): Row {
   const first = rows[0];

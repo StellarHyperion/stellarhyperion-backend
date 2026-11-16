@@ -19,7 +19,27 @@
  * had handled the case. `observed_at` is deliberately left out of every update: it records when
  * this indexer first saw the row, and a reorg does not change that.
  */
+import { createHash } from "node:crypto";
+import type { Hash } from "node:crypto";
 import type { Queryable } from "../db/pool.js";
+import {
+  HISTORY_DIGEST_KINDS,
+  bigintOf,
+  bigintOrNull,
+  boolean,
+  integer,
+  integerOrNull,
+  isHistoryDigestKind,
+  json,
+  maybeOne,
+  one,
+  readHistoryIntegrityDigestRow,
+  text,
+  textOrNull,
+  timestamp,
+  timestampOrNull,
+} from "../db/rows.js";
+import type { HistoryDigestKind, HistoryIntegrityDigestRow, Row } from "../db/rows.js";
 
 /** Where on a chain a row was observed. One shape for a ledger and for a block. */
 export interface Position {
@@ -371,4 +391,609 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
       row.lastError,
     ],
   );
+}
+
+export { HISTORY_DIGEST_KINDS };
+export type { HistoryDigestKind, HistoryIntegrityDigestRow };
+
+const DIGEST_PROTOCOL_VERSION = "hyperion:history-digest:v1";
+
+export interface HistoryRangeKey {
+  readonly chainKey: string;
+  readonly recordKind: HistoryDigestKind;
+  readonly rangeStart: bigint;
+  readonly rangeEnd: bigint;
+}
+
+export interface BlockRangeInput {
+  readonly chainKey: string;
+  readonly fromBlock: bigint;
+  readonly toBlock: bigint;
+}
+
+export interface ClaimRangeInput {
+  readonly chainKey: string;
+  readonly fromClaimId: bigint;
+  readonly toClaimId: bigint;
+}
+
+export interface ActionRangeInput {
+  readonly chainKey: string;
+  readonly fromActionId: bigint;
+  readonly toActionId: bigint;
+}
+
+export interface HistoryRangeDigest {
+  readonly chainKey: string;
+  readonly recordKind: HistoryDigestKind;
+  readonly rangeStart: bigint;
+  readonly rangeEnd: bigint;
+  readonly rowCount: bigint;
+  readonly digestAlgorithm: "sha256";
+  readonly digestHex: `0x${string}`;
+}
+
+export interface VerifyHistoryRangeInput extends HistoryRangeKey {
+  readonly expectedDigestHex?: string;
+  readonly expectedRowCount?: bigint;
+}
+
+export interface HistoryDigestVerificationResult {
+  readonly matches: boolean;
+  readonly reason: "matched" | "missing_checkpoint" | "row_count_mismatch" | "digest_mismatch";
+  readonly expectedDigestHex: `0x${string}` | null;
+  readonly actualDigestHex: `0x${string}`;
+  readonly expectedRowCount: bigint | null;
+  readonly actualRowCount: bigint;
+  readonly computed: HistoryRangeDigest;
+}
+
+function validateHistoryRange(
+  chainKey: string,
+  recordKind: string,
+  rangeStart: bigint,
+  rangeEnd: bigint,
+): asserts recordKind is HistoryDigestKind {
+  if (chainKey.trim().length === 0) {
+    throw new RangeError("chainKey must be a non-empty string");
+  }
+  if (!isHistoryDigestKind(recordKind)) {
+    throw new RangeError(`Unsupported history digest recordKind: ${recordKind}`);
+  }
+  if (rangeStart < 0n) {
+    throw new RangeError("rangeStart must be non-negative");
+  }
+  if (rangeEnd < rangeStart) {
+    throw new RangeError("rangeEnd must be greater than or equal to rangeStart");
+  }
+}
+
+function normalizeExpectedDigestHex(raw: string): `0x${string}` {
+  const normalized = raw.trim().toLowerCase();
+  if (!/^0x[0-9a-f]{64}$/.test(normalized)) {
+    throw new RangeError(`expectedDigestHex must be a 32-byte 0x-prefixed hex string: ${raw}`);
+  }
+  return normalized as `0x${string}`;
+}
+
+/**
+ * Deterministic JSON serialization with lexicographically sorted object keys so JSONB column
+ * key order in PostgreSQL never alters a record's canonical fact digest.
+ */
+export function canonicalJson(value: unknown): string {
+  if (value === null || value === undefined) return "null";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new RangeError("JSON payload cannot contain non-finite numbers");
+    }
+    return JSON.stringify(value);
+  }
+  if (typeof value === "bigint") {
+    return JSON.stringify(value.toString(10));
+  }
+  if (typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record)
+      .filter((key) => record[key] !== undefined)
+      .sort();
+    const entries = keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`);
+    return `{${entries.join(",")}}`;
+  }
+  throw new TypeError(`Unsupported JSON value of type ${typeof value}`);
+}
+
+function appendFramedField(hash: Hash, value: string | null): void {
+  if (value === null) {
+    hash.update("N\n", "utf8");
+    return;
+  }
+  const byteLength = Buffer.byteLength(value, "utf8");
+  hash.update(`S${byteLength}:${value}\n`, "utf8");
+}
+
+function createRangeHasher(
+  chainKey: string,
+  recordKind: HistoryDigestKind,
+  rangeStart: bigint,
+  rangeEnd: bigint,
+): Hash {
+  const hash = createHash("sha256");
+  appendFramedField(hash, DIGEST_PROTOCOL_VERSION);
+  appendFramedField(hash, chainKey);
+  appendFramedField(hash, recordKind);
+  appendFramedField(hash, rangeStart.toString(10));
+  appendFramedField(hash, rangeEnd.toString(10));
+  return hash;
+}
+
+function finalizeRangeDigest(
+  hash: Hash,
+  key: HistoryRangeKey,
+  rowCount: bigint,
+): HistoryRangeDigest {
+  hash.update(`C${rowCount.toString(10)}\n`, "utf8");
+  const digestHex: `0x${string}` = `0x${hash.digest("hex")}`;
+  return {
+    chainKey: key.chainKey,
+    recordKind: key.recordKind,
+    rangeStart: key.rangeStart,
+    rangeEnd: key.rangeEnd,
+    rowCount,
+    digestAlgorithm: "sha256",
+    digestHex,
+  };
+}
+
+function appendOutboundRowFields(hash: Hash, row: Row): void {
+  const logIndex = integerOrNull(row, "origin_log_index");
+  hash.update("R\n", "utf8");
+  appendFramedField(hash, text(row, "origin_chain"));
+  appendFramedField(hash, integer(row, "route").toString(10));
+  appendFramedField(hash, bigintOf(row, "nonce").toString(10));
+  appendFramedField(hash, text(row, "sender"));
+  appendFramedField(hash, text(row, "token"));
+  appendFramedField(hash, bigintOf(row, "gross_amount").toString(10));
+  appendFramedField(hash, bigintOf(row, "fee").toString(10));
+  appendFramedField(hash, bigintOf(row, "net_amount").toString(10));
+  appendFramedField(hash, text(row, "destination_chain"));
+  appendFramedField(hash, text(row, "destination"));
+  appendFramedField(hash, textOrNull(row, "rail_ref"));
+  appendFramedField(hash, bigintOf(row, "origin_block").toString(10));
+  appendFramedField(hash, text(row, "origin_tx"));
+  appendFramedField(hash, logIndex === null ? null : logIndex.toString(10));
+}
+
+function appendInboundRowFields(hash: Hash, row: Row): void {
+  const claimId = bigintOrNull(row, "claim_id");
+  const logIndex = integerOrNull(row, "destination_log_index");
+  hash.update("R\n", "utf8");
+  appendFramedField(hash, text(row, "destination_chain"));
+  appendFramedField(hash, integer(row, "route").toString(10));
+  appendFramedField(hash, text(row, "source_chain"));
+  appendFramedField(hash, bigintOf(row, "source_nonce").toString(10));
+  appendFramedField(hash, textOrNull(row, "rail_message_id"));
+  appendFramedField(hash, text(row, "recipient"));
+  appendFramedField(hash, text(row, "token"));
+  appendFramedField(hash, bigintOf(row, "amount").toString(10));
+  appendFramedField(hash, boolean(row, "delivered") ? "1" : "0");
+  appendFramedField(hash, claimId === null ? null : claimId.toString(10));
+  appendFramedField(hash, bigintOf(row, "destination_block").toString(10));
+  appendFramedField(hash, text(row, "destination_tx"));
+  appendFramedField(hash, logIndex === null ? null : logIndex.toString(10));
+}
+
+function appendPendingClaimRowFields(hash: Hash, row: Row): void {
+  const settledAt = timestampOrNull(row, "settled_at");
+  hash.update("R\n", "utf8");
+  appendFramedField(hash, text(row, "chain"));
+  appendFramedField(hash, bigintOf(row, "claim_id").toString(10));
+  appendFramedField(hash, text(row, "recipient"));
+  appendFramedField(hash, text(row, "token"));
+  appendFramedField(hash, bigintOf(row, "amount").toString(10));
+  appendFramedField(hash, integer(row, "route").toString(10));
+  appendFramedField(hash, text(row, "source_chain"));
+  appendFramedField(hash, bigintOf(row, "source_nonce").toString(10));
+  appendFramedField(hash, timestamp(row, "created_at").getTime().toString(10));
+  appendFramedField(hash, boolean(row, "settled") ? "1" : "0");
+  appendFramedField(hash, settledAt === null ? null : settledAt.getTime().toString(10));
+  appendFramedField(hash, textOrNull(row, "settled_by"));
+  appendFramedField(hash, textOrNull(row, "settled_tx"));
+}
+
+function appendAdminActionRowFields(hash: Hash, row: Row): void {
+  const eta = timestampOrNull(row, "eta");
+  const expiresAt = timestampOrNull(row, "expires_at");
+  const settledAt = timestampOrNull(row, "settled_at");
+  hash.update("R\n", "utf8");
+  appendFramedField(hash, text(row, "chain"));
+  appendFramedField(hash, bigintOf(row, "action_id").toString(10));
+  appendFramedField(hash, integer(row, "kind").toString(10));
+  appendFramedField(hash, text(row, "state"));
+  appendFramedField(hash, canonicalJson(json(row, "payload")));
+  appendFramedField(hash, eta === null ? null : eta.getTime().toString(10));
+  appendFramedField(hash, expiresAt === null ? null : expiresAt.getTime().toString(10));
+  appendFramedField(hash, timestamp(row, "queued_at").getTime().toString(10));
+  appendFramedField(hash, settledAt === null ? null : settledAt.getTime().toString(10));
+  appendFramedField(hash, textOrNull(row, "actor"));
+}
+
+export async function computeOutboundRangeDigest(
+  db: Queryable,
+  input: BlockRangeInput,
+): Promise<HistoryRangeDigest> {
+  validateHistoryRange(input.chainKey, "outbound_transfer", input.fromBlock, input.toBlock);
+
+  const { rows } = await db.query(
+    `SELECT origin_chain, route, nonce::text AS nonce, sender, token,
+            gross_amount::text AS gross_amount, fee::text AS fee, net_amount::text AS net_amount,
+            destination_chain, destination, rail_ref,
+            origin_block::text AS origin_block, origin_tx, origin_log_index
+       FROM outbound_transfer
+      WHERE origin_chain = $1
+        AND origin_block >= $2::numeric
+        AND origin_block <= $3::numeric
+      ORDER BY origin_block ASC, nonce ASC`,
+    [input.chainKey, input.fromBlock.toString(10), input.toBlock.toString(10)],
+  );
+
+  const hash = createRangeHasher(
+    input.chainKey,
+    "outbound_transfer",
+    input.fromBlock,
+    input.toBlock,
+  );
+  for (const row of rows) {
+    appendOutboundRowFields(hash, row);
+  }
+  return finalizeRangeDigest(
+    hash,
+    {
+      chainKey: input.chainKey,
+      recordKind: "outbound_transfer",
+      rangeStart: input.fromBlock,
+      rangeEnd: input.toBlock,
+    },
+    BigInt(rows.length),
+  );
+}
+
+export async function computeInboundRangeDigest(
+  db: Queryable,
+  input: BlockRangeInput,
+): Promise<HistoryRangeDigest> {
+  validateHistoryRange(input.chainKey, "inbound_delivery", input.fromBlock, input.toBlock);
+
+  const { rows } = await db.query(
+    `SELECT destination_chain, route, source_chain, source_nonce::text AS source_nonce,
+            rail_message_id, recipient, token, amount::text AS amount, delivered,
+            claim_id::text AS claim_id, destination_block::text AS destination_block,
+            destination_tx, destination_log_index
+       FROM inbound_delivery
+      WHERE destination_chain = $1
+        AND destination_block >= $2::numeric
+        AND destination_block <= $3::numeric
+      ORDER BY destination_block ASC, route ASC, source_chain ASC, source_nonce ASC`,
+    [input.chainKey, input.fromBlock.toString(10), input.toBlock.toString(10)],
+  );
+
+  const hash = createRangeHasher(
+    input.chainKey,
+    "inbound_delivery",
+    input.fromBlock,
+    input.toBlock,
+  );
+  for (const row of rows) {
+    appendInboundRowFields(hash, row);
+  }
+  return finalizeRangeDigest(
+    hash,
+    {
+      chainKey: input.chainKey,
+      recordKind: "inbound_delivery",
+      rangeStart: input.fromBlock,
+      rangeEnd: input.toBlock,
+    },
+    BigInt(rows.length),
+  );
+}
+
+export async function computePendingClaimRangeDigest(
+  db: Queryable,
+  input: ClaimRangeInput,
+): Promise<HistoryRangeDigest> {
+  validateHistoryRange(input.chainKey, "pending_claim", input.fromClaimId, input.toClaimId);
+
+  const { rows } = await db.query(
+    `SELECT chain, claim_id::text AS claim_id, recipient, token, amount::text AS amount,
+            route, source_chain, source_nonce::text AS source_nonce, created_at,
+            settled, settled_at, settled_by, settled_tx
+       FROM pending_claim
+      WHERE chain = $1
+        AND claim_id >= $2::numeric
+        AND claim_id <= $3::numeric
+      ORDER BY claim_id ASC`,
+    [input.chainKey, input.fromClaimId.toString(10), input.toClaimId.toString(10)],
+  );
+
+  const hash = createRangeHasher(
+    input.chainKey,
+    "pending_claim",
+    input.fromClaimId,
+    input.toClaimId,
+  );
+  for (const row of rows) {
+    appendPendingClaimRowFields(hash, row);
+  }
+  return finalizeRangeDigest(
+    hash,
+    {
+      chainKey: input.chainKey,
+      recordKind: "pending_claim",
+      rangeStart: input.fromClaimId,
+      rangeEnd: input.toClaimId,
+    },
+    BigInt(rows.length),
+  );
+}
+
+export async function computeAdminActionRangeDigest(
+  db: Queryable,
+  input: ActionRangeInput,
+): Promise<HistoryRangeDigest> {
+  validateHistoryRange(input.chainKey, "admin_action", input.fromActionId, input.toActionId);
+
+  const { rows } = await db.query(
+    `SELECT chain, action_id::text AS action_id, kind, state, payload,
+            eta, expires_at, queued_at, settled_at, actor
+       FROM admin_action
+      WHERE chain = $1
+        AND action_id >= $2::numeric
+        AND action_id <= $3::numeric
+      ORDER BY action_id ASC`,
+    [input.chainKey, input.fromActionId.toString(10), input.toActionId.toString(10)],
+  );
+
+  const hash = createRangeHasher(
+    input.chainKey,
+    "admin_action",
+    input.fromActionId,
+    input.toActionId,
+  );
+  for (const row of rows) {
+    appendAdminActionRowFields(hash, row);
+  }
+  return finalizeRangeDigest(
+    hash,
+    {
+      chainKey: input.chainKey,
+      recordKind: "admin_action",
+      rangeStart: input.fromActionId,
+      rangeEnd: input.toActionId,
+    },
+    BigInt(rows.length),
+  );
+}
+
+async function computeChainBlockRollupDigest(
+  db: Queryable,
+  input: BlockRangeInput,
+): Promise<HistoryRangeDigest> {
+  const outbound = await computeOutboundRangeDigest(db, input);
+  const inbound = await computeInboundRangeDigest(db, input);
+
+  const { rows: parkedClaims } = await db.query(
+    `SELECT pc.chain, pc.claim_id::text AS claim_id, pc.recipient, pc.token,
+            pc.amount::text AS amount, pc.route, pc.source_chain,
+            pc.source_nonce::text AS source_nonce, pc.created_at,
+            pc.settled, pc.settled_at, pc.settled_by, pc.settled_tx
+       FROM pending_claim pc
+      WHERE pc.chain = $1
+        AND EXISTS (
+          SELECT 1
+            FROM inbound_delivery idel
+           WHERE idel.destination_chain = pc.chain
+             AND idel.claim_id = pc.claim_id
+             AND idel.destination_block >= $2::numeric
+             AND idel.destination_block <= $3::numeric
+        )
+      ORDER BY pc.claim_id ASC`,
+    [input.chainKey, input.fromBlock.toString(10), input.toBlock.toString(10)],
+  );
+
+  const hash = createRangeHasher(input.chainKey, "chain_range", input.fromBlock, input.toBlock);
+  appendFramedField(hash, outbound.digestHex);
+  appendFramedField(hash, outbound.rowCount.toString(10));
+  appendFramedField(hash, inbound.digestHex);
+  appendFramedField(hash, inbound.rowCount.toString(10));
+  for (const claimRow of parkedClaims) {
+    appendPendingClaimRowFields(hash, claimRow);
+  }
+
+  const totalRows = outbound.rowCount + inbound.rowCount + BigInt(parkedClaims.length);
+  return finalizeRangeDigest(
+    hash,
+    {
+      chainKey: input.chainKey,
+      recordKind: "chain_range",
+      rangeStart: input.fromBlock,
+      rangeEnd: input.toBlock,
+    },
+    totalRows,
+  );
+}
+
+export async function computeHistoryRangeDigest(
+  db: Queryable,
+  key: HistoryRangeKey,
+): Promise<HistoryRangeDigest> {
+  validateHistoryRange(key.chainKey, key.recordKind, key.rangeStart, key.rangeEnd);
+
+  switch (key.recordKind) {
+    case "outbound_transfer":
+      return computeOutboundRangeDigest(db, {
+        chainKey: key.chainKey,
+        fromBlock: key.rangeStart,
+        toBlock: key.rangeEnd,
+      });
+    case "inbound_delivery":
+      return computeInboundRangeDigest(db, {
+        chainKey: key.chainKey,
+        fromBlock: key.rangeStart,
+        toBlock: key.rangeEnd,
+      });
+    case "pending_claim":
+      return computePendingClaimRangeDigest(db, {
+        chainKey: key.chainKey,
+        fromClaimId: key.rangeStart,
+        toClaimId: key.rangeEnd,
+      });
+    case "admin_action":
+      return computeAdminActionRangeDigest(db, {
+        chainKey: key.chainKey,
+        fromActionId: key.rangeStart,
+        toActionId: key.rangeEnd,
+      });
+    case "chain_range":
+      return computeChainBlockRollupDigest(db, {
+        chainKey: key.chainKey,
+        fromBlock: key.rangeStart,
+        toBlock: key.rangeEnd,
+      });
+  }
+}
+
+export async function writeHistoryIntegrityDigest(
+  db: Queryable,
+  digest: HistoryRangeDigest,
+  computedAt: Date = new Date(),
+): Promise<HistoryIntegrityDigestRow> {
+  validateHistoryRange(digest.chainKey, digest.recordKind, digest.rangeStart, digest.rangeEnd);
+  const normalizedDigest = normalizeExpectedDigestHex(digest.digestHex);
+
+  const { rows } = await db.query(
+    `INSERT INTO history_integrity_digest
+       (chain_key, record_kind, range_start, range_end, row_count, digest_algorithm, digest_hex, computed_at)
+     VALUES ($1, $2, $3::numeric, $4::numeric, $5::numeric, 'sha256', $6, $7::timestamptz)
+     ON CONFLICT (chain_key, record_kind, range_start, range_end) DO UPDATE
+       SET row_count = EXCLUDED.row_count,
+           digest_algorithm = EXCLUDED.digest_algorithm,
+           digest_hex = EXCLUDED.digest_hex,
+           computed_at = EXCLUDED.computed_at
+     RETURNING chain_key, record_kind, range_start::text AS range_start,
+               range_end::text AS range_end, row_count::text AS row_count,
+               digest_algorithm, digest_hex, computed_at`,
+    [
+      digest.chainKey,
+      digest.recordKind,
+      digest.rangeStart.toString(10),
+      digest.rangeEnd.toString(10),
+      digest.rowCount.toString(10),
+      normalizedDigest,
+      computedAt,
+    ],
+  );
+
+  return readHistoryIntegrityDigestRow(one(rows, "history_integrity_digest upsert"));
+}
+
+export async function getHistoryIntegrityDigest(
+  db: Queryable,
+  key: HistoryRangeKey,
+): Promise<HistoryIntegrityDigestRow | null> {
+  validateHistoryRange(key.chainKey, key.recordKind, key.rangeStart, key.rangeEnd);
+
+  const { rows } = await db.query(
+    `SELECT chain_key, record_kind, range_start::text AS range_start,
+            range_end::text AS range_end, row_count::text AS row_count,
+            digest_algorithm, digest_hex, computed_at
+       FROM history_integrity_digest
+      WHERE chain_key = $1
+        AND record_kind = $2
+        AND range_start = $3::numeric
+        AND range_end = $4::numeric`,
+    [key.chainKey, key.recordKind, key.rangeStart.toString(10), key.rangeEnd.toString(10)],
+  );
+
+  const row = maybeOne(rows, "history_integrity_digest get");
+  return row === null ? null : readHistoryIntegrityDigestRow(row);
+}
+
+export async function recordHistoryRangeDigest(
+  db: Queryable,
+  key: HistoryRangeKey,
+  computedAt: Date = new Date(),
+): Promise<HistoryIntegrityDigestRow> {
+  const computed = await computeHistoryRangeDigest(db, key);
+  return writeHistoryIntegrityDigest(db, computed, computedAt);
+}
+
+export async function verifyHistoryRangeDigest(
+  db: Queryable,
+  input: VerifyHistoryRangeInput,
+): Promise<HistoryDigestVerificationResult> {
+  const computed = await computeHistoryRangeDigest(db, input);
+
+  let expectedDigestHex: `0x${string}` | null = null;
+  let expectedRowCount: bigint | null = null;
+
+  if (input.expectedDigestHex !== undefined) {
+    expectedDigestHex = normalizeExpectedDigestHex(input.expectedDigestHex);
+    expectedRowCount = input.expectedRowCount ?? null;
+  } else {
+    const stored = await getHistoryIntegrityDigest(db, input);
+    if (stored === null) {
+      return {
+        matches: false,
+        reason: "missing_checkpoint",
+        expectedDigestHex: null,
+        actualDigestHex: computed.digestHex,
+        expectedRowCount: null,
+        actualRowCount: computed.rowCount,
+        computed,
+      };
+    }
+    expectedDigestHex = stored.digestHex;
+    expectedRowCount = input.expectedRowCount ?? stored.rowCount;
+  }
+
+  if (expectedRowCount !== null && expectedRowCount !== computed.rowCount) {
+    return {
+      matches: false,
+      reason: "row_count_mismatch",
+      expectedDigestHex,
+      actualDigestHex: computed.digestHex,
+      expectedRowCount,
+      actualRowCount: computed.rowCount,
+      computed,
+    };
+  }
+
+  if (expectedDigestHex !== computed.digestHex) {
+    return {
+      matches: false,
+      reason: "digest_mismatch",
+      expectedDigestHex,
+      actualDigestHex: computed.digestHex,
+      expectedRowCount,
+      actualRowCount: computed.rowCount,
+      computed,
+    };
+  }
+
+  return {
+    matches: true,
+    reason: "matched",
+    expectedDigestHex,
+    actualDigestHex: computed.digestHex,
+    expectedRowCount,
+    actualRowCount: computed.rowCount,
+    computed,
+  };
 }

@@ -14,6 +14,18 @@
  */
 import { Pool } from "pg";
 import type { PoolClient, PoolConfig } from "pg";
+import {
+  computeHistoryRangeDigest,
+  recordHistoryRangeDigest,
+  verifyHistoryRangeDigest,
+} from "../chains/writers.js";
+import type {
+  HistoryDigestVerificationResult,
+  HistoryIntegrityDigestRow,
+  HistoryRangeDigest,
+  HistoryRangeKey,
+  VerifyHistoryRangeInput,
+} from "../chains/writers.js";
 
 export interface QueryResultRows {
   readonly rows: readonly Record<string, unknown>[];
@@ -98,6 +110,29 @@ export class Database implements Transactional {
   /** Cheapest possible proof the database is answering, for the ready check. */
   async ping(): Promise<void> {
     await this.query("SELECT 1");
+  }
+
+  /**
+   * Compute a deterministic SHA-256 integrity digest over canonical chain event and monetary rows
+   * in `[rangeStart, rangeEnd]` without touching presentation formatting.
+   */
+  async computeHistoryDigest(key: HistoryRangeKey): Promise<HistoryRangeDigest> {
+    return computeHistoryRangeDigest(this, key);
+  }
+
+  /** Compute and persist a range integrity digest checkpoint in `history_integrity_digest`. */
+  async recordHistoryDigest(
+    key: HistoryRangeKey,
+    computedAt?: Date,
+  ): Promise<HistoryIntegrityDigestRow> {
+    return recordHistoryRangeDigest(this, key, computedAt);
+  }
+
+  /** Verify live indexed rows in `[rangeStart, rangeEnd]` against an expected or stored digest. */
+  async verifyHistoryDigest(
+    input: VerifyHistoryRangeInput,
+  ): Promise<HistoryDigestVerificationResult> {
+    return verifyHistoryRangeDigest(this, input);
   }
 
   /**
