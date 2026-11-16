@@ -36,3 +36,9 @@ export function completeEnv(
     ...overrides,
   };
 }
+
+export {
+  runLogRedactionFuzzer,
+  type FuzzCaseResult,
+  type FuzzRunReport,
+} from "./log-redaction-fuzzer.js";

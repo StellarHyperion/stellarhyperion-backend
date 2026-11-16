@@ -12,6 +12,8 @@
  * dump at info level is the most common way a credential ends up in a log aggregator.
  */
 
+import { redactSensitiveText } from "../logging/redact.js";
+
 /** What a variable has to look like. Each kind owns its own parse and its own error sentence. */
 export type VarKind = "string" | "integer" | "boolean" | "url" | "enum";
 
@@ -292,6 +294,6 @@ export class EnvReader {
 
   /** A value in an error message, or a description of it when printing it would leak a secret. */
   private show(spec: VarSpec, raw: string): string {
-    return spec.printable ? `"${raw}"` : `a ${raw.length} character value`;
+    return spec.printable ? `"${redactSensitiveText(raw)}"` : `a ${raw.length} character value`;
   }
 }
