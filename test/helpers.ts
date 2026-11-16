@@ -36,3 +36,11 @@ export function completeEnv(
     ...overrides,
   };
 }
+
+export {
+  compareServerlessAndContinuousEntrypoints,
+  createSeededParityDatabase,
+  type EntrypointComparisonReport,
+  type ParityFixtureIds,
+  type TrackedDatabaseHandle,
+} from "./entrypoint-parity.js";

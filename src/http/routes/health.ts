@@ -25,33 +25,41 @@ const LIVENESS_MEANING =
 const READINESS_MEANING =
   "This process can do its job: Postgres and Redis answer and every watcher is current. A 503 here means take this replica out of rotation, not restart it.";
 
+const API_ONLY_READINESS_MEANING =
+  "This API-only process serves indexed Postgres reads; no chain watchers, rail pollers, or keeper workers run here. A 503 here means take this replica out of rotation, not restart it.";
+
 export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const startedAt = deps.startedAt ?? new Date();
+  const apiOnly =
+    !deps.config.indexer.enabled && !deps.config.rails.enabled && !deps.config.keeper.enabled;
 
   app.get("/health", () => ({
     status: "ok",
     meaning: LIVENESS_MEANING,
     service: "hyperion-backend",
     network: deps.config.network,
+    mode: apiOnly ? "api-only" : "continuous",
     uptimeSeconds: Math.floor((Date.now() - startedAt.getTime()) / 1000),
   }));
 
   app.get("/ready", async (_request, reply) => {
     const checks: ReadinessReport[] = [await checkDatabase(deps), await checkRedis(deps)];
 
-    for (const source of deps.readiness) {
-      try {
-        const report = await source.readiness();
-        if (report.name === "redis" && deps.redis !== undefined) continue;
-        checks.push(report);
-      } catch (error) {
-        // A readiness check that throws is itself a failure, and swallowing it would report
-        // ready for a component nobody can hear from.
-        checks.push({
-          name: "unknown",
-          state: "down",
-          detail: `readiness check threw: ${messageOf(error)}`,
-        });
+    if (!apiOnly) {
+      for (const source of deps.readiness) {
+        try {
+          const report = await source.readiness();
+          if (report.name === "redis" && deps.redis !== undefined) continue;
+          checks.push(report);
+        } catch (error) {
+          // A readiness check that throws is itself a failure, and swallowing it would report
+          // ready for a component nobody can hear from.
+          checks.push({
+            name: "unknown",
+            state: "down",
+            detail: `readiness check threw: ${messageOf(error)}`,
+          });
+        }
       }
     }
 
@@ -61,9 +69,12 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
     const status = state === "down" ? 503 : 200;
     return reply.code(status).send({
       status: state,
-      meaning: READINESS_MEANING,
+      meaning: apiOnly ? API_ONLY_READINESS_MEANING : READINESS_MEANING,
       network: deps.config.network,
+      mode: apiOnly ? "api-only" : "continuous",
       indexer: deps.config.indexer.enabled ? "enabled" : "disabled",
+      rails: deps.config.rails.enabled ? "enabled" : "disabled",
+      keeper: deps.config.keeper.enabled ? "enabled" : "disabled",
       checks,
     });
   });
