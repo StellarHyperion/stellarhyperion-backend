@@ -151,7 +151,11 @@ export class StellarRpc {
       });
     } catch (cause) {
       const aborted = signal?.aborted === true;
-      throw new StellarRpcError(method, aborted ? "cancelled" : describe(cause), !aborted);
+      throw new StellarRpcError(
+        method,
+        aborted ? "cancelled" : sanitizeStellarErrorText(describe(cause)),
+        !aborted,
+      );
     }
 
     if (!response.ok) {
@@ -165,11 +169,15 @@ export class StellarRpc {
     try {
       body = (await response.json()) as RpcResponse;
     } catch (cause) {
-      throw new StellarRpcError(method, `response was not json: ${describe(cause)}`, true);
+      throw new StellarRpcError(
+        method,
+        `response was not json: ${sanitizeStellarErrorText(describe(cause))}`,
+        true,
+      );
     }
 
     if (body.error !== undefined) {
-      const message = body.error.message ?? "unspecified";
+      const message = sanitizeStellarErrorText(body.error.message ?? "unspecified");
       // The one error worth recognising by content. It means the cursor or start ledger has fallen
       // out of the node's retention window, which no amount of retrying fixes.
       const outOfWindow = /ledger range|must be within/i.test(message);
@@ -180,6 +188,31 @@ export class StellarRpc {
     }
     return body.result;
   }
+}
+
+const MAX_REASON_CHARS = 512;
+
+export function sanitizeStellarErrorText(raw: string): string {
+  const scrubbed = raw
+    .replace(/https?:\/\/[^\s"'<>]+/gi, (match) => {
+      try {
+        const parsed = new URL(match);
+        return `${parsed.protocol}//${parsed.host}`;
+      } catch {
+        return "[redacted-url]";
+      }
+    })
+    .replace(/\bS[A-Z2-7]{55}\b/g, "[redacted-stellar-secret]")
+    .replace(/\b0x[0-9a-fA-F]{64,}\b/g, "[redacted-signing-material]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    .replace(
+      /\b(api[_-]?key|token|secret|password|private[_-]?key|seed|signature)=([^\s&"']+)/gi,
+      "$1=[redacted]",
+    );
+
+  return scrubbed.length <= MAX_REASON_CHARS
+    ? scrubbed
+    : `${scrubbed.slice(0, MAX_REASON_CHARS)}...`;
 }
 
 function describe(cause: unknown): string {

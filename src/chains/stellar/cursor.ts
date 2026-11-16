@@ -33,6 +33,14 @@ const END_OF_WINDOW_INDEX = 0xffff_ffff;
 /** Observed window width for a `startLedger` request. Used for reporting, never for resuming. */
 export const SCAN_WINDOW_LEDGERS = 10_000;
 
+/** Observed window width for a cursor-resumed `getEvents` request. */
+export const CURSOR_SCAN_WINDOW_LEDGERS = 9_999;
+
+export function expectedRequestedWindowEnd(fromLedger: number, byCursor: boolean): number {
+  const span = byCursor ? CURSOR_SCAN_WINDOW_LEDGERS : SCAN_WINDOW_LEDGERS;
+  return fromLedger + span - 1;
+}
+
 export class EventCursorError extends Error {
   constructor(cursor: string, reason: string) {
     super(`event cursor ${JSON.stringify(cursor)} ${reason}`);

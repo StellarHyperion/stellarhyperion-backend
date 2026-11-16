@@ -13,8 +13,19 @@
 import { ROUTE_KINDS } from "@hyperion/protocol";
 
 import type { Queryable } from "../../db/pool.js";
-import { bigintOf, maybeOne, text, textOrNull, timestampOrNull } from "../../db/rows.js";
+import {
+  bigintOf,
+  bigintOrNull,
+  integer,
+  maybeOne,
+  text,
+  textOrNull,
+  timestamp,
+  timestampOrNull,
+} from "../../db/rows.js";
 import type { Position } from "../writers.js";
+import { endOfLedgerCursor } from "./cursor.js";
+import { sanitizeStellarErrorText, type EventsQuery } from "./rpc.js";
 import {
   settleAction,
   settleClaim,
@@ -287,4 +298,191 @@ export async function recordRouteConfigured(
     blocker: event.enabled ? 0 : 2,
     flowAvailable: null,
   });
+}
+
+export type ScanJournalStatus = "completed" | "noop" | "interrupted";
+
+export interface StellarScanJournalEntry {
+  readonly id: bigint;
+  readonly chainKey: string;
+  readonly contract: string;
+  readonly requestedFromLedger: number;
+  readonly requestedToLedger: number;
+  readonly committedFromLedger: number | null;
+  readonly committedThroughLedger: number | null;
+  readonly decodedCount: number;
+  readonly skippedCount: number;
+  readonly pagesRead: number;
+  readonly status: ScanJournalStatus;
+  readonly interruptionReason: string | null;
+  readonly recordedAt: Date;
+}
+
+export interface UncompletedStellarRange {
+  readonly chainKey: string;
+  readonly contract: string;
+  readonly lastCommittedLedger: number | null;
+  readonly nextFromLedger: number;
+  readonly resumeQuery: Pick<EventsQuery, "startLedger" | "cursor">;
+  readonly lastInterruption: {
+    readonly requestedFromLedger: number;
+    readonly requestedToLedger: number;
+    readonly reason: string | null;
+  } | null;
+}
+
+export async function writeCompletedScanJournal(
+  tx: Queryable,
+  entry: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly requestedFromLedger: number;
+    readonly requestedToLedger: number;
+    readonly committedFromLedger: number;
+    readonly committedThroughLedger: number;
+    readonly decodedCount: number;
+    readonly skippedCount: number;
+    readonly pagesRead: number;
+  },
+): Promise<void> {
+  await tx.query(
+    `INSERT INTO stellar_scan_journal
+       (chain_key, contract, requested_from_ledger, requested_to_ledger,
+        committed_from_ledger, committed_through_ledger, decoded_count, skipped_count,
+        pages_read, status, interruption_reason)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'completed', NULL)`,
+    [
+      entry.chainKey,
+      entry.contract,
+      String(entry.requestedFromLedger),
+      String(entry.requestedToLedger),
+      String(entry.committedFromLedger),
+      String(entry.committedThroughLedger),
+      entry.decodedCount,
+      entry.skippedCount,
+      entry.pagesRead,
+    ],
+  );
+}
+
+export async function recordNonCommittedScanJournal(
+  db: Queryable,
+  entry: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly requestedFromLedger: number;
+    readonly requestedToLedger: number;
+    readonly decodedCount: number;
+    readonly skippedCount: number;
+    readonly pagesRead: number;
+    readonly status: "noop" | "interrupted";
+    readonly interruptionReason: string | null;
+  },
+): Promise<void> {
+  const sanitizedReason =
+    entry.interruptionReason === null ? null : sanitizeStellarErrorText(entry.interruptionReason);
+  await db.query(`SELECT record_stellar_scan_noncommit($1, $2, $3, $4, $5, $6, $7, $8, $9)`, [
+    entry.chainKey,
+    entry.contract,
+    String(entry.requestedFromLedger),
+    String(entry.requestedToLedger),
+    entry.decodedCount,
+    entry.skippedCount,
+    entry.pagesRead,
+    entry.status,
+    sanitizedReason,
+  ]);
+}
+
+export async function readStellarScanJournals(
+  db: Queryable,
+  chainKey: string,
+): Promise<readonly StellarScanJournalEntry[]> {
+  const { rows } = await db.query(
+    `SELECT id, chain_key, contract, requested_from_ledger, requested_to_ledger,
+            committed_from_ledger, committed_through_ledger, decoded_count, skipped_count,
+            pages_read, status, interruption_reason, recorded_at
+       FROM stellar_scan_journal
+      WHERE chain_key = $1
+      ORDER BY id ASC`,
+    [chainKey],
+  );
+  return rows.map((row) => {
+    const statusRaw = text(row, "status");
+    if (statusRaw !== "completed" && statusRaw !== "noop" && statusRaw !== "interrupted") {
+      throw new Error(`unexpected scan journal status: ${statusRaw}`);
+    }
+    const committedFrom = bigintOrNull(row, "committed_from_ledger");
+    const committedThrough = bigintOrNull(row, "committed_through_ledger");
+    return {
+      id: bigintOf(row, "id"),
+      chainKey: text(row, "chain_key"),
+      contract: text(row, "contract"),
+      requestedFromLedger: Number(bigintOf(row, "requested_from_ledger")),
+      requestedToLedger: Number(bigintOf(row, "requested_to_ledger")),
+      committedFromLedger: committedFrom === null ? null : Number(committedFrom),
+      committedThroughLedger: committedThrough === null ? null : Number(committedThrough),
+      decodedCount: integer(row, "decoded_count"),
+      skippedCount: integer(row, "skipped_count"),
+      pagesRead: integer(row, "pages_read"),
+      status: statusRaw,
+      interruptionReason: textOrNull(row, "interruption_reason"),
+      recordedAt: timestamp(row, "recorded_at"),
+    };
+  });
+}
+
+export async function resolveNextUncompletedRange(
+  db: Queryable,
+  options: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly startLedger: number;
+  },
+): Promise<UncompletedStellarRange> {
+  const { chainKey, contract, startLedger } = options;
+  const cursor = await readCursor(db, chainKey);
+  if (cursor !== null && cursor.contract !== contract) {
+    throw new Error(
+      `the cursor for ${chainKey} was written for router ${cursor.contract} and cannot recover ${contract}`,
+    );
+  }
+
+  const journals = await readStellarScanJournals(db, chainKey);
+  const contractJournals = journals.filter((entry) => entry.contract === contract);
+
+  let lastCommittedLedger: number | null = cursor === null ? null : Number(cursor.position);
+  for (const entry of contractJournals) {
+    if (entry.status === "completed" && entry.committedThroughLedger !== null) {
+      lastCommittedLedger =
+        lastCommittedLedger === null
+          ? entry.committedThroughLedger
+          : Math.max(lastCommittedLedger, entry.committedThroughLedger);
+    }
+  }
+
+  const latestEntry = contractJournals[contractJournals.length - 1];
+  const lastInterruption =
+    latestEntry?.status === "interrupted"
+      ? {
+          requestedFromLedger: latestEntry.requestedFromLedger,
+          requestedToLedger: latestEntry.requestedToLedger,
+          reason: latestEntry.interruptionReason,
+        }
+      : null;
+
+  const nextFromLedger = lastCommittedLedger === null ? startLedger : lastCommittedLedger + 1;
+  const resumeQuery: Pick<EventsQuery, "startLedger" | "cursor"> =
+    lastCommittedLedger === null
+      ? { startLedger }
+      : { cursor: endOfLedgerCursor(lastCommittedLedger) };
+
+  return {
+    chainKey,
+    contract,
+    lastCommittedLedger,
+    nextFromLedger,
+    resumeQuery,
+    lastInterruption,
+  };
 }

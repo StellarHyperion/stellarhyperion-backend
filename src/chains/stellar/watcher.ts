@@ -26,10 +26,15 @@ import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
-import { completeThrough, endOfLedgerCursor, parseEventCursor } from "./cursor.js";
+import {
+  completeThrough,
+  endOfLedgerCursor,
+  expectedRequestedWindowEnd,
+  parseEventCursor,
+} from "./cursor.js";
 import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
 import type { EventSource, EventsQuery } from "./rpc.js";
-import { StellarRpcError } from "./rpc.js";
+import { StellarRpcError, sanitizeStellarErrorText } from "./rpc.js";
 import {
   readCursor,
   recordActionQueued,
@@ -38,11 +43,15 @@ import {
   recordBridgeOut,
   recordClaimParked,
   recordClaimSettled,
+  recordNonCommittedScanJournal,
   recordPauseSet,
   recordRouteConfigured,
   recordTokenRegistered,
+  resolveNextUncompletedRange,
+  writeCompletedScanJournal,
   writeCursor,
   type EventContext,
+  type UncompletedStellarRange,
 } from "./store.js";
 
 /**
@@ -153,8 +162,37 @@ export class StellarWatcher {
       );
     }
 
-    const base = stored === null ? this.options.startLedger - 1 : Number(stored.position);
-    const scan = await this.scan(base, stored === null, signal);
+    const fresh = stored === null;
+    const base = fresh ? this.options.startLedger - 1 : Number(stored.position);
+    const requestedFromLedger = base + 1;
+    const requestedToLedger = expectedRequestedWindowEnd(requestedFromLedger, !fresh);
+
+    let scan: {
+      readonly events: readonly RawStellarEvent[];
+      readonly through: number;
+      readonly latestLedger: number;
+      readonly oldestLedger: number;
+      readonly pages: number;
+    };
+    try {
+      scan = await this.scan(base, fresh, signal);
+    } catch (error) {
+      const reason = sanitizeStellarErrorText(
+        error instanceof Error ? error.message : String(error),
+      );
+      await recordNonCommittedScanJournal(db, {
+        chainKey,
+        contract: router,
+        requestedFromLedger,
+        requestedToLedger,
+        decodedCount: 0,
+        skippedCount: 0,
+        pagesRead: 0,
+        status: "interrupted",
+        interruptionReason: reason,
+      }).catch(() => undefined);
+      throw error;
+    }
 
     if (scan.oldestLedger > base + 1 && stored !== null) {
       // The retention window moved past where we stopped. Anything between the two is gone from
@@ -168,6 +206,17 @@ export class StellarWatcher {
     if (scan.through <= base && scan.events.length === 0) {
       // No window crossed and nothing read. Report where we still are so readiness keeps telling
       // the truth about the lag rather than going quiet.
+      await recordNonCommittedScanJournal(db, {
+        chainKey,
+        contract: router,
+        requestedFromLedger,
+        requestedToLedger,
+        decodedCount: 0,
+        skippedCount: 0,
+        pagesRead: scan.pages,
+        status: "noop",
+        interruptionReason: null,
+      }).catch(() => undefined);
       this.lastProgress = {
         ledger: base,
         decoded: 0,
@@ -187,35 +236,81 @@ export class StellarWatcher {
 
     // One transaction for the page and the cursor. This is the restart guarantee, and splitting it
     // would turn every crash into either a lost page or a duplicated one.
-    await db.transaction(async (tx: Queryable) => {
-      for (const raw of scan.events) {
-        if (raw.type !== "contract" || raw.inSuccessfulContractCall === false) {
-          // getEvents no longer returns the deprecated success flag (RPC30).
-          // Diagnostic events are excluded by current RPC; retain legacy explicit-failure checks.
-          // https://github.com/stellar/stellar-rpc/releases/tag/v30.0.0
-          skipped += 1;
-          continue;
+    try {
+      await db.transaction(async (tx: Queryable) => {
+        for (const raw of scan.events) {
+          if (raw.type !== "contract" || raw.inSuccessfulContractCall === false) {
+            // getEvents no longer returns the deprecated success flag (RPC30).
+            // Diagnostic events are excluded by current RPC; retain legacy explicit-failure checks.
+            // https://github.com/stellar/stellar-rpc/releases/tag/v30.0.0
+            skipped += 1;
+            continue;
+          }
+          const context: EventContext = {
+            chainKey,
+            ledger: raw.ledger,
+            txHash: raw.txHash,
+            closedAt: new Date(raw.ledgerClosedAt),
+          };
+          if (await this.apply(tx, context, raw)) decoded += 1;
+          else skipped += 1;
         }
-        const context: EventContext = {
-          chainKey,
-          ledger: raw.ledger,
-          txHash: raw.txHash,
-          closedAt: new Date(raw.ledgerClosedAt),
-        };
-        if (await this.apply(tx, context, raw)) decoded += 1;
-        else skipped += 1;
-      }
 
-      await writeCursor(tx, {
-        chainKey,
-        family: "stellar",
-        contract: router,
-        position: BigInt(scan.through),
-        observedAt: closedAt,
-        // Nothing to record: a closed ledger cannot be replaced by a different one.
-        hash: null,
+        await writeCursor(tx, {
+          chainKey,
+          family: "stellar",
+          contract: router,
+          position: BigInt(scan.through),
+          observedAt: closedAt,
+          // Nothing to record: a closed ledger cannot be replaced by a different one.
+          hash: null,
+        });
+
+        if (scan.through >= requestedFromLedger) {
+          await writeCompletedScanJournal(tx, {
+            chainKey,
+            contract: router,
+            requestedFromLedger,
+            requestedToLedger,
+            committedFromLedger: requestedFromLedger,
+            committedThroughLedger: scan.through,
+            decodedCount: decoded,
+            skippedCount: skipped,
+            pagesRead: scan.pages,
+          });
+        }
       });
-    });
+    } catch (error) {
+      const reason = sanitizeStellarErrorText(
+        error instanceof Error ? error.message : String(error),
+      );
+      await recordNonCommittedScanJournal(db, {
+        chainKey,
+        contract: router,
+        requestedFromLedger,
+        requestedToLedger,
+        decodedCount: decoded,
+        skippedCount: skipped,
+        pagesRead: scan.pages,
+        status: "interrupted",
+        interruptionReason: reason,
+      }).catch(() => undefined);
+      throw error;
+    }
+
+    if (scan.through < requestedFromLedger) {
+      await recordNonCommittedScanJournal(db, {
+        chainKey,
+        contract: router,
+        requestedFromLedger,
+        requestedToLedger,
+        decodedCount: decoded,
+        skippedCount: skipped,
+        pagesRead: scan.pages,
+        status: "interrupted",
+        interruptionReason: "scan did not cross a whole ledger boundary within page ceiling",
+      }).catch(() => undefined);
+    }
 
     const behind = Math.max(scan.latestLedger - scan.through, 0);
     this.lastProgress = { ledger: scan.through, decoded, skipped, behind, at: new Date() };
@@ -385,6 +480,14 @@ export class StellarWatcher {
         // a kind somebody added last week is the failure this line exists to prevent.
         return assertNever(event);
     }
+  }
+
+  nextUncompletedRange(): Promise<UncompletedStellarRange> {
+    return resolveNextUncompletedRange(this.options.db, {
+      chainKey: this.options.chainKey,
+      contract: this.options.router,
+      startLedger: this.options.startLedger,
+    });
   }
 }
 

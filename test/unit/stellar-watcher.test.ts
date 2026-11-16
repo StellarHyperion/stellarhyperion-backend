@@ -6,11 +6,20 @@
  * even when it finds nothing, a page and the cursor advance commit together, and a cursor is never
  * reused across routers.
  */
+import { readdirSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { PGlite } from "@electric-sql/pglite";
 import { describe, expect, it } from "vitest";
 
 import { endOfLedgerCursor } from "../../src/chains/stellar/cursor.js";
 import type { RawStellarEvent } from "../../src/chains/stellar/events.js";
+import { StellarRpcError, type EventSource } from "../../src/chains/stellar/rpc.js";
+import {
+  readStellarScanJournals,
+  resolveNextUncompletedRange,
+} from "../../src/chains/stellar/store.js";
 import { StellarWatcher } from "../../src/chains/stellar/watcher.js";
+import type { Queryable, Transactional } from "../../src/db/pool.js";
 import {
   FakeRpc,
   LIVE_ROUTER,
@@ -342,5 +351,208 @@ describe("gaps it cannot close", () => {
 
     const warnings = lines.filter((line) => line.message.includes("running ahead of the indexer"));
     expect(warnings).toHaveLength(1);
+  });
+});
+
+async function openMigratedPgLite(): Promise<{
+  readonly db: Transactional;
+  readonly close: () => Promise<void>;
+}> {
+  const pg = new PGlite();
+  const migrationsDir = fileURLToPath(new URL("../../migrations", import.meta.url));
+  const migrationNames = readdirSync(migrationsDir)
+    .filter((name) => name.endsWith(".sql"))
+    .sort();
+  for (const name of migrationNames) {
+    const sql = readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8").split(
+      "-- Down Migration",
+    )[0]!;
+    await pg.exec(sql);
+  }
+
+  const queryable: Queryable = {
+    query: async (sql: string, params: readonly unknown[] = []) => {
+      const result = await pg.query(sql, [...params]);
+      const int8 = result.fields
+        .filter((field) => field.dataTypeID === 20)
+        .map((field) => field.name);
+      const rows = result.rows.map((raw) => {
+        const row = { ...(raw as Record<string, unknown>) };
+        for (const column of int8) {
+          const value = row[column];
+          if (typeof value === "number" || typeof value === "bigint") row[column] = String(value);
+        }
+        return row;
+      });
+      return {
+        rows,
+        rowCount: result.rows.length > 0 ? result.rows.length : (result.affectedRows ?? 0),
+      };
+    },
+  };
+
+  const db: Transactional = {
+    query: (sql, params) => queryable.query(sql, params),
+    transaction: async <T>(work: (tx: Queryable) => Promise<T>): Promise<T> => {
+      await pg.exec("BEGIN");
+      try {
+        const out = await work(queryable);
+        await pg.exec("COMMIT");
+        return out;
+      } catch (error) {
+        await pg.exec("ROLLBACK");
+        throw error;
+      }
+    },
+  };
+
+  return { db, close: () => pg.close() };
+}
+
+describe("scan progress journals for catch-up windows", () => {
+  it("records committed progress rather than requested bounds and pinpoints the next uncompleted range after crash", async () => {
+    const { db, close } = await openMigratedPgLite();
+    try {
+      const { logger } = capturingLogger();
+      const head = 4_994_010;
+      const baseRpc = new FakeRpc({ events: ROUTER_HISTORY, latestLedger: head });
+
+      let callCount = 0;
+      const crashingSecondWindowRpc: EventSource = {
+        events: (query) => {
+          callCount += 1;
+          if (callCount === 2) {
+            return Promise.reject(new StellarRpcError("getEvents", "upstream socket reset", true));
+          }
+          return baseRpc.events(query);
+        },
+      };
+
+      const watcher = new StellarWatcher({
+        chainKey: CHAIN,
+        router: LIVE_ROUTER,
+        startLedger: FIRST_EVENT_LEDGER,
+        pageSize: 200,
+        rpc: crashingSecondWindowRpc,
+        db,
+        logger,
+      });
+
+      // First window commits 10,000 ledgers cleanly.
+      expect(await watcher.tick(AbortSignal.timeout(5_000))).toBe(true);
+      const firstWindowEnd = FIRST_EVENT_LEDGER + 9_999;
+
+      // Second window crashes mid-catch-up.
+      await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+        "upstream socket reset",
+      );
+
+      const journalsAfterCrash = await readStellarScanJournals(db, CHAIN);
+      expect(journalsAfterCrash).toHaveLength(2);
+      expect(journalsAfterCrash[0]).toMatchObject({
+        requestedFromLedger: FIRST_EVENT_LEDGER,
+        requestedToLedger: firstWindowEnd,
+        committedFromLedger: FIRST_EVENT_LEDGER,
+        committedThroughLedger: firstWindowEnd,
+        status: "completed",
+        interruptionReason: null,
+      });
+      expect(journalsAfterCrash[1]).toMatchObject({
+        requestedFromLedger: firstWindowEnd + 1,
+        requestedToLedger: firstWindowEnd + 9_999,
+        committedFromLedger: null,
+        committedThroughLedger: null,
+        status: "interrupted",
+      });
+
+      // Crash recovery identifies the exact next uncompleted range.
+      const recovery = await resolveNextUncompletedRange(db, {
+        chainKey: CHAIN,
+        contract: LIVE_ROUTER,
+        startLedger: FIRST_EVENT_LEDGER,
+      });
+      expect(recovery.lastCommittedLedger).toBe(firstWindowEnd);
+      expect(recovery.nextFromLedger).toBe(firstWindowEnd + 1);
+      expect(recovery.resumeQuery).toEqual({ cursor: endOfLedgerCursor(firstWindowEnd) });
+      expect(recovery.lastInterruption?.requestedFromLedger).toBe(firstWindowEnd + 1);
+
+      // Resuming with a healthy RPC finishes catch-up to `head`, where committedThroughLedger is
+      // clamped to `head` even though the final window requested 9,999 ledgers past the cursor.
+      const healthyWatcher = new StellarWatcher({
+        chainKey: CHAIN,
+        router: LIVE_ROUTER,
+        startLedger: FIRST_EVENT_LEDGER,
+        pageSize: 200,
+        rpc: new FakeRpc({ events: ROUTER_HISTORY, latestLedger: head }),
+        db,
+        logger,
+      });
+      while (await healthyWatcher.tick(AbortSignal.timeout(5_000))) {
+        // finish remaining catch-up passes
+      }
+
+      const finalJournals = await readStellarScanJournals(db, CHAIN);
+      const lastCompleted = finalJournals[finalJournals.length - 1]!;
+      expect(lastCompleted.status).toBe("completed");
+      expect(lastCompleted.committedThroughLedger).toBe(head);
+      expect(lastCompleted.requestedToLedger).toBeGreaterThan(head);
+
+      const afterComplete = await healthyWatcher.nextUncompletedRange();
+      expect(afterComplete.lastCommittedLedger).toBe(head);
+      expect(afterComplete.nextFromLedger).toBe(head + 1);
+      expect(afterComplete.lastInterruption).toBeNull();
+    } finally {
+      await close();
+    }
+  });
+
+  it("strips rpc url credentials and signing material from interrupted journal entries", async () => {
+    const { db, close } = await openMigratedPgLite();
+    try {
+      const { logger } = capturingLogger();
+      const userPass = ["svc_user", "rpcPassValue77"].join(":");
+      const querySecret = "rpcQueryKey88";
+      const stellarSeed = `S${"B".repeat(55)}`;
+      const hexSigning = `0x${"cd".repeat(32)}`;
+      const bearerToken = "bearerSecretValue66";
+
+      const leakyRpc: EventSource = {
+        events: () =>
+          Promise.reject(
+            new Error(
+              `transport failed at https://${userPass}@rpc.stellar.invalid/v1/priv99?api_key=${querySecret} ` +
+                `auth=Bearer ${bearerToken} seed=${stellarSeed} sig=${hexSigning}`,
+            ),
+          ),
+      };
+
+      const watcher = new StellarWatcher({
+        chainKey: CHAIN,
+        router: LIVE_ROUTER,
+        startLedger: FIRST_EVENT_LEDGER,
+        pageSize: 200,
+        rpc: leakyRpc,
+        db,
+        logger,
+      });
+
+      await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow();
+
+      const journals = await readStellarScanJournals(db, CHAIN);
+      expect(journals).toHaveLength(1);
+      const entry = journals[0]!;
+      expect(entry.status).toBe("interrupted");
+      expect(entry.committedThroughLedger).toBeNull();
+      expect(entry.interruptionReason).not.toBeNull();
+      expect(entry.interruptionReason).not.toContain("rpcPassValue77");
+      expect(entry.interruptionReason).not.toContain("priv99");
+      expect(entry.interruptionReason).not.toContain(querySecret);
+      expect(entry.interruptionReason).not.toContain(stellarSeed);
+      expect(entry.interruptionReason).not.toContain(hexSigning);
+      expect(entry.interruptionReason).not.toContain(bearerToken);
+      expect(entry.interruptionReason).toContain("https://rpc.stellar.invalid");
+    } finally {
+      await close();
+    }
   });
 });

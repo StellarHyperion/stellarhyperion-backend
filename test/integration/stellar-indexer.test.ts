@@ -32,6 +32,7 @@ const FIRST_EVENT_LEDGER = 4_965_951;
 const HEAD = 4_994_010;
 
 const TABLES = [
+  ["stellar_scan_journal", "chain_key"],
   ["admin_action", "chain"],
   ["route_health", "origin_chain"],
   ["outbound_transfer", "origin_chain"],
