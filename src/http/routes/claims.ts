@@ -8,7 +8,8 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
-import { integer, text } from "../../db/rows.js";
+import { integer, text, textOrNull, timestampOrNull } from "../../db/rows.js";
+import { type ConfirmedClaimSettlementProof, sanitizeProvenanceText } from "../provenance.js";
 import type { ServerDeps } from "../server.js";
 
 export interface FormattedClaim {
@@ -24,22 +25,44 @@ export interface FormattedClaim {
   readonly settled: boolean;
   readonly createdAt: string;
   readonly observedAt: string;
+  readonly settlement: ConfirmedClaimSettlementProof | null;
 }
 
 function formatClaimRow(row: Record<string, unknown>): FormattedClaim {
+  const chain = text(row, "chain");
+  const claimId = text(row, "claim_id");
+  const settled = row.settled === true;
+  const settledTx = textOrNull(row, "settled_tx");
+  const settledBy = sanitizeProvenanceText(textOrNull(row, "settled_by"));
+  const settledAtDate = timestampOrNull(row, "settled_at");
+  const settledAt = settledAtDate ? settledAtDate.toISOString() : null;
+
   return {
     id: text(row, "id"),
-    chain: text(row, "chain"),
-    claimId: text(row, "claim_id"),
+    chain,
+    claimId,
     recipient: text(row, "recipient"),
     token: text(row, "token"),
     amount: text(row, "amount"),
     route: integer(row, "route"),
     sourceChain: text(row, "source_chain"),
     sourceNonce: text(row, "source_nonce"),
-    settled: row.settled === true,
+    settled,
     createdAt: new Date(row.created_at as string | number | Date).toISOString(),
     observedAt: new Date(row.observed_at as string | number | Date).toISOString(),
+    settlement:
+      settled && settledTx !== null
+        ? {
+            verification: "confirmed_on_chain",
+            verified: true,
+            role: "claim_settlement",
+            chain,
+            claimId,
+            txHash: sanitizeProvenanceText(settledTx) ?? settledTx,
+            settledBy,
+            settledAt,
+          }
+        : null,
   };
 }
 
@@ -56,7 +79,7 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       const { chain, claimId } = request.params;
       const { rows } = await db.query(
         `SELECT chain || ':' || claim_id::text AS id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
-                created_at, settled, observed_at
+                created_at, settled, settled_at, settled_by, settled_tx, observed_at
            FROM pending_claim
           WHERE chain = $1 AND claim_id = $2
           LIMIT 1`,
@@ -119,7 +142,7 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
 
       const { rows } = await db.query(
         `SELECT chain || ':' || claim_id::text AS id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
-                created_at, settled, observed_at
+                created_at, settled, settled_at, settled_by, settled_tx, observed_at
            FROM pending_claim
           ${whereClause}
           ORDER BY chain ASC, claim_id DESC

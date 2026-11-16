@@ -123,5 +123,21 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     expect(response.json().destination.decimals).toBe(6);
     expect(response.json().destination.symbol).toBe("USDC");
     expect(response.json().origin.netAmount).toBe("9970000");
+    expect(response.json().provenance.source).toMatchObject({
+      verification: "confirmed_on_chain",
+      verified: true,
+      role: "source_event",
+      chain: "stellar-testnet",
+      txHash: "cctp-source",
+      block: "124",
+    });
+    expect(response.json().provenance.destination).toMatchObject({
+      verification: "confirmed_on_chain",
+      verified: true,
+      role: "destination_delivery",
+      chain: "sepolia",
+      txHash: "cctp-mint",
+      block: "400",
+    });
   });
 });

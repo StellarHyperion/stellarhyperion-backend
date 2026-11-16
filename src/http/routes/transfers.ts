@@ -11,7 +11,12 @@ import type { AppConfig } from "../../config/config.js";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
-import { integer, text, textOrNull } from "../../db/rows.js";
+import { integer, integerOrNull, text, textOrNull, timestampOrNull } from "../../db/rows.js";
+import {
+  buildTransferProvenance,
+  sanitizeProvenanceText,
+  type TransferProofProvenance,
+} from "../provenance.js";
 import type { ServerDeps } from "../server.js";
 
 export type TransferLifecycleStage =
@@ -65,6 +70,7 @@ export interface FormattedTransfer {
     readonly id: string;
     readonly settled: boolean;
   } | null;
+  readonly provenance: TransferProofProvenance;
 }
 
 function deriveStage(
@@ -126,17 +132,57 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
       ? { symbol: `${entry[0]} (ITS)`, decimals: entry[1].decimals }
       : null);
   const hasClaim = row.claim_id !== null && row.claim_id !== undefined;
+  const claimId = textOrNull(row, "claim_id");
   const claimSettled = row.claim_settled === true;
   const railStatus = textOrNull(row, "attestation_status");
+  const railProviderStatus = sanitizeProvenanceText(textOrNull(row, "rail_status"));
+  const railProviderReference = sanitizeProvenanceText(textOrNull(row, "rail_reference"));
+  const railLastError = sanitizeProvenanceText(textOrNull(row, "last_error"));
+
+  const originBlock = text(row, "origin_block");
+  const originTx = text(row, "origin_tx");
+  const originObservedAt = new Date(row.observed_at as string | number | Date).toISOString();
+  const destinationBlock = textOrNull(row, "destination_block");
+  const destinationTx = textOrNull(row, "destination_tx");
+  const deliveredAtDate = timestampOrNull(row, "delivered_at");
+  const deliveredAt = deliveredAtDate ? deliveredAtDate.toISOString() : null;
+  const attestedAtDate = timestampOrNull(row, "attested_at");
+  const attestedAt = attestedAtDate ? attestedAtDate.toISOString() : null;
+  const claimSettledAtDate = timestampOrNull(row, "claim_settled_at");
+  const claimSettledAt = claimSettledAtDate ? claimSettledAtDate.toISOString() : null;
 
   const stage = deriveStage(delivered, hasClaim, claimSettled, railStatus);
+  const provenance = buildTransferProvenance({
+    originChain: chain,
+    originTxHash: originTx,
+    originBlock,
+    originLogIndex: integerOrNull(row, "origin_log_index"),
+    originObservedAt,
+    originRailRef: textOrNull(row, "rail_ref"),
+    destinationChain,
+    inboundDelivered: delivered,
+    destinationTxHash: destinationTx,
+    destinationBlock,
+    destinationLogIndex: integerOrNull(row, "destination_log_index"),
+    railMessageId: textOrNull(row, "rail_message_id"),
+    inboundClaimId: textOrNull(row, "inbound_claim_id"),
+    deliveredAt,
+    claimId,
+    claimSettled,
+    claimSettledTx: textOrNull(row, "claim_settled_tx"),
+    claimSettledBy: textOrNull(row, "claim_settled_by"),
+    claimSettledAt,
+    railProviderReference,
+    railProviderStatus,
+    railAttestedAt: attestedAt,
+  });
 
   return {
     id: text(row, "id"),
     stage,
     route: integer(row, "route"),
     origin: {
-      chain: text(row, "origin_chain"),
+      chain,
       nonce: text(row, "nonce"),
       sender: text(row, "sender"),
       token,
@@ -145,9 +191,9 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
       grossAmount: text(row, "gross_amount"),
       fee: text(row, "fee"),
       netAmount: text(row, "net_amount"),
-      block: text(row, "origin_block"),
-      txHash: text(row, "origin_tx"),
-      observedAt: new Date(row.observed_at as string | number | Date).toISOString(),
+      block: originBlock,
+      txHash: originTx,
+      observedAt: originObservedAt,
     },
     destination: {
       token: receivedToken,
@@ -157,30 +203,28 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
       chain: destinationChain,
       recipient,
       delivered,
-      block: textOrNull(row, "destination_block"),
-      txHash: textOrNull(row, "destination_tx"),
-      deliveredAt: row.delivered_at
-        ? new Date(row.delivered_at as string | number | Date).toISOString()
-        : null,
+      block: destinationBlock,
+      txHash: destinationTx,
+      deliveredAt,
     },
     rail:
       railStatus === null
         ? null
         : {
             status: railStatus,
-            railStatus: textOrNull(row, "rail_status"),
-            reference: textOrNull(row, "rail_reference"),
-            attestedAt: row.attested_at
-              ? new Date(row.attested_at as string | number | Date).toISOString()
-              : null,
-            lastError: textOrNull(row, "last_error"),
+            railStatus: railProviderStatus,
+            reference: railProviderReference,
+            attestedAt,
+            lastError: railLastError,
           },
-    claim: hasClaim
-      ? {
-          id: text(row, "claim_id"),
-          settled: claimSettled,
-        }
-      : null,
+    claim:
+      hasClaim && claimId !== null
+        ? {
+            id: claimId,
+            settled: claimSettled,
+          }
+        : null,
+    provenance,
   };
 }
 
@@ -199,6 +243,7 @@ const TRANSFER_QUERY = `
          t.rail_ref,
          t.origin_block,
          t.origin_tx,
+         t.origin_log_index,
          t.observed_at,
          a.status AS attestation_status,
          a.rail_status,
@@ -206,13 +251,19 @@ const TRANSFER_QUERY = `
          a.attested_at,
          a.last_error,
          d.delivered AS inbound_delivered,
+         d.claim_id AS inbound_claim_id,
+         d.rail_message_id,
          d.destination_block,
          d.destination_tx,
+         d.destination_log_index,
          d.token AS received_token,
          d.amount AS received_amount,
          d.observed_at AS delivered_at,
          c.claim_id,
-         c.settled AS claim_settled
+         c.settled AS claim_settled,
+         c.settled_tx AS claim_settled_tx,
+         c.settled_by AS claim_settled_by,
+         c.settled_at AS claim_settled_at
     FROM outbound_transfer t
     LEFT JOIN rail_attestation a ON a.transfer_id = t.id
     LEFT JOIN inbound_delivery d
