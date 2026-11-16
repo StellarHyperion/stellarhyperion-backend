@@ -11,6 +11,12 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import {
+  MAINTENANCE_JOBS,
+  acquireMaintenanceLease,
+  executeAttestationRetentionBatch,
+  releaseMaintenanceLease,
+} from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
@@ -57,6 +63,7 @@ suite("the schema", () => {
       "admin_action",
       "inbound_delivery",
       "indexer_cursor",
+      "maintenance_job_lease",
       "outbound_transfer",
       "pending_claim",
       "rail_attestation",
@@ -283,9 +290,15 @@ suite("maintenance and pruning", () => {
 
   afterAll(async () => {
     await db.query(
-      "DELETE FROM public.rail_attestation WHERE transfer_id IN (999991, 999992, 999993)",
+      "DELETE FROM public.pending_claim WHERE chain = 'stellar-testnet' AND claim_id = 999994",
     );
-    await db.query("DELETE FROM public.outbound_transfer WHERE id IN (999991, 999992, 999993)");
+    await db.query(
+      "DELETE FROM public.rail_attestation WHERE transfer_id IN (999991, 999992, 999993, 999994, 999995, 999996)",
+    );
+    await db.query(
+      "DELETE FROM public.outbound_transfer WHERE id IN (999991, 999992, 999993, 999994, 999995, 999996)",
+    );
+    await db.query("DELETE FROM public.maintenance_job_lease WHERE job_name LIKE 'schema-test-%'");
     await db.close();
   });
 
@@ -334,5 +347,86 @@ suite("maintenance and pruning", () => {
     expect(ids).not.toContain(999991);
     expect(ids).toContain(999992);
     expect(ids).toContain(999993);
+  });
+
+  it("enforces single-owner leases, protects unsettled claims, and resumes across batches", async () => {
+    const jobName = `schema-test-${MAINTENANCE_JOBS.railAttestationRetention}`;
+    await db.query(
+      `INSERT INTO public.outbound_transfer
+         (id, origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
+          destination_chain, destination, origin_block, origin_tx)
+       VALUES (999994, 'prune-test-4', 0, 999994, '0xsender', '0xtoken', 100, 0, 100,
+               'stellar-testnet', 'GA5ZYIIV', 1, '0xtx-4'),
+              (999995, 'prune-test-5', 0, 999995, '0xsender', '0xtoken', 100, 0, 100,
+               'stellar-testnet', 'GA5ZYIIV', 1, '0xtx-5'),
+              (999996, 'prune-test-6', 0, 999996, '0xsender', '0xtoken', 100, 0, 100,
+               'stellar-testnet', 'GA5ZYIIV', 1, '0xtx-6')
+       ON CONFLICT (origin_chain, nonce) DO NOTHING`,
+    );
+    await db.query(
+      `INSERT INTO public.pending_claim
+         (chain, claim_id, recipient, token, amount, route, source_chain, source_nonce, created_at, settled)
+       VALUES ('stellar-testnet', 999994, 'GA5ZYIIV', 'USDC', 100, 0, 'prune-test-4', 999994, now() - INTERVAL '40 days', false)
+       ON CONFLICT (chain, claim_id) DO NOTHING`,
+    );
+    await db.query(
+      `INSERT INTO public.rail_attestation (transfer_id, route, status, updated_at)
+       VALUES (999994, 0, 'delivered', now() - INTERVAL '40 days'),
+              (999995, 0, 'delivered', now() - INTERVAL '40 days'),
+              (999996, 0, 'delivered', now() - INTERVAL '40 days')
+       ON CONFLICT (transfer_id) DO UPDATE SET status = 'delivered', updated_at = now() - INTERVAL '40 days'`,
+    );
+
+    const workerA = await acquireMaintenanceLease(db, {
+      jobName,
+      ownerId: "worker-a",
+      leaseDurationMs: 60_000,
+    });
+    expect(workerA.acquired).toBe(true);
+    if (!workerA.acquired) throw new Error("expected worker-a lease");
+
+    const workerBBlocked = await acquireMaintenanceLease(db, {
+      jobName,
+      ownerId: "worker-b",
+      leaseDurationMs: 60_000,
+    });
+    expect(workerBBlocked.acquired).toBe(false);
+
+    // Advance cursor up to right before 999994 so this test stays isolated from lower ids.
+    await db.query(
+      "UPDATE public.maintenance_job_lease SET resume_cursor = 999993 WHERE job_name = $1",
+      [jobName],
+    );
+
+    const firstBatch = await executeAttestationRetentionBatch(db, {
+      jobName,
+      ownerId: "worker-a",
+      fenceToken: workerA.lease.fenceToken,
+      olderThanDays: 30,
+      batchSize: 1,
+    });
+    expect(firstBatch.leaseLost).toBe(false);
+    expect(firstBatch.deletedCount).toBe(1);
+    expect(firstBatch.hasMore).toBe(true);
+    expect(firstBatch.resumeCursor).toBe(999995n);
+
+    await releaseMaintenanceLease(db, {
+      jobName,
+      ownerId: "worker-a",
+      fenceToken: workerA.lease.fenceToken,
+    });
+
+    const secondPass = await db.pruneCompletedAttestations(30, {
+      jobName,
+      ownerId: "worker-b",
+      batchSize: 1,
+      maxBatches: 5,
+    });
+    expect(secondPass).toBe(1);
+
+    const { rows } = await db.query(
+      "SELECT transfer_id FROM public.rail_attestation WHERE transfer_id IN (999994, 999995, 999996)",
+    );
+    expect(rows.map((r) => Number(r.transfer_id))).toEqual([999994]);
   });
 });

@@ -12,8 +12,15 @@
  * not check the shape it returns against anything, so a generic there is a cast wearing a
  * costume. Narrowing happens once per table, in `rows.ts`, where it is visible.
  */
+import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 import type { PoolClient, PoolConfig } from "pg";
+import { runAttestationRetentionJob, runRouteHealthRetentionJob } from "../chains/writers.js";
+import type {
+  AttestationRetentionJobOptions,
+  MaintenanceRunResult,
+  RouteHealthRetentionJobOptions,
+} from "../chains/writers.js";
 
 export interface QueryResultRows {
   readonly rows: readonly Record<string, unknown>[];
@@ -44,26 +51,52 @@ export interface OpenOptions {
   readonly connectionTimeoutMs?: number;
   readonly statementTimeoutMs?: number;
   readonly applicationName?: string;
+  readonly maintenanceOwnerId?: string;
+}
+
+export interface MaintenanceCycleOptions {
+  readonly ownerId?: string;
+  readonly attestationOlderThanDays?: number;
+  readonly routeHealthOlderThanDays?: number;
+  readonly batchSize?: number;
+  readonly maxBatches?: number;
+  readonly leaseDurationMs?: number;
+  readonly requireInboundProvenance?: boolean;
+  readonly now?: () => Date;
+  readonly signal?: AbortSignal;
+}
+
+export interface MaintenanceCycleResult {
+  readonly attestations: MaintenanceRunResult;
+  readonly routeHealth: MaintenanceRunResult;
 }
 
 export class Database implements Transactional {
   private closed = false;
+  readonly maintenanceOwnerId: string;
 
-  private constructor(private readonly pool: Pool) {}
+  private constructor(
+    private readonly pool: Pool,
+    maintenanceOwnerId: string,
+  ) {
+    this.maintenanceOwnerId = maintenanceOwnerId;
+  }
 
   static open(connectionString: string, options: OpenOptions = {}): Database {
+    const appName = options.applicationName ?? "hyperion-backend";
     const config: PoolConfig = {
       connectionString,
       max: options.maxConnections ?? 10,
       connectionTimeoutMillis: options.connectionTimeoutMs ?? 10_000,
       // Named so `pg_stat_activity` says which process is holding a connection. During an
       // incident that is the difference between knowing and guessing.
-      application_name: options.applicationName ?? "hyperion-backend",
+      application_name: appName,
       // A watcher query that has not finished in thirty seconds is wedged, not slow, and holding
       // the connection does not help it.
       statement_timeout: options.statementTimeoutMs ?? 30_000,
     };
-    return new Database(new Pool(config));
+    const ownerId = options.maintenanceOwnerId ?? `${appName}:${randomUUID()}`;
+    return new Database(new Pool(config), ownerId);
   }
 
   async query(text: string, params: readonly unknown[] = []): Promise<QueryResultRows> {
@@ -101,17 +134,66 @@ export class Database implements Transactional {
   }
 
   /**
-   * Lightweight maintenance task that cleans up completed attestation audit rows older than 30 days.
-   * Returns the count of deleted rows.
+   * Bounded, lease-protected cleanup of completed attestation audit rows older than the configured
+   * retention window. Returns the count of deleted rows in this run.
    */
-  async pruneCompletedAttestations(olderThanDays = 30): Promise<number> {
-    const { rowCount } = await this.query(
-      `DELETE FROM rail_attestation
-        WHERE status = 'delivered'
-          AND updated_at < now() - ($1 * INTERVAL '1 day')`,
-      [olderThanDays],
-    );
-    return rowCount;
+  async pruneCompletedAttestations(
+    olderThanDays = 30,
+    options: Omit<Partial<AttestationRetentionJobOptions>, "olderThanDays"> = {},
+  ): Promise<number> {
+    const result = await runAttestationRetentionJob(this, {
+      ...options,
+      ownerId: options.ownerId ?? this.maintenanceOwnerId,
+      olderThanDays,
+    });
+    return result.deletedCount;
+  }
+
+  /**
+   * Bounded, lease-protected cleanup of superseded route health samples older than the configured
+   * retention window while preserving the latest sample per route and token.
+   */
+  async pruneRouteHealthSamples(
+    olderThanDays = 14,
+    options: Omit<Partial<RouteHealthRetentionJobOptions>, "olderThanDays"> = {},
+  ): Promise<number> {
+    const result = await runRouteHealthRetentionJob(this, {
+      ...options,
+      ownerId: options.ownerId ?? this.maintenanceOwnerId,
+      olderThanDays,
+    });
+    return result.deletedCount;
+  }
+
+  async runMaintenanceCycle(
+    options: MaintenanceCycleOptions = {},
+  ): Promise<MaintenanceCycleResult> {
+    const ownerId = options.ownerId ?? this.maintenanceOwnerId;
+    const shared = {
+      ownerId,
+      ...(options.batchSize !== undefined ? { batchSize: options.batchSize } : {}),
+      ...(options.maxBatches !== undefined ? { maxBatches: options.maxBatches } : {}),
+      ...(options.leaseDurationMs !== undefined
+        ? { leaseDurationMs: options.leaseDurationMs }
+        : {}),
+      ...(options.now !== undefined ? { now: options.now } : {}),
+      ...(options.signal !== undefined ? { signal: options.signal } : {}),
+    };
+
+    const attestations = await runAttestationRetentionJob(this, {
+      ...shared,
+      olderThanDays: options.attestationOlderThanDays ?? 30,
+      ...(options.requireInboundProvenance !== undefined
+        ? { requireInboundProvenance: options.requireInboundProvenance }
+        : {}),
+    });
+
+    const routeHealth = await runRouteHealthRetentionJob(this, {
+      ...shared,
+      olderThanDays: options.routeHealthOlderThanDays ?? 14,
+    });
+
+    return { attestations, routeHealth };
   }
 
   async close(): Promise<void> {
@@ -124,6 +206,12 @@ export class Database implements Transactional {
 export interface MaintenanceTaskOptions {
   readonly intervalMs?: number;
   readonly olderThanDays?: number;
+  readonly routeHealthOlderThanDays?: number;
+  readonly batchSize?: number;
+  readonly maxBatches?: number;
+  readonly leaseDurationMs?: number;
+  readonly ownerId?: string;
+  readonly requireInboundProvenance?: boolean;
   readonly logger?: {
     info?: (obj: unknown, msg: string) => void;
     error?: (obj: unknown, msg: string) => void;
@@ -132,24 +220,60 @@ export interface MaintenanceTaskOptions {
 }
 
 /**
- * Periodically runs the attestation cleanup maintenance task.
- * Returns a function to cancel the scheduled task.
+ * Periodically runs bounded, lease-protected retention maintenance tasks.
+ * Returns a function to cancel the scheduled task and abort any active batch loop.
  */
 export function startMaintenanceTask(
-  db: Database,
+  db: Pick<Database, "runMaintenanceCycle">,
   options: MaintenanceTaskOptions = {},
 ): () => void {
   const intervalMs = options.intervalMs ?? 24 * 60 * 60 * 1000;
-  const olderThanDays = options.olderThanDays ?? 30;
+  const controller = new AbortController();
+  let inFlight = false;
 
   const timer = setInterval(() => {
-    void db.pruneCompletedAttestations(olderThanDays).catch((error: unknown) => {
-      options.logger?.warn?.({ err: error }, "maintenance attestation pruning failed");
-    });
+    if (inFlight || controller.signal.aborted) return;
+    inFlight = true;
+    void db
+      .runMaintenanceCycle({
+        attestationOlderThanDays: options.olderThanDays ?? 30,
+        routeHealthOlderThanDays: options.routeHealthOlderThanDays ?? 14,
+        ...(options.batchSize !== undefined ? { batchSize: options.batchSize } : {}),
+        ...(options.maxBatches !== undefined ? { maxBatches: options.maxBatches } : {}),
+        ...(options.leaseDurationMs !== undefined
+          ? { leaseDurationMs: options.leaseDurationMs }
+          : {}),
+        ...(options.ownerId !== undefined ? { ownerId: options.ownerId } : {}),
+        ...(options.requireInboundProvenance !== undefined
+          ? { requireInboundProvenance: options.requireInboundProvenance }
+          : {}),
+        signal: controller.signal,
+      })
+      .then((cycle) => {
+        if (cycle.attestations.deletedCount > 0 || cycle.routeHealth.deletedCount > 0) {
+          options.logger?.info?.(
+            {
+              attestationsDeleted: cycle.attestations.deletedCount,
+              attestationsCompleted: cycle.attestations.completed,
+              routeHealthDeleted: cycle.routeHealth.deletedCount,
+              routeHealthCompleted: cycle.routeHealth.completed,
+            },
+            "maintenance retention cycle completed",
+          );
+        }
+      })
+      .catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : "unknown maintenance error";
+        options.logger?.warn?.({ errorMessage: message }, "maintenance retention cycle failed");
+      })
+      .finally(() => {
+        inFlight = false;
+      });
   }, intervalMs);
 
   timer.unref();
   return () => {
+    controller.abort();
     clearInterval(timer);
   };
 }
