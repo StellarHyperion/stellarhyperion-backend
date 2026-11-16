@@ -57,6 +57,7 @@ suite("the schema", () => {
       "admin_action",
       "inbound_delivery",
       "indexer_cursor",
+      "keeper_restore_checkpoint",
       "outbound_transfer",
       "pending_claim",
       "rail_attestation",

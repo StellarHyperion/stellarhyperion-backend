@@ -10,6 +10,7 @@ import { Redis } from "ioredis";
 
 import { processClaimSettlement } from "./jobs/claims.js";
 import { processTtlBump } from "./jobs/ttl.js";
+import { PostgresRestoreCheckpointStore } from "./restore.js";
 import type { KeeperContext, KeeperJobName, KeeperJobResult } from "./types.js";
 
 export const KEEPER_QUEUE_NAME = "hyperion-keeper";
@@ -34,6 +35,12 @@ export async function startKeeperQueue(
   redisUrl: string,
 ): Promise<KeeperHandle> {
   const { config, logger } = ctx;
+  const workerCtx: KeeperContext = ctx.restoreStore
+    ? ctx
+    : {
+        ...ctx,
+        restoreStore: new PostgresRestoreCheckpointStore(ctx.db),
+      };
   const redis = createKeeperRedis(redisUrl);
   await redis.connect();
 
@@ -47,11 +54,11 @@ export async function startKeeperQueue(
       logger.info({ jobName: job.name, jobId: job.id }, "processing keeper job");
       switch (job.name as KeeperJobName) {
         case "ttl-bump": {
-          const result = await processTtlBump(ctx, job.data as object);
+          const result = await processTtlBump(workerCtx, job.data as object);
           return { kind: "ttl-bump", result };
         }
         case "claim-settlement": {
-          const result = await processClaimSettlement(ctx, job.data as object);
+          const result = await processClaimSettlement(workerCtx, job.data as object);
           return { kind: "claim-settlement", result };
         }
         default:

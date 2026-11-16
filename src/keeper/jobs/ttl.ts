@@ -1,7 +1,9 @@
 import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 import { bigintOf } from "../../db/rows.js";
+import { ttlRestoreScopeKey, UncertainRestoreError } from "../restore.js";
 import { submitStellar } from "../stellar.js";
 import type { KeeperContext, TtlBumpPayload, TtlBumpResult } from "../types.js";
+
 export async function processTtlBump(
   ctx: KeeperContext,
   payload: TtlBumpPayload = {},
@@ -40,19 +42,63 @@ export async function processTtlBump(
       dryRun: true,
       detail: `No signer: ${tokens.length} tokens, ${claims.length} claims, ${transfers.length} transfers need maintenance.`,
     };
+
+  let restoredFootprints = 0;
+  let restoredKeys = 0;
+  const restoreTxHashes: string[] = [];
   const vector = (values: xdr.ScVal[]) => xdr.ScVal.scvVec(values);
-  const hash = await submitStellar(ctx.config, chain.routerContractId, "keep_alive", () => [
-    vector(tokens.map((token) => new Address(token).toScVal())),
-    vector([0, 1, 2, 3].map((route) => nativeToScVal(route, { type: "u32" }))),
-    vector(claims.map((id) => nativeToScVal(id, { type: "u64" }))),
-    vector(transfers.map((id) => nativeToScVal(id, { type: "u64" }))),
-  ]);
-  ctx.logger.info({ hash }, "router keep_alive confirmed");
-  return {
-    bumpedTokens: tokens.length,
-    bumpedClaims: claims.length,
-    bumpedTransfers: transfers.length,
-    dryRun: false,
-    detail: `Confirmed router maintenance: ${hash}`,
-  };
+  try {
+    const hash = await submitStellar(
+      ctx.config,
+      chain.routerContractId,
+      "keep_alive",
+      () => [
+        vector(tokens.map((token) => new Address(token).toScVal())),
+        vector([0, 1, 2, 3].map((route) => nativeToScVal(route, { type: "u32" }))),
+        vector(claims.map((id) => nativeToScVal(id, { type: "u64" }))),
+        vector(transfers.map((id) => nativeToScVal(id, { type: "u64" }))),
+      ],
+      {
+        scopeKey: ttlRestoreScopeKey(chain.chain),
+        jobKind: "ttl-bump",
+        restoreStore: ctx.restoreStore,
+        pollIntervalMs: ctx.pollIntervalMs,
+        onRestoreConfirmed: (event) => {
+          restoredFootprints += 1;
+          restoredKeys += event.footprintKeys.length;
+          restoreTxHashes.push(event.restoreTxHash);
+          ctx.logger.info(
+            {
+              restoreTxHash: event.restoreTxHash,
+              restoredKeys: event.footprintKeys.length,
+              recoveredFromCheckpoint: event.recoveredFromCheckpoint,
+            },
+            "restored archived Soroban footprint before router keep_alive",
+          );
+        },
+      },
+    );
+    ctx.logger.info({ hash }, "router keep_alive confirmed");
+    return {
+      bumpedTokens: tokens.length,
+      bumpedClaims: claims.length,
+      bumpedTransfers: transfers.length,
+      dryRun: false,
+      detail: `Confirmed router maintenance: ${hash}`,
+      restoreSummary: {
+        restoredFootprints,
+        restoredKeys,
+        restoreTxHashes,
+        pendingRestoreHashes: [],
+      },
+    };
+  } catch (error) {
+    if (error instanceof UncertainRestoreError) {
+      ctx.logger.warn(
+        { scopeKey: error.scopeKey, restoreTxHash: error.restoreTxHash },
+        "router keep_alive paused awaiting uncertain restore hash reconciliation",
+      );
+    }
+    throw error;
+  }
 }
