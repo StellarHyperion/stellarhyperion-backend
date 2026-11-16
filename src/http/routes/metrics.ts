@@ -49,17 +49,27 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
     const cursorResult = await db.query(
       "SELECT chain_key, last_processed AS cursor_block, last_processed_hash AS cursor_hash, updated_at FROM indexer_cursor",
     );
-    const cursors = cursorResult.rows.map((row) => ({
-      chain: text(row, "chain_key"),
-      block: text(row, "cursor_block"),
-      hash: textOrNull(row, "cursor_hash"),
-      updatedAt: new Date(row.updated_at as string | number | Date).toISOString(),
-    }));
+    const nowMs = Date.now();
+    const maxCursorStaleMs = deps.config.readinessPolicy.maxCursorStaleMs;
+    const cursors = cursorResult.rows.map((row) => {
+      const updatedDate = new Date(row.updated_at as string | number | Date);
+      const ageMs = Math.max(0, nowMs - updatedDate.getTime());
+      return {
+        chain: text(row, "chain_key"),
+        block: text(row, "cursor_block"),
+        hash: textOrNull(row, "cursor_hash"),
+        updatedAt: updatedDate.toISOString(),
+        ageMs,
+        stale: maxCursorStaleMs !== null ? ageMs > maxCursorStaleMs : false,
+      };
+    });
 
     return reply.send({
       service: "hyperion-backend",
       network: deps.config.network,
-      uptimeSeconds: Math.floor((Date.now() - startedAt.getTime()) / 1000),
+      mode: deps.config.readinessPolicy.mode,
+      readinessPolicy: deps.config.readinessPolicy,
+      uptimeSeconds: Math.floor((nowMs - startedAt.getTime()) / 1000),
       transfers: {
         totalOutbound,
         totalInbound,

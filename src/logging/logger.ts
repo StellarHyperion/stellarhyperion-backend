@@ -47,7 +47,11 @@ export function createLogger(config: AppConfig): Logger {
     level: config.logLevel,
     // The service name is on every line because the keeper and the API will run as separate
     // processes against the same aggregator before long.
-    base: { service: "hyperion-backend", network: config.network },
+    base: {
+      service: "hyperion-backend",
+      network: config.network,
+      mode: config.readinessPolicy.mode,
+    },
     redact: { paths: REDACTED_PATHS, censor: "[redacted]" },
     serializers: {
       err: stdSerializers.err,

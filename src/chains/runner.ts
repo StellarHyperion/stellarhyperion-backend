@@ -23,7 +23,7 @@ import type {
 import type { Transactional } from "../db/pool.js";
 import { Poller } from "../runtime/poller.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
-import { fixedReadiness } from "../runtime/readiness.js";
+import { absentDependencyReadiness, fixedReadiness } from "../runtime/readiness.js";
 import { RouteKind } from "@hyperion/protocol";
 
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
@@ -135,9 +135,9 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
     return {
       workers: [],
       readiness: [
-        fixedReadiness(
+        absentDependencyReadiness(
           "indexer",
-          "ready",
+          "indexer",
           "disabled by configuration, so this replica answers questions and watches nothing",
         ),
       ],
@@ -176,9 +176,9 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
     }
   } else {
     extra.push(
-      fixedReadiness(
+      absentDependencyReadiness(
         "rails",
-        "ready",
+        "rails",
         "disabled by configuration, so no transfer's rail status is being refreshed",
       ),
     );
@@ -189,9 +189,9 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
     workers.push(new KeeperWorker(config, db, logger));
   } else {
     extra.push(
-      fixedReadiness(
+      absentDependencyReadiness(
         "keeper",
-        "ready",
+        "keeper",
         "disabled by configuration, so no automated upkeep tasks run on this replica",
       ),
     );

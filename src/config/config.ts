@@ -29,6 +29,13 @@ import {
 
 import type { EnumSpec, VarSpec } from "./env.js";
 import { EnvReader } from "./env.js";
+import type {
+  DependencyPolicy,
+  DeploymentMode,
+  ReadinessPolicyConfig,
+} from "../runtime/readiness.js";
+
+export type { DependencyPolicy, DeploymentMode, ReadinessPolicyConfig };
 
 /**
  * Axelar's status API, per network.
@@ -112,6 +119,7 @@ export interface AppConfig {
   readonly indexer: IndexerConfig;
   readonly rails: RailsConfig;
   readonly keeper: KeeperConfig;
+  readonly readinessPolicy: ReadinessPolicyConfig;
   readonly shutdownTimeoutMs: number;
 }
 
@@ -333,6 +341,71 @@ const SHUTDOWN_TIMEOUT_MS: VarSpec = {
   purpose: "How long shutdown waits for in-flight work before it stops waiting.",
 };
 
+const DEPLOYMENT_MODE: EnumSpec<DeploymentMode> = {
+  name: "DEPLOYMENT_MODE",
+  kind: "enum",
+  required: false,
+  choices: ["api-only", "worker", "combined"],
+  printable: true,
+  purpose:
+    "Process deployment mode (api-only, worker, or combined) governing which dependencies /ready may certify.",
+};
+
+const READINESS_DATABASE_POLICY: EnumSpec<"required" | "optional"> = {
+  name: "READINESS_DATABASE_POLICY",
+  kind: "enum",
+  required: false,
+  choices: ["required", "optional"],
+  printable: true,
+  purpose: "Whether PostgreSQL unavailability marks /ready down (503) or degraded (200).",
+};
+
+const READINESS_REDIS_POLICY: EnumSpec<DependencyPolicy> = {
+  name: "READINESS_REDIS_POLICY",
+  kind: "enum",
+  required: false,
+  choices: ["required", "optional", "disabled"],
+  printable: true,
+  purpose: "Readiness policy for Redis and BullMQ connectivity.",
+};
+
+const READINESS_INDEXER_POLICY: EnumSpec<DependencyPolicy> = {
+  name: "READINESS_INDEXER_POLICY",
+  kind: "enum",
+  required: false,
+  choices: ["required", "optional", "disabled"],
+  printable: true,
+  purpose: "Readiness policy for chain watchers and persisted indexer cursor freshness.",
+};
+
+const READINESS_RAILS_POLICY: EnumSpec<DependencyPolicy> = {
+  name: "READINESS_RAILS_POLICY",
+  kind: "enum",
+  required: false,
+  choices: ["required", "optional", "disabled"],
+  printable: true,
+  purpose: "Readiness policy for CCTP and Axelar ITS status pollers.",
+};
+
+const READINESS_KEEPER_POLICY: EnumSpec<DependencyPolicy> = {
+  name: "READINESS_KEEPER_POLICY",
+  kind: "enum",
+  required: false,
+  choices: ["required", "optional", "disabled"],
+  printable: true,
+  purpose: "Readiness policy for Stellar TTL and claim maintenance workers.",
+};
+
+const READINESS_MAX_CURSOR_STALE_MS: VarSpec = {
+  name: "READINESS_MAX_CURSOR_STALE_MS",
+  kind: "integer",
+  required: false,
+  min: 1_000,
+  printable: true,
+  purpose:
+    "Maximum age in milliseconds of persisted indexer_cursor rows before /ready flags cursor staleness.",
+};
+
 const STELLAR_RPC_URL: VarSpec = {
   name: "STELLAR_RPC_URL",
   kind: "url",
@@ -451,14 +524,24 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const host = reader.string(HTTP_HOST);
   const port = reader.integer(HTTP_PORT);
   const databaseUrl = reader.url(DATABASE_URL);
-  const keeperEnabled = reader.boolean(KEEPER_ENABLED);
+  const explicitMode = reader.has(DEPLOYMENT_MODE.name) ? reader.choice(DEPLOYMENT_MODE) : null;
+  const rawIndexerEnabled = reader.boolean(INDEXER_ENABLED);
+  const rawRailsEnabled = reader.boolean(RAILS_ENABLED);
+  const rawKeeperEnabled = reader.boolean(KEEPER_ENABLED);
+
+  const indexerExplicit = reader.has(INDEXER_ENABLED.name);
+  const railsExplicit = reader.has(RAILS_ENABLED.name);
+  const keeperExplicit = reader.has(KEEPER_ENABLED.name);
+
+  const indexerEnabled =
+    explicitMode === "api-only" && !indexerExplicit ? false : rawIndexerEnabled;
+  const railsEnabled = explicitMode === "api-only" && !railsExplicit ? false : rawRailsEnabled;
+  const keeperEnabled = explicitMode === "api-only" && !keeperExplicit ? false : rawKeeperEnabled;
+
   const redisUrl = reader.url({ ...REDIS_URL, required: keeperEnabled });
   const network = reader.choice(HYPERION_NETWORK);
   const deploymentsPath = reader.string(DEPLOYMENTS_FILE);
-  const indexerEnabled = reader.boolean(INDEXER_ENABLED);
   const shutdownTimeoutMs = reader.integer(SHUTDOWN_TIMEOUT_MS);
-
-  const railsEnabled = reader.boolean(RAILS_ENABLED);
   const irisOverride = reader.url(IRIS_API_URL);
   const axelarOverride = reader.url(AXELAR_API_URL);
   const railPollIntervalMs = reader.integer(RAIL_POLL_INTERVAL_MS);
@@ -499,6 +582,13 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     env,
   });
 
+  const readinessPolicy = planReadinessPolicy(reader, {
+    explicitMode,
+    indexerEnabled,
+    railsEnabled,
+    keeperEnabled,
+  });
+
   // One throw, after everything has had a chance to complain.
   reader.finish();
 
@@ -527,6 +617,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       concurrency: keeperConcurrency,
       stellarSecret: keeperStellarSecret,
     },
+    readinessPolicy,
     shutdownTimeoutMs,
   };
 }
@@ -700,4 +791,72 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+interface ReadinessPlanInput {
+  readonly explicitMode: DeploymentMode | null;
+  readonly indexerEnabled: boolean;
+  readonly railsEnabled: boolean;
+  readonly keeperEnabled: boolean;
+}
+
+function planReadinessPolicy(reader: EnvReader, input: ReadinessPlanInput): ReadinessPolicyConfig {
+  const anyWorkerEnabled = input.indexerEnabled || input.railsEnabled || input.keeperEnabled;
+  const mode: DeploymentMode = input.explicitMode ?? (anyWorkerEnabled ? "combined" : "api-only");
+
+  if (!reader.failed(DEPLOYMENT_MODE)) {
+    if (mode === "api-only" && anyWorkerEnabled) {
+      reader.reject(
+        DEPLOYMENT_MODE,
+        'cannot be "api-only" while INDEXER_ENABLED, RAILS_ENABLED, or KEEPER_ENABLED is true',
+      );
+    } else if ((mode === "worker" || mode === "combined") && !anyWorkerEnabled) {
+      reader.reject(
+        DEPLOYMENT_MODE,
+        `cannot be "${mode}" when INDEXER_ENABLED, RAILS_ENABLED, and KEEPER_ENABLED are all false`,
+      );
+    }
+  }
+
+  const database: DependencyPolicy = reader.has(READINESS_DATABASE_POLICY.name)
+    ? reader.choice(READINESS_DATABASE_POLICY)
+    : "required";
+
+  const redis: DependencyPolicy = reader.has(READINESS_REDIS_POLICY.name)
+    ? reader.choice(READINESS_REDIS_POLICY)
+    : input.keeperEnabled
+      ? "required"
+      : "disabled";
+
+  const indexer: DependencyPolicy = reader.has(READINESS_INDEXER_POLICY.name)
+    ? reader.choice(READINESS_INDEXER_POLICY)
+    : input.indexerEnabled
+      ? "required"
+      : "disabled";
+
+  const rails: DependencyPolicy = reader.has(READINESS_RAILS_POLICY.name)
+    ? reader.choice(READINESS_RAILS_POLICY)
+    : input.railsEnabled
+      ? "required"
+      : "disabled";
+
+  const keeper: DependencyPolicy = reader.has(READINESS_KEEPER_POLICY.name)
+    ? reader.choice(READINESS_KEEPER_POLICY)
+    : input.keeperEnabled
+      ? "required"
+      : "disabled";
+
+  const maxCursorStaleMs = reader.has(READINESS_MAX_CURSOR_STALE_MS.name)
+    ? reader.integer(READINESS_MAX_CURSOR_STALE_MS)
+    : null;
+
+  return {
+    mode,
+    database,
+    redis,
+    indexer,
+    rails,
+    keeper,
+    maxCursorStaleMs,
+  };
 }

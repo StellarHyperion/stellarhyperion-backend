@@ -14,12 +14,33 @@
 
 export type ReadinessState = "ready" | "degraded" | "down";
 
+export type DeploymentMode = "api-only" | "worker" | "combined";
+
+export type DependencyPolicy = "required" | "optional" | "disabled";
+
+export type DependencyCategory = "database" | "redis" | "indexer" | "rails" | "keeper";
+
+export interface ReadinessPolicyConfig {
+  readonly mode: DeploymentMode;
+  readonly database: DependencyPolicy;
+  readonly redis: DependencyPolicy;
+  readonly indexer: DependencyPolicy;
+  readonly rails: DependencyPolicy;
+  readonly keeper: DependencyPolicy;
+  readonly maxCursorStaleMs: number | null;
+}
+
 export interface ReadinessReport {
   /** Stable, lowercase, dash separated. Shows up in the `/ready` body and in alerts. */
   readonly name: string;
   readonly state: ReadinessState;
   /** One sentence a human can act on. Never a stack trace and never a connection string. */
   readonly detail: string;
+  readonly category?: DependencyCategory;
+  readonly policy?: DependencyPolicy;
+  readonly observedState?: ReadinessState | "absent";
+  readonly certified?: boolean;
+  readonly stale?: boolean;
 }
 
 export interface ReadinessSource {
@@ -54,6 +75,191 @@ export function fixedReadiness(
   detail: string,
 ): ReadinessSource {
   return { readiness: () => ({ name, state, detail }) };
+}
+
+/**
+ * Explicit marker for an intentionally absent subsystem so `/ready` never certifies an absent
+ * worker as live while keeping disabled subsystems from tripping `worstOf`.
+ */
+export function absentDependencyReadiness(
+  name: string,
+  category: DependencyCategory,
+  detail: string,
+): ReadinessSource {
+  return {
+    readiness: () => ({
+      name,
+      category,
+      observedState: "absent",
+      certified: false,
+      state: "ready",
+      detail,
+    }),
+  };
+}
+
+export function inferCategoryFromCheckName(name: string): DependencyCategory {
+  if (name === "postgres" || name === "database") return "database";
+  if (name === "redis" || name === "bullmq") return "redis";
+  if (name === "keeper" || name.startsWith("keeper")) return "keeper";
+  if (name === "rails" || name === "cctp" || name === "axelar" || name.startsWith("rail")) {
+    return "rails";
+  }
+  return "indexer";
+}
+
+export function policyForCategory(
+  config: ReadinessPolicyConfig,
+  category: DependencyCategory,
+): DependencyPolicy {
+  switch (category) {
+    case "database":
+      return config.database;
+    case "redis":
+      return config.redis;
+    case "indexer":
+      return config.indexer;
+    case "rails":
+      return config.rails;
+    case "keeper":
+      return config.keeper;
+  }
+}
+
+/**
+ * Applies configured required/optional/disabled dependency policy and deployment-mode certification
+ * rules to an observed readiness report.
+ */
+export function applyDependencyPolicy(
+  report: ReadinessReport,
+  policyConfig: ReadinessPolicyConfig,
+): ReadinessReport {
+  const category = report.category ?? inferCategoryFromCheckName(report.name);
+  const policy = report.policy ?? policyForCategory(policyConfig, category);
+  const observedState = report.observedState ?? report.state;
+  const isWorkerCategory = category === "indexer" || category === "rails" || category === "keeper";
+
+  // API-only processes never certify live background workers, even if a caller wired one in.
+  if (policyConfig.mode === "api-only" && isWorkerCategory && observedState !== "absent") {
+    if (report.name !== "indexer-cursor") {
+      return {
+        ...report,
+        category,
+        policy,
+        observedState,
+        certified: false,
+        state: "degraded",
+        detail: `api-only mode cannot certify in-process worker "${report.name}": ${report.detail}`,
+      };
+    }
+  }
+
+  if (observedState === "absent") {
+    if (policy === "required") {
+      return {
+        ...report,
+        category,
+        policy,
+        observedState: "absent",
+        certified: false,
+        state: "down",
+        detail: `required ${category} dependency is absent in ${policyConfig.mode} mode: ${report.detail}`,
+      };
+    }
+    if (policy === "optional") {
+      return {
+        ...report,
+        category,
+        policy,
+        observedState: "absent",
+        certified: false,
+        state: "degraded",
+        detail: `optional ${category} dependency is absent: ${report.detail}`,
+      };
+    }
+    return {
+      ...report,
+      category,
+      policy: "disabled",
+      observedState: "absent",
+      certified: false,
+      state: "ready",
+    };
+  }
+
+  if (policy === "disabled") {
+    return {
+      ...report,
+      category,
+      policy: "disabled",
+      observedState,
+      certified: false,
+      state: "ready",
+      detail: `disabled ${category} policy: ${report.detail}`,
+    };
+  }
+
+  if (report.stale === true) {
+    const staleState: ReadinessState = policy === "required" ? "down" : "degraded";
+    return {
+      ...report,
+      category,
+      policy,
+      observedState,
+      certified: false,
+      stale: true,
+      state: staleState,
+      detail:
+        policy === "required"
+          ? `required ${category} dependency is stale: ${report.detail}`
+          : `optional ${category} dependency is stale (serving degraded): ${report.detail}`,
+    };
+  }
+
+  if (observedState === "down") {
+    if (policy === "optional") {
+      return {
+        ...report,
+        category,
+        policy: "optional",
+        observedState: "down",
+        certified: false,
+        state: "degraded",
+        detail: `optional ${category} outage (observed down, serving degraded): ${report.detail}`,
+      };
+    }
+    return {
+      ...report,
+      category,
+      policy: "required",
+      observedState: "down",
+      certified: false,
+      state: "down",
+    };
+  }
+
+  if (observedState === "degraded") {
+    return {
+      ...report,
+      category,
+      policy,
+      observedState: "degraded",
+      certified: false,
+      state: "degraded",
+    };
+  }
+
+  const certified =
+    report.certified ?? (policyConfig.mode === "api-only" && isWorkerCategory ? false : true);
+
+  return {
+    ...report,
+    category,
+    policy,
+    observedState: "ready",
+    certified,
+    state: "ready",
+  };
 }
 
 export interface RedisPingable {
