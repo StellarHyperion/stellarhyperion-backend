@@ -66,6 +66,7 @@ async function main(): Promise<void> {
   indexer.start();
   logger.info(
     {
+      role: config.indexer.enabled ? "worker" : "api-only",
       host: config.http.host,
       port: config.http.port,
       network: config.network,

@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-10-30T00:00:00.000Z",
+  "networks": {
+    "stellar-testnet": {
+      "family": "stellar",
+      "chain": "stellar-testnet",
+      "networkPassphrase": "Test SDF Network ; September 2015",
+      "router": "CDVDU67TASWDY7ECUQWGPIIAYVLFYTGULAQVLMUEYRIBILVHKJHBCPSI",
+      "adapters": {
+        "axelar-its": "CBK3TPRQR5A3H2AWESOUX4MVYOP63VNQ5EYHCX26EEJUC5B5FLB4DV5O",
+        "cctp": "CDBV6A5IQ5AL5KBWDJIHUQSIJZF7GMPZTRJ2TE6GTRRHDO5RRECXSKBO"
+      },
+      "tokens": {
+        "USDC": {
+          "sacId": "CD5IB466XCQIUDYWV22PUMJTF6EE3KPXBDGLLBSKAPNE6QPXVUZLXJGA",
+          "code": "USDC",
+          "issuer": "GBLUB2OAKSNBM4EZJWXC3ODA4YRQCCCMMWJNYUZZEYFPSDCPPULU7WWY",
+          "decimals": 7,
+          "flowLimit": "10000000000000",
+          "routes": ["axelar-its", "cctp"]
+        }
+      },
+      "treasury": "GC4FD5G3CZJ57VPYTVNWU4FRDLLV37EYDGT3OVZA35WKHBWDI6PKTYTN",
+      "admin": "GD4IEL76RCF2CULJZAKDTEZOQIIUTH3JDKY52W7SR6GBI42PZFIZGWIB",
+      "guardian": "GCK4I7AM6GVA5XORMZ6SZHJUNNSDYBBXWNYUQHHQLAMGAMZUNG3PJWI6",
+      "feeBps": 30,
+      "flowWindow": 720,
+      "timelockDelay": 3600,
+      "wasmHashes": {
+        "router": "3b6f1d29a4c8e05f71b2d8460a9c3e7f5d2140b8c96e3a7f04d1b8529ce6a03f",
+        "adapter-axelar": "5f32139554d29edc3501a39ae3d05761101234523dd48b4d9e2d81ebf001f2c3",
+        "adapter-cctp": "a71c4e08d35b92f6071e8c4d5a3b20f9e68d471c0b5a9e23f8d4061c7b2e95a8"
+      },
+      "deployedAt": {
+        "ledger": 6100100,
+        "timestamp": "2026-10-30T00:00:00.000Z"
+      },
+      "commit": "rehearsal01"
+    }
+  }
+}

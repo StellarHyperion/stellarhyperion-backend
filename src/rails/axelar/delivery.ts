@@ -18,7 +18,7 @@ import {
   toEvmAddress,
 } from "@hyperion/protocol";
 import { createPublicClient, http, stringToHex } from "viem";
-import type { AppConfig } from "../../config/config.js";
+import { destinationRpcUrl, type AppConfig } from "../../config/config.js";
 import type { Transactional } from "../../db/pool.js";
 import { bigintOf, text } from "../../db/rows.js";
 import type { InboundRow, Position } from "../../chains/writers.js";
@@ -86,7 +86,10 @@ export async function verifyItsDelivery(
     throw new Error("Source token id is invalid.");
   const tokenId = toHex(id);
   const client = createPublicClient({
-    transport: http(destination.defaultRpcUrl, { timeout: 15_000, retryCount: 0 }),
+    transport: http(destinationRpcUrl(config, transfer.destinationChain), {
+      timeout: 15_000,
+      retryCount: 0,
+    }),
   });
   if ((await client.getChainId()) !== destination.chainId)
     throw new Error("Destination RPC chain mismatch.");

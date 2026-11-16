@@ -71,6 +71,18 @@ One process serializes its Stellar submissions to avoid sequence conflicts. Run 
 
 `npm run check` runs formatting, lint, type checking and tests. Schema/API regressions execute repository migrations in embedded PostgreSQL (PGlite). The full PostgreSQL integration suite requires `TEST_DATABASE_URL`; it is skipped when unset. Use `npm run build` for emitted production code.
 
+## Local recovery rehearsal
+
+`docker-compose.rehearsal.yml` and `src/rehearsal/recovery.ts` run an isolated multi-service setup (`rehearsal-postgres`, `rehearsal-providers`, `rehearsal-indexer` and `rehearsal-api`) against dedicated fixtures in `test/fixtures/rehearsal-deployments-testnet.json` and `test/fixtures/rehearsal-stellar-events.json` with no production or live RPC dependencies:
+
+```bash
+docker compose -f docker-compose.rehearsal.yml up --build -d
+```
+
+- The API-only replica (`INDEXER_ENABLED=false`, `RAILS_ENABLED=false`, `RUN_MIGRATIONS=false`) reports replica availability on `GET /ready` (`role: "api-only"`) independently of background workers.
+- Worker cursor age is reported separately on `GET /v1/metrics` under `workerFreshness` (`fresh`, `stale`, `incomplete` or `empty`, controlled by `WORKER_FRESHNESS_STALE_MS`).
+- Destination receipt verification honors `EVM_RPC_URL_<CHAIN>` / `EVM_RPC_URLS_<CHAIN>` even when the deployment record defines no EVM Hyperion router, and never records `inbound_delivery` from a rail status response alone.
+
 RPC event retention is finite. A fresh deployment record may predate the public RPC's retained history; initialize `STELLAR_START_LEDGER` within retained history only if you accept that older events are unavailable, or use a historical provider. Check readiness and logs rather than treating an empty database as complete history.
 
 ## Verified testnet status

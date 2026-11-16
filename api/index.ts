@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { resolve as resolvePath } from "node:path";
 import type { FastifyInstance } from "fastify";
+import { buildIndexer } from "../src/chains/runner.js";
 import { loadConfig } from "../src/config/config.js";
 import { Database } from "../src/db/pool.js";
 import { buildServer } from "../src/http/server.js";
@@ -27,11 +28,13 @@ async function getApp(): Promise<FastifyInstance> {
     connectionTimeoutMs: 2000,
   });
 
+  const indexer = buildIndexer({ config, logger, db });
+
   app = buildServer({
     config,
     logger,
     db,
-    readiness: [],
+    readiness: indexer.readiness,
     startedAt,
   });
 

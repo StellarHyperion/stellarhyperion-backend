@@ -56,10 +56,44 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       updatedAt: new Date(row.updated_at as string | number | Date).toISOString(),
     }));
 
+    const currentTime = deps.now?.() ?? new Date();
+    const watchedChains: string[] = [
+      ...(deps.config.indexer.stellar ? [deps.config.indexer.stellar.chain] : []),
+      ...deps.config.indexer.evm.map((entry) => entry.chain),
+    ];
+    const missingCursors = watchedChains.filter(
+      (chain) => !cursors.some((cursor) => cursor.chain === chain),
+    );
+    const relevantCursors =
+      watchedChains.length > 0
+        ? cursors.filter((cursor) => watchedChains.includes(cursor.chain))
+        : cursors;
+    const agesMs = relevantCursors.map((cursor) =>
+      Math.max(0, currentTime.getTime() - Date.parse(cursor.updatedAt)),
+    );
+    const maxCursorAgeMs = agesMs.length > 0 ? Math.max(...agesMs) : null;
+    const latestCursorUpdatedAt =
+      relevantCursors.length > 0
+        ? relevantCursors.reduce(
+            (latest, cursor) =>
+              Date.parse(cursor.updatedAt) > Date.parse(latest) ? cursor.updatedAt : latest,
+            relevantCursors[0]?.updatedAt ?? "",
+          )
+        : null;
+    const freshnessState: "fresh" | "stale" | "incomplete" | "empty" =
+      relevantCursors.length === 0
+        ? "empty"
+        : missingCursors.length > 0
+          ? "incomplete"
+          : maxCursorAgeMs !== null && maxCursorAgeMs > deps.config.workerFreshnessStaleMs
+            ? "stale"
+            : "fresh";
+
     return reply.send({
       service: "hyperion-backend",
+      role: deps.config.indexer.enabled ? "worker" : "api-only",
       network: deps.config.network,
-      uptimeSeconds: Math.floor((Date.now() - startedAt.getTime()) / 1000),
+      uptimeSeconds: Math.floor((currentTime.getTime() - startedAt.getTime()) / 1000),
       transfers: {
         totalOutbound,
         totalInbound,
@@ -67,6 +101,17 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       claims,
       railAttestations: railStatusCounts,
       cursors,
+      workerFreshness: {
+        state: freshnessState,
+        indexerEnabled: deps.config.indexer.enabled,
+        railsEnabled: deps.config.rails.enabled,
+        keeperEnabled: deps.config.keeper.enabled,
+        staleAfterMs: deps.config.workerFreshnessStaleMs,
+        maxCursorAgeMs,
+        latestCursorUpdatedAt,
+        watchedChains,
+        missingCursors,
+      },
     });
   });
 }

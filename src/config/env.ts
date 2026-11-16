@@ -292,6 +292,22 @@ export class EnvReader {
 
   /** A value in an error message, or a description of it when printing it would leak a secret. */
   private show(spec: VarSpec, raw: string): string {
-    return spec.printable ? `"${raw}"` : `a ${raw.length} character value`;
+    if (!spec.printable) return `a ${raw.length} character value`;
+    return `"${redactUrlUserinfo(raw)}"`;
   }
+}
+
+/** Strip userinfo from URL-shaped inputs so credentials never appear in diagnostic messages. */
+export function redactUrlUserinfo(raw: string): string {
+  try {
+    const parsed = new URL(raw);
+    if (parsed.username !== "" || parsed.password !== "") {
+      parsed.username = "";
+      parsed.password = "";
+      return parsed.toString();
+    }
+  } catch {
+    // Not a URL; fall through to credential-pattern check below.
+  }
+  return raw.replace(/([a-z][a-z0-9+.-]*:\/\/)([^/@\s]+)@/gi, "$1");
 }

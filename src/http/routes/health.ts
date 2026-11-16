@@ -61,9 +61,12 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
     const status = state === "down" ? 503 : 200;
     return reply.code(status).send({
       status: state,
+      role: deps.config.indexer.enabled ? "worker" : "api-only",
       meaning: READINESS_MEANING,
       network: deps.config.network,
       indexer: deps.config.indexer.enabled ? "enabled" : "disabled",
+      rails: deps.config.rails.enabled ? "enabled" : "disabled",
+      keeper: deps.config.keeper.enabled ? "enabled" : "disabled",
       checks,
     });
   });

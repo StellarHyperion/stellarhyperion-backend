@@ -15,11 +15,12 @@ ENV NODE_ENV=production \
     HYPERION_DEPLOYMENTS_FILE=./deployments/testnet.json \
     INDEXER_ENABLED=true \
     RAILS_ENABLED=true \
-    KEEPER_ENABLED=false
+    KEEPER_ENABLED=false \
+    RUN_MIGRATIONS=true
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./
 COPY migrations ./migrations
 COPY deployments/testnet.json ./deployments/testnet.json
 USER node
-CMD ["sh", "-c", "npm run migrate:up && exec node dist/main.js"]
+CMD ["sh", "-c", "if [ \"$RUN_MIGRATIONS\" = \"true\" ]; then npm run migrate:up; fi && exec node dist/main.js"]

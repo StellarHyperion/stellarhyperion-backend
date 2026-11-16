@@ -110,8 +110,12 @@ export interface AppConfig {
   readonly deploymentsFile: string;
   readonly deployments: DeploymentSet;
   readonly indexer: IndexerConfig;
+  /** Resolved RPC endpoints per EVM chain on this network for canonical destination receipt checks. */
+  readonly destinationRpcUrls: Readonly<Partial<Record<ChainKey, readonly string[]>>>;
   readonly rails: RailsConfig;
   readonly keeper: KeeperConfig;
+  /** Maximum age of a stored indexer cursor before worker freshness is reported as stale. */
+  readonly workerFreshnessStaleMs: number;
   readonly shutdownTimeoutMs: number;
 }
 
@@ -323,6 +327,17 @@ const KEEPER_STELLAR_SECRET: VarSpec = {
     "Secret key for submitting Stellar keep_alive and claim transactions. Optional; runs dry-run when absent.",
 };
 
+const WORKER_FRESHNESS_STALE_MS: VarSpec = {
+  name: "WORKER_FRESHNESS_STALE_MS",
+  kind: "integer",
+  required: false,
+  fallback: "300000",
+  min: 1_000,
+  printable: true,
+  purpose:
+    "Maximum age in milliseconds of stored indexer cursors before worker freshness reports stale.",
+};
+
 const SHUTDOWN_TIMEOUT_MS: VarSpec = {
   name: "SHUTDOWN_TIMEOUT_MS",
   kind: "integer",
@@ -456,6 +471,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const network = reader.choice(HYPERION_NETWORK);
   const deploymentsPath = reader.string(DEPLOYMENTS_FILE);
   const indexerEnabled = reader.boolean(INDEXER_ENABLED);
+  const workerFreshnessStaleMs = reader.integer(WORKER_FRESHNESS_STALE_MS);
   const shutdownTimeoutMs = reader.integer(SHUTDOWN_TIMEOUT_MS);
 
   const railsEnabled = reader.boolean(RAILS_ENABLED);
@@ -485,6 +501,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
 
   const absoluteDeployments = deploymentsPath === "" ? "" : resolvePath(cwd, deploymentsPath);
   const deployments = readDeployments(reader, read, absoluteDeployments);
+  const destinationRpcUrls = planDestinationRpcs(reader, network);
   const indexer = planIndexer(reader, {
     network,
     deployments,
@@ -496,6 +513,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     evmPollIntervalMs,
     logRange,
     reorgDepthOverride,
+    destinationRpcUrls,
     env,
   });
 
@@ -512,6 +530,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     deploymentsFile: absoluteDeployments,
     deployments,
     indexer,
+    destinationRpcUrls,
     rails: {
       enabled: railsEnabled,
       irisUrl: irisOverride === "" ? IRIS_API[network] : irisOverride,
@@ -527,8 +546,37 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       concurrency: keeperConcurrency,
       stellarSecret: keeperStellarSecret,
     },
+    workerFreshnessStaleMs,
     shutdownTimeoutMs,
   };
+}
+
+/** Primary RPC endpoint for canonical destination receipt verification on `chain`. */
+export function destinationRpcUrl(config: AppConfig, chain: ChainKey): string {
+  const configured = config.destinationRpcUrls[chain];
+  return configured?.[0] ?? CHAINS[chain].defaultRpcUrl;
+}
+
+function planDestinationRpcs(
+  reader: EnvReader,
+  network: NetworkMode,
+): Readonly<Partial<Record<ChainKey, readonly string[]>>> {
+  if (reader.failed(HYPERION_NETWORK)) return {};
+
+  const resolved: Partial<Record<ChainKey, readonly string[]>> = {};
+  for (const chain of chainsFor(network)) {
+    if (!isEvmChain(chain)) continue;
+    const override = rpcOverrideSpec(chain.key);
+    const urlsOverride = rpcUrlsOverrideSpec(chain.key);
+    if (reader.has(urlsOverride.name)) {
+      resolved[chain.key] = reader.urls(urlsOverride);
+    } else if (reader.has(override.name)) {
+      resolved[chain.key] = reader.urls(override);
+    } else {
+      resolved[chain.key] = [chain.defaultRpcUrl];
+    }
+  }
+  return resolved;
 }
 
 const EMPTY_SET: DeploymentSet = { schemaVersion: 1, generatedAt: "", networks: {} };
@@ -584,6 +632,7 @@ interface PlanInput {
   readonly evmPollIntervalMs: number;
   readonly logRange: number;
   readonly reorgDepthOverride: number | null;
+  readonly destinationRpcUrls: Readonly<Partial<Record<ChainKey, readonly string[]>>>;
   readonly env: Readonly<Record<string, string | undefined>>;
 }
 
@@ -659,16 +708,7 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
         );
         continue;
       }
-      const override = rpcOverrideSpec(chainKey);
-      const urlsOverride = rpcUrlsOverrideSpec(chainKey);
-      let rpcUrls: readonly string[];
-      if (reader.has(urlsOverride.name)) {
-        rpcUrls = reader.urls(urlsOverride);
-      } else if (reader.has(override.name)) {
-        rpcUrls = reader.urls(override);
-      } else {
-        rpcUrls = [chain.defaultRpcUrl];
-      }
+      const rpcUrls = input.destinationRpcUrls[chainKey] ?? [chain.defaultRpcUrl];
       const rpcUrl = rpcUrls[0] ?? chain.defaultRpcUrl;
       evm.push({
         chain: chainKey,

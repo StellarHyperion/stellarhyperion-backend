@@ -1,0 +1,103 @@
+# Isolated local multi-service recovery rehearsal.
+#
+# Runs dedicated PostgreSQL, loopback mock providers, an API-only replica, and a separate
+# indexer/rail worker against rehearsal-only fixtures with zero production or public testnet calls:
+#
+#   docker compose -f docker-compose.rehearsal.yml up --build -d
+services:
+  rehearsal-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: rehearsal
+      POSTGRES_PASSWORD: rehearsal-local-only
+      POSTGRES_DB: hyperion_rehearsal
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    ports:
+      - "127.0.0.1:55433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rehearsal -d hyperion_rehearsal"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  rehearsal-providers:
+    build: .
+    environment:
+      REHEARSAL_PROVIDER_HOST: 0.0.0.0
+      REHEARSAL_PROVIDER_PORT: "18090"
+      REHEARSAL_DEPLOYMENTS_FILE: /app/rehearsal-fixtures/rehearsal-deployments-testnet.json
+      REHEARSAL_EVENTS_FILE: /app/rehearsal-fixtures/rehearsal-stellar-events.json
+    volumes:
+      - ./test/fixtures:/app/rehearsal-fixtures:ro
+    ports:
+      - "127.0.0.1:18090:18090"
+    command: ["node", "dist/rehearsal/recovery.js", "--serve-providers"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:18090/health').then((r)=>{if(!r.ok)process.exit(1)})",
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  rehearsal-indexer:
+    build: .
+    depends_on:
+      rehearsal-postgres:
+        condition: service_healthy
+      rehearsal-providers:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: "18081"
+      DATABASE_URL: postgres://rehearsal:rehearsal-local-only@rehearsal-postgres:5432/hyperion_rehearsal
+      HYPERION_NETWORK: testnet
+      HYPERION_DEPLOYMENTS_FILE: /app/rehearsal-fixtures/rehearsal-deployments-testnet.json
+      INDEXER_ENABLED: "true"
+      RAILS_ENABLED: "true"
+      KEEPER_ENABLED: "false"
+      RUN_MIGRATIONS: "true"
+      WORKER_FRESHNESS_STALE_MS: "15000"
+      STELLAR_POLL_INTERVAL_MS: "1000"
+      RAIL_POLL_INTERVAL_MS: "2000"
+      STELLAR_RPC_URL: http://rehearsal-providers:18090/soroban
+      IRIS_API_URL: http://rehearsal-providers:18090/iris
+      AXELAR_API_URL: http://rehearsal-providers:18090/axelar
+      EVM_RPC_URL_SEPOLIA: http://rehearsal-providers:18090/sepolia
+    volumes:
+      - ./test/fixtures:/app/rehearsal-fixtures:ro
+    ports:
+      - "127.0.0.1:18081:18081"
+
+  rehearsal-api:
+    build: .
+    depends_on:
+      rehearsal-postgres:
+        condition: service_healthy
+      rehearsal-indexer:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: "18080"
+      DATABASE_URL: postgres://rehearsal:rehearsal-local-only@rehearsal-postgres:5432/hyperion_rehearsal
+      HYPERION_NETWORK: testnet
+      HYPERION_DEPLOYMENTS_FILE: /app/rehearsal-fixtures/rehearsal-deployments-testnet.json
+      INDEXER_ENABLED: "false"
+      RAILS_ENABLED: "false"
+      KEEPER_ENABLED: "false"
+      RUN_MIGRATIONS: "false"
+      WORKER_FRESHNESS_STALE_MS: "15000"
+      STELLAR_RPC_URL: http://rehearsal-providers:18090/soroban
+      IRIS_API_URL: http://rehearsal-providers:18090/iris
+      AXELAR_API_URL: http://rehearsal-providers:18090/axelar
+      EVM_RPC_URL_SEPOLIA: http://rehearsal-providers:18090/sepolia
+    volumes:
+      - ./test/fixtures:/app/rehearsal-fixtures:ro
+    ports:
+      - "127.0.0.1:18080:18080"
