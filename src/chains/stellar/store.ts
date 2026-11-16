@@ -13,7 +13,17 @@
 import { ROUTE_KINDS } from "@hyperion/protocol";
 
 import type { Queryable } from "../../db/pool.js";
-import { bigintOf, maybeOne, text, textOrNull, timestampOrNull } from "../../db/rows.js";
+import {
+  bigintOf,
+  bigintOrNull,
+  integer,
+  integerOrNull,
+  maybeOne,
+  text,
+  textOrNull,
+  timestamp,
+  timestampOrNull,
+} from "../../db/rows.js";
 import type { Position } from "../writers.js";
 import {
   settleAction,
@@ -36,6 +46,17 @@ import type {
   TokenRegisteredEvent,
 } from "./events.js";
 
+/** Explicit operator diagnostic raised when watched deployment metadata conflicts with stored cursor history. */
+export class StellarDeploymentConflictError extends Error {
+  constructor(
+    readonly chainKey: string,
+    readonly detail: string,
+  ) {
+    super(detail);
+    this.name = "StellarDeploymentConflictError";
+  }
+}
+
 /** Where a watcher has read up to. */
 export interface ChainCursor {
   readonly position: bigint;
@@ -43,11 +64,29 @@ export interface ChainCursor {
   readonly observedAt: Date | null;
   /** EVM only. Null on Stellar, where a closed ledger cannot change. */
   readonly hash: string | null;
+  /** Monotonic watched deployment revision for this chain cursor. */
+  readonly deploymentRevision: number;
+  /** Configured start ledger recorded for the active Stellar deployment revision. */
+  readonly startLedger: bigint | null;
+}
+
+/** Historical or active Stellar router deployment cursor snapshot. */
+export interface StellarDeploymentRecord {
+  readonly chainKey: string;
+  readonly deploymentRevision: number;
+  readonly contract: string;
+  readonly startLedger: bigint;
+  readonly lastProcessed: bigint;
+  readonly observedAt: Date | null;
+  readonly status: "active" | "superseded";
+  readonly activatedAt: Date;
+  readonly supersededAt: Date | null;
 }
 
 export async function readCursor(db: Queryable, chainKey: string): Promise<ChainCursor | null> {
   const { rows } = await db.query(
-    `SELECT last_processed, contract, last_processed_at, last_processed_hash
+    `SELECT last_processed, contract, last_processed_at, last_processed_hash,
+            deployment_revision, start_ledger
        FROM indexer_cursor WHERE chain_key = $1`,
     [chainKey],
   );
@@ -58,15 +97,115 @@ export async function readCursor(db: Queryable, chainKey: string): Promise<Chain
     contract: text(row, "contract"),
     observedAt: timestampOrNull(row, "last_processed_at"),
     hash: textOrNull(row, "last_processed_hash"),
+    deploymentRevision: integerOrNull(row, "deployment_revision") ?? 1,
+    startLedger: bigintOrNull(row, "start_ledger"),
   };
+}
+
+export async function readStellarDeploymentHistory(
+  db: Queryable,
+  chainKey: string,
+): Promise<readonly StellarDeploymentRecord[]> {
+  const { rows } = await db.query(
+    `SELECT chain_key, deployment_revision, contract, start_ledger, last_processed,
+            last_processed_at, status, activated_at, superseded_at
+       FROM stellar_deployment_cursor
+      WHERE chain_key = $1
+      ORDER BY deployment_revision ASC`,
+    [chainKey],
+  );
+  return rows.map((row) => {
+    const rawStatus = text(row, "status");
+    if (rawStatus !== "active" && rawStatus !== "superseded") {
+      throw new Error(`unexpected stellar_deployment_cursor status: ${rawStatus}`);
+    }
+    return {
+      chainKey: text(row, "chain_key"),
+      deploymentRevision: integer(row, "deployment_revision"),
+      contract: text(row, "contract"),
+      startLedger: bigintOf(row, "start_ledger"),
+      lastProcessed: bigintOf(row, "last_processed"),
+      observedAt: timestampOrNull(row, "last_processed_at"),
+      status: rawStatus,
+      activatedAt: timestamp(row, "activated_at"),
+      supersededAt: timestampOrNull(row, "superseded_at"),
+    };
+  });
+}
+
+export async function supersedeStellarDeploymentCursor(
+  db: Queryable,
+  entry: {
+    readonly chainKey: string;
+    readonly deploymentRevision: number;
+    readonly contract: string;
+    readonly startLedger: bigint;
+    readonly position: bigint;
+    readonly observedAt: Date | null;
+  },
+): Promise<void> {
+  await db.query(
+    `INSERT INTO stellar_deployment_cursor
+       (chain_key, deployment_revision, contract, start_ledger, last_processed, last_processed_at, status, superseded_at)
+     VALUES ($1, $2, $3, $4, $5, $6, 'superseded', now())
+     ON CONFLICT (chain_key, deployment_revision) DO UPDATE
+       SET last_processed = EXCLUDED.last_processed,
+           last_processed_at = EXCLUDED.last_processed_at,
+           status = 'superseded',
+           superseded_at = COALESCE(stellar_deployment_cursor.superseded_at, now()),
+           updated_at = now()`,
+    [
+      entry.chainKey,
+      entry.deploymentRevision,
+      entry.contract,
+      entry.startLedger.toString(),
+      entry.position.toString(),
+      entry.observedAt,
+    ],
+  );
+}
+
+export async function writeStellarDeploymentCursor(
+  db: Queryable,
+  entry: {
+    readonly chainKey: string;
+    readonly deploymentRevision: number;
+    readonly contract: string;
+    readonly startLedger: bigint;
+    readonly position: bigint;
+    readonly observedAt: Date | null;
+  },
+): Promise<void> {
+  await db.query(
+    `INSERT INTO stellar_deployment_cursor
+       (chain_key, deployment_revision, contract, start_ledger, last_processed, last_processed_at, status, superseded_at)
+     VALUES ($1, $2, $3, $4, $5, $6, 'active', NULL)
+     ON CONFLICT (chain_key, deployment_revision) DO UPDATE
+       SET contract = EXCLUDED.contract,
+           start_ledger = EXCLUDED.start_ledger,
+           last_processed = EXCLUDED.last_processed,
+           last_processed_at = EXCLUDED.last_processed_at,
+           status = 'active',
+           superseded_at = NULL,
+           updated_at = now()`,
+    [
+      entry.chainKey,
+      entry.deploymentRevision,
+      entry.contract,
+      entry.startLedger.toString(),
+      entry.position.toString(),
+      entry.observedAt,
+    ],
+  );
 }
 
 /**
  * Advance the cursor, or create it.
  *
- * The contract is part of the write rather than just the read. A redeployed router at a new address
- * shares no history with the old one, so a cursor carried across would skip everything the new one
- * has ever done, silently. Storing it means the watcher can notice.
+ * The contract and deployment revision are part of the write rather than just the read. A
+ * redeployed router at a new address shares no history with the old one, so a cursor carried across
+ * would skip everything the new one has ever done, silently. Storing them means the watcher can
+ * archive the prior router cursor and start the replacement deployment from its own start ledger.
  */
 export async function writeCursor(
   db: Queryable,
@@ -77,18 +216,23 @@ export async function writeCursor(
     readonly position: bigint;
     readonly observedAt: Date | null;
     readonly hash: string | null;
+    readonly deploymentRevision?: number;
+    readonly startLedger?: bigint | null;
   },
 ): Promise<void> {
   await db.query(
     `INSERT INTO indexer_cursor
-       (chain_key, family, contract, last_processed, last_processed_at, last_processed_hash)
-     VALUES ($1, $2, $3, $4, $5, $6)
+       (chain_key, family, contract, last_processed, last_processed_at, last_processed_hash,
+        deployment_revision, start_ledger)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      ON CONFLICT (chain_key) DO UPDATE
        SET contract = EXCLUDED.contract,
            family = EXCLUDED.family,
            last_processed = EXCLUDED.last_processed,
            last_processed_at = EXCLUDED.last_processed_at,
            last_processed_hash = EXCLUDED.last_processed_hash,
+           deployment_revision = EXCLUDED.deployment_revision,
+           start_ledger = EXCLUDED.start_ledger,
            updated_at = now()`,
     [
       entry.chainKey,
@@ -97,6 +241,10 @@ export async function writeCursor(
       entry.position.toString(),
       entry.observedAt,
       entry.hash,
+      entry.deploymentRevision ?? 1,
+      entry.startLedger === undefined || entry.startLedger === null
+        ? null
+        : entry.startLedger.toString(),
     ],
   );
 }

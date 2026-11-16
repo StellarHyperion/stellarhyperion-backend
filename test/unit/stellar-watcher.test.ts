@@ -6,11 +6,19 @@
  * even when it finds nothing, a page and the cursor advance commit together, and a cursor is never
  * reused across routers.
  */
+import { readdirSync, readFileSync } from "node:fs";
+import { PGlite } from "@electric-sql/pglite";
 import { describe, expect, it } from "vitest";
 
 import { endOfLedgerCursor } from "../../src/chains/stellar/cursor.js";
 import type { RawStellarEvent } from "../../src/chains/stellar/events.js";
+import {
+  StellarDeploymentConflictError,
+  readCursor,
+  readStellarDeploymentHistory,
+} from "../../src/chains/stellar/store.js";
 import { StellarWatcher } from "../../src/chains/stellar/watcher.js";
+import type { Queryable, Transactional } from "../../src/db/pool.js";
 import {
   FakeRpc,
   LIVE_ROUTER,
@@ -342,5 +350,296 @@ describe("gaps it cannot close", () => {
 
     const warnings = lines.filter((line) => line.message.includes("running ahead of the indexer"));
     expect(warnings).toHaveLength(1);
+  });
+});
+
+async function openMigratedPgLite(): Promise<{
+  readonly db: Transactional & Queryable;
+  readonly close: () => Promise<void>;
+}> {
+  const pg = new PGlite();
+  const migrationsDir = new URL("../../migrations/", import.meta.url);
+  const files = readdirSync(migrationsDir)
+    .filter((entry) => entry.endsWith(".sql"))
+    .sort();
+  for (const file of files) {
+    const sql = readFileSync(new URL(file, migrationsDir), "utf8").split("-- Down Migration")[0]!;
+    await pg.exec(sql);
+  }
+
+  const runQuery = async (sql: string, params: readonly unknown[] = []) => {
+    const result = await pg.query(sql, [...params]);
+    const int8 = result.fields
+      .filter((field) => field.dataTypeID === 20)
+      .map((field) => field.name);
+    const rows = result.rows.map((raw) => {
+      const row = { ...(raw as Record<string, unknown>) };
+      for (const column of int8) {
+        const value = row[column];
+        if (typeof value === "number" || typeof value === "bigint") row[column] = String(value);
+      }
+      return row;
+    });
+    return {
+      rows,
+      rowCount: result.rows.length > 0 ? result.rows.length : (result.affectedRows ?? 0),
+    };
+  };
+
+  const queryable: Queryable = { query: runQuery };
+  const db: Transactional & Queryable = {
+    query: runQuery,
+    async transaction<T>(work: (tx: Queryable) => Promise<T>): Promise<T> {
+      await pg.exec("BEGIN");
+      try {
+        const out = await work(queryable);
+        await pg.exec("COMMIT");
+        return out;
+      } catch (error) {
+        await pg.exec("ROLLBACK");
+        throw error;
+      }
+    },
+  };
+
+  return {
+    db,
+    close: async () => {
+      await pg.close();
+    },
+  };
+}
+
+describe("deployment revision handling", () => {
+  const SECOND_ROUTER = "CBK3TPRQR5A3H2AWESOUX4MVYOP63VNQ5EYHCX26EEJUC5B5FLB4DV5O";
+  const THIRD_ROUTER = "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75";
+
+  it("starts a replacement router from its own startLedger without inheriting prior positions and keeps old deployment history queryable", async () => {
+    const { db, close } = await openMigratedPgLite();
+    try {
+      const { logger } = capturingLogger();
+      const firstRpc = new FakeRpc({
+        events: ROUTER_HISTORY,
+        latestLedger: 4_994_010,
+      });
+      const v1 = new StellarWatcher({
+        chainKey: CHAIN,
+        router: LIVE_ROUTER,
+        startLedger: FIRST_EVENT_LEDGER,
+        deploymentRevision: 1,
+        pageSize: 200,
+        rpc: firstRpc,
+        db,
+        logger,
+      });
+
+      while (await v1.tick(AbortSignal.timeout(5_000))) {
+        // catch up v1 to 4_994_010
+      }
+
+      const v1Cursor = await readCursor(db, CHAIN);
+      expect(v1Cursor?.contract).toBe(LIVE_ROUTER);
+      expect(v1Cursor?.position).toBe(4_994_010n);
+      expect(v1Cursor?.deploymentRevision).toBe(1);
+      expect(v1Cursor?.startLedger).toBe(BigInt(FIRST_EVENT_LEDGER));
+
+      // Replace router at an earlier startLedger than v1's cursor position to prove no position inheritance.
+      const v2StartLedger = 4_980_000;
+      const v2Queued = ROUTER_HISTORY.find((event) => event.topicJson[1]?.symbol === "queued");
+      if (!v2Queued) throw new Error("Missing queued fixture event");
+      const v2Event: RawStellarEvent = {
+        ...v2Queued,
+        contractId: SECOND_ROUTER,
+        ledger: 4_980_005,
+        id: `${toid(4_980_005, 0, 1).toString().padStart(19, "0")}-0000000000`,
+        txHash: "ab".repeat(32),
+        ledgerClosedAt: "2026-10-05T08:00:00Z",
+      };
+      const secondRpc = new FakeRpc({
+        events: [v2Event],
+        latestLedger: 4_995_000,
+      });
+      const v2 = new StellarWatcher({
+        chainKey: CHAIN,
+        router: SECOND_ROUTER,
+        startLedger: v2StartLedger,
+        deploymentRevision: 2,
+        pageSize: 200,
+        rpc: secondRpc,
+        db,
+        logger,
+      });
+
+      const firstPassProgressed = await v2.tick(AbortSignal.timeout(5_000));
+      expect(firstPassProgressed).toBe(true);
+      expect(secondRpc.requests[0]?.startLedger).toBe(v2StartLedger);
+      expect(secondRpc.requests[0]?.cursor).toBeUndefined();
+
+      // Second pass resumes from v2's boundary cursor rather than v1's old cursor.
+      const secondPassProgressed = await v2.tick(AbortSignal.timeout(5_000));
+      expect(secondPassProgressed).toBe(false);
+      expect(secondRpc.requests[1]?.cursor).toBe(endOfLedgerCursor(4_989_999));
+
+      const activeCursor = await readCursor(db, CHAIN);
+      expect(activeCursor?.contract).toBe(SECOND_ROUTER);
+      expect(activeCursor?.deploymentRevision).toBe(2);
+      expect(activeCursor?.startLedger).toBe(BigInt(v2StartLedger));
+      expect(activeCursor?.position).toBe(4_995_000n);
+      expect(activeCursor?.observedAt?.toISOString()).toBe("2026-10-05T08:00:00.000Z");
+
+      const history = await readStellarDeploymentHistory(db, CHAIN);
+      expect(history).toHaveLength(2);
+      expect(history[0]).toMatchObject({
+        chainKey: CHAIN,
+        deploymentRevision: 1,
+        contract: LIVE_ROUTER,
+        startLedger: BigInt(FIRST_EVENT_LEDGER),
+        lastProcessed: 4_994_010n,
+        status: "superseded",
+      });
+      expect(history[0]?.supersededAt).toBeInstanceOf(Date);
+      expect(history[1]).toMatchObject({
+        chainKey: CHAIN,
+        deploymentRevision: 2,
+        contract: SECOND_ROUTER,
+        startLedger: BigInt(v2StartLedger),
+        lastProcessed: 4_995_000n,
+        status: "active",
+        supersededAt: null,
+      });
+
+      // Historical rows emitted by v1 remain intact and queryable in materialized tables.
+      const actions = await db.query(
+        "SELECT count(*)::int AS n FROM admin_action WHERE chain = $1",
+        [CHAIN],
+      );
+      expect(Number(actions.rows[0]?.n)).toBe(7);
+    } finally {
+      await close();
+    }
+  });
+
+  it("raises StellarDeploymentConflictError with explicit operator diagnostics on conflicting revisions or routers", async () => {
+    const { db, close } = await openMigratedPgLite();
+    try {
+      const { logger } = capturingLogger();
+      const rpc = new FakeRpc({ events: [], latestLedger: 4_994_010 });
+
+      const v1 = new StellarWatcher({
+        chainKey: CHAIN,
+        router: LIVE_ROUTER,
+        startLedger: FIRST_EVENT_LEDGER,
+        deploymentRevision: 1,
+        pageSize: 200,
+        rpc,
+        db,
+        logger,
+      });
+      await v1.tick(AbortSignal.timeout(5_000));
+
+      // 1. Different router without incrementing deploymentRevision.
+      const unincremented = new StellarWatcher({
+        chainKey: CHAIN,
+        router: SECOND_ROUTER,
+        startLedger: 4_990_000,
+        deploymentRevision: 1,
+        pageSize: 200,
+        rpc,
+        db,
+        logger,
+      });
+      await expect(unincremented.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+        StellarDeploymentConflictError,
+      );
+      await expect(unincremented.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+        /increment deploymentRevision/,
+      );
+
+      // 2. Same router with mismatched deploymentRevision.
+      const bumpedSameRouter = new StellarWatcher({
+        chainKey: CHAIN,
+        router: LIVE_ROUTER,
+        startLedger: FIRST_EVENT_LEDGER,
+        deploymentRevision: 2,
+        pageSize: 200,
+        rpc,
+        db,
+        logger,
+      });
+      await expect(bumpedSameRouter.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+        StellarDeploymentConflictError,
+      );
+
+      // 3. Same router and revision with conflicting startLedger.
+      const changedStartLedger = new StellarWatcher({
+        chainKey: CHAIN,
+        router: LIVE_ROUTER,
+        startLedger: FIRST_EVENT_LEDGER + 500,
+        deploymentRevision: 1,
+        pageSize: 200,
+        rpc,
+        db,
+        logger,
+      });
+      await expect(changedStartLedger.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+        /conflicting with configured startLedger/,
+      );
+
+      // 4. Valid advance to revision 2, followed by illegal regression to revision 1 or reuse of superseded router.
+      const v2 = new StellarWatcher({
+        chainKey: CHAIN,
+        router: SECOND_ROUTER,
+        startLedger: 4_990_000,
+        deploymentRevision: 2,
+        pageSize: 200,
+        rpc,
+        db,
+        logger,
+      });
+      await v2.tick(AbortSignal.timeout(5_000));
+
+      const regressed = new StellarWatcher({
+        chainKey: CHAIN,
+        router: THIRD_ROUTER,
+        startLedger: 4_991_000,
+        deploymentRevision: 1,
+        pageSize: 200,
+        rpc,
+        db,
+        logger,
+      });
+      await expect(regressed.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+        /regresses below recorded deployment revision/,
+      );
+
+      const reactivateSuperseded = new StellarWatcher({
+        chainKey: CHAIN,
+        router: LIVE_ROUTER,
+        startLedger: FIRST_EVENT_LEDGER,
+        deploymentRevision: 3,
+        pageSize: 200,
+        rpc,
+        db,
+        logger,
+      });
+      await expect(reactivateSuperseded.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+        /superseded deployment revision/,
+      );
+
+      // Invalid non-positive revision diagnostic.
+      const invalidRev = new StellarWatcher({
+        chainKey: CHAIN,
+        router: THIRD_ROUTER,
+        startLedger: 4_991_000,
+        deploymentRevision: 0,
+        pageSize: 200,
+        rpc,
+        db,
+        logger,
+      });
+      await expect(invalidRev.tick(AbortSignal.timeout(5_000))).rejects.toThrow(/positive integer/);
+    } finally {
+      await close();
+    }
   });
 });

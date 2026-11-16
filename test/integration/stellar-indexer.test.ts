@@ -17,6 +17,10 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import {
+  StellarDeploymentConflictError,
+  readStellarDeploymentHistory,
+} from "../../src/chains/stellar/store.js";
 import { StellarWatcher } from "../../src/chains/stellar/watcher.js";
 import { Database } from "../../src/db/pool.js";
 import { FakeRpc, LIVE_ROUTER, ROUTER_HISTORY, capturingLogger } from "../stellar-fakes.js";
@@ -37,6 +41,7 @@ const TABLES = [
   ["outbound_transfer", "origin_chain"],
   ["inbound_delivery", "destination_chain"],
   ["pending_claim", "chain"],
+  ["stellar_deployment_cursor", "chain_key"],
 ] as const;
 
 suite("replaying the live router's history", () => {
@@ -230,6 +235,50 @@ suite("replaying the live router's history", () => {
     await expect(other.tick(AbortSignal.timeout(20_000))).rejects.toThrow(
       /needs its cursor reset rather than reused/,
     );
+  });
+
+  it("replaces a router cleanly under a higher deployment revision while keeping old history queryable", async () => {
+    const { logger } = capturingLogger();
+    const replacementRouter = "CBK3TPRQR5A3H2AWESOUX4MVYOP63VNQ5EYHCX26EEJUC5B5FLB4DV5O";
+    const replacementStart = 4_992_000;
+    const replacement = new StellarWatcher({
+      chainKey: CHAIN,
+      router: replacementRouter,
+      startLedger: replacementStart,
+      deploymentRevision: 2,
+      pageSize: 200,
+      rpc: new FakeRpc({ events: [], latestLedger: HEAD }),
+      db,
+      logger,
+    });
+
+    await replacement.tick(AbortSignal.timeout(20_000));
+
+    const history = await readStellarDeploymentHistory(db, CHAIN);
+    expect(history).toHaveLength(2);
+    expect(history[0]?.contract).toBe(LIVE_ROUTER);
+    expect(history[0]?.status).toBe("superseded");
+    expect(Number(history[0]?.lastProcessed)).toBe(HEAD);
+    expect(history[1]?.contract).toBe(replacementRouter);
+    expect(history[1]?.status).toBe("active");
+    expect(Number(history[1]?.startLedger)).toBe(replacementStart);
+
+    const regressed = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      deploymentRevision: 1,
+      pageSize: 200,
+      rpc: new FakeRpc({ events: [], latestLedger: HEAD }),
+      db,
+      logger,
+    });
+    await expect(regressed.tick(AbortSignal.timeout(20_000))).rejects.toBeInstanceOf(
+      StellarDeploymentConflictError,
+    );
+
+    await clean();
+    await drain();
   });
 });
 

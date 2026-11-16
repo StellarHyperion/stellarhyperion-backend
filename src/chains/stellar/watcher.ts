@@ -31,7 +31,9 @@ import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
 import type { EventSource, EventsQuery } from "./rpc.js";
 import { StellarRpcError } from "./rpc.js";
 import {
+  StellarDeploymentConflictError,
   readCursor,
+  readStellarDeploymentHistory,
   recordActionQueued,
   recordActionSettled,
   recordBridgeIn,
@@ -41,8 +43,12 @@ import {
   recordPauseSet,
   recordRouteConfigured,
   recordTokenRegistered,
+  supersedeStellarDeploymentCursor,
   writeCursor,
+  writeStellarDeploymentCursor,
+  type ChainCursor,
   type EventContext,
+  type StellarDeploymentRecord,
 } from "./store.js";
 
 /**
@@ -72,6 +78,8 @@ export interface StellarWatcherOptions {
   readonly router: string;
   /** The ledger to start a fresh cursor from. */
   readonly startLedger: number;
+  /** Monotonic deployment revision for router replacement tracking. Defaults to 1. */
+  readonly deploymentRevision?: number;
   readonly pageSize: number;
   readonly rpc: EventSource;
   readonly db: Transactional;
@@ -143,20 +151,13 @@ export class StellarWatcher {
     const { chainKey, router, db, logger } = this.options;
 
     const stored = await readCursor(db, chainKey);
-    if (stored !== null && stored.contract !== router) {
-      // A different router at a different address shares no history with this cursor. Carrying it
-      // over would skip everything the new deployment has ever done, and it would do it silently,
-      // which is the worst available outcome. Stopping is the only honest move.
-      throw new Error(
-        `the cursor for ${chainKey} was written for router ${stored.contract} and this process is watching ${router}. ` +
-          "A redeployed router needs its cursor reset rather than reused.",
-      );
-    }
+    const history = await readStellarDeploymentHistory(db, chainKey);
+    const state = this.resolveDeploymentState(stored, history);
 
-    const base = stored === null ? this.options.startLedger - 1 : Number(stored.position);
-    const scan = await this.scan(base, stored === null, signal);
+    const { base, fresh, deploymentRevision, priorDeployment } = state;
+    const scan = await this.scan(base, fresh, signal);
 
-    if (scan.oldestLedger > base + 1 && stored !== null) {
+    if (scan.oldestLedger > base + 1 && !fresh) {
       // The retention window moved past where we stopped. Anything between the two is gone from
       // this node, and carrying on from the window edge would leave a hole nothing ever reports.
       logger.error(
@@ -180,7 +181,7 @@ export class StellarWatcher {
 
     let decoded = 0;
     let skipped = 0;
-    let closedAt = stored?.observedAt ?? null;
+    let closedAt = fresh ? null : (stored?.observedAt ?? null);
     for (const raw of scan.events) {
       if (raw.ledger <= scan.through) closedAt = new Date(raw.ledgerClosedAt);
     }
@@ -206,6 +207,17 @@ export class StellarWatcher {
         else skipped += 1;
       }
 
+      if (priorDeployment !== null) {
+        await supersedeStellarDeploymentCursor(tx, {
+          chainKey,
+          deploymentRevision: priorDeployment.deploymentRevision,
+          contract: priorDeployment.contract,
+          startLedger: priorDeployment.startLedger ?? priorDeployment.position,
+          position: priorDeployment.position,
+          observedAt: priorDeployment.observedAt,
+        });
+      }
+
       await writeCursor(tx, {
         chainKey,
         family: "stellar",
@@ -214,19 +226,162 @@ export class StellarWatcher {
         observedAt: closedAt,
         // Nothing to record: a closed ledger cannot be replaced by a different one.
         hash: null,
+        deploymentRevision,
+        startLedger: BigInt(this.options.startLedger),
+      });
+
+      await writeStellarDeploymentCursor(tx, {
+        chainKey,
+        deploymentRevision,
+        contract: router,
+        startLedger: BigInt(this.options.startLedger),
+        position: BigInt(scan.through),
+        observedAt: closedAt,
       });
     });
 
     const behind = Math.max(scan.latestLedger - scan.through, 0);
     this.lastProgress = { ledger: scan.through, decoded, skipped, behind, at: new Date() };
     logger.info(
-      { chain: chainKey, ledger: scan.through, decoded, skipped, behind, pages: scan.pages },
+      {
+        chain: chainKey,
+        deploymentRevision,
+        ledger: scan.through,
+        decoded,
+        skipped,
+        behind,
+        pages: scan.pages,
+      },
       "stellar window indexed",
     );
 
     // Behind the head means there is another window waiting, so say we progressed and let the
     // poller come straight back rather than sleeping out the interval mid-backfill.
     return behind > 0;
+  }
+
+  private resolveDeploymentState(
+    stored: ChainCursor | null,
+    history: readonly StellarDeploymentRecord[],
+  ): {
+    readonly deploymentRevision: number;
+    readonly fresh: boolean;
+    readonly base: number;
+    readonly priorDeployment: ChainCursor | null;
+  } {
+    const { chainKey, router, startLedger } = this.options;
+    const deploymentRevision = this.options.deploymentRevision ?? 1;
+
+    if (!Number.isInteger(deploymentRevision) || deploymentRevision < 1) {
+      throw new StellarDeploymentConflictError(
+        chainKey,
+        `invalid deploymentRevision ${String(deploymentRevision)} for ${chainKey}: deploymentRevision must be a positive integer.`,
+      );
+    }
+    if (!Number.isInteger(startLedger) || startLedger < 0) {
+      throw new StellarDeploymentConflictError(
+        chainKey,
+        `invalid startLedger ${String(startLedger)} for ${chainKey}: startLedger must be a non-negative integer.`,
+      );
+    }
+
+    const highestRecorded = history.reduce(
+      (max, entry) => Math.max(max, entry.deploymentRevision),
+      0,
+    );
+    if (highestRecorded > deploymentRevision) {
+      throw new StellarDeploymentConflictError(
+        chainKey,
+        `configured deploymentRevision ${String(deploymentRevision)} for ${chainKey} regresses below recorded deployment revision ${String(highestRecorded)}.`,
+      );
+    }
+
+    const existingRevision = history.find(
+      (entry) => entry.deploymentRevision === deploymentRevision,
+    );
+    if (existingRevision !== undefined) {
+      if (existingRevision.status === "superseded") {
+        throw new StellarDeploymentConflictError(
+          chainKey,
+          `deployment revision ${String(deploymentRevision)} for ${chainKey} is already superseded and cannot be reused.`,
+        );
+      }
+      if (existingRevision.contract !== router) {
+        throw new StellarDeploymentConflictError(
+          chainKey,
+          `deployment revision ${String(deploymentRevision)} for ${chainKey} is bound to router ${existingRevision.contract} rather than ${router}. ` +
+            "A redeployed router needs its cursor reset rather than reused; increment deploymentRevision for the replacement router.",
+        );
+      }
+      if (existingRevision.startLedger !== BigInt(startLedger)) {
+        throw new StellarDeploymentConflictError(
+          chainKey,
+          `deployment revision ${String(deploymentRevision)} for router ${router} on ${chainKey} was initialized with startLedger ${existingRevision.startLedger.toString()}, conflicting with configured startLedger ${String(startLedger)}.`,
+        );
+      }
+    }
+
+    const existingRouter = history.find((entry) => entry.contract === router);
+    if (existingRouter !== undefined) {
+      if (existingRouter.status === "superseded") {
+        throw new StellarDeploymentConflictError(
+          chainKey,
+          `router ${router} on ${chainKey} belongs to superseded deployment revision ${String(existingRouter.deploymentRevision)} and cannot be reactivated.`,
+        );
+      }
+      if (existingRouter.deploymentRevision !== deploymentRevision) {
+        throw new StellarDeploymentConflictError(
+          chainKey,
+          `router ${router} on ${chainKey} is already recorded at deployment revision ${String(existingRouter.deploymentRevision)}, conflicting with configured revision ${String(deploymentRevision)}.`,
+        );
+      }
+    }
+
+    if (stored === null) {
+      return {
+        deploymentRevision,
+        fresh: true,
+        base: startLedger - 1,
+        priorDeployment: null,
+      };
+    }
+
+    if (stored.contract !== router) {
+      if (deploymentRevision <= stored.deploymentRevision) {
+        throw new StellarDeploymentConflictError(
+          chainKey,
+          `the cursor for ${chainKey} was written for router ${stored.contract} at deployment revision ${String(stored.deploymentRevision)} and this process is watching ${router} at revision ${String(deploymentRevision)}. ` +
+            `A redeployed router needs its cursor reset rather than reused; increment deploymentRevision above ${String(stored.deploymentRevision)} to start a new deployment cursor.`,
+        );
+      }
+      return {
+        deploymentRevision,
+        fresh: true,
+        base: startLedger - 1,
+        priorDeployment: stored,
+      };
+    }
+
+    if (deploymentRevision !== stored.deploymentRevision) {
+      throw new StellarDeploymentConflictError(
+        chainKey,
+        `the cursor for ${chainKey} on router ${router} is recorded at deployment revision ${String(stored.deploymentRevision)}, conflicting with configured revision ${String(deploymentRevision)}.`,
+      );
+    }
+
+    if (stored.startLedger !== null && stored.startLedger !== BigInt(startLedger)) {
+      throw new StellarDeploymentConflictError(
+        chainKey,
+        `the cursor for ${chainKey} on router ${router} at deployment revision ${String(deploymentRevision)} was initialized with startLedger ${stored.startLedger.toString()}, conflicting with configured startLedger ${String(startLedger)}.`,
+      );
+    }
+
+    return {
+      deploymentRevision,
+      fresh: false,
+      base: Number(stored.position),
+      priorDeployment: null,
+    };
   }
 
   /**
