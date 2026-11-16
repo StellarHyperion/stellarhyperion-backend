@@ -39,6 +39,7 @@ const TABLES = [
   ["outbound_transfer", "origin_chain"],
   ["inbound_delivery", "destination_chain"],
   ["pending_claim", "chain"],
+  ["evm_watcher_lease", "chain_key"],
 ] as const;
 
 suite("replaying the anvil deployment's logs", () => {
@@ -66,12 +67,16 @@ suite("replaying the anvil deployment's logs", () => {
       db,
       logger,
     });
-    let passes = 0;
-    while (await watcher.tick(AbortSignal.timeout(20_000))) {
-      passes += 1;
-      if (passes > 50) throw new Error("the watcher never reported catching up");
+    try {
+      let passes = 0;
+      while (await watcher.tick(AbortSignal.timeout(20_000))) {
+        passes += 1;
+        if (passes > 50) throw new Error("the watcher never reported catching up");
+      }
+      return passes + 1;
+    } finally {
+      await watcher.releaseLease();
     }
-    return passes + 1;
   };
 
   beforeAll(async () => {
@@ -194,6 +199,51 @@ suite("replaying the anvil deployment's logs", () => {
     expect(passes).toBeGreaterThan(5);
     expect(narrow).toEqual(wide);
 
+    await clean();
+    await drain();
+  });
+
+  it("coordinates concurrent watchers via expiring deployment leases", async () => {
+    await clean();
+    let nowMs = Date.parse("2026-10-01T12:00:00.000Z");
+    const clock = () => new Date(nowMs);
+    const { logger } = capturingLogger();
+    const client = new FakeEvmClient({ head: ANVIL_HEAD });
+
+    const first = new EvmWatcher({
+      chainKey: CHAIN,
+      router: ANVIL_ROUTER,
+      chainId: ANVIL_CHAIN_ID,
+      startBlock: ANVIL_START_BLOCK,
+      confirmations: 0,
+      reorgDepth: 5,
+      logRange: 5,
+      lease: { ownerId: "replica-1", ttlMs: 10_000, now: clock },
+      client,
+      db,
+      logger,
+    });
+    const second = new EvmWatcher({
+      chainKey: CHAIN,
+      router: ANVIL_ROUTER,
+      chainId: ANVIL_CHAIN_ID,
+      startBlock: ANVIL_START_BLOCK,
+      confirmations: 0,
+      reorgDepth: 5,
+      logRange: 5,
+      lease: { ownerId: "replica-2", ttlMs: 10_000, now: clock },
+      client,
+      db,
+      logger,
+    });
+
+    expect(await first.tick(AbortSignal.timeout(20_000))).toBe(true);
+    expect(await second.tick(AbortSignal.timeout(20_000))).toBe(false);
+
+    nowMs += 11_000;
+    expect(await second.tick(AbortSignal.timeout(20_000))).toBe(true);
+
+    await second.releaseLease();
     await clean();
     await drain();
   });

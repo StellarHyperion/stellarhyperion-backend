@@ -10,6 +10,7 @@
 import { ROUTE_KINDS } from "@hyperion/protocol";
 
 import type { Queryable } from "../../db/pool.js";
+import { bigintOf, boolean, maybeOne, text, timestamp } from "../../db/rows.js";
 import type { Position } from "../writers.js";
 import {
   settleAction,
@@ -31,6 +32,167 @@ import {
   secondsOrNull,
   wordOrNull,
 } from "./logs.js";
+
+export interface EvmDeploymentLease {
+  readonly chainKey: string;
+  readonly contract: string;
+  readonly ownerId: string;
+  readonly epoch: bigint;
+  readonly acquiredAt: Date;
+  readonly heartbeatAt: Date;
+  readonly expiresAt: Date;
+  readonly acquired: boolean;
+}
+
+export class EvmLeaseLostError extends Error {
+  readonly chainKey: string;
+  readonly contract: string;
+  readonly ownerId: string;
+  readonly expectedEpoch: bigint;
+
+  constructor(chainKey: string, contract: string, ownerId: string, expectedEpoch: bigint) {
+    super(
+      `lost EVM watcher lease for ${chainKey} (${contract.toLowerCase()}) held by ${ownerId} at epoch ${expectedEpoch.toString()}`,
+    );
+    this.name = "EvmLeaseLostError";
+    this.chainKey = chainKey;
+    this.contract = contract.toLowerCase();
+    this.ownerId = ownerId;
+    this.expectedEpoch = expectedEpoch;
+  }
+}
+
+export async function acquireDeploymentLease(
+  db: Queryable,
+  input: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly ownerId: string;
+    readonly now: Date;
+    readonly ttlMs: number;
+  },
+): Promise<EvmDeploymentLease | null> {
+  if (!Number.isInteger(input.ttlMs) || input.ttlMs <= 0) {
+    throw new Error(`EVM lease ttlMs must be a positive integer, received ${String(input.ttlMs)}`);
+  }
+  const normalizedContract = input.contract.toLowerCase();
+  const expiresAt = new Date(input.now.getTime() + input.ttlMs);
+  const { rows } = await db.query(
+    `SELECT owner_id, lease_epoch, acquired_at, heartbeat_at, expires_at, acquired
+       FROM acquire_evm_watcher_lease($1, $2, $3, $4, $5)`,
+    [input.chainKey, normalizedContract, input.ownerId, input.now, expiresAt],
+  );
+  const row = maybeOne(rows, `evm watcher lease for ${input.chainKey}`);
+  // Recording test doubles that do not implement the lease function return zero rows.
+  if (row === null) return null;
+  return {
+    chainKey: input.chainKey,
+    contract: normalizedContract,
+    ownerId: text(row, "owner_id"),
+    epoch: bigintOf(row, "lease_epoch"),
+    acquiredAt: timestamp(row, "acquired_at"),
+    heartbeatAt: timestamp(row, "heartbeat_at"),
+    expiresAt: timestamp(row, "expires_at"),
+    acquired: boolean(row, "acquired"),
+  };
+}
+
+export async function verifyDeploymentLease(
+  db: Queryable,
+  input: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly ownerId: string;
+    readonly expectedEpoch: bigint;
+    readonly now: Date;
+    readonly ttlMs: number;
+  },
+): Promise<void> {
+  const normalizedContract = input.contract.toLowerCase();
+  const expiresAt = new Date(input.now.getTime() + input.ttlMs);
+  const { rowCount } = await db.query(
+    `UPDATE evm_watcher_lease
+        SET heartbeat_at = $4,
+            expires_at = $5
+      WHERE chain_key = $1
+        AND contract = $2
+        AND owner_id = $3
+        AND lease_epoch = $6
+        AND expires_at > $4`,
+    [
+      input.chainKey,
+      normalizedContract,
+      input.ownerId,
+      input.now,
+      expiresAt,
+      input.expectedEpoch.toString(),
+    ],
+  );
+  if (rowCount === 0) {
+    throw new EvmLeaseLostError(
+      input.chainKey,
+      normalizedContract,
+      input.ownerId,
+      input.expectedEpoch,
+    );
+  }
+}
+
+export async function releaseDeploymentLease(
+  db: Queryable,
+  input: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly ownerId: string;
+    readonly expectedEpoch?: bigint | null;
+  },
+): Promise<boolean> {
+  const normalizedContract = input.contract.toLowerCase();
+  if (input.expectedEpoch !== undefined && input.expectedEpoch !== null) {
+    const { rowCount } = await db.query(
+      `DELETE FROM evm_watcher_lease
+        WHERE chain_key = $1
+          AND contract = $2
+          AND owner_id = $3
+          AND lease_epoch = $4`,
+      [input.chainKey, normalizedContract, input.ownerId, input.expectedEpoch.toString()],
+    );
+    return rowCount > 0;
+  }
+  const { rowCount } = await db.query(
+    `DELETE FROM evm_watcher_lease
+      WHERE chain_key = $1
+        AND contract = $2
+        AND owner_id = $3`,
+    [input.chainKey, normalizedContract, input.ownerId],
+  );
+  return rowCount > 0;
+}
+
+export async function readDeploymentLease(
+  db: Queryable,
+  chainKey: string,
+  contract: string,
+): Promise<Omit<EvmDeploymentLease, "acquired"> | null> {
+  const normalizedContract = contract.toLowerCase();
+  const { rows } = await db.query(
+    `SELECT owner_id, lease_epoch, acquired_at, heartbeat_at, expires_at
+       FROM evm_watcher_lease
+      WHERE chain_key = $1 AND contract = $2`,
+    [chainKey, normalizedContract],
+  );
+  const row = maybeOne(rows, `evm watcher lease state for ${chainKey}`);
+  if (row === null) return null;
+  return {
+    chainKey,
+    contract: normalizedContract,
+    ownerId: text(row, "owner_id"),
+    epoch: bigintOf(row, "lease_epoch"),
+    acquiredAt: timestamp(row, "acquired_at"),
+    heartbeatAt: timestamp(row, "heartbeat_at"),
+    expiresAt: timestamp(row, "expires_at"),
+  };
+}
 
 /** How a log was applied, so the watcher can count and report rather than guess. */
 export type Applied =

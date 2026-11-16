@@ -24,6 +24,8 @@
  * deleted money records to tidy up after a reorg deeper than the chain's own stated finality would
  * be a worse failure than the one it was cleaning up. So that case is reported and left.
  */
+import { randomUUID } from "node:crypto";
+
 import type { Logger } from "pino";
 import type { Hex } from "viem";
 
@@ -31,7 +33,15 @@ import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
 import type { Position } from "../writers.js";
-import { ClaimPairing, applyRouterLog } from "./store.js";
+import {
+  ClaimPairing,
+  type EvmDeploymentLease,
+  EvmLeaseLostError,
+  acquireDeploymentLease,
+  applyRouterLog,
+  releaseDeploymentLease,
+  verifyDeploymentLease,
+} from "./store.js";
 import { decodeRouterLog, signatureOf } from "./logs.js";
 import type { EvmClient, RawEvmLog } from "./client.js";
 
@@ -44,6 +54,16 @@ import type { EvmClient, RawEvmLog } from "./client.js";
  * chain in the registry.
  */
 const CURRENT_WITHIN_BLOCKS = 2;
+const DEFAULT_LEASE_TTL_MS = 30_000;
+
+export interface EvmLeaseOptions {
+  /** Explicit owner identifier for this watcher instance. Generated with a random UUID when omitted. */
+  readonly ownerId?: string;
+  /** Lease expiry duration in milliseconds. Defaults to 30 seconds. */
+  readonly ttlMs?: number;
+  /** Clock hook for deterministic lease-expiry testing. */
+  readonly now?: () => Date;
+}
 
 export interface EvmWatcherOptions {
   readonly chainKey: string;
@@ -58,6 +78,7 @@ export interface EvmWatcherOptions {
   readonly reorgDepth: number;
   /** Blocks per `getLogs` call. Public endpoints reject wide ranges. */
   readonly logRange: number;
+  readonly lease?: EvmLeaseOptions;
   readonly client: EvmClient;
   readonly db: Transactional;
   readonly logger: Logger;
@@ -76,14 +97,31 @@ export interface EvmProgress {
 }
 
 export class EvmWatcher {
+  readonly ownerId: string;
+
   private lastProgress: EvmProgress | null = null;
   private reorgs = 0;
+  private lostLeaseCount = 0;
+  private heldLeaseEpoch: bigint | null = null;
+  private standbyLease: EvmDeploymentLease | null = null;
+  private lastLoggedStandbyKey: string | null = null;
   /** Set once the node has confirmed which chain it is. */
   private chainConfirmed = false;
   /** Signatures seen once and logged once. A router ahead of this build is not a log flood. */
   private readonly reportedUnknown = new Set<string>();
+  private readonly leaseTtlMs: number;
+  private readonly now: () => Date;
 
-  constructor(private readonly options: EvmWatcherOptions) {}
+  constructor(private readonly options: EvmWatcherOptions) {
+    this.ownerId = options.lease?.ownerId ?? `evm-watcher:${options.chainKey}:${randomUUID()}`;
+    this.leaseTtlMs = options.lease?.ttlMs ?? DEFAULT_LEASE_TTL_MS;
+    this.now = options.lease?.now ?? (() => new Date());
+    if (!Number.isInteger(this.leaseTtlMs) || this.leaseTtlMs <= 0) {
+      throw new Error(
+        `EVM watcher lease ttlMs must be a positive integer, received ${String(this.leaseTtlMs)}`,
+      );
+    }
+  }
 
   get name(): string {
     return this.options.chainKey;
@@ -91,6 +129,37 @@ export class EvmWatcher {
 
   get progress(): EvmProgress | null {
     return this.lastProgress;
+  }
+
+  get leaseLosses(): number {
+    return this.lostLeaseCount;
+  }
+
+  get leaseEpoch(): bigint | null {
+    return this.heldLeaseEpoch;
+  }
+
+  async releaseLease(): Promise<boolean> {
+    const expectedEpoch = this.heldLeaseEpoch;
+    this.heldLeaseEpoch = null;
+    this.standbyLease = null;
+    return releaseDeploymentLease(this.options.db, {
+      chainKey: this.options.chainKey,
+      contract: this.options.router,
+      ownerId: this.ownerId,
+      expectedEpoch,
+    });
+  }
+
+  async stop(): Promise<void> {
+    try {
+      await this.releaseLease();
+    } catch (error) {
+      this.options.logger.warn(
+        { chain: this.options.chainKey, ownerId: this.ownerId, err: error },
+        "failed to release evm deployment lease on stop; lease will expire automatically",
+      );
+    }
   }
 
   /**
@@ -101,6 +170,15 @@ export class EvmWatcher {
    * reason to stop answering about the chains that are reachable.
    */
   readiness(): ReadinessReport {
+    if (this.standbyLease !== null) {
+      return {
+        name: this.name,
+        state: "ready",
+        detail:
+          `standby for ${this.options.router.toLowerCase()}; deployment lease held by ` +
+          `${this.standbyLease.ownerId} until ${this.standbyLease.expiresAt.toISOString()}`,
+      };
+    }
     const progress = this.lastProgress;
     if (progress === null) {
       return {
@@ -134,6 +212,39 @@ export class EvmWatcher {
    */
   async tick(signal: AbortSignal): Promise<boolean> {
     const { chainKey, router, db, logger, client, confirmations } = this.options;
+
+    const leaseState = await acquireDeploymentLease(db, {
+      chainKey,
+      contract: router,
+      ownerId: this.ownerId,
+      now: this.now(),
+      ttlMs: this.leaseTtlMs,
+    });
+    if (leaseState !== null && !leaseState.acquired) {
+      this.heldLeaseEpoch = null;
+      this.standbyLease = leaseState;
+      const standbyKey = `${leaseState.ownerId}:${leaseState.epoch.toString()}`;
+      if (this.lastLoggedStandbyKey !== standbyKey) {
+        this.lastLoggedStandbyKey = standbyKey;
+        logger.info(
+          {
+            chain: chainKey,
+            contract: router.toLowerCase(),
+            ownerId: this.ownerId,
+            holderId: leaseState.ownerId,
+            leaseEpoch: leaseState.epoch.toString(),
+            expiresAt: leaseState.expiresAt.toISOString(),
+          },
+          "evm deployment lease is held by another worker; standing by",
+        );
+      }
+      return false;
+    }
+    if (leaseState !== null) {
+      this.heldLeaseEpoch = leaseState.epoch;
+      this.standbyLease = null;
+      this.lastLoggedStandbyKey = null;
+    }
 
     const stored = await readCursor(db, chainKey);
     if (stored !== null && stored.contract.toLowerCase() !== router.toLowerCase()) {
@@ -196,37 +307,77 @@ export class EvmWatcher {
     let ignored = 0;
     const pairing = new ClaimPairing();
 
-    // One transaction for the range and the cursor advance past it. This is the restart guarantee,
-    // and splitting it would turn every crash into either a lost range or a duplicated one.
-    await db.transaction(async (tx: Queryable) => {
-      for (const log of logs) {
-        if (log.removed) {
-          // viem marks a log from an orphaned block. Indexing one would record a transfer that is
-          // no longer on the chain.
-          ignored += 1;
-          continue;
+    try {
+      // One transaction for the range and the cursor advance past it. This is the restart guarantee,
+      // and splitting it would turn every crash into either a lost range or a duplicated one.
+      await db.transaction(async (tx: Queryable) => {
+        if (leaseState !== null) {
+          await verifyDeploymentLease(tx, {
+            chainKey,
+            contract: router,
+            ownerId: this.ownerId,
+            expectedEpoch: leaseState.epoch,
+            now: this.now(),
+            ttlMs: this.leaseTtlMs,
+          });
         }
-        const timestamp = blocks.get(log.blockNumber)?.timestamp;
-        if (timestamp === undefined) {
-          throw new Error(
-            `no timestamp for block ${log.blockNumber.toString()} on ${chainKey}, which three columns need`,
-          );
-        }
-        if (await this.apply(tx, log, timestamp, pairing)) written += 1;
-        else ignored += 1;
-      }
 
-      await writeCursor(tx, {
-        chainKey,
-        family: "evm",
-        contract: router,
-        position: to,
-        observedAt: timestampOf(blocks.get(to)?.timestamp ?? null),
-        // The whole reason the column exists. Without it the next pass cannot tell advancing from
-        // being handed a different history.
-        hash: endHash,
+        for (const log of logs) {
+          if (log.removed) {
+            // viem marks a log from an orphaned block. Indexing one would record a transfer that is
+            // no longer on the chain.
+            ignored += 1;
+            continue;
+          }
+          const timestamp = blocks.get(log.blockNumber)?.timestamp;
+          if (timestamp === undefined) {
+            throw new Error(
+              `no timestamp for block ${log.blockNumber.toString()} on ${chainKey}, which three columns need`,
+            );
+          }
+          if (await this.apply(tx, log, timestamp, pairing)) written += 1;
+          else ignored += 1;
+        }
+
+        if (leaseState !== null) {
+          await verifyDeploymentLease(tx, {
+            chainKey,
+            contract: router,
+            ownerId: this.ownerId,
+            expectedEpoch: leaseState.epoch,
+            now: this.now(),
+            ttlMs: this.leaseTtlMs,
+          });
+        }
+
+        await writeCursor(tx, {
+          chainKey,
+          family: "evm",
+          contract: router,
+          position: to,
+          observedAt: timestampOf(blocks.get(to)?.timestamp ?? null),
+          // The whole reason the column exists. Without it the next pass cannot tell advancing from
+          // being handed a different history.
+          hash: endHash,
+        });
       });
-    });
+    } catch (error) {
+      if (error instanceof EvmLeaseLostError) {
+        this.heldLeaseEpoch = null;
+        this.lostLeaseCount += 1;
+        logger.warn(
+          {
+            chain: chainKey,
+            contract: router.toLowerCase(),
+            ownerId: this.ownerId,
+            expectedEpoch: error.expectedEpoch.toString(),
+          },
+          "lost evm deployment lease mid pass, so nothing was committed",
+        );
+        return false;
+      }
+      throw error;
+    }
 
     const behind = Number(confirmed - to);
     this.lastProgress = {

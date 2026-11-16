@@ -7,10 +7,17 @@
  * rather than pointed at anvil, which will mine on demand but will not rewrite history underneath
  * a running watcher.
  */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+import { PGlite } from "@electric-sql/pglite";
 import { describe, expect, it } from "vitest";
 
-import { EvmWatcher } from "../../src/chains/evm/watcher.js";
+import { readDeploymentLease } from "../../src/chains/evm/store.js";
+import { EvmWatcher, type EvmLeaseOptions } from "../../src/chains/evm/watcher.js";
 import { viemClient, type EvmClient } from "../../src/chains/evm/client.js";
+import { readCursor } from "../../src/chains/stellar/store.js";
+import type { Queryable, QueryResultRows, Transactional } from "../../src/db/pool.js";
 import {
   ANVIL_HISTORY,
   ANVIL_CHAIN_ID,
@@ -545,5 +552,252 @@ describe("RPC endpoint failover", () => {
 
     // Cursor now advances properly from cursorRow(20n)
     expect(cursorWrites(db)).toEqual([{ block: 57n, family: "evm", hash: expect.any(String) }]);
+  });
+});
+
+async function openMigratedPglite(): Promise<{ db: Transactional; close: () => Promise<void> }> {
+  const pg = new PGlite();
+  for (const name of [
+    "1790900000000_initial-schema.sql",
+    "1791000000000_cursor-block-hash.sql",
+    "1791100000000_cursor-autovacuum-tuning.sql",
+    "1791200000000_evm-watcher-leases.sql",
+  ]) {
+    const migrationPath = fileURLToPath(new URL(`../../migrations/${name}`, import.meta.url));
+    const upSql = readFileSync(migrationPath, "utf8").split("-- Down Migration")[0] ?? "";
+    await pg.exec(upSql);
+  }
+
+  let txQueue = Promise.resolve();
+  const runQuery = async (
+    sql: string,
+    params: readonly unknown[] = [],
+  ): Promise<QueryResultRows> => {
+    const result = await pg.query(sql, [...params]);
+    const int8Columns = result.fields
+      .filter((field) => field.dataTypeID === 20)
+      .map((field) => field.name);
+    const rows = result.rows.map((raw) => {
+      const copy = { ...(raw as Record<string, unknown>) };
+      for (const column of int8Columns) {
+        const value = copy[column];
+        if (typeof value === "number" || typeof value === "bigint") {
+          copy[column] = String(value);
+        }
+      }
+      return copy;
+    });
+    return { rows, rowCount: result.affectedRows ?? result.rows.length };
+  };
+
+  const queryable: Queryable = { query: runQuery };
+  const db: Transactional = {
+    query: runQuery,
+    transaction<T>(work: (tx: Queryable) => Promise<T>): Promise<T> {
+      const run = txQueue.then(async () => {
+        await pg.exec("BEGIN");
+        try {
+          const out = await work(queryable);
+          await pg.exec("COMMIT");
+          return out;
+        } catch (error) {
+          await pg.exec("ROLLBACK");
+          throw error;
+        }
+      });
+      txQueue = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      return run;
+    },
+  };
+
+  return {
+    db,
+    close: () => pg.close(),
+  };
+}
+
+describe("per-deployment EVM watcher leases", () => {
+  const RECIPIENT = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8";
+  const TOKEN = "0x5fbdb2315678afecb367f032d93f642f64180aa3";
+  const MESSAGE = `0x${"33".repeat(32)}` as const;
+  const TX = `0x${"44".repeat(32)}` as const;
+
+  function buildWatcher(
+    db: Transactional,
+    client: EvmClient,
+    lease: EvmLeaseOptions,
+    options: { readonly chainKey?: string; readonly logRange?: number } = {},
+  ) {
+    const { logger, lines } = capturingLogger();
+    const watcher = new EvmWatcher({
+      chainKey: options.chainKey ?? CHAIN,
+      router: ANVIL_ROUTER,
+      chainId: ANVIL_CHAIN_ID,
+      startBlock: ANVIL_START_BLOCK,
+      confirmations: 0,
+      reorgDepth: 5,
+      logRange: options.logRange ?? 10,
+      lease,
+      client,
+      db,
+      logger,
+    });
+    return { watcher, lines };
+  }
+
+  it("prevents concurrent workers from both advancing the same deployment cursor", async () => {
+    const { db, close } = await openMigratedPglite();
+    try {
+      const now = new Date("2026-10-01T12:00:00.000Z");
+      const clientA = new FakeEvmClient({ head: 40n });
+      const clientB = new FakeEvmClient({ head: 40n });
+
+      const workerA = buildWatcher(db, clientA, {
+        ownerId: "worker-a",
+        ttlMs: 30_000,
+        now: () => now,
+      });
+      const workerB = buildWatcher(db, clientB, {
+        ownerId: "worker-b",
+        ttlMs: 30_000,
+        now: () => now,
+      });
+
+      const [aProgressed, bProgressed] = await Promise.all([
+        workerA.watcher.tick(AbortSignal.timeout(5_000)),
+        workerB.watcher.tick(AbortSignal.timeout(5_000)),
+      ]);
+
+      // Exactly one worker acquires the deployment lease and advances one 10-block range.
+      expect([aProgressed, bProgressed].filter(Boolean)).toHaveLength(1);
+      expect(clientA.logQueries.length + clientB.logQueries.length).toBe(1);
+
+      const cursor = await readCursor(db, CHAIN);
+      expect(cursor?.position).toBe(ANVIL_START_BLOCK + 9n);
+
+      const standby = aProgressed ? workerB : workerA;
+      expect(standby.watcher.readiness().state).toBe("ready");
+      expect(standby.watcher.readiness().detail).toContain("standby");
+    } finally {
+      await close();
+    }
+  });
+
+  it("allows takeover after lease expiry when a previous owner crashes", async () => {
+    const { db, close } = await openMigratedPglite();
+    try {
+      let currentMs = Date.parse("2026-10-01T12:00:00.000Z");
+      const clock = () => new Date(currentMs);
+      const client = new FakeEvmClient({ head: 40n });
+
+      const crashedOwner = buildWatcher(db, client, {
+        ownerId: "pod-crashed",
+        ttlMs: 10_000,
+        now: clock,
+      });
+      const replacementOwner = buildWatcher(db, client, {
+        ownerId: "pod-replacement",
+        ttlMs: 10_000,
+        now: clock,
+      });
+
+      expect(await crashedOwner.watcher.tick(AbortSignal.timeout(5_000))).toBe(true);
+      expect((await readCursor(db, CHAIN))?.position).toBe(ANVIL_START_BLOCK + 9n);
+
+      // Before TTL expiry, replacement cannot advance the cursor.
+      currentMs += 5_000;
+      expect(await replacementOwner.watcher.tick(AbortSignal.timeout(5_000))).toBe(false);
+      expect((await readCursor(db, CHAIN))?.position).toBe(ANVIL_START_BLOCK + 9n);
+
+      // Once TTL expires without releaseLease(), replacement acquires epoch 2 and continues.
+      currentMs += 6_000;
+      expect(await replacementOwner.watcher.tick(AbortSignal.timeout(5_000))).toBe(true);
+      expect((await readCursor(db, CHAIN))?.position).toBe(ANVIL_START_BLOCK + 19n);
+
+      const leaseState = await readDeploymentLease(db, CHAIN, ANVIL_ROUTER);
+      expect(leaseState?.ownerId).toBe("pod-replacement");
+      expect(leaseState?.epoch).toBe(2n);
+    } finally {
+      await close();
+    }
+  });
+
+  it("aborts cursor and event mutations safely when lease ownership is lost mid-tick", async () => {
+    const { db, close } = await openMigratedPglite();
+    try {
+      let currentMs = Date.parse("2026-10-01T12:00:00.000Z");
+      const clock = () => new Date(currentMs);
+
+      const rogueArrival = encodedLog(
+        "BridgeIn",
+        {
+          route: 0,
+          recipient: RECIPIENT,
+          token: TOKEN,
+          amount: 777_000n,
+          sourceChain: "stellar-testnet",
+          sourceNonce: 999n,
+          messageId: MESSAGE,
+        },
+        { blockNumber: ANVIL_START_BLOCK + 2n, logIndex: 0, txHash: TX },
+      );
+
+      const innerSlow = new FakeEvmClient({ logs: [rogueArrival], head: 40n });
+      const innerFast = new FakeEvmClient({ logs: [], head: 40n });
+
+      const takeover = buildWatcher(
+        db,
+        innerFast,
+        { ownerId: "worker-fast", ttlMs: 10_000, now: clock },
+        { logRange: 20 },
+      );
+
+      // Slow worker stalls inside `blocks()` past its lease TTL while `worker-fast` takes over
+      // and commits blocks up to startBlock + 19.
+      const slowClient: EvmClient = {
+        chainId: () => innerSlow.chainId(),
+        blockNumber: () => innerSlow.blockNumber(),
+        logs: (q) => innerSlow.logs(q),
+        blocks: async (nums) => {
+          const stamps = await innerSlow.blocks(nums);
+          currentMs += 15_000;
+          await takeover.watcher.tick(AbortSignal.timeout(5_000));
+          return stamps;
+        },
+      };
+
+      const stalled = buildWatcher(
+        db,
+        slowClient,
+        { ownerId: "worker-stalled", ttlMs: 10_000, now: clock },
+        { logRange: 5 },
+      );
+
+      const result = await stalled.watcher.tick(AbortSignal.timeout(5_000));
+      expect(result).toBe(false);
+      expect(stalled.watcher.leaseLosses).toBe(1);
+      expect(stalled.watcher.progress).toBeNull();
+      expect(
+        stalled.lines.some((line) =>
+          line.message.includes("lost evm deployment lease mid pass, so nothing was committed"),
+        ),
+      ).toBe(true);
+
+      // Takeover worker's cursor at startBlock + 19 was NOT overwritten backward to startBlock + 4,
+      // and stalled worker's inbound_delivery row was rolled back atomically.
+      const cursor = await readCursor(db, CHAIN);
+      expect(cursor?.position).toBe(ANVIL_START_BLOCK + 19n);
+
+      const { rows } = await db.query(
+        "SELECT count(*)::int AS n FROM inbound_delivery WHERE destination_chain = $1",
+        [CHAIN],
+      );
+      expect(rows[0]?.n).toBe(0);
+    } finally {
+      await close();
+    }
   });
 });
