@@ -107,3 +107,12 @@ export interface RailClient {
   /** Throws `RailError`; returns `missing` rather than throwing for a transfer not yet indexed. */
   look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup>;
 }
+
+export type {
+  CachedCandidateReceipt,
+  CandidateReceiptCacheOptions,
+  CandidateReceiptRpcClient,
+  GetConfirmedReceiptArgs,
+  ReceiptCacheStats,
+} from "./receipt-cache.js";
+export { CandidateReceiptCache, formatCandidateReceiptCacheKey } from "./receipt-cache.js";

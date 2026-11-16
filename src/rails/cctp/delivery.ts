@@ -14,13 +14,20 @@ import type { Transactional } from "../../db/pool.js";
 import { bigintOf, text } from "../../db/rows.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 import type { VerifiedDelivery } from "../axelar/delivery.js";
+import { CandidateReceiptCache, type CandidateReceiptRpcClient } from "../receipt-cache.js";
 import { matchingCctpPayment, verifiedCctpMessage, type ExpectedCctpTransfer } from "./events.js";
+
+export interface CctpDeliveryOptions {
+  readonly receiptCache?: CandidateReceiptCache;
+  readonly evmClientFactory?: (chainKey: string, rpcUrl: string) => CandidateReceiptRpcClient;
+}
 
 export async function verifyCctpDelivery(
   config: AppConfig,
   db: Transactional,
   transfer: PendingTransfer,
   report: RailReport,
+  options: CctpDeliveryOptions = {},
 ): Promise<VerifiedDelivery | null> {
   if (
     transfer.route !== RouteKind.Cctp ||
@@ -69,26 +76,29 @@ export async function verifyCctpDelivery(
   const raw = report.messageBytes as Hex;
   const message = verifiedCctpMessage(raw, expected);
   if (!message) return null;
-  const client = createPublicClient({
-    transport: http(destination.defaultRpcUrl, { timeout: 15000, retryCount: 0 }),
+  const client: CandidateReceiptRpcClient = options.evmClientFactory
+    ? options.evmClientFactory(transfer.destinationChain, destination.defaultRpcUrl)
+    : createPublicClient({
+        transport: http(destination.defaultRpcUrl, { timeout: 15000, retryCount: 0 }),
+      });
+  const cache = options.receiptCache ?? new CandidateReceiptCache({ maxEntries: 1 });
+  const receipt = await cache.getConfirmedReceipt({
+    chainKey: transfer.destinationChain,
+    expectedChainId: destination.chainId,
+    confirmations: destination.confirmations,
+    txHash: report.forwardTxHash,
+    client,
   });
-  if ((await client.getChainId()) !== destination.chainId)
-    throw new Error("CCTP destination RPC chain mismatch.");
-  const receipt = await client.getTransactionReceipt({ hash: report.forwardTxHash });
-  if (receipt.status !== "success") return null;
-  const head = await client.getBlockNumber();
-  if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations)) return null;
+  if (!receipt) return null;
   const payment = matchingCctpPayment(receipt.logs, raw, expected);
   if (!payment) return null;
-  const block = await client.getBlock({ blockNumber: receipt.blockNumber });
-  if (block.hash !== receipt.blockHash) return null;
   return {
     at: {
       chainKey: transfer.destinationChain,
       block: receipt.blockNumber,
       txHash: receipt.transactionHash,
       logIndex: payment.logIndex,
-      observedAt: new Date(Number(block.timestamp) * 1000),
+      observedAt: new Date(Number(receipt.blockTimestampSeconds) * 1000),
     },
     row: {
       route: transfer.route,

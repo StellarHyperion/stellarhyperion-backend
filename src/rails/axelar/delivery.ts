@@ -22,6 +22,7 @@ import type { AppConfig } from "../../config/config.js";
 import type { Transactional } from "../../db/pool.js";
 import { bigintOf, text } from "../../db/rows.js";
 import type { InboundRow, Position } from "../../chains/writers.js";
+import { CandidateReceiptCache, type CandidateReceiptRpcClient } from "../receipt-cache.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 
 import { ITS_ABI, matchingPayment } from "./events.js";
@@ -30,12 +31,32 @@ export interface VerifiedDelivery {
   readonly row: InboundRow;
 }
 
+export interface ItsEvmClient extends CandidateReceiptRpcClient {
+  readContract(args: {
+    readonly address: `0x${string}`;
+    readonly abi: typeof ITS_ABI;
+    readonly functionName: "registeredTokenAddress";
+    readonly args: readonly [`0x${string}`];
+  }): Promise<`0x${string}`>;
+}
+
+export interface ItsDeliveryOptions {
+  readonly receiptCache?: CandidateReceiptCache;
+  readonly evmClientFactory?: (chainKey: string, rpcUrl: string) => ItsEvmClient;
+  readonly stellarView?: (
+    contract: string,
+    method: string,
+    args?: ReturnType<typeof nativeToScVal>[],
+  ) => Promise<unknown>;
+}
+
 // The rail API supplies a candidate receipt. Only matching confirmed chain events establish delivery.
 export async function verifyItsDelivery(
   config: AppConfig,
   db: Transactional,
   transfer: PendingTransfer,
   report: RailReport,
+  options: ItsDeliveryOptions = {},
 ): Promise<VerifiedDelivery | null> {
   const execution = report.execution;
   const source = config.indexer.stellar;
@@ -63,37 +84,40 @@ export async function verifyItsDelivery(
   if (!deployment) return null;
   const adapter = deployment.adapters[RouteKind.AxelarIts];
   if (!adapter) return null;
-  const stellar = new rpc.Server(source.rpcUrl, { timeout: 15_000 });
-  const view = async (
-    contract: string,
-    method: string,
-    args: ReturnType<typeof nativeToScVal>[] = [],
-  ) => {
-    const tx = new TransactionBuilder(new Account(deployment.admin, "0"), {
-      fee: BASE_FEE,
-      networkPassphrase: source.networkPassphrase,
-    })
-      .addOperation(new Contract(contract).call(method, ...args))
-      .setTimeout(60)
-      .build();
-    const result = await stellar.simulateTransaction(tx);
-    if (!rpc.Api.isSimulationSuccess(result) || !result.result)
-      throw new Error("Source lane cannot be verified.");
-    return scValToNative(result.result.retval) as unknown;
-  };
+  const view =
+    options.stellarView ??
+    (async (contract: string, method: string, args: ReturnType<typeof nativeToScVal>[] = []) => {
+      const stellar = new rpc.Server(source.rpcUrl, { timeout: 15_000 });
+      const tx = new TransactionBuilder(new Account(deployment.admin, "0"), {
+        fee: BASE_FEE,
+        networkPassphrase: source.networkPassphrase,
+      })
+        .addOperation(new Contract(contract).call(method, ...args))
+        .setTimeout(60)
+        .build();
+      const result = await stellar.simulateTransaction(tx);
+      if (!rpc.Api.isSimulationSuccess(result) || !result.result)
+        throw new Error("Source lane cannot be verified.");
+      return scValToNative(result.result.retval) as unknown;
+    });
   const id = await view(adapter, "token_id_for", [new Address(token).toScVal()]);
   if (!(id instanceof Uint8Array) || id.length !== 32)
     throw new Error("Source token id is invalid.");
   const tokenId = toHex(id);
-  const client = createPublicClient({
-    transport: http(destination.defaultRpcUrl, { timeout: 15_000, retryCount: 0 }),
+  const client: ItsEvmClient = options.evmClientFactory
+    ? options.evmClientFactory(transfer.destinationChain, destination.defaultRpcUrl)
+    : createPublicClient({
+        transport: http(destination.defaultRpcUrl, { timeout: 15_000, retryCount: 0 }),
+      });
+  const cache = options.receiptCache ?? new CandidateReceiptCache({ maxEntries: 1 });
+  const receipt = await cache.getConfirmedReceipt({
+    chainKey: transfer.destinationChain,
+    expectedChainId: destination.chainId,
+    confirmations: destination.confirmations,
+    txHash: execution.txHash,
+    client,
   });
-  if ((await client.getChainId()) !== destination.chainId)
-    throw new Error("Destination RPC chain mismatch.");
-  const receipt = await client.getTransactionReceipt({ hash: execution.txHash });
-  if (receipt.status !== "success") return null;
-  const head = await client.getBlockNumber();
-  if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations)) return null;
+  if (!receipt) return null;
   const destinationToken = await client.readContract({
     address: its as `0x${string}`,
     abi: ITS_ABI,
@@ -115,15 +139,13 @@ export async function verifyItsDelivery(
     amount,
   });
   if (!payment) return null;
-  const block = await client.getBlock({ blockNumber: receipt.blockNumber });
-  if (block.hash !== receipt.blockHash) return null;
   return {
     at: {
       chainKey: transfer.destinationChain,
       block: receipt.blockNumber,
       txHash: receipt.transactionHash,
       logIndex: payment.logIndex,
-      observedAt: new Date(Number(block.timestamp) * 1000),
+      observedAt: new Date(Number(receipt.blockTimestampSeconds) * 1000),
     },
     row: {
       route: transfer.route,

@@ -18,8 +18,9 @@
  * second would spend those five minutes refreshing the block.
  */
 import type { AppConfig } from "../config/config.js";
-import { verifyItsDelivery } from "./axelar/delivery.js";
-import { verifyCctpDelivery } from "./cctp/delivery.js";
+import { verifyItsDelivery, type ItsDeliveryOptions } from "./axelar/delivery.js";
+import { verifyCctpDelivery, type CctpDeliveryOptions } from "./cctp/delivery.js";
+import { CandidateReceiptCache, type ReceiptCacheStats } from "./receipt-cache.js";
 import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
@@ -48,6 +49,10 @@ export interface RailPassOptions {
   readonly maxCheckFailures: number;
   readonly now?: () => Date;
   readonly config?: AppConfig;
+  readonly receiptCacheMaxEntries?: number;
+  readonly evmClientFactory?: CctpDeliveryOptions["evmClientFactory"];
+  readonly itsEvmClientFactory?: ItsDeliveryOptions["evmClientFactory"];
+  readonly stellarView?: ItsDeliveryOptions["stellarView"];
 }
 
 export interface RailProgress {
@@ -56,6 +61,7 @@ export interface RailProgress {
   readonly failures: number;
   readonly outstanding: number;
   readonly at: Date;
+  readonly receiptCache?: ReceiptCacheStats;
 }
 
 export class RailPass {
@@ -122,6 +128,12 @@ export class RailPass {
       maxCheckFailures: this.options.maxCheckFailures,
     });
 
+    const receiptCache = new CandidateReceiptCache(
+      this.options.receiptCacheMaxEntries !== undefined
+        ? { maxEntries: this.options.receiptCacheMaxEntries }
+        : {},
+    );
+
     let checked = 0;
     let settled = 0;
     let failures = 0;
@@ -129,7 +141,7 @@ export class RailPass {
     for (const transfer of queue) {
       if (signal.aborted) break;
       try {
-        if (await this.handle(transfer)) settled += 1;
+        if (await this.handle(transfer, receiptCache)) settled += 1;
         checked += 1;
       } catch (error) {
         if (error instanceof RailError && error.kind === "rateLimited") {
@@ -150,7 +162,14 @@ export class RailPass {
     }
 
     const outstanding = await outstandingForRail(db, this.options.route);
-    this.lastProgress = { checked, settled, failures, outstanding, at: this.now() };
+    this.lastProgress = {
+      checked,
+      settled,
+      failures,
+      outstanding,
+      at: this.now(),
+      receiptCache: receiptCache.stats,
+    };
 
     if (checked > 0 || failures > 0) {
       logger.info(
@@ -164,7 +183,10 @@ export class RailPass {
   }
 
   /** Returns true when the transfer reached a terminal state on this pass. */
-  private async handle(transfer: PendingTransfer): Promise<boolean> {
+  private async handle(
+    transfer: PendingTransfer,
+    receiptCache: CandidateReceiptCache,
+  ): Promise<boolean> {
     const at = this.now();
 
     if (transfer.delivered) {
@@ -200,8 +222,21 @@ export class RailPass {
     const { report } = lookup;
     if (this.options.config && (report.execution || report.forwardTxHash)) {
       const verified =
-        (await verifyItsDelivery(this.options.config, this.options.db, transfer, report)) ??
-        (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report));
+        (await verifyItsDelivery(this.options.config, this.options.db, transfer, report, {
+          receiptCache,
+          ...(this.options.itsEvmClientFactory !== undefined
+            ? { evmClientFactory: this.options.itsEvmClientFactory }
+            : {}),
+          ...(this.options.stellarView !== undefined
+            ? { stellarView: this.options.stellarView }
+            : {}),
+        })) ??
+        (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report, {
+          receiptCache,
+          ...(this.options.evmClientFactory !== undefined
+            ? { evmClientFactory: this.options.evmClientFactory }
+            : {}),
+        }));
       if (verified) {
         await this.options.db.transaction(async (tx) => {
           await writeInbound(tx, verified.at, verified.row);
