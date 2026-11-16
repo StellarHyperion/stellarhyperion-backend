@@ -10,18 +10,47 @@ import type { AppConfig } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
 import { startKeeperQueue, type KeeperHandle } from "./queue.js";
+import {
+  KeeperSpendingTracker,
+  sanitizeSpendDiagnostic,
+  type OverrideSpendingCapInput,
+  type ResetSpendingCapInput,
+  type SignerSpendingSnapshot,
+  type SpendingCapAuditEntry,
+} from "./spending.js";
+import { resolveKeeperSignerPublicKey } from "./stellar.js";
 
 export class KeeperWorker implements ReadinessSource {
   readonly name = "keeper";
   private handle: KeeperHandle | null = null;
   private starting = false;
   private failedError: string | null = null;
+  private readonly spendingTracker: KeeperSpendingTracker;
 
   constructor(
     private readonly config: AppConfig,
     private readonly db: Transactional,
     private readonly logger: Logger,
-  ) {}
+    spendingTracker?: KeeperSpendingTracker,
+  ) {
+    this.spendingTracker = spendingTracker ?? new KeeperSpendingTracker(config.keeper.spendingCap);
+  }
+
+  spendingDiagnostics(): readonly SignerSpendingSnapshot[] {
+    return this.spendingTracker.allSnapshots();
+  }
+
+  spendingAuditTrail(signerPublicKey?: string): readonly SpendingCapAuditEntry[] {
+    return this.spendingTracker.auditTrail(signerPublicKey);
+  }
+
+  resetSpendingCap(input: Omit<ResetSpendingCapInput, "logger">): SpendingCapAuditEntry {
+    return this.spendingTracker.resetSignerCap({ ...input, logger: this.logger });
+  }
+
+  overrideSpendingCap(input: Omit<OverrideSpendingCapInput, "logger">): SpendingCapAuditEntry {
+    return this.spendingTracker.overrideSignerCap({ ...input, logger: this.logger });
+  }
 
   readiness(): ReadinessReport {
     if (!this.config.keeper.enabled) {
@@ -35,7 +64,19 @@ export class KeeperWorker implements ReadinessSource {
       return {
         name: this.name,
         state: "degraded",
-        detail: `redis connection failure: ${this.failedError}`,
+        detail: `redis connection failure: ${sanitizeSpendDiagnostic(this.failedError)}`,
+      };
+    }
+    const signerPublicKey = resolveKeeperSignerPublicKey(this.config);
+    if (signerPublicKey !== null && this.spendingTracker.isPaused(signerPublicKey)) {
+      const snap = this.spendingTracker.snapshot(signerPublicKey);
+      return {
+        name: this.name,
+        state: "degraded",
+        detail: sanitizeSpendDiagnostic(
+          snap.pauseReason ??
+            `signer ${signerPublicKey} paused by operational spending cap in ${snap.windowId}`,
+        ),
       };
     }
     if (this.handle === null) {
@@ -57,7 +98,12 @@ export class KeeperWorker implements ReadinessSource {
     this.starting = true;
 
     startKeeperQueue(
-      { db: this.db, config: this.config, logger: this.logger },
+      {
+        db: this.db,
+        config: this.config,
+        logger: this.logger,
+        spendingTracker: this.spendingTracker,
+      },
       this.config.redisUrl,
     )
       .then((handle) => {
@@ -67,8 +113,9 @@ export class KeeperWorker implements ReadinessSource {
       })
       .catch((err: unknown) => {
         this.starting = false;
-        this.failedError = err instanceof Error ? err.message : String(err);
-        this.logger.error({ err }, "failed to start keeper queue");
+        const raw = err instanceof Error ? err.message : String(err);
+        this.failedError = sanitizeSpendDiagnostic(raw);
+        this.logger.error({ reason: this.failedError }, "failed to start keeper queue");
       });
   }
 

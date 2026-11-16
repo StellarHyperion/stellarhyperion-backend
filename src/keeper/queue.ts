@@ -10,6 +10,7 @@ import { Redis } from "ioredis";
 
 import { processClaimSettlement } from "./jobs/claims.js";
 import { processTtlBump } from "./jobs/ttl.js";
+import { KeeperSpendingTracker, sanitizeSpendDiagnostic } from "./spending.js";
 import type { KeeperContext, KeeperJobName, KeeperJobResult } from "./types.js";
 
 export const KEEPER_QUEUE_NAME = "hyperion-keeper";
@@ -18,6 +19,7 @@ export interface KeeperHandle {
   readonly queue: Queue;
   readonly worker: Worker<unknown, KeeperJobResult>;
   readonly redis: Redis;
+  readonly spendingTracker: KeeperSpendingTracker;
   close(): Promise<void>;
 }
 
@@ -34,6 +36,10 @@ export async function startKeeperQueue(
   redisUrl: string,
 ): Promise<KeeperHandle> {
   const { config, logger } = ctx;
+  const spendingTracker =
+    ctx.spendingTracker ?? new KeeperSpendingTracker(config.keeper.spendingCap);
+  const sharedCtx: KeeperContext = { ...ctx, spendingTracker };
+
   const redis = createKeeperRedis(redisUrl);
   await redis.connect();
 
@@ -47,11 +53,11 @@ export async function startKeeperQueue(
       logger.info({ jobName: job.name, jobId: job.id }, "processing keeper job");
       switch (job.name as KeeperJobName) {
         case "ttl-bump": {
-          const result = await processTtlBump(ctx, job.data as object);
+          const result = await processTtlBump(sharedCtx, job.data as object);
           return { kind: "ttl-bump", result };
         }
         case "claim-settlement": {
-          const result = await processClaimSettlement(ctx, job.data as object);
+          const result = await processClaimSettlement(sharedCtx, job.data as object);
           return { kind: "claim-settlement", result };
         }
         default:
@@ -69,7 +75,14 @@ export async function startKeeperQueue(
   });
 
   worker.on("failed", (job, error) => {
-    logger.error({ jobName: job?.name, jobId: job?.id, err: error }, "keeper job failed");
+    logger.error(
+      {
+        jobName: job?.name,
+        jobId: job?.id,
+        reason: sanitizeSpendDiagnostic(error.message),
+      },
+      "keeper job failed",
+    );
   });
 
   // Schedule repeatable jobs for the two Stellar tasks
@@ -87,6 +100,7 @@ export async function startKeeperQueue(
     queue,
     worker,
     redis,
+    spendingTracker,
     close: async () => {
       await worker.close();
       await queue.close();

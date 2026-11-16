@@ -93,11 +93,18 @@ export interface IndexerConfig {
   readonly evm: readonly EvmWatchConfig[];
 }
 
+export interface KeeperSpendingCapConfig {
+  readonly dailyCapStroops: bigint;
+  readonly maxSingleTxFeeStroops: bigint;
+  readonly windowLedgers: number | null;
+}
+
 export interface KeeperConfig {
   readonly enabled: boolean;
   readonly pollIntervalMs: number;
   readonly concurrency: number;
   readonly stellarSecret: string | null;
+  readonly spendingCap: KeeperSpendingCapConfig;
 }
 
 export interface AppConfig {
@@ -323,6 +330,37 @@ const KEEPER_STELLAR_SECRET: VarSpec = {
     "Secret key for submitting Stellar keep_alive and claim transactions. Optional; runs dry-run when absent.",
 };
 
+const KEEPER_DAILY_SPEND_CAP_STROOPS: VarSpec = {
+  name: "KEEPER_DAILY_SPEND_CAP_STROOPS",
+  kind: "integer",
+  required: false,
+  fallback: "100000000",
+  min: 1,
+  printable: true,
+  purpose:
+    "Maximum total Stellar fee spend in stroops allowed per signer within one daily or ledger maintenance window.",
+};
+
+const KEEPER_MAX_SINGLE_TX_FEE_STROOPS: VarSpec = {
+  name: "KEEPER_MAX_SINGLE_TX_FEE_STROOPS",
+  kind: "integer",
+  required: false,
+  fallback: "10000000",
+  min: 100,
+  printable: true,
+  purpose: "Maximum Stellar fee in stroops allowed for a single keeper maintenance transaction.",
+};
+
+const KEEPER_SPEND_WINDOW_LEDGERS: VarSpec = {
+  name: "KEEPER_SPEND_WINDOW_LEDGERS",
+  kind: "integer",
+  required: false,
+  min: 1,
+  printable: true,
+  purpose:
+    "Optional ledger window width for per-signer spending caps; defaults to UTC calendar day windows when unset.",
+};
+
 const SHUTDOWN_TIMEOUT_MS: VarSpec = {
   name: "SHUTDOWN_TIMEOUT_MS",
   kind: "integer",
@@ -471,6 +509,11 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const keeperStellarSecret = reader.has(KEEPER_STELLAR_SECRET.name)
     ? reader.string(KEEPER_STELLAR_SECRET)
     : null;
+  const keeperDailySpendCapStroops = BigInt(reader.integer(KEEPER_DAILY_SPEND_CAP_STROOPS));
+  const keeperMaxSingleTxFeeStroops = BigInt(reader.integer(KEEPER_MAX_SINGLE_TX_FEE_STROOPS));
+  const keeperSpendWindowLedgers = reader.has(KEEPER_SPEND_WINDOW_LEDGERS.name)
+    ? reader.integer(KEEPER_SPEND_WINDOW_LEDGERS)
+    : null;
   const stellarRpcOverride = reader.url(STELLAR_RPC_URL);
   const startLedgerOverride = reader.has(STELLAR_START_LEDGER.name)
     ? reader.integer(STELLAR_START_LEDGER)
@@ -526,6 +569,11 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       pollIntervalMs: keeperPollIntervalMs,
       concurrency: keeperConcurrency,
       stellarSecret: keeperStellarSecret,
+      spendingCap: {
+        dailyCapStroops: keeperDailySpendCapStroops,
+        maxSingleTxFeeStroops: keeperMaxSingleTxFeeStroops,
+        windowLedgers: keeperSpendWindowLedgers,
+      },
     },
     shutdownTimeoutMs,
   };
