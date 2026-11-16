@@ -30,6 +30,7 @@ import { AxelarGmpClient } from "../rails/axelar/gmp.js";
 import { IrisClient } from "../rails/cctp/iris.js";
 import { RailPass } from "../rails/pass.js";
 import type { RailClient } from "../rails/types.js";
+import { KeeperOutcomeTracker } from "../keeper/outcomes.js";
 import { KeeperWorker } from "../keeper/worker.js";
 import { viemClient } from "./evm/client.js";
 import { EvmWatcher } from "./evm/watcher.js";
@@ -186,7 +187,8 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
 
   // The keeper submits Stellar TTL maintenance and claim settlement through BullMQ.
   if (config.keeper.enabled) {
-    workers.push(new KeeperWorker(config, db, logger));
+    const outcomes = new KeeperOutcomeTracker(db);
+    workers.push(new KeeperWorker(config, db, logger, outcomes));
   } else {
     extra.push(
       fixedReadiness(

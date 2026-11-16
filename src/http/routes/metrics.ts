@@ -7,6 +7,7 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import { readKeeperOutcomeMetrics } from "../../keeper/outcomes.js";
 import type { ServerDeps } from "../server.js";
 
 export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): void {
@@ -56,6 +57,9 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       updatedAt: new Date(row.updated_at as string | number | Date).toISOString(),
     }));
 
+    // 6. Keeper maintenance transaction outcomes (bounded low-cardinality series + pending refs)
+    const keeperOutcomes = await readKeeperOutcomeMetrics(db);
+
     return reply.send({
       service: "hyperion-backend",
       network: deps.config.network,
@@ -66,6 +70,7 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       },
       claims,
       railAttestations: railStatusCounts,
+      keeperOutcomes,
       cursors,
     });
   });

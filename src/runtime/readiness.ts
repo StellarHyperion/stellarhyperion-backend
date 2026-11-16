@@ -166,6 +166,26 @@ export function bullmqWorkersReadiness(
   };
 }
 
+export function keeperPendingReadiness(getPendingCount: () => number): ReadinessSource {
+  return {
+    readiness: () => {
+      const pending = getPendingCount();
+      if (pending > 0) {
+        return {
+          name: "keeper-submissions",
+          state: "degraded",
+          detail: `${String(pending)} keeper transaction submission(s) awaiting chain finality`,
+        };
+      }
+      return {
+        name: "keeper-submissions",
+        state: "ready",
+        detail: "no unresolved keeper submissions",
+      };
+    },
+  };
+}
+
 export class ReadinessRegistry {
   private readonly sources: ReadinessSource[] = [];
 

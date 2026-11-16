@@ -1,6 +1,8 @@
 import type { Logger } from "pino";
 import type { AppConfig } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
+import type { KeeperOutcomeTracker } from "./outcomes.js";
+import type { StellarKeeperRpcClient } from "./stellar.js";
 export type KeeperJobName = "ttl-bump" | "claim-settlement";
 export interface TtlBumpPayload {
   readonly maxClaims?: number;
@@ -30,4 +32,8 @@ export interface KeeperContext {
   readonly db: Transactional;
   readonly config: AppConfig;
   readonly logger: Logger;
+  readonly outcomes?: KeeperOutcomeTracker;
+  readonly rpcClient?: StellarKeeperRpcClient;
+  readonly pollAttempts?: number;
+  readonly pollIntervalMs?: number;
 }

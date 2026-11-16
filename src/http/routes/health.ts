@@ -15,6 +15,7 @@
  */
 import type { FastifyInstance } from "fastify";
 
+import { readKeeperOutcomeMetrics } from "../../keeper/outcomes.js";
 import type { ServerDeps } from "../server.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { checkRedisHealth, worstOf } from "../../runtime/readiness.js";
@@ -55,6 +56,16 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
       }
     }
 
+    let keeperPendingSubmissions = 0;
+    if (checks[0]?.state === "ready") {
+      try {
+        const snapshot = await readKeeperOutcomeMetrics(deps.db, 5);
+        keeperPendingSubmissions = snapshot.totals.pending;
+      } catch {
+        keeperPendingSubmissions = 0;
+      }
+    }
+
     const state = worstOf(checks);
     // Degraded still serves. One stalled chain watcher is a reason to alert, not a reason to stop
     // answering questions about the three chains that are fine.
@@ -64,6 +75,7 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
       meaning: READINESS_MEANING,
       network: deps.config.network,
       indexer: deps.config.indexer.enabled ? "enabled" : "disabled",
+      keeperPendingSubmissions,
       checks,
     });
   });

@@ -32,7 +32,10 @@ export async function processTtlBump(
   const claims = claimRows.rows.map((row) => bigintOf(row, "claim_id"));
   const transfers = transferRows.rows.map((row) => bigintOf(row, "nonce"));
   const dryRun = ctx.config.keeper.stellarSecret === null;
-  if (dryRun)
+  if (dryRun) {
+    if (ctx.outcomes !== undefined) {
+      await ctx.outcomes.recordSimulated("ttl-bump");
+    }
     return {
       bumpedTokens: 0,
       bumpedClaims: 0,
@@ -40,13 +43,41 @@ export async function processTtlBump(
       dryRun: true,
       detail: `No signer: ${tokens.length} tokens, ${claims.length} claims, ${transfers.length} transfers need maintenance.`,
     };
+  }
   const vector = (values: xdr.ScVal[]) => xdr.ScVal.scvVec(values);
-  const hash = await submitStellar(ctx.config, chain.routerContractId, "keep_alive", () => [
-    vector(tokens.map((token) => new Address(token).toScVal())),
-    vector([0, 1, 2, 3].map((route) => nativeToScVal(route, { type: "u32" }))),
-    vector(claims.map((id) => nativeToScVal(id, { type: "u64" }))),
-    vector(transfers.map((id) => nativeToScVal(id, { type: "u64" }))),
-  ]);
+  const submitOptions =
+    ctx.outcomes !== undefined ||
+    ctx.rpcClient !== undefined ||
+    ctx.pollAttempts !== undefined ||
+    ctx.pollIntervalMs !== undefined
+      ? {
+          jobKind: "ttl-bump" as const,
+          outcomes: ctx.outcomes,
+          rpcClient: ctx.rpcClient,
+          pollAttempts: ctx.pollAttempts,
+          pollIntervalMs: ctx.pollIntervalMs,
+        }
+      : undefined;
+  const hash =
+    submitOptions !== undefined
+      ? await submitStellar(
+          ctx.config,
+          chain.routerContractId,
+          "keep_alive",
+          () => [
+            vector(tokens.map((token) => new Address(token).toScVal())),
+            vector([0, 1, 2, 3].map((route) => nativeToScVal(route, { type: "u32" }))),
+            vector(claims.map((id) => nativeToScVal(id, { type: "u64" }))),
+            vector(transfers.map((id) => nativeToScVal(id, { type: "u64" }))),
+          ],
+          submitOptions,
+        )
+      : await submitStellar(ctx.config, chain.routerContractId, "keep_alive", () => [
+          vector(tokens.map((token) => new Address(token).toScVal())),
+          vector([0, 1, 2, 3].map((route) => nativeToScVal(route, { type: "u32" }))),
+          vector(claims.map((id) => nativeToScVal(id, { type: "u64" }))),
+          vector(transfers.map((id) => nativeToScVal(id, { type: "u64" }))),
+        ]);
   ctx.logger.info({ hash }, "router keep_alive confirmed");
   return {
     bumpedTokens: tokens.length,

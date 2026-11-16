@@ -33,6 +33,8 @@ const REDACTED_PATHS = [
   "stellarSecret",
   "*.stellarSecret",
   "config.keeper.stellarSecret",
+  "signerSecret",
+  "*.signerSecret",
   "*.databaseUrl",
   "*.redisUrl",
   "*.connectionString",

@@ -19,7 +19,10 @@ export async function processClaimSettlement(
     "SELECT claim_id FROM pending_claim WHERE chain = $1 AND NOT settled ORDER BY claim_id ASC LIMIT $2",
     [chain.chain, payload.limit ?? 20],
   );
-  if (!ctx.config.keeper.stellarSecret)
+  if (!ctx.config.keeper.stellarSecret) {
+    if (ctx.outcomes !== undefined) {
+      await ctx.outcomes.recordSimulated("claim-settlement");
+    }
     return {
       settled: 0,
       attempted: 0,
@@ -27,16 +30,37 @@ export async function processClaimSettlement(
       dryRun: true,
       detail: "No signer configured; no settlement was attempted.",
     };
+  }
+  const submitOptions =
+    ctx.outcomes !== undefined ||
+    ctx.rpcClient !== undefined ||
+    ctx.pollAttempts !== undefined ||
+    ctx.pollIntervalMs !== undefined
+      ? {
+          jobKind: "claim-settlement" as const,
+          outcomes: ctx.outcomes,
+          rpcClient: ctx.rpcClient,
+          pollAttempts: ctx.pollAttempts,
+          pollIntervalMs: ctx.pollIntervalMs,
+        }
+      : undefined;
   let settled = 0;
   for (const row of rows) {
     const id = bigintOf(row, "claim_id");
     try {
-      const hash = await submitStellar(
-        ctx.config,
-        chain.routerContractId,
-        "settle_claim",
-        (sender) => [new Address(sender).toScVal(), nativeToScVal(id, { type: "u64" })],
-      );
+      const hash =
+        submitOptions !== undefined
+          ? await submitStellar(
+              ctx.config,
+              chain.routerContractId,
+              "settle_claim",
+              (sender) => [new Address(sender).toScVal(), nativeToScVal(id, { type: "u64" })],
+              submitOptions,
+            )
+          : await submitStellar(ctx.config, chain.routerContractId, "settle_claim", (sender) => [
+              new Address(sender).toScVal(),
+              nativeToScVal(id, { type: "u64" }),
+            ]);
       ctx.logger.info(
         { claimId: String(id), hash },
         "claim settlement confirmed; watcher will update the claim record",
