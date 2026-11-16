@@ -23,6 +23,12 @@ export interface ServerDeps {
   readonly readiness: readonly ReadinessSource[];
   /** Set at boot so `/health` can report how long the process has been up. */
   readonly startedAt?: Date;
+  /** Optional bounded replica identifier for split API and worker deployments. */
+  readonly replicaId?: string;
+  /** Optional clock override for deterministic freshness evaluation in tests. */
+  readonly now?: () => Date;
+  /** Explicitly evaluate persistent worker heartbeats even when in-process watchers are attached. */
+  readonly checkPersistentHeartbeats?: boolean;
 }
 
 export function buildServer(deps: ServerDeps): FastifyInstance {

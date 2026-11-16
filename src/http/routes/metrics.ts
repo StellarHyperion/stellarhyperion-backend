@@ -7,13 +7,22 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import {
+  MIN_BOUNDED_HEARTBEAT_MS,
+  generateProcessReplicaId,
+  summarizeWorkerHeartbeats,
+} from "../../runtime/heartbeat.js";
 import type { ServerDeps } from "../server.js";
 
 export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
   const startedAt = deps.startedAt ?? new Date();
+  const replicaId = generateProcessReplicaId(deps.replicaId);
 
   app.get("/v1/metrics", async (_request, reply: FastifyReply) => {
+    const nowDate = deps.now?.() ?? new Date();
+    const nowMs = nowDate.getTime();
+
     // 1. Total outbound transfers
     const outboundResult = await db.query("SELECT count(*)::int AS count FROM outbound_transfer");
     const totalOutbound = outboundResult.rows[0] ? integer(outboundResult.rows[0], "count") : 0;
@@ -49,17 +58,31 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
     const cursorResult = await db.query(
       "SELECT chain_key, last_processed AS cursor_block, last_processed_hash AS cursor_hash, updated_at FROM indexer_cursor",
     );
-    const cursors = cursorResult.rows.map((row) => ({
-      chain: text(row, "chain_key"),
-      block: text(row, "cursor_block"),
-      hash: textOrNull(row, "cursor_hash"),
-      updatedAt: new Date(row.updated_at as string | number | Date).toISOString(),
-    }));
+    const cursors = cursorResult.rows.map((row) => {
+      const rawUpdated = new Date(row.updated_at as string | number | Date).getTime();
+      const boundedUpdated = Number.isNaN(rawUpdated)
+        ? nowMs
+        : Math.max(MIN_BOUNDED_HEARTBEAT_MS, Math.min(rawUpdated, nowMs));
+      return {
+        chain: text(row, "chain_key"),
+        block: text(row, "cursor_block"),
+        hash: textOrNull(row, "cursor_hash"),
+        updatedAt: new Date(boundedUpdated).toISOString(),
+      };
+    });
+
+    // 6. Persistent worker heartbeats across split processes
+    const heartbeatSummary = await summarizeWorkerHeartbeats(
+      db,
+      deps.config,
+      deps.now ? { now: deps.now } : {},
+    );
 
     return reply.send({
       service: "hyperion-backend",
       network: deps.config.network,
-      uptimeSeconds: Math.floor((Date.now() - startedAt.getTime()) / 1000),
+      replicaId,
+      uptimeSeconds: Math.max(0, Math.floor((nowMs - startedAt.getTime()) / 1000)),
       transfers: {
         totalOutbound,
         totalInbound,
@@ -67,6 +90,19 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       claims,
       railAttestations: railStatusCounts,
       cursors,
+      heartbeats: heartbeatSummary.heartbeats,
+      indexerHeartbeat: {
+        status: heartbeatSummary.status,
+        detail: heartbeatSummary.detail,
+        evaluatedAt: heartbeatSummary.evaluatedAt,
+        expectedWorkers: heartbeatSummary.expectedWorkers,
+        freshWorkers: heartbeatSummary.freshWorkers,
+        staleWorkers: heartbeatSummary.staleWorkers,
+        missingWorkers: heartbeatSummary.missingWorkers,
+        evidenceGapWorkers: heartbeatSummary.evidenceGapWorkers,
+        degradedWorkers: heartbeatSummary.degradedWorkers,
+        totalWorkloadPending: heartbeatSummary.totalWorkloadPending,
+      },
     });
   });
 }

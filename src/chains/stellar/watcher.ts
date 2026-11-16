@@ -25,6 +25,7 @@
 import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../../db/pool.js";
+import type { WorkerHeartbeatSnapshot } from "../../runtime/heartbeat.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { completeThrough, endOfLedgerCursor, parseEventCursor } from "./cursor.js";
 import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
@@ -91,6 +92,7 @@ export interface WatcherProgress {
 
 export class StellarWatcher {
   private lastProgress: WatcherProgress | null = null;
+  private evidenceGapDetected = false;
   /** Tags seen once and logged once. A contract ahead of this build should not be a log flood. */
   private readonly reportedUnknown = new Set<string>();
 
@@ -102,6 +104,18 @@ export class StellarWatcher {
 
   get progress(): WatcherProgress | null {
     return this.lastProgress;
+  }
+
+  heartbeatSnapshot(): WorkerHeartbeatSnapshot {
+    const progress = this.lastProgress;
+    return {
+      workerKind: "chain",
+      completedPosition: progress === null ? null : BigInt(progress.ledger),
+      lagUnits: progress === null ? null : progress.behind,
+      evidenceGap: this.evidenceGapDetected,
+      workloadPending: null,
+      lastProgressAt: progress?.at ?? null,
+    };
   }
 
   /**
@@ -157,6 +171,7 @@ export class StellarWatcher {
     const scan = await this.scan(base, stored === null, signal);
 
     if (scan.oldestLedger > base + 1 && stored !== null) {
+      this.evidenceGapDetected = true;
       // The retention window moved past where we stopped. Anything between the two is gone from
       // this node, and carrying on from the window edge would leave a hole nothing ever reports.
       logger.error(
@@ -304,6 +319,7 @@ export class StellarWatcher {
       return await this.options.rpc.events(query, signal);
     } catch (error) {
       if (error instanceof StellarRpcError && !error.retryable) {
+        this.evidenceGapDetected = true;
         // Almost always the start ledger or the cursor having fallen out of the node's retention
         // window. Said plainly, because the fix is an archive source rather than another retry.
         this.options.logger.error(

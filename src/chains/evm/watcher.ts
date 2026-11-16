@@ -28,6 +28,7 @@ import type { Logger } from "pino";
 import type { Hex } from "viem";
 
 import type { Queryable, Transactional } from "../../db/pool.js";
+import type { WorkerHeartbeatSnapshot } from "../../runtime/heartbeat.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
 import type { Position } from "../writers.js";
@@ -91,6 +92,18 @@ export class EvmWatcher {
 
   get progress(): EvmProgress | null {
     return this.lastProgress;
+  }
+
+  heartbeatSnapshot(): WorkerHeartbeatSnapshot {
+    const progress = this.lastProgress;
+    return {
+      workerKind: "chain",
+      completedPosition: progress?.block ?? null,
+      lagUnits: progress === null ? null : Math.max(0, progress.behind),
+      evidenceGap: false,
+      workloadPending: null,
+      lastProgressAt: progress?.at ?? null,
+    };
   }
 
   /**

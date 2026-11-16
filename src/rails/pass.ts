@@ -23,6 +23,7 @@ import { verifyCctpDelivery } from "./cctp/delivery.js";
 import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
+import type { WorkerHeartbeatSnapshot } from "../runtime/heartbeat.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
 import { writeInbound, writeAttestation } from "../chains/writers.js";
 import { outstandingForRail, pendingForRail } from "./queue.js";
@@ -70,6 +71,18 @@ export class RailPass {
 
   get progress(): RailProgress | null {
     return this.lastProgress;
+  }
+
+  heartbeatSnapshot(): WorkerHeartbeatSnapshot {
+    const progress = this.lastProgress;
+    return {
+      workerKind: "rail",
+      completedPosition: null,
+      lagUnits: null,
+      evidenceGap: false,
+      workloadPending: progress?.outstanding ?? null,
+      lastProgressAt: progress?.at ?? null,
+    };
   }
 
   readiness(): ReadinessReport {

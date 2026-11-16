@@ -20,7 +20,12 @@ import type {
   RailsConfig,
   StellarWatchConfig,
 } from "../config/config.js";
-import type { Transactional } from "../db/pool.js";
+import type { Queryable, Transactional } from "../db/pool.js";
+import {
+  generateProcessReplicaId,
+  recordWorkerHeartbeat,
+  type WorkerHeartbeatSnapshot,
+} from "../runtime/heartbeat.js";
 import { Poller } from "../runtime/poller.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
 import { fixedReadiness } from "../runtime/readiness.js";
@@ -64,6 +69,13 @@ export interface IndexerHandle {
 interface Pass extends ReadinessSource {
   readonly name: string;
   tick(signal: AbortSignal): Promise<boolean>;
+  heartbeatSnapshot?(): WorkerHeartbeatSnapshot;
+}
+
+export interface PolledWorkerHeartbeatConfig {
+  readonly db: Queryable;
+  readonly replicaId: string;
+  readonly now?: () => Date;
 }
 
 /**
@@ -75,17 +87,20 @@ interface Pass extends ReadinessSource {
  */
 export class PolledWorker implements Worker {
   private readonly poller: Poller;
+  private consecutivePollFailures = 0;
+  private lastPollError: string | null = null;
 
   constructor(
     private readonly pass: Pass,
-    intervalMs: number,
-    logger: Logger,
+    private readonly intervalMs: number,
+    private readonly logger: Logger,
+    private readonly heartbeat?: PolledWorkerHeartbeatConfig,
   ) {
     this.poller = new Poller({
       name: pass.name,
       intervalMs,
       logger,
-      tick: (signal) => pass.tick(signal),
+      tick: (signal) => this.runTick(signal),
     });
   }
 
@@ -102,15 +117,67 @@ export class PolledWorker implements Worker {
   }
 
   async readiness(): Promise<ReadinessReport> {
-    const stats = this.poller.stats;
-    if (stats.consecutiveFailures >= FAILURES_BEFORE_DEGRADED) {
+    const failures = Math.max(this.poller.stats.consecutiveFailures, this.consecutivePollFailures);
+    const lastError = this.poller.stats.lastError ?? this.lastPollError;
+    if (failures >= FAILURES_BEFORE_DEGRADED) {
       return {
         name: this.name,
         state: "degraded",
-        detail: `${String(stats.consecutiveFailures)} polls in a row failed: ${stats.lastError ?? "no reason recorded"}`,
+        detail: `${String(failures)} polls in a row failed: ${lastError ?? "no reason recorded"}`,
       };
     }
     return this.pass.readiness();
+  }
+
+  async flushHeartbeat(): Promise<void> {
+    if (this.heartbeat === undefined) {
+      return;
+    }
+    try {
+      const report = await this.readiness();
+      const snapshot = this.pass.heartbeatSnapshot?.();
+      const defaultKind = this.name.startsWith("rail:") ? "rail" : "chain";
+      await recordWorkerHeartbeat(
+        this.heartbeat.db,
+        {
+          workerName: this.name,
+          replicaId: this.heartbeat.replicaId,
+          workerKind: snapshot?.workerKind ?? defaultKind,
+          state: report.state,
+          detail: report.detail,
+          completedPosition: snapshot?.completedPosition ?? null,
+          lagUnits: snapshot?.lagUnits ?? null,
+          consecutiveFailures: Math.max(
+            this.poller.stats.consecutiveFailures,
+            this.consecutivePollFailures,
+          ),
+          expectedIntervalMs: this.intervalMs,
+          evidenceGap: snapshot?.evidenceGap ?? false,
+          workloadPending: snapshot?.workloadPending ?? null,
+          lastProgressAt: snapshot?.lastProgressAt ?? null,
+        },
+        this.heartbeat.now ? { now: this.heartbeat.now } : {},
+      );
+    } catch (error) {
+      this.logger.warn({ err: error, worker: this.name }, "worker heartbeat write failed");
+    }
+  }
+
+  private async runTick(signal: AbortSignal): Promise<boolean> {
+    try {
+      const progressed = await this.pass.tick(signal);
+      this.consecutivePollFailures = 0;
+      this.lastPollError = null;
+      await this.flushHeartbeat();
+      return progressed;
+    } catch (error) {
+      if (!signal.aborted) {
+        this.consecutivePollFailures += 1;
+        this.lastPollError = error instanceof Error ? error.message : String(error);
+        await this.flushHeartbeat();
+      }
+      throw error;
+    }
   }
 }
 
@@ -118,6 +185,8 @@ export interface BuildIndexerDeps {
   readonly config: AppConfig;
   readonly logger: Logger;
   readonly db: Transactional;
+  readonly replicaId?: string;
+  readonly now?: () => Date;
 }
 
 /**
@@ -146,11 +215,17 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
     };
   }
 
+  const heartbeatConfig: PolledWorkerHeartbeatConfig = {
+    db,
+    replicaId: generateProcessReplicaId(deps.replicaId),
+    ...(deps.now ? { now: deps.now } : {}),
+  };
+
   const workers: Worker[] = [];
   const extra: ReadinessSource[] = [];
 
   if (config.indexer.stellar !== null) {
-    workers.push(stellarWorker(config.indexer.stellar, db, logger));
+    workers.push(stellarWorker(config.indexer.stellar, db, logger, heartbeatConfig));
   } else {
     logger.warn("the deployment record has no Stellar router, so nothing is watching Stellar");
   }
@@ -158,7 +233,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // One per chain in the record. Each carries its own confirmations from the registry, which is
   // the honest way to treat one block on Arc and twelve on Ethereum as the same kind of fact.
   for (const chain of config.indexer.evm) {
-    workers.push(evmWorker(chain, db, logger));
+    workers.push(evmWorker(chain, db, logger, heartbeatConfig));
   }
 
   // Counted before the rail pollers join the list, because the two questions are different. "Is
@@ -171,7 +246,14 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // They are not conditional on a router being watched: a transfer indexed by a previous run is
   // still waiting on its rail whether or not this replica is watching the chain it left.
   if (config.rails.enabled) {
-    for (const worker of railWorkers(config.rails, config.network, db, logger, config)) {
+    for (const worker of railWorkers(
+      config.rails,
+      config.network,
+      db,
+      logger,
+      config,
+      heartbeatConfig,
+    )) {
       workers.push(worker);
     }
   } else {
@@ -242,6 +324,7 @@ function railWorkers(
   db: Transactional,
   logger: Logger,
   appConfig: AppConfig,
+  heartbeat: PolledWorkerHeartbeatConfig,
 ): readonly Worker[] {
   const clients: readonly { readonly route: RouteKind; readonly client: RailClient }[] = [
     {
@@ -273,11 +356,16 @@ function railWorkers(
       recheckAfterMs: config.recheckAfterMs,
       maxCheckFailures: config.maxCheckFailures,
     });
-    return new PolledWorker(pass, config.pollIntervalMs, child);
+    return new PolledWorker(pass, config.pollIntervalMs, child, heartbeat);
   });
 }
 
-function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): Worker {
+function evmWorker(
+  config: EvmWatchConfig,
+  db: Transactional,
+  logger: Logger,
+  heartbeat: PolledWorkerHeartbeatConfig,
+): Worker {
   const child = logger.child({ chain: config.chain, chainId: config.chainId });
   const watcher = new EvmWatcher({
     chainKey: config.chain,
@@ -291,10 +379,15 @@ function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): W
     db,
     logger: child,
   });
-  return new PolledWorker(watcher, config.pollIntervalMs, child);
+  return new PolledWorker(watcher, config.pollIntervalMs, child, heartbeat);
 }
 
-function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Logger): Worker {
+function stellarWorker(
+  config: StellarWatchConfig,
+  db: Transactional,
+  logger: Logger,
+  heartbeat: PolledWorkerHeartbeatConfig,
+): Worker {
   const child = logger.child({ chain: config.chain });
   const watcher = new StellarWatcher({
     chainKey: config.chain,
@@ -305,5 +398,5 @@ function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Lo
     db,
     logger: child,
   });
-  return new PolledWorker(watcher, config.pollIntervalMs, child);
+  return new PolledWorker(watcher, config.pollIntervalMs, child, heartbeat);
 }

@@ -30,6 +30,10 @@ const REDACTED_PATHS = [
   "redisUrl",
   "connectionString",
   "password",
+  "authorization",
+  "apiKey",
+  "secret",
+  "token",
   "stellarSecret",
   "*.stellarSecret",
   "config.keeper.stellarSecret",
@@ -37,10 +41,104 @@ const REDACTED_PATHS = [
   "*.redisUrl",
   "*.connectionString",
   "*.password",
+  "*.authorization",
+  "*.apiKey",
+  "*.secret",
+  "*.token",
   "err.connectionString",
   "config.databaseUrl",
   "config.redisUrl",
 ];
+
+export const MAX_REPLICA_ID_LENGTH = 64;
+export const MAX_DIAGNOSTIC_LENGTH = 256;
+
+const URL_CREDENTIALS_PATTERN = /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^/\s@]+@)/g;
+const QUERY_SECRET_PATTERN =
+  /([?&](?:api[_-]?key|apikey|access[_-]?token|auth[_-]?token|token|password|passwd|secret|key)=)([^&#\s]+)/gi;
+const KV_SECRET_PATTERN =
+  /\b((?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|bearer|authorization)\s*[:=]\s*)([^\s,;]+)/gi;
+const BEARER_HEADER_PATTERN = /\b(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi;
+const STELLAR_SECRET_PATTERN = /\bS[A-Z2-7]{55}\b/g;
+
+/**
+ * Scrub credentials, connection userinfo, secret keys, and unbounded text from diagnostic strings
+ * before persisting to worker_heartbeat or returning in readiness and metrics payloads.
+ */
+export function sanitizeDiagnosticText(
+  input: string,
+  maxLength: number = MAX_DIAGNOSTIC_LENGTH,
+): string {
+  const limit = Math.max(16, Math.min(maxLength, 512));
+  const scrubbed = input
+    .replace(URL_CREDENTIALS_PATTERN, "$1[redacted]@")
+    .replace(QUERY_SECRET_PATTERN, "$1[redacted]")
+    .replace(BEARER_HEADER_PATTERN, "$1[redacted]")
+    .replace(KV_SECRET_PATTERN, "$1[redacted]")
+    .replace(STELLAR_SECRET_PATTERN, "[redacted]")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+
+  if (scrubbed.length <= limit) {
+    return scrubbed;
+  }
+  return `${scrubbed.slice(0, limit - 3)}...`;
+}
+
+/**
+ * Produce a bounded, credential-free replica identifier safe for database keys, logs, and APIs.
+ */
+export function sanitizeReplicaId(raw?: string | null, fallback = "replica-default"): string {
+  const safeFallback = normalizeReplicaToken(fallback) || "replica-default";
+  if (raw === undefined || raw === null) {
+    return safeFallback;
+  }
+
+  const trimmed = raw.trim();
+  if (trimmed === "") {
+    return safeFallback;
+  }
+
+  // Reject raw inputs that look directly like credentials, URLs with userinfo, or signing keys.
+  if (looksLikeSecretOrCredential(trimmed)) {
+    return safeFallback;
+  }
+
+  const normalized = normalizeReplicaToken(trimmed);
+  return normalized === "" ? safeFallback : normalized;
+}
+
+function looksLikeSecretOrCredential(value: string): boolean {
+  if (value.includes("://") || value.includes("@")) return true;
+  if (
+    /[?&](?:api[_-]?key|apikey|access[_-]?token|auth[_-]?token|token|password|passwd|secret|key)=/i.test(
+      value,
+    )
+  ) {
+    return true;
+  }
+  if (
+    /\b(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|bearer|authorization)\s*[:=]/i.test(
+      value,
+    )
+  ) {
+    return true;
+  }
+  if (/\bBearer\s+[A-Za-z0-9._~+/=-]+/i.test(value)) return true;
+  if (/\bS[A-Z2-7]{55}\b/.test(value)) return true;
+  if (/\b0x[0-9a-fA-F]{64}\b/.test(value)) return true;
+  return false;
+}
+
+function normalizeReplicaToken(value: string): string {
+  return value
+    .replace(/[^a-zA-Z0-9._:-]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^[-.:_]+|[-.:_]+$/g, "")
+    .slice(0, MAX_REPLICA_ID_LENGTH)
+    .replace(/[-.:_]+$/g, "");
+}
 
 export function createLogger(config: AppConfig): Logger {
   return pino({

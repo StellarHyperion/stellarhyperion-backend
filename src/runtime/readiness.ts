@@ -12,6 +12,10 @@
  * its own readiness and the HTTP layer only aggregates.
  */
 
+import type { AppConfig } from "../config/config.js";
+import type { Queryable } from "../db/pool.js";
+import { checkPersistentIndexerHeartbeats, type EvaluateHeartbeatOptions } from "./heartbeat.js";
+
 export type ReadinessState = "ready" | "degraded" | "down";
 
 export interface ReadinessReport {
@@ -166,6 +170,16 @@ export function bullmqWorkersReadiness(
   };
 }
 
+export function persistentHeartbeatReadiness(
+  db: Queryable,
+  config: AppConfig,
+  options: EvaluateHeartbeatOptions = {},
+): ReadinessSource {
+  return {
+    readiness: () => checkPersistentIndexerHeartbeats(db, config, options),
+  };
+}
+
 export class ReadinessRegistry {
   private readonly sources: ReadinessSource[] = [];
 
@@ -179,6 +193,14 @@ export class ReadinessRegistry {
 
   registerBullmq(workers: readonly BullMQWorkerState[], name?: string): void {
     this.sources.push(bullmqWorkersReadiness(workers, name));
+  }
+
+  registerPersistentHeartbeats(
+    db: Queryable,
+    config: AppConfig,
+    options?: EvaluateHeartbeatOptions,
+  ): void {
+    this.sources.push(persistentHeartbeatReadiness(db, config, options));
   }
 
   async check(): Promise<{ state: ReadinessState; checks: ReadinessReport[] }> {

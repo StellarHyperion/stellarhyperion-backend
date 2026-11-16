@@ -16,6 +16,11 @@
 import type { FastifyInstance } from "fastify";
 
 import type { ServerDeps } from "../server.js";
+import { sanitizeDiagnosticText } from "../../logging/logger.js";
+import {
+  checkPersistentIndexerHeartbeats,
+  generateProcessReplicaId,
+} from "../../runtime/heartbeat.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { checkRedisHealth, worstOf } from "../../runtime/readiness.js";
 
@@ -27,30 +32,63 @@ const READINESS_MEANING =
 
 export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const startedAt = deps.startedAt ?? new Date();
+  const replicaId = generateProcessReplicaId(deps.replicaId);
 
   app.get("/health", () => ({
     status: "ok",
     meaning: LIVENESS_MEANING,
     service: "hyperion-backend",
     network: deps.config.network,
-    uptimeSeconds: Math.floor((Date.now() - startedAt.getTime()) / 1000),
+    replicaId,
+    uptimeSeconds: Math.max(
+      0,
+      Math.floor(((deps.now?.() ?? new Date()).getTime() - startedAt.getTime()) / 1000),
+    ),
   }));
 
   app.get("/ready", async (_request, reply) => {
-    const checks: ReadinessReport[] = [await checkDatabase(deps), await checkRedis(deps)];
+    const postgresReport = await checkDatabase(deps);
+    const redisReport = await checkRedis(deps);
+    const checks: ReadinessReport[] = [postgresReport, redisReport];
 
     for (const source of deps.readiness) {
       try {
         const report = await source.readiness();
         if (report.name === "redis" && deps.redis !== undefined) continue;
-        checks.push(report);
+        checks.push({
+          name: report.name,
+          state: report.state,
+          detail: sanitizeDiagnosticText(report.detail),
+        });
       } catch (error) {
         // A readiness check that throws is itself a failure, and swallowing it would report
         // ready for a component nobody can hear from.
         checks.push({
           name: "unknown",
           state: "down",
-          detail: `readiness check threw: ${messageOf(error)}`,
+          detail: sanitizeDiagnosticText(`readiness check threw: ${messageOf(error)}`),
+        });
+      }
+    }
+
+    const shouldCheckPersistentHeartbeats =
+      deps.checkPersistentHeartbeats === true ||
+      !deps.config.indexer.enabled ||
+      deps.readiness.length === 0;
+
+    if (postgresReport.state === "ready" && shouldCheckPersistentHeartbeats) {
+      try {
+        const heartbeatReport = await checkPersistentIndexerHeartbeats(
+          deps.db,
+          deps.config,
+          deps.now ? { now: deps.now } : {},
+        );
+        checks.push(heartbeatReport);
+      } catch (error) {
+        checks.push({
+          name: "indexer-heartbeat",
+          state: "degraded",
+          detail: sanitizeDiagnosticText(`persistent heartbeat query failed: ${messageOf(error)}`),
         });
       }
     }
@@ -63,6 +101,7 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
       status: state,
       meaning: READINESS_MEANING,
       network: deps.config.network,
+      replicaId,
       indexer: deps.config.indexer.enabled ? "enabled" : "disabled",
       checks,
     });
@@ -76,7 +115,11 @@ async function checkDatabase(deps: ServerDeps): Promise<ReadinessReport> {
   } catch (error) {
     // The message is from pg and can name a host and a database but never a password, because
     // the pool was built from a connection string pg does not echo back.
-    return { name: "postgres", state: "down", detail: `not answering: ${messageOf(error)}` };
+    return {
+      name: "postgres",
+      state: "down",
+      detail: sanitizeDiagnosticText(`not answering: ${messageOf(error)}`),
+    };
   }
 }
 
