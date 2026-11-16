@@ -9,6 +9,12 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { writeOutbound, writeInbound } from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
+import {
+  AxelarGmpClient,
+  AxelarSchemaParserRegistry,
+  listQuarantinedAxelarRecords,
+  replayQuarantinedAxelarRecords,
+} from "../../src/rails/axelar/gmp.js";
 import { outstandingForRail, pendingForRail } from "../../src/rails/queue.js";
 import { RailPass } from "../../src/rails/pass.js";
 import type { PendingTransfer, RailClient, RailLookup } from "../../src/rails/types.js";
@@ -214,5 +220,106 @@ suite("rail pollers against real Postgres", () => {
     // Outstanding should now be 0 for this transfer since delivered is terminal
     const outstanding = await outstandingForRail(db, 1);
     expect(outstanding).toBe(0);
+  });
+
+  it("quarantines drifted Axelar status schemas without advancing to delivered and replays idempotently", async () => {
+    const { logger } = capturingLogger();
+
+    await db.transaction(async (tx) => {
+      await writeOutbound(
+        tx,
+        {
+          chainKey: ORIGIN_CHAIN,
+          block: 1010n,
+          txHash: `0x${"33".repeat(32)}`,
+          logIndex: 0,
+          observedAt: new Date(),
+        },
+        {
+          route: 1,
+          nonce: 303n,
+          sender: "0x1111111111111111111111111111111111111111",
+          token: "0x3333333333333333333333333333333333333333",
+          grossAmount: 2002000n,
+          fee: 2000n,
+          netAmount: 2000000n,
+          destinationChain: DESTINATION_CHAIN,
+          destination: "0x2222222222222222222222222222222222222222",
+          railRef: "0x0000",
+        },
+      );
+    });
+
+    const fetch = (() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            data: [
+              {
+                call: { transactionHash: `0x${"33".repeat(32)}` },
+                status: "delivered_v2",
+                message_id: "axl-msg-303",
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )) as typeof globalThis.fetch;
+
+    const client = new AxelarGmpClient("https://testnet.api.gmp.axelarscan.io", {
+      fetch,
+      quarantineDb: db,
+    });
+
+    const pass = new RailPass({
+      route: 1,
+      client,
+      db,
+      logger,
+      batchSize: 10,
+      recheckAfterMs: 0,
+      maxCheckFailures: 5,
+    });
+
+    await pass.tick(new AbortController().signal);
+
+    const { rows: attRows } = await db.query(
+      `SELECT a.status FROM rail_attestation a
+       JOIN outbound_transfer t ON t.id = a.transfer_id
+       WHERE t.nonce = 303 AND t.route = 1`,
+    );
+    expect(attRows[0]?.status).toBe("pending");
+
+    const quarantined = await listQuarantinedAxelarRecords(db, { quarantineStatus: "quarantined" });
+    const match = quarantined.find((q) => q.nonce === 303n);
+    expect(match?.providerReference).toBe("axl-msg-303");
+
+    const registry = new AxelarSchemaParserRegistry();
+    registry.register({
+      id: "axelar-v2",
+      canParse: (payload): boolean =>
+        typeof payload === "object" &&
+        payload !== null &&
+        (payload as { status?: unknown }).status === "delivered_v2",
+      parse: () => ({
+        kind: "found",
+        report: {
+          status: "delivered",
+          railStatus: "delivered_v2",
+          reference: "axl-msg-303",
+          attestedAt: new Date("2026-10-08T00:00:00Z"),
+        },
+      }),
+    });
+
+    const firstReplay = await replayQuarantinedAxelarRecords(db, registry);
+    expect(firstReplay.replayed).toBeGreaterThanOrEqual(1);
+
+    const { rows: afterRows } = await db.query(
+      `SELECT a.status FROM rail_attestation a
+       JOIN outbound_transfer t ON t.id = a.transfer_id
+       WHERE t.nonce = 303 AND t.route = 1`,
+    );
+    expect(afterRows[0]?.status).toBe("attested");
   });
 });

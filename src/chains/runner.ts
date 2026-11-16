@@ -251,6 +251,7 @@ function railWorkers(
     {
       route: RouteKind.AxelarIts,
       client: new AxelarGmpClient(config.axelarUrl, {
+        quarantineDb: db,
         onUnknownStatus: (status) => {
           logger.warn(
             { rail: "axelar", status },

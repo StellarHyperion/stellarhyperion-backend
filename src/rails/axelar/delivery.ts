@@ -25,9 +25,44 @@ import type { InboundRow, Position } from "../../chains/writers.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 
 import { ITS_ABI, matchingPayment } from "./events.js";
+import {
+  replayQuarantinedAxelarRecords,
+  type AxelarSchemaParserRegistry,
+  type ReplayQuarantineOptions,
+  type ReplayQuarantineResult,
+} from "./quarantine.js";
+
+export {
+  AxelarSchemaParserRegistry,
+  listQuarantinedAxelarRecords,
+  recordQuarantinedAxelarSchema,
+  replayQuarantinedAxelarRecords,
+  type AxelarSchemaDriftKind,
+  type AxelarSchemaParser,
+  type QuarantinedAxelarRecord,
+  type ReplayQuarantineOptions,
+  type ReplayQuarantineResult,
+} from "./quarantine.js";
+
 export interface VerifiedDelivery {
   readonly at: Position;
   readonly row: InboundRow;
+}
+
+/**
+ * Replays quarantined Axelar schema records while requiring full ITS destination receipt and
+ * ERC-20 payment verification before any transfer can advance to `delivered`.
+ */
+export async function replayQuarantinedItsDeliveries(
+  config: AppConfig,
+  db: Transactional,
+  registry: AxelarSchemaParserRegistry,
+  options: Omit<ReplayQuarantineOptions, "verifyDelivery"> = {},
+): Promise<ReplayQuarantineResult> {
+  return replayQuarantinedAxelarRecords(db, registry, {
+    ...options,
+    verifyDelivery: (transfer, report) => verifyItsDelivery(config, db, transfer, report),
+  });
 }
 
 // The rail API supplies a candidate receipt. Only matching confirmed chain events establish delivery.
