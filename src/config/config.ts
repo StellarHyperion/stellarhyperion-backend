@@ -11,6 +11,7 @@
  * cast. That is the point of the shared package: there is one description of where Hyperion is
  * deployed, one validator for it, and the backend is not allowed its own opinion.
  */
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 
@@ -98,6 +99,8 @@ export interface KeeperConfig {
   readonly pollIntervalMs: number;
   readonly concurrency: number;
   readonly stellarSecret: string | null;
+  readonly leaseTtlMs: number;
+  readonly instanceId: string;
 }
 
 export interface AppConfig {
@@ -323,6 +326,27 @@ const KEEPER_STELLAR_SECRET: VarSpec = {
     "Secret key for submitting Stellar keep_alive and claim transactions. Optional; runs dry-run when absent.",
 };
 
+const KEEPER_LEASE_TTL_MS: VarSpec = {
+  name: "KEEPER_LEASE_TTL_MS",
+  kind: "integer",
+  required: false,
+  fallback: "30000",
+  min: 2000,
+  max: 600_000,
+  printable: true,
+  purpose:
+    "Bounded lease lifetime in milliseconds for distributed Stellar signer ownership before another replica may recover.",
+};
+
+const KEEPER_INSTANCE_ID: VarSpec = {
+  name: "KEEPER_INSTANCE_ID",
+  kind: "string",
+  required: false,
+  printable: true,
+  purpose:
+    "Unique replica identifier used to hold distributed keeper signer leases. Generated automatically when omitted.",
+};
+
 const SHUTDOWN_TIMEOUT_MS: VarSpec = {
   name: "SHUTDOWN_TIMEOUT_MS",
   kind: "integer",
@@ -471,6 +495,12 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const keeperStellarSecret = reader.has(KEEPER_STELLAR_SECRET.name)
     ? reader.string(KEEPER_STELLAR_SECRET)
     : null;
+  const keeperLeaseTtlMs = reader.integer(KEEPER_LEASE_TTL_MS);
+  const configuredInstanceId = reader.string(KEEPER_INSTANCE_ID);
+  const keeperInstanceId =
+    configuredInstanceId === ""
+      ? `keeper-${String(process.pid)}-${randomUUID().slice(0, 8)}`
+      : configuredInstanceId;
   const stellarRpcOverride = reader.url(STELLAR_RPC_URL);
   const startLedgerOverride = reader.has(STELLAR_START_LEDGER.name)
     ? reader.integer(STELLAR_START_LEDGER)
@@ -526,6 +556,8 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       pollIntervalMs: keeperPollIntervalMs,
       concurrency: keeperConcurrency,
       stellarSecret: keeperStellarSecret,
+      leaseTtlMs: keeperLeaseTtlMs,
+      instanceId: keeperInstanceId,
     },
     shutdownTimeoutMs,
   };
