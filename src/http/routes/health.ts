@@ -16,6 +16,7 @@
 import type { FastifyInstance } from "fastify";
 
 import type { ServerDeps } from "../server.js";
+import { sanitizePublicErrorText } from "../errors.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { checkRedisHealth, worstOf } from "../../runtime/readiness.js";
 
@@ -90,5 +91,6 @@ async function checkRedis(deps: ServerDeps): Promise<ReadinessReport> {
 }
 
 function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  const raw = error instanceof Error ? error.message : String(error);
+  return sanitizePublicErrorText(raw, "dependency check failed");
 }

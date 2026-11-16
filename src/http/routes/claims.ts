@@ -5,10 +5,17 @@
  * (e.g. uninitialized account or contract). Once the recipient is ready, the claim can be
  * settled permissionlessly.
  */
+import { isChainKey } from "@hyperion/protocol";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text } from "../../db/rows.js";
+import {
+  PublicApiError,
+  parseNonNegativeIntParam,
+  parsePaginationQuery,
+  sendPublicError,
+} from "../errors.js";
 import type { ServerDeps } from "../server.js";
 
 export interface FormattedClaim {
@@ -54,20 +61,27 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       reply: FastifyReply,
     ) => {
       const { chain, claimId } = request.params;
+      if (!isChainKey(chain)) {
+        throw PublicApiError.validation("invalid chain parameter", [
+          { field: "chain", reason: "unsupported chain identifier" },
+        ]);
+      }
+      const normalizedClaimId = parseNonNegativeIntParam(claimId, "claimId");
+
       const { rows } = await db.query(
         `SELECT chain || ':' || claim_id::text AS id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
                 created_at, settled, observed_at
            FROM pending_claim
           WHERE chain = $1 AND claim_id = $2
           LIMIT 1`,
-        [chain, claimId],
+        [chain, normalizedClaimId],
       );
 
       const row = rows[0];
       if (row === undefined) {
-        return reply.code(404).send({
-          error: "not_found",
-          message: `no claim found on chain ${chain} with id ${claimId}`,
+        return sendPublicError(reply, request, {
+          code: "not_found",
+          message: `no claim found on chain ${chain} with id ${normalizedClaimId}`,
         });
       }
 
@@ -95,22 +109,41 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       const conditions: string[] = [];
       const params: unknown[] = [];
 
-      if (chain) {
+      if (chain !== undefined) {
+        if (!isChainKey(chain)) {
+          throw PublicApiError.validation("invalid chain filter", [
+            { field: "chain", reason: "unsupported chain identifier" },
+          ]);
+        }
         params.push(chain);
         conditions.push(`chain = $${String(params.length)}`);
       }
-      if (recipient) {
-        params.push(recipient);
+      if (recipient !== undefined) {
+        const trimmedRecipient = recipient.trim();
+        if (
+          trimmedRecipient.length === 0 ||
+          trimmedRecipient.length > 128 ||
+          /[\x00-\x1f\x7f\s]/.test(trimmedRecipient)
+        ) {
+          throw PublicApiError.validation("invalid recipient filter", [
+            { field: "recipient", reason: "must be a non-empty address up to 128 characters" },
+          ]);
+        }
+        params.push(trimmedRecipient);
         conditions.push(`recipient = $${String(params.length)}`);
       }
       if (settled !== undefined) {
+        if (settled !== "true" && settled !== "false") {
+          throw PublicApiError.validation("invalid settled filter", [
+            { field: "settled", reason: "must be 'true' or 'false'" },
+          ]);
+        }
         params.push(settled === "true");
         conditions.push(`settled = $${String(params.length)}`);
       }
 
       const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-      const parsedLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
-      const parsedOffset = Math.max(Number(offset) || 0, 0);
+      const { limit: parsedLimit, offset: parsedOffset } = parsePaginationQuery(limit, offset);
 
       params.push(parsedLimit);
       const limitClause = `LIMIT $${String(params.length)}`;

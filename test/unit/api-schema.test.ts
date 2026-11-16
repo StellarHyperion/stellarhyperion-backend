@@ -124,4 +124,40 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     expect(response.json().destination.symbol).toBe("USDC");
     expect(response.json().origin.netAmount).toBe("9970000");
   });
+
+  it("preserves 200 empty history responses while normalizing validation and not-found envelopes", async () => {
+    const emptyClaims = await app.inject("/v1/claims?chain=sepolia");
+    expect(emptyClaims.statusCode).toBe(200);
+    expect(emptyClaims.json()).toEqual({
+      claims: [],
+      limit: 20,
+      offset: 0,
+      count: 0,
+    });
+
+    const emptyRoutes = await app.inject("/v1/routes/health?originChain=sepolia");
+    expect(emptyRoutes.statusCode).toBe(200);
+    expect(emptyRoutes.json()).toEqual({
+      routes: [],
+      count: 0,
+    });
+
+    const invalidLimit = await app.inject("/v1/transfers?limit=0");
+    expect(invalidLimit.statusCode).toBe(400);
+    expect(invalidLimit.json()).toMatchObject({
+      error: "bad_request",
+      code: "validation_error",
+      status: 400,
+      retryable: false,
+    });
+
+    const missingTransfer = await app.inject("/v1/transfers/stellar-testnet/999999");
+    expect(missingTransfer.statusCode).toBe(404);
+    expect(missingTransfer.json()).toMatchObject({
+      error: "not_found",
+      code: "not_found",
+      status: 404,
+      retryable: false,
+    });
+  });
 });

@@ -69,6 +69,8 @@ One process serializes its Stellar submissions to avoid sequence conflicts. Run 
 - `GET /v1/claims`, `GET /v1/claims/:chain/:claimId`
 - `GET /v1/routes/health`, `GET /v1/metrics`
 
+Public error responses return a consistent JSON envelope (`{ error, code, status, message, retryable, requestId, details? }`) free of SQL text and connection credentials. Empty transfer, claim and route queries remain `200` responses with empty arrays (`transfers: []`, `claims: []`, `routes: []`). For client compatibility during migration, responses preserve the legacy `error` string (`bad_request`, `not_found`, `too_many_requests`, `service_unavailable`, `request_timeout`, `internal_error`) alongside the normalized `code` (`validation_error`, `not_found`, `rate_limited`, `service_unavailable`, `request_timeout`, `internal_error`).
+
 `npm run check` runs formatting, lint, type checking and tests. Schema/API regressions execute repository migrations in embedded PostgreSQL (PGlite). The full PostgreSQL integration suite requires `TEST_DATABASE_URL`; it is skipped when unset. Use `npm run build` for emitted production code.
 
 RPC event retention is finite. A fresh deployment record may predate the public RPC's retained history; initialize `STELLAR_START_LEDGER` within retained history only if you accept that older events are unavailable, or use a historical provider. Check readiness and logs rather than treating an empty database as complete history.

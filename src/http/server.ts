@@ -7,6 +7,7 @@ import rateLimit from "@fastify/rate-limit";
 import type { AppConfig } from "../config/config.js";
 import type { Database } from "../db/pool.js";
 import type { BullMQWorkerState, RedisPingable, ReadinessSource } from "../runtime/readiness.js";
+import { PublicApiError, classifyThrownError, sendPublicError } from "./errors.js";
 import { registerClaimRoutes } from "./routes/claims.js";
 import { registerHealthRoutes } from "./routes/health.js";
 import { registerMetricsRoutes } from "./routes/metrics.js";
@@ -60,36 +61,41 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     max: 120,
     timeWindow: "1 minute",
     allowList: (req) => deps.config.nodeEnv === "test" || req.url.includes("/stream"),
-    errorResponseBuilder: () => ({
-      error: "too_many_requests",
-      message:
-        "rate limit exceeded; status endpoints must not be polled faster than twice a second",
-    }),
+    errorResponseBuilder: () => new PublicApiError("rate_limited"),
   });
 
-  registerHealthRoutes(app, deps);
-  registerTransferRoutes(app, deps);
-  registerClaimRoutes(app, deps);
-  registerRouteHealthRoutes(app, deps);
-  registerMetricsRoutes(app, deps);
+  app.after(() => {
+    registerHealthRoutes(app, deps);
+    registerTransferRoutes(app, deps);
+    registerClaimRoutes(app, deps);
+    registerRouteHealthRoutes(app, deps);
+    registerMetricsRoutes(app, deps);
+  });
 
   app.setNotFoundHandler((request, reply) => {
-    void reply.code(404).send({
-      error: "not_found",
-      message: `no route for ${request.method} ${request.url}`,
+    const pathname = request.url.split("?")[0] ?? request.url;
+    return sendPublicError(reply, request, {
+      code: "not_found",
+      message: `no route for ${request.method} ${pathname}`,
     });
   });
 
   app.setErrorHandler((error: FastifyError, request, reply) => {
-    const status = error.statusCode ?? 500;
-    // The log gets the error, the response does not. An internal error message is the kind of
-    // thing that carries a table name, a file path or, on a bad day, a connection string.
-    request.log.error({ err: error, status }, "request failed");
-    void reply.code(status).send({
-      error: status >= 500 ? "internal_error" : "bad_request",
-      message: status >= 500 ? "the server could not complete that request" : error.message,
-      requestId: request.id,
-    });
+    const envelope = classifyThrownError(error, request.id);
+    // The log gets the raw error, the public response gets only the sanitized envelope.
+    request.log.error(
+      { err: error, status: envelope.status, code: envelope.code },
+      "request failed",
+    );
+    if (
+      (envelope.code === "service_unavailable" ||
+        envelope.code === "request_timeout" ||
+        envelope.code === "rate_limited") &&
+      !reply.hasHeader("retry-after")
+    ) {
+      reply.header("Retry-After", "1");
+    }
+    void reply.code(envelope.status).send(envelope);
   });
 
   return app;

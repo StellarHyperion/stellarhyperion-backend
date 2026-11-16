@@ -1,4 +1,12 @@
-import { CHAINS, assetOn, isChainKey, isEvmChain, toEvmAddress } from "@hyperion/protocol";
+import {
+  CHAINS,
+  assetOn,
+  isChainKey,
+  isEvmChain,
+  isRouteKind,
+  toEvmAddress,
+  tryRouteFromSlug,
+} from "@hyperion/protocol";
 import type { AppConfig } from "../../config/config.js";
 /**
  * Transfer status and lookup REST API endpoints.
@@ -12,6 +20,12 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import {
+  PublicApiError,
+  parseNonNegativeIntParam,
+  parsePaginationQuery,
+  sendPublicError,
+} from "../errors.js";
 import type { ServerDeps } from "../server.js";
 
 export type TransferLifecycleStage =
@@ -233,6 +247,51 @@ function isDeliveryFinalized(transfer: FormattedTransfer): boolean {
   );
 }
 
+function parseRouteFilter(raw: string): number {
+  const trimmed = raw.trim();
+  if (/^[0-9]+$/.test(trimmed)) {
+    const numeric = Number(trimmed);
+    if (isRouteKind(numeric)) {
+      return numeric;
+    }
+  } else {
+    const fromSlug = tryRouteFromSlug(trimmed);
+    if (fromSlug !== null) {
+      return fromSlug;
+    }
+  }
+  throw PublicApiError.validation("invalid route filter", [
+    { field: "route", reason: "unsupported route identifier" },
+  ]);
+}
+
+function parseBoundedIdentifier(raw: string, field: string, maxLength: number): string {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0 || trimmed.length > maxLength || /[\x00-\x1f\x7f\s]/.test(trimmed)) {
+    throw PublicApiError.validation(`invalid ${field} parameter`, [
+      {
+        field,
+        reason: `must be a non-empty identifier without whitespace up to ${String(maxLength)} characters`,
+      },
+    ]);
+  }
+  return trimmed;
+}
+
+function parsePositiveIntervalMs(raw: string | undefined, field: string): number | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  const normalized = parseNonNegativeIntParam(raw, field);
+  const numeric = Number(normalized);
+  if (!Number.isSafeInteger(numeric) || numeric < 1) {
+    throw PublicApiError.validation(`invalid ${field} parameter`, [
+      { field, reason: "must be a positive integer" },
+    ]);
+  }
+  return numeric;
+}
+
 export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
 
@@ -250,16 +309,23 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       reply: FastifyReply,
     ) => {
       const { originChain, nonce } = request.params;
+      if (!isChainKey(originChain)) {
+        throw PublicApiError.validation("invalid originChain parameter", [
+          { field: "originChain", reason: "unsupported chain identifier" },
+        ]);
+      }
+      const normalizedNonce = parseNonNegativeIntParam(nonce, "nonce");
+
       const { rows } = await db.query(
         `${TRANSFER_QUERY} WHERE t.origin_chain = $1 AND t.nonce = $2 LIMIT 1`,
-        [originChain, nonce],
+        [originChain, normalizedNonce],
       );
 
       const row = rows[0];
       if (row === undefined) {
-        return reply.code(404).send({
-          error: "not_found",
-          message: `no transfer found for chain ${originChain} and nonce ${nonce}`,
+        return sendPublicError(reply, request, {
+          code: "not_found",
+          message: `no transfer found for chain ${originChain} and nonce ${normalizedNonce}`,
         });
       }
 
@@ -271,17 +337,18 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
   app.get(
     "/v1/transfers/by-tx/:txHash",
     async (request: FastifyRequest<{ Params: { txHash: string } }>, reply: FastifyReply) => {
-      const { txHash } = request.params;
+      const normalizedTxHash = parseBoundedIdentifier(request.params.txHash, "txHash", 256);
       const { rows } = await db.query(
         `${TRANSFER_QUERY} WHERE t.origin_tx = $1 OR d.destination_tx = $1 LIMIT 1`,
-        [txHash],
+        [normalizedTxHash],
       );
 
       const row = rows[0];
       if (row === undefined) {
-        return reply.code(404).send({
-          error: "not_found",
-          message: `no transfer found with transaction hash ${txHash}`,
+        return sendPublicError(reply, request, {
+          code: "not_found",
+          message: `no transfer found with transaction hash ${normalizedTxHash}`,
+          preservePublicIdentifier: true,
         });
       }
 
@@ -297,11 +364,17 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     }>,
     reply: FastifyReply,
   ) => {
-    const { id } = request.params;
+    const id = parseNonNegativeIntParam(request.params.id, "id");
+    const requestedPollMs = parsePositiveIntervalMs(request.query.pollIntervalMs, "pollIntervalMs");
+    const requestedHeartbeatMs = parsePositiveIntervalMs(
+      request.query.heartbeatIntervalMs,
+      "heartbeatIntervalMs",
+    );
+
     const initial = await queryTransferById(id);
     if (initial === null) {
-      return reply.code(404).send({
-        error: "not_found",
+      return sendPublicError(reply, request, {
+        code: "not_found",
         message: `no transfer found with id ${id}`,
       });
     }
@@ -338,8 +411,8 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     let lastSerialized = JSON.stringify(initial);
     let closed = false;
 
-    const pollInterval = Math.max(Number(request.query.pollIntervalMs) || 1000, 1000);
-    const heartbeatInterval = Math.max(Number(request.query.heartbeatIntervalMs) || 15000, 5000);
+    const pollInterval = Math.max(requestedPollMs ?? 1000, 1000);
+    const heartbeatInterval = Math.max(requestedHeartbeatMs ?? 15000, 5000);
 
     let pollTimer: ReturnType<typeof setInterval> | null = null;
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -404,11 +477,11 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     request: FastifyRequest<{ Params: { id: string } }>,
     reply: FastifyReply,
   ) => {
-    const { id } = request.params;
+    const id = parseNonNegativeIntParam(request.params.id, "id");
     const transfer = await queryTransferById(id);
     if (transfer === null) {
-      return reply.code(404).send({
-        error: "not_found",
+      return sendPublicError(reply, request, {
+        code: "not_found",
         message: `no transfer found with id ${id}`,
       });
     }
@@ -442,38 +515,55 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       const conditions: string[] = [];
       const params: unknown[] = [];
 
-      if (originChain) {
+      if (originChain !== undefined) {
+        if (!isChainKey(originChain)) {
+          throw PublicApiError.validation("invalid originChain filter", [
+            { field: "originChain", reason: "unsupported chain identifier" },
+          ]);
+        }
         params.push(originChain);
         conditions.push(`t.origin_chain = $${String(params.length)}`);
       }
-      if (destinationChain) {
+      if (destinationChain !== undefined) {
+        if (!isChainKey(destinationChain)) {
+          throw PublicApiError.validation("invalid destinationChain filter", [
+            { field: "destinationChain", reason: "unsupported chain identifier" },
+          ]);
+        }
         params.push(destinationChain);
         conditions.push(`t.destination_chain = $${String(params.length)}`);
       }
       if (route !== undefined) {
-        params.push(Number(route));
+        params.push(parseRouteFilter(route));
         conditions.push(`t.route = $${String(params.length)}`);
       }
-      if (sender) {
-        params.push(sender);
+      if (sender !== undefined) {
+        params.push(parseBoundedIdentifier(sender, "sender", 128));
         conditions.push(`t.sender = $${String(params.length)}`);
       }
-      if (recipient) {
-        params.push(recipient);
+      if (recipient !== undefined) {
+        params.push(parseBoundedIdentifier(recipient, "recipient", 128));
         conditions.push(`t.destination = $${String(params.length)}`);
       }
 
-      if (search?.trim()) {
-        params.push(`%${search.trim()}%`);
-        const parameter = `$${String(params.length)}`;
-        conditions.push(
-          `(t.origin_tx ILIKE ${parameter} OR d.destination_tx ILIKE ${parameter} OR t.sender ILIKE ${parameter} OR t.destination ILIKE ${parameter} OR t.nonce::text ILIKE ${parameter})`,
-        );
+      if (search !== undefined) {
+        if (search.length > 256 || /[\x00-\x1f\x7f]/.test(search)) {
+          throw PublicApiError.validation("invalid search filter", [
+            { field: "search", reason: "must be printable text up to 256 characters" },
+          ]);
+        }
+        const trimmedSearch = search.trim();
+        if (trimmedSearch.length > 0) {
+          params.push(`%${trimmedSearch}%`);
+          const parameter = `$${String(params.length)}`;
+          conditions.push(
+            `(t.origin_tx ILIKE ${parameter} OR d.destination_tx ILIKE ${parameter} OR t.sender ILIKE ${parameter} OR t.destination ILIKE ${parameter} OR t.nonce::text ILIKE ${parameter})`,
+          );
+        }
       }
 
       const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-      const parsedLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
-      const parsedOffset = Math.max(Number(offset) || 0, 0);
+      const { limit: parsedLimit, offset: parsedOffset } = parsePaginationQuery(limit, offset);
 
       params.push(parsedLimit);
       const limitClause = `LIMIT $${String(params.length)}`;
