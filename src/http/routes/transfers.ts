@@ -12,6 +12,10 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import {
+  readAxelarDeliveryEvidenceByHop,
+  readAxelarDeliveryEvidenceById,
+} from "../../rails/axelar/evidence.js";
 import type { ServerDeps } from "../server.js";
 
 export type TransferLifecycleStage =
@@ -398,6 +402,69 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
 
   app.get("/v1/transfers/:id/stream", handleStream);
   app.get("/api/v1/transfers/:id/stream", handleStream);
+
+  // Axelar delivery evidence read endpoints
+  const handleAxelarEvidenceById = async (
+    request: FastifyRequest<{ Params: { id: string } }>,
+    reply: FastifyReply,
+  ) => {
+    const id = request.params.id.trim();
+    if (!/^\d{1,20}$/.test(id)) {
+      return reply.code(400).send({
+        error: "bad_request",
+        message: "transfer id must be a non-negative integer",
+      });
+    }
+    const outcome = await readAxelarDeliveryEvidenceById(db, deps.config, id);
+    if (outcome.kind === "not_found") {
+      return reply.code(404).send({
+        error: "not_found",
+        message: `no transfer found with id ${id}`,
+      });
+    }
+    if (outcome.kind === "unsupported_route") {
+      return reply.code(400).send({
+        error: "unsupported_route",
+        message: `transfer ${id} uses route ${String(outcome.route)}, not an Axelar route`,
+      });
+    }
+    return reply.send(outcome.evidence);
+  };
+
+  const handleAxelarEvidenceByHop = async (
+    request: FastifyRequest<{ Params: { originChain: string; nonce: string } }>,
+    reply: FastifyReply,
+  ) => {
+    const originChain = request.params.originChain.trim();
+    const nonce = request.params.nonce.trim();
+    if (originChain.length === 0 || originChain.length > 64 || !/^\d{1,20}$/.test(nonce)) {
+      return reply.code(400).send({
+        error: "bad_request",
+        message: "originChain must be bounded and nonce must be a non-negative integer",
+      });
+    }
+    const outcome = await readAxelarDeliveryEvidenceByHop(db, deps.config, originChain, nonce);
+    if (outcome.kind === "not_found") {
+      return reply.code(404).send({
+        error: "not_found",
+        message: `no transfer found for chain ${originChain} and nonce ${nonce}`,
+      });
+    }
+    if (outcome.kind === "unsupported_route") {
+      return reply.code(400).send({
+        error: "unsupported_route",
+        message: `transfer ${originChain}:${nonce} uses route ${String(outcome.route)}, not an Axelar route`,
+      });
+    }
+    return reply.send(outcome.evidence);
+  };
+
+  app.get("/v1/transfers/:id/evidence", handleAxelarEvidenceById);
+  app.get("/api/v1/transfers/:id/evidence", handleAxelarEvidenceById);
+  app.get("/v1/transfers/:id/evidence/axelar", handleAxelarEvidenceById);
+  app.get("/api/v1/transfers/:id/evidence/axelar", handleAxelarEvidenceById);
+  app.get("/v1/transfers/:originChain/:nonce/evidence/axelar", handleAxelarEvidenceByHop);
+  app.get("/api/v1/transfers/:originChain/:nonce/evidence/axelar", handleAxelarEvidenceByHop);
 
   // 4. Look up by ID
   const getTransferById = async (

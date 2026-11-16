@@ -25,6 +25,19 @@ import type { InboundRow, Position } from "../../chains/writers.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 
 import { ITS_ABI, matchingPayment } from "./events.js";
+export {
+  MAX_EVIDENCE_ID_LENGTH,
+  MAX_EVIDENCE_TEXT_LENGTH,
+  formatAxelarDeliveryEvidence,
+  readAxelarDeliveryEvidenceByHop,
+  readAxelarDeliveryEvidenceById,
+  scrubEvidenceText,
+  type AxelarDeliveryEvidence,
+  type AxelarEvidenceChecklistStep,
+  type AxelarEvidenceVerdict,
+  type ProviderEvidenceAssessment,
+  type ReadAxelarEvidenceOutcome,
+} from "./evidence.js";
 export interface VerifiedDelivery {
   readonly at: Position;
   readonly row: InboundRow;

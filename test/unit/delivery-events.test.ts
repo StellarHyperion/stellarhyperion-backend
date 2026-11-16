@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { encodeAbiParameters, encodeEventTopics, stringToHex, type Hex } from "viem";
 import {
   ITS_ABI,
+  inspectReceiptEvidence,
   matchingPayment,
   type DeliveryLog,
   type ExpectedDelivery,
@@ -70,5 +71,24 @@ describe("Destination delivery evidence", () => {
   it("does not lose a matching receipt event when another transfer shares the transaction", () => {
     const unrelated = { ...received, address: token as Hex };
     expect(matchingPayment([received, unrelated, paid], expected)).toBe(paid);
+  });
+  it("exposes command and ERC-20 payment checklist inspection for candidate receipts", () => {
+    const full = inspectReceiptEvidence([received, paid], expected);
+    expect(full.verified).toBe(true);
+    expect(full.commandLog).toBe(received);
+    expect(full.paymentLog).toBe(paid);
+    expect(full.paymentSender?.toLowerCase()).toBe(its.toLowerCase());
+    expect(full.checklist).toEqual({
+      itsCommandMatched: true,
+      tokenContractMatched: true,
+      recipientMatched: true,
+      amountExactMatch: true,
+      erc20PaymentMatched: true,
+    });
+
+    const commandOnly = inspectReceiptEvidence([received], expected);
+    expect(commandOnly.verified).toBe(false);
+    expect(commandOnly.checklist.itsCommandMatched).toBe(true);
+    expect(commandOnly.checklist.erc20PaymentMatched).toBe(false);
   });
 });
