@@ -110,3 +110,29 @@ export function parseEventCursor(cursor: string): CursorPosition {
 export function completeThrough(position: CursorPosition): number {
   return position.completesLedger ? position.ledger : position.ledger - 1;
 }
+
+/**
+ * First unread ledger of a backfill job `[fromLedger, toLedger]`, resuming immediately after
+ * `completedLedger` when present.
+ */
+export function nextBackfillLedger(fromLedger: bigint, completedLedger: bigint | null): bigint {
+  if (completedLedger === null || completedLedger < fromLedger) {
+    return fromLedger;
+  }
+  return completedLedger + 1n;
+}
+
+/**
+ * Inclusive upper ledger bound for a bounded backfill pass starting at `nextLedger`.
+ */
+export function boundedBackfillTarget(
+  nextLedger: bigint,
+  toLedger: bigint,
+  maxLedgers: number,
+): bigint {
+  if (!Number.isInteger(maxLedgers) || maxLedgers < 1) {
+    throw new RangeError(`maxLedgers must be a positive integer, got ${String(maxLedgers)}`);
+  }
+  const capped = nextLedger + BigInt(maxLedgers) - 1n;
+  return capped < toLedger ? capped : toLedger;
+}

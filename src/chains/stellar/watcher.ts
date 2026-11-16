@@ -26,11 +26,22 @@ import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
-import { completeThrough, endOfLedgerCursor, parseEventCursor } from "./cursor.js";
-import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
-import type { EventSource, EventsQuery } from "./rpc.js";
-import { StellarRpcError } from "./rpc.js";
 import {
+  EventCursorError,
+  boundedBackfillTarget,
+  completeThrough,
+  endOfLedgerCursor,
+  nextBackfillLedger,
+  parseEventCursor,
+} from "./cursor.js";
+import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
+import type { EventSource, EventsPage, EventsQuery } from "./rpc.js";
+import { StellarRpcError, sanitizeStellarRpcReason } from "./rpc.js";
+import {
+  enqueueBackfillJob,
+  listBackfillJobs,
+  markBackfillUnresolved,
+  readBackfillJob,
   readCursor,
   recordActionQueued,
   recordActionSettled,
@@ -41,8 +52,11 @@ import {
   recordPauseSet,
   recordRouteConfigured,
   recordTokenRegistered,
+  saveBackfillProgress,
   writeCursor,
+  type BackfillJobStatus,
   type EventContext,
+  type StellarBackfillJob,
 } from "./store.js";
 
 /**
@@ -320,71 +334,463 @@ export class StellarWatcher {
     context: EventContext,
     raw: RawStellarEvent,
   ): Promise<boolean> {
-    const event = decodeStellarEvent(raw);
+    return applyStellarEvent(tx, context, raw, this.options.logger, this.reportedUnknown);
+  }
+}
 
-    switch (event.kind) {
-      case "bridgeOut":
-        await recordBridgeOut(tx, context, event.data);
-        return true;
-      case "bridgeIn":
-        await recordBridgeIn(tx, context, event.data);
-        return true;
-      case "claimParked":
-        await recordClaimParked(tx, context, event.data);
-        return true;
-      case "claimSettled": {
-        const matched = await recordClaimSettled(tx, context, event.data);
-        if (!matched) {
-          // A settlement for a claim never seen parked. The park event is older than the retention
-          // window, and inventing a row from a settlement would record a claim with no origin.
-          this.options.logger.warn(
-            { chain: context.chainKey, claimId: event.data.claimId.toString() },
-            "settlement for a claim this indexer never saw parked",
-          );
-        }
-        return matched;
-      }
-      case "actionQueued":
-        await recordActionQueued(tx, context, event.data, raw.valueJson);
-        return true;
-      case "actionExecuted":
-        await recordActionSettled(tx, context, event.data, "executed");
-        return true;
-      case "actionCancelled":
-        await recordActionSettled(tx, context, event.data, "cancelled");
-        return true;
-      case "tokenRegistered":
-        await recordTokenRegistered(tx, context, event.data);
-        return true;
-      case "pauseSet":
-        // A pause is router wide and there is no table for it, so it is recorded as every rail
-        // becoming unavailable for the reason the router would give. That is not a cosmetic
-        // mapping: a pause is the one operational state somebody needs to see in the same place
-        // they look at route health, rather than in a log they have to go and find.
-        await recordPauseSet(tx, context, event.data);
-        return true;
-      case "routeConfigured":
-        // The sample needs a token and this event names none, so it is attributed to the chain
-        // itself. A route being on or off is a property of the router, not of one asset.
-        await recordRouteConfigured(tx, context, event.data, context.chainKey);
-        return true;
-      case "ignored":
-        return false;
-      case "unknown":
-        if (!this.reportedUnknown.has(event.tag)) {
-          this.reportedUnknown.add(event.tag);
-          this.options.logger.warn(
-            { chain: context.chainKey, tag: event.tag },
-            "the router emitted an event tag this build does not know; it is running ahead of the indexer",
-          );
-        }
-        return false;
-      default:
-        // Unreachable while the switch covers the union, and the point is that it stops compiling
-        // the moment a new event kind is added without a case here. An indexer that silently drops
-        // a kind somebody added last week is the failure this line exists to prevent.
-        return assertNever(event);
+export interface RunBackfillJobOptions {
+  readonly jobId: bigint;
+  readonly expectedRouter: string;
+  readonly historicalRpc: EventSource | null;
+  readonly db: Transactional;
+  readonly logger: Logger;
+  readonly pageSize?: number;
+  readonly maxLedgersPerPass?: number;
+  readonly maxPagesPerWindow?: number;
+}
+
+export interface BackfillRunResult {
+  readonly jobId: bigint;
+  readonly status: BackfillJobStatus;
+  readonly completedLedger: bigint | null;
+  readonly decoded: number;
+  readonly skipped: number;
+  readonly reason: string | null;
+}
+
+export interface StellarBackfillRunnerOptions {
+  readonly chainKey: string;
+  readonly router: string;
+  readonly historicalRpc: EventSource | null;
+  readonly db: Transactional;
+  readonly logger: Logger;
+  readonly pageSize?: number;
+  readonly maxLedgersPerPass?: number;
+  readonly maxPagesPerWindow?: number;
+}
+
+/**
+ * Bounded historical backfill runner using an explicitly configured historical `EventSource` and
+ * durable per-job replay state in `stellar_backfill_job` (never modifying live `indexer_cursor`).
+ */
+export class StellarBackfillRunner {
+  private lastUnresolvedCount = 0;
+
+  constructor(private readonly options: StellarBackfillRunnerOptions) {}
+
+  get name(): string {
+    return `backfill:${this.options.chainKey}`;
+  }
+
+  readiness(): ReadinessReport {
+    if (this.lastUnresolvedCount > 0) {
+      return {
+        name: this.name,
+        state: "degraded",
+        detail: `${String(this.lastUnresolvedCount)} historical backfill job(s) remain unresolved`,
+      };
     }
+    return {
+      name: this.name,
+      state: "ready",
+      detail:
+        this.options.historicalRpc === null
+          ? "no historical backfill jobs pending"
+          : "historical backfill provider ready",
+    };
+  }
+
+  enqueue(fromLedger: bigint, toLedger: bigint): Promise<StellarBackfillJob> {
+    return enqueueBackfillJob(this.options.db, {
+      chainKey: this.options.chainKey,
+      contract: this.options.router,
+      fromLedger,
+      toLedger,
+    });
+  }
+
+  runJob(jobId: bigint, signal: AbortSignal): Promise<BackfillRunResult> {
+    return runBackfillJob(
+      {
+        jobId,
+        expectedRouter: this.options.router,
+        historicalRpc: this.options.historicalRpc,
+        db: this.options.db,
+        logger: this.options.logger,
+        ...(this.options.pageSize === undefined ? {} : { pageSize: this.options.pageSize }),
+        ...(this.options.maxLedgersPerPass === undefined
+          ? {}
+          : { maxLedgersPerPass: this.options.maxLedgersPerPass }),
+        ...(this.options.maxPagesPerWindow === undefined
+          ? {}
+          : { maxPagesPerWindow: this.options.maxPagesPerWindow }),
+      },
+      signal,
+    );
+  }
+
+  /**
+   * Run one bounded pass across active (`pending` or `running`) backfill jobs.
+   * Returns `true` when at least one job remains `running` and has further ledgers to replay.
+   */
+  async tick(signal: AbortSignal): Promise<boolean> {
+    const active = await listBackfillJobs(this.options.db, {
+      chainKey: this.options.chainKey,
+      contract: this.options.router,
+      statuses: ["pending", "running"],
+    });
+
+    let moreWork = false;
+    for (const job of active) {
+      if (signal.aborted) break;
+      const result = await this.runJob(job.id, signal);
+      if (result.status === "running") {
+        moreWork = true;
+      }
+    }
+
+    const unresolved = await listBackfillJobs(this.options.db, {
+      chainKey: this.options.chainKey,
+      contract: this.options.router,
+      statuses: ["unresolved"],
+    });
+    this.lastUnresolvedCount = unresolved.length;
+    return moreWork;
+  }
+}
+
+export async function runBackfillJob(
+  options: RunBackfillJobOptions,
+  signal: AbortSignal,
+): Promise<BackfillRunResult> {
+  const { jobId, expectedRouter, historicalRpc, db, logger } = options;
+  const pageSize = options.pageSize ?? 200;
+  const maxLedgersPerPass = options.maxLedgersPerPass ?? 10_000;
+  const maxPagesPerWindow = options.maxPagesPerWindow ?? MAX_PAGES_PER_TICK;
+  const reportedUnknown = new Set<string>();
+
+  const job = await readBackfillJob(db, jobId);
+  if (job === null) {
+    throw new Error(`stellar_backfill_job ${jobId.toString()} does not exist`);
+  }
+  if (job.status === "completed") {
+    return {
+      jobId: job.id,
+      status: "completed",
+      completedLedger: job.toLedger,
+      decoded: 0,
+      skipped: 0,
+      reason: null,
+    };
+  }
+
+  const failUnresolved = async (
+    reason: string,
+    completedLedger: bigint | null,
+    decoded: number,
+    skipped: number,
+  ): Promise<BackfillRunResult> => {
+    const sanitized = sanitizeStellarRpcReason(reason);
+    await markBackfillUnresolved(db, job.id, sanitized);
+    logger.warn(
+      {
+        chain: job.chainKey,
+        jobId: job.id.toString(),
+        fromLedger: job.fromLedger.toString(),
+        toLedger: job.toLedger.toString(),
+        completedLedger: completedLedger === null ? null : completedLedger.toString(),
+        reason: sanitized,
+      },
+      "stellar historical backfill job marked unresolved",
+    );
+    return {
+      jobId: job.id,
+      status: "unresolved",
+      completedLedger,
+      decoded,
+      skipped,
+      reason: sanitized,
+    };
+  };
+
+  if (job.contract !== expectedRouter) {
+    return failUnresolved(
+      `backfill job router ${job.contract} does not match configured router ${expectedRouter}`,
+      job.completedLedger,
+      0,
+      0,
+    );
+  }
+
+  if (historicalRpc === null) {
+    return failUnresolved(
+      "historical event provider is not configured (set STELLAR_HISTORICAL_RPC_URL)",
+      job.completedLedger,
+      0,
+      0,
+    );
+  }
+
+  let currentCompleted = job.completedLedger;
+  let currentResumeCursor = resolveBoundaryResumeCursor(job.completedLedger, job.resumeCursor);
+  const startOfPass = nextBackfillLedger(job.fromLedger, currentCompleted);
+  const passTarget = boundedBackfillTarget(startOfPass, job.toLedger, maxLedgersPerPass);
+
+  let nextLedger = Number(startOfPass);
+  const passTargetNum = Number(passTarget);
+  let status: BackfillJobStatus = currentCompleted === null ? "pending" : "running";
+  let totalDecoded = 0;
+  let totalSkipped = 0;
+
+  while (nextLedger <= passTargetNum && !signal.aborted) {
+    const windowEvents: RawStellarEvent[] = [];
+    let pagination: Pick<EventsQuery, "startLedger" | "cursor"> =
+      currentCompleted === null
+        ? { startLedger: nextLedger }
+        : { cursor: currentResumeCursor ?? endOfLedgerCursor(Number(currentCompleted)) };
+    let pages = 0;
+    let windowThrough = nextLedger - 1;
+    let windowLatestLedger = 0;
+
+    while (pages < maxPagesPerWindow) {
+      let page: EventsPage;
+      try {
+        page = await historicalRpc.events(
+          { ...pagination, contractIds: [job.contract], limit: pageSize },
+          signal,
+        );
+      } catch (error) {
+        if (error instanceof StellarRpcError && !error.retryable) {
+          return failUnresolved(error.message, currentCompleted, totalDecoded, totalSkipped);
+        }
+        throw error;
+      }
+      pages += 1;
+      windowLatestLedger = page.latestLedger;
+
+      if (page.oldestLedger > nextLedger) {
+        return failUnresolved(
+          `historical provider oldestLedger ${String(page.oldestLedger)} exceeds requested ledger ${String(nextLedger)}`,
+          currentCompleted,
+          totalDecoded,
+          totalSkipped,
+        );
+      }
+      if (page.latestLedger > 0 && page.latestLedger < nextLedger) {
+        return failUnresolved(
+          `historical provider latestLedger ${String(page.latestLedger)} is behind requested ledger ${String(nextLedger)}`,
+          currentCompleted,
+          totalDecoded,
+          totalSkipped,
+        );
+      }
+      if (page.cursor === null) {
+        return failUnresolved(
+          "historical provider returned a page with no cursor",
+          currentCompleted,
+          totalDecoded,
+          totalSkipped,
+        );
+      }
+
+      const rawPageEvents = page.events as readonly RawStellarEvent[];
+      for (const raw of rawPageEvents) {
+        if (raw.contractId !== job.contract) {
+          return failUnresolved(
+            `historical provider returned event for unexpected contract ${raw.contractId}`,
+            currentCompleted,
+            totalDecoded,
+            totalSkipped,
+          );
+        }
+      }
+      windowEvents.push(...rawPageEvents);
+
+      let candidate: number;
+      try {
+        candidate = completeThrough(parseEventCursor(page.cursor));
+      } catch (error) {
+        const message =
+          error instanceof EventCursorError ? error.message : "invalid cursor from provider";
+        return failUnresolved(message, currentCompleted, totalDecoded, totalSkipped);
+      }
+
+      if (candidate >= nextLedger) {
+        windowThrough = Math.min(candidate, passTargetNum);
+        break;
+      }
+      pagination = { cursor: page.cursor };
+    }
+
+    if (windowThrough < nextLedger) {
+      return failUnresolved(
+        `ledger ${String(nextLedger)} could not be drained within ${String(maxPagesPerWindow)} pages`,
+        currentCompleted,
+        totalDecoded,
+        totalSkipped,
+      );
+    }
+
+    const boundedEvents = windowEvents.filter(
+      (raw) => raw.ledger >= nextLedger && raw.ledger <= windowThrough,
+    );
+    const completedBigInt = BigInt(windowThrough);
+    const boundaryCursor = endOfLedgerCursor(windowThrough);
+
+    let windowDecoded = 0;
+    let windowSkipped = 0;
+
+    status = await db.transaction(async (tx: Queryable) => {
+      for (const raw of boundedEvents) {
+        if (raw.type !== "contract" || raw.inSuccessfulContractCall === false) {
+          windowSkipped += 1;
+          continue;
+        }
+        const context: EventContext = {
+          chainKey: job.chainKey,
+          ledger: raw.ledger,
+          txHash: raw.txHash,
+          closedAt: new Date(raw.ledgerClosedAt),
+        };
+        if (await applyStellarEvent(tx, context, raw, logger, reportedUnknown)) {
+          windowDecoded += 1;
+        } else {
+          windowSkipped += 1;
+        }
+      }
+
+      return saveBackfillProgress(tx, {
+        jobId: job.id,
+        toLedger: job.toLedger,
+        completedLedger: completedBigInt,
+        resumeCursor: boundaryCursor,
+      });
+    });
+
+    totalDecoded += windowDecoded;
+    totalSkipped += windowSkipped;
+    currentCompleted = completedBigInt;
+    currentResumeCursor = boundaryCursor;
+    nextLedger = windowThrough + 1;
+
+    if (
+      status !== "completed" &&
+      windowLatestLedger > 0 &&
+      windowLatestLedger <= windowThrough &&
+      BigInt(windowThrough) < job.toLedger
+    ) {
+      return failUnresolved(
+        `historical provider latestLedger ${String(windowLatestLedger)} stops before target ledger ${job.toLedger.toString()}`,
+        currentCompleted,
+        totalDecoded,
+        totalSkipped,
+      );
+    }
+  }
+
+  logger.info(
+    {
+      chain: job.chainKey,
+      jobId: job.id.toString(),
+      fromLedger: job.fromLedger.toString(),
+      toLedger: job.toLedger.toString(),
+      completedLedger: currentCompleted === null ? null : currentCompleted.toString(),
+      status,
+      decoded: totalDecoded,
+      skipped: totalSkipped,
+    },
+    "stellar historical backfill pass finished",
+  );
+
+  return {
+    jobId: job.id,
+    status,
+    completedLedger: currentCompleted,
+    decoded: totalDecoded,
+    skipped: totalSkipped,
+    reason: null,
+  };
+}
+
+function resolveBoundaryResumeCursor(
+  completedLedger: bigint | null,
+  storedCursor: string | null,
+): string | null {
+  if (completedLedger === null) return null;
+  const expectedLedger = Number(completedLedger);
+  if (storedCursor !== null) {
+    try {
+      const parsed = parseEventCursor(storedCursor);
+      if (parsed.completesLedger && parsed.ledger === expectedLedger) {
+        return storedCursor;
+      }
+    } catch {
+      // Reconstruct the exact canonical boundary cursor below.
+    }
+  }
+  return endOfLedgerCursor(expectedLedger);
+}
+
+async function applyStellarEvent(
+  tx: Queryable,
+  context: EventContext,
+  raw: RawStellarEvent,
+  logger: Logger,
+  reportedUnknown: Set<string>,
+): Promise<boolean> {
+  const event = decodeStellarEvent(raw);
+
+  switch (event.kind) {
+    case "bridgeOut":
+      await recordBridgeOut(tx, context, event.data);
+      return true;
+    case "bridgeIn":
+      await recordBridgeIn(tx, context, event.data);
+      return true;
+    case "claimParked":
+      await recordClaimParked(tx, context, event.data);
+      return true;
+    case "claimSettled": {
+      const matched = await recordClaimSettled(tx, context, event.data);
+      if (!matched) {
+        logger.warn(
+          { chain: context.chainKey, claimId: event.data.claimId.toString() },
+          "settlement for a claim this indexer never saw parked",
+        );
+      }
+      return matched;
+    }
+    case "actionQueued":
+      await recordActionQueued(tx, context, event.data, raw.valueJson);
+      return true;
+    case "actionExecuted":
+      await recordActionSettled(tx, context, event.data, "executed");
+      return true;
+    case "actionCancelled":
+      await recordActionSettled(tx, context, event.data, "cancelled");
+      return true;
+    case "tokenRegistered":
+      await recordTokenRegistered(tx, context, event.data);
+      return true;
+    case "pauseSet":
+      await recordPauseSet(tx, context, event.data);
+      return true;
+    case "routeConfigured":
+      await recordRouteConfigured(tx, context, event.data, context.chainKey);
+      return true;
+    case "ignored":
+      return false;
+    case "unknown":
+      if (!reportedUnknown.has(event.tag)) {
+        reportedUnknown.add(event.tag);
+        logger.warn(
+          { chain: context.chainKey, tag: event.tag },
+          "the router emitted an event tag this build does not know; it is running ahead of the indexer",
+        );
+      }
+      return false;
+    default:
+      return assertNever(event);
   }
 }
 

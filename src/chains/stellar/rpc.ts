@@ -15,7 +15,7 @@ export class StellarRpcError extends Error {
     reason: string,
     readonly retryable: boolean,
   ) {
-    super(`${method}: ${reason}`);
+    super(`${method}: ${sanitizeStellarRpcReason(reason)}`);
     this.name = "StellarRpcError";
   }
 }
@@ -184,4 +184,19 @@ export class StellarRpc {
 
 function describe(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+/**
+ * Strip URL userinfo, secret API-key paths/query parameters, and bearer headers from RPC errors.
+ */
+export function sanitizeStellarRpcReason(reason: string): string {
+  return reason
+    .replace(/https?:\/\/[^\s"'<>]+/gi, (raw) => {
+      try {
+        return new URL(raw).origin;
+      } catch {
+        return "[redacted-rpc-url]";
+      }
+    })
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, "$1 [REDACTED]");
 }

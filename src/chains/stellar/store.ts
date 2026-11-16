@@ -13,7 +13,16 @@
 import { ROUTE_KINDS } from "@hyperion/protocol";
 
 import type { Queryable } from "../../db/pool.js";
-import { bigintOf, maybeOne, text, textOrNull, timestampOrNull } from "../../db/rows.js";
+import {
+  bigintOf,
+  bigintOrNull,
+  maybeOne,
+  one,
+  text,
+  textOrNull,
+  timestamp,
+  timestampOrNull,
+} from "../../db/rows.js";
 import type { Position } from "../writers.js";
 import {
   settleAction,
@@ -287,4 +296,194 @@ export async function recordRouteConfigured(
     blocker: event.enabled ? 0 : 2,
     flowAvailable: null,
   });
+}
+
+export type BackfillJobStatus = "pending" | "running" | "completed" | "unresolved";
+
+export interface StellarBackfillJob {
+  readonly id: bigint;
+  readonly chainKey: string;
+  readonly contract: string;
+  readonly fromLedger: bigint;
+  readonly toLedger: bigint;
+  readonly completedLedger: bigint | null;
+  readonly resumeCursor: string | null;
+  readonly status: BackfillJobStatus;
+  readonly lastError: string | null;
+  readonly createdAt: Date;
+  readonly updatedAt: Date;
+  readonly completedAt: Date | null;
+}
+
+const BACKFILL_STATUSES: readonly BackfillJobStatus[] = [
+  "pending",
+  "running",
+  "completed",
+  "unresolved",
+];
+
+function parseBackfillStatus(raw: string): BackfillJobStatus {
+  if ((BACKFILL_STATUSES as readonly string[]).includes(raw)) {
+    return raw as BackfillJobStatus;
+  }
+  throw new Error(`stellar_backfill_job.status holds unexpected value ${raw}`);
+}
+
+function mapBackfillJobRow(row: Record<string, unknown>): StellarBackfillJob {
+  return {
+    id: bigintOf(row, "id"),
+    chainKey: text(row, "chain_key"),
+    contract: text(row, "contract"),
+    fromLedger: bigintOf(row, "from_ledger"),
+    toLedger: bigintOf(row, "to_ledger"),
+    completedLedger: bigintOrNull(row, "completed_ledger"),
+    resumeCursor: textOrNull(row, "resume_cursor"),
+    status: parseBackfillStatus(text(row, "status")),
+    lastError: textOrNull(row, "last_error"),
+    createdAt: timestamp(row, "created_at"),
+    updatedAt: timestamp(row, "updated_at"),
+    completedAt: timestampOrNull(row, "completed_at"),
+  };
+}
+
+export async function enqueueBackfillJob(
+  db: Queryable,
+  input: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly fromLedger: bigint;
+    readonly toLedger: bigint;
+  },
+): Promise<StellarBackfillJob> {
+  if (input.fromLedger < 1n || input.toLedger < input.fromLedger) {
+    throw new RangeError(
+      `backfill job bounds must satisfy 1 <= fromLedger <= toLedger, got ${input.fromLedger.toString()}..${input.toLedger.toString()}`,
+    );
+  }
+  const { rows } = await db.query(
+    `INSERT INTO stellar_backfill_job (chain_key, contract, from_ledger, to_ledger, status)
+     VALUES ($1, $2, $3, $4, 'pending')
+     ON CONFLICT (chain_key, contract, from_ledger, to_ledger) DO UPDATE
+       SET status = CASE
+             WHEN stellar_backfill_job.status = 'completed' THEN 'completed'
+             ELSE 'pending'
+           END,
+           last_error = CASE
+             WHEN stellar_backfill_job.status = 'completed' THEN stellar_backfill_job.last_error
+             ELSE NULL
+           END,
+           updated_at = now()
+     RETURNING id, chain_key, contract, from_ledger, to_ledger, completed_ledger,
+               resume_cursor, status, last_error, created_at, updated_at, completed_at`,
+    [input.chainKey, input.contract, input.fromLedger.toString(), input.toLedger.toString()],
+  );
+  return mapBackfillJobRow(one(rows, "enqueued stellar_backfill_job"));
+}
+
+export async function readBackfillJob(
+  db: Queryable,
+  jobId: bigint,
+): Promise<StellarBackfillJob | null> {
+  const { rows } = await db.query(
+    `SELECT id, chain_key, contract, from_ledger, to_ledger, completed_ledger,
+            resume_cursor, status, last_error, created_at, updated_at, completed_at
+       FROM stellar_backfill_job
+      WHERE id = $1`,
+    [jobId.toString()],
+  );
+  const row = maybeOne(rows, `stellar_backfill_job ${jobId.toString()}`);
+  return row === null ? null : mapBackfillJobRow(row);
+}
+
+export async function listBackfillJobs(
+  db: Queryable,
+  options: {
+    readonly chainKey?: string;
+    readonly contract?: string;
+    readonly statuses?: readonly BackfillJobStatus[];
+  } = {},
+): Promise<readonly StellarBackfillJob[]> {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+
+  if (options.chainKey !== undefined) {
+    params.push(options.chainKey);
+    clauses.push(`chain_key = $${String(params.length)}`);
+  }
+  if (options.contract !== undefined) {
+    params.push(options.contract);
+    clauses.push(`contract = $${String(params.length)}`);
+  }
+  if (options.statuses !== undefined && options.statuses.length > 0) {
+    params.push([...options.statuses]);
+    clauses.push(`status = ANY($${String(params.length)}::text[])`);
+  }
+
+  const whereSql = clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`;
+  const { rows } = await db.query(
+    `SELECT id, chain_key, contract, from_ledger, to_ledger, completed_ledger,
+            resume_cursor, status, last_error, created_at, updated_at, completed_at
+       FROM stellar_backfill_job
+       ${whereSql}
+      ORDER BY from_ledger, id`,
+    params,
+  );
+  return rows.map(mapBackfillJobRow);
+}
+
+export async function saveBackfillProgress(
+  db: Queryable,
+  input: {
+    readonly jobId: bigint;
+    readonly toLedger: bigint;
+    readonly completedLedger: bigint;
+    readonly resumeCursor: string;
+  },
+): Promise<BackfillJobStatus> {
+  if (input.completedLedger >= input.toLedger) {
+    await db.query(
+      `UPDATE stellar_backfill_job
+          SET status = 'completed',
+              completed_ledger = $2,
+              resume_cursor = $3,
+              last_error = NULL,
+              completed_at = now(),
+              updated_at = now()
+        WHERE id = $1`,
+      [input.jobId.toString(), input.toLedger.toString(), input.resumeCursor],
+    );
+    return "completed";
+  }
+
+  await db.query(
+    `UPDATE stellar_backfill_job
+        SET status = 'running',
+            completed_ledger = GREATEST(
+              COALESCE(completed_ledger, from_ledger),
+              $2::numeric(20, 0)
+            ),
+            resume_cursor = $3,
+            last_error = NULL,
+            completed_at = NULL,
+            updated_at = now()
+      WHERE id = $1 AND status <> 'completed'`,
+    [input.jobId.toString(), input.completedLedger.toString(), input.resumeCursor],
+  );
+  return "running";
+}
+
+export async function markBackfillUnresolved(
+  db: Queryable,
+  jobId: bigint,
+  reason: string,
+): Promise<void> {
+  await db.query(
+    `UPDATE stellar_backfill_job
+        SET status = 'unresolved',
+            last_error = $2,
+            completed_at = NULL,
+            updated_at = now()
+      WHERE id = $1 AND status <> 'completed'`,
+    [jobId.toString(), reason],
+  );
 }

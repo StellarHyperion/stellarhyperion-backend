@@ -48,6 +48,8 @@ export type LogLevel = "trace" | "debug" | "info" | "warn" | "error" | "fatal";
 export interface StellarWatchConfig {
   readonly chain: ChainKey;
   readonly rpcUrl: string;
+  /** Explicitly configured archive/historical Soroban RPC URL for bounded backfill jobs, or null. */
+  readonly historicalRpcUrl: string | null;
   readonly networkPassphrase: string;
   /** The router contract id, from the deployment record. */
   readonly routerContractId: string;
@@ -55,6 +57,8 @@ export interface StellarWatchConfig {
   readonly startLedger: number;
   readonly pageSize: number;
   readonly pollIntervalMs: number;
+  /** Maximum ledgers replayed in one bounded backfill pass. */
+  readonly backfillMaxLedgers: number;
 }
 
 /** Everything the EVM watcher needs, per chain. */
@@ -338,9 +342,30 @@ const STELLAR_RPC_URL: VarSpec = {
   kind: "url",
   protocols: ["http", "https"],
   required: false,
-  printable: true,
+  printable: false,
   purpose:
     "Soroban RPC. Defaults to the chain registry endpoint, which is public and will rate limit you under real load.",
+};
+
+const STELLAR_HISTORICAL_RPC_URL: VarSpec = {
+  name: "STELLAR_HISTORICAL_RPC_URL",
+  kind: "url",
+  protocols: ["http", "https"],
+  required: false,
+  printable: false,
+  purpose:
+    "Optional historical Soroban event RPC for bounded backfill jobs. Never defaults to STELLAR_RPC_URL, so unconfigured historical backfills stay explicitly unresolved.",
+};
+
+const STELLAR_BACKFILL_MAX_LEDGERS: VarSpec = {
+  name: "STELLAR_BACKFILL_MAX_LEDGERS",
+  kind: "integer",
+  required: false,
+  fallback: "10000",
+  min: 1,
+  max: 500_000,
+  printable: true,
+  purpose: "Maximum ledgers replayed in one bounded historical backfill pass.",
 };
 
 const STELLAR_START_LEDGER: VarSpec = {
@@ -472,6 +497,10 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     ? reader.string(KEEPER_STELLAR_SECRET)
     : null;
   const stellarRpcOverride = reader.url(STELLAR_RPC_URL);
+  const stellarHistoricalRpcUrl = reader.has(STELLAR_HISTORICAL_RPC_URL.name)
+    ? reader.url(STELLAR_HISTORICAL_RPC_URL)
+    : "";
+  const backfillMaxLedgers = reader.integer(STELLAR_BACKFILL_MAX_LEDGERS);
   const startLedgerOverride = reader.has(STELLAR_START_LEDGER.name)
     ? reader.integer(STELLAR_START_LEDGER)
     : null;
@@ -490,6 +519,8 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     deployments,
     enabled: indexerEnabled,
     stellarRpcOverride,
+    stellarHistoricalRpcUrl: stellarHistoricalRpcUrl === "" ? null : stellarHistoricalRpcUrl,
+    backfillMaxLedgers,
     startLedgerOverride,
     pageSize,
     stellarPollIntervalMs,
@@ -578,6 +609,8 @@ interface PlanInput {
   readonly deployments: DeploymentSet;
   readonly enabled: boolean;
   readonly stellarRpcOverride: string;
+  readonly stellarHistoricalRpcUrl: string | null;
+  readonly backfillMaxLedgers: number;
   readonly startLedgerOverride: number | null;
   readonly pageSize: number;
   readonly stellarPollIntervalMs: number;
@@ -642,11 +675,13 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
       stellar = {
         chain: chainKey,
         rpcUrl: input.stellarRpcOverride === "" ? chain.defaultRpcUrl : input.stellarRpcOverride,
+        historicalRpcUrl: input.stellarHistoricalRpcUrl,
         networkPassphrase: chain.networkPassphrase,
         routerContractId: deployment.router,
         startLedger: input.startLedgerOverride ?? deployment.deployedAt.ledger,
         pageSize: input.pageSize,
         pollIntervalMs: input.stellarPollIntervalMs,
+        backfillMaxLedgers: input.backfillMaxLedgers,
       };
       continue;
     }
