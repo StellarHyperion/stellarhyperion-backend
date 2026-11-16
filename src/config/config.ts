@@ -100,6 +100,13 @@ export interface KeeperConfig {
   readonly stellarSecret: string | null;
 }
 
+export interface ServerlessDbConfig {
+  readonly maxConnections: number;
+  readonly idleTimeoutMs: number;
+  readonly connectionTimeoutMs: number;
+  readonly warmHealthIntervalMs: number;
+}
+
 export interface AppConfig {
   readonly nodeEnv: NodeEnv;
   readonly logLevel: LogLevel;
@@ -112,6 +119,7 @@ export interface AppConfig {
   readonly indexer: IndexerConfig;
   readonly rails: RailsConfig;
   readonly keeper: KeeperConfig;
+  readonly serverlessDb: ServerlessDbConfig;
   readonly shutdownTimeoutMs: number;
 }
 
@@ -333,6 +341,53 @@ const SHUTDOWN_TIMEOUT_MS: VarSpec = {
   purpose: "How long shutdown waits for in-flight work before it stops waiting.",
 };
 
+const SERVERLESS_DB_MAX_CONNECTIONS: VarSpec = {
+  name: "SERVERLESS_DB_MAX_CONNECTIONS",
+  kind: "integer",
+  required: false,
+  fallback: "2",
+  min: 1,
+  max: 10,
+  printable: true,
+  purpose:
+    "Bounded PostgreSQL pool ceiling per serverless API instance so concurrent warm containers do not exhaust database connections.",
+};
+
+const SERVERLESS_DB_IDLE_TIMEOUT_MS: VarSpec = {
+  name: "SERVERLESS_DB_IDLE_TIMEOUT_MS",
+  kind: "integer",
+  required: false,
+  fallback: "10000",
+  min: 500,
+  max: 300_000,
+  printable: true,
+  purpose:
+    "Idle pooled client timeout in milliseconds for serverless API instances across freeze and thaw gaps.",
+};
+
+const SERVERLESS_DB_CONNECTION_TIMEOUT_MS: VarSpec = {
+  name: "SERVERLESS_DB_CONNECTION_TIMEOUT_MS",
+  kind: "integer",
+  required: false,
+  fallback: "2000",
+  min: 250,
+  max: 30_000,
+  printable: true,
+  purpose: "Connection establishment timeout in milliseconds for serverless API cold starts.",
+};
+
+const SERVERLESS_DB_WARM_HEALTH_INTERVAL_MS: VarSpec = {
+  name: "SERVERLESS_DB_WARM_HEALTH_INTERVAL_MS",
+  kind: "integer",
+  required: false,
+  fallback: "5000",
+  min: 0,
+  max: 300_000,
+  printable: true,
+  purpose:
+    "Minimum elapsed milliseconds between warm-invocation pool liveness checks before reusing a cached serverless database handle.",
+};
+
 const STELLAR_RPC_URL: VarSpec = {
   name: "STELLAR_RPC_URL",
   kind: "url",
@@ -457,6 +512,10 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const deploymentsPath = reader.string(DEPLOYMENTS_FILE);
   const indexerEnabled = reader.boolean(INDEXER_ENABLED);
   const shutdownTimeoutMs = reader.integer(SHUTDOWN_TIMEOUT_MS);
+  const serverlessMaxConnections = reader.integer(SERVERLESS_DB_MAX_CONNECTIONS);
+  const serverlessIdleTimeoutMs = reader.integer(SERVERLESS_DB_IDLE_TIMEOUT_MS);
+  const serverlessConnectionTimeoutMs = reader.integer(SERVERLESS_DB_CONNECTION_TIMEOUT_MS);
+  const serverlessWarmHealthIntervalMs = reader.integer(SERVERLESS_DB_WARM_HEALTH_INTERVAL_MS);
 
   const railsEnabled = reader.boolean(RAILS_ENABLED);
   const irisOverride = reader.url(IRIS_API_URL);
@@ -526,6 +585,12 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       pollIntervalMs: keeperPollIntervalMs,
       concurrency: keeperConcurrency,
       stellarSecret: keeperStellarSecret,
+    },
+    serverlessDb: {
+      maxConnections: serverlessMaxConnections,
+      idleTimeoutMs: serverlessIdleTimeoutMs,
+      connectionTimeoutMs: serverlessConnectionTimeoutMs,
+      warmHealthIntervalMs: serverlessWarmHealthIntervalMs,
     },
     shutdownTimeoutMs,
   };

@@ -40,16 +40,40 @@ export interface Transactional extends Queryable {
 
 export interface OpenOptions {
   /** Low by default. Two watchers and an HTTP server do not need twenty connections. */
-  readonly maxConnections?: number;
-  readonly connectionTimeoutMs?: number;
-  readonly statementTimeoutMs?: number;
-  readonly applicationName?: string;
+  readonly maxConnections?: number | undefined;
+  readonly connectionTimeoutMs?: number | undefined;
+  readonly statementTimeoutMs?: number | undefined;
+  readonly idleTimeoutMs?: number | undefined;
+  readonly allowExitOnIdle?: boolean | undefined;
+  readonly applicationName?: string | undefined;
+  readonly onPoolError?: ((error: Error) => void) | undefined;
+  readonly poolFactory?: ((config: PoolConfig) => Pool) | undefined;
+}
+
+export interface DatabasePoolStats {
+  readonly totalCount: number;
+  readonly idleCount: number;
+  readonly waitingCount: number;
+  readonly closed: boolean;
+  readonly errorListenerCount: number;
+  readonly poolErrors: number;
 }
 
 export class Database implements Transactional {
   private closed = false;
+  private poolErrorCount = 0;
+  private readonly poolErrorListener: (error: Error) => void;
 
-  private constructor(private readonly pool: Pool) {}
+  private constructor(
+    private readonly pool: Pool,
+    onPoolError?: (error: Error) => void,
+  ) {
+    this.poolErrorListener = (error: Error) => {
+      this.poolErrorCount += 1;
+      onPoolError?.(error);
+    };
+    this.pool.on("error", this.poolErrorListener);
+  }
 
   static open(connectionString: string, options: OpenOptions = {}): Database {
     const config: PoolConfig = {
@@ -62,11 +86,30 @@ export class Database implements Transactional {
       // A watcher query that has not finished in thirty seconds is wedged, not slow, and holding
       // the connection does not help it.
       statement_timeout: options.statementTimeoutMs ?? 30_000,
+      ...(options.idleTimeoutMs !== undefined ? { idleTimeoutMillis: options.idleTimeoutMs } : {}),
+      ...(options.allowExitOnIdle !== undefined
+        ? { allowExitOnIdle: options.allowExitOnIdle }
+        : {}),
     };
-    return new Database(new Pool(config));
+    const pool = options.poolFactory ? options.poolFactory(config) : new Pool(config);
+    return new Database(pool, options.onPoolError);
+  }
+
+  get stats(): DatabasePoolStats {
+    return {
+      totalCount: this.pool.totalCount,
+      idleCount: this.pool.idleCount,
+      waitingCount: this.pool.waitingCount,
+      closed: this.closed,
+      errorListenerCount: this.pool.listenerCount("error"),
+      poolErrors: this.poolErrorCount,
+    };
   }
 
   async query(text: string, params: readonly unknown[] = []): Promise<QueryResultRows> {
+    if (this.closed) {
+      throw new Error("Database pool is closed.");
+    }
     const result = await this.pool.query(text, params as unknown[]);
     return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount ?? 0 };
   }
@@ -79,6 +122,9 @@ export class Database implements Transactional {
    * only as good as nobody being able to write one without the other.
    */
   async transaction<T>(work: (tx: Queryable) => Promise<T>): Promise<T> {
+    if (this.closed) {
+      throw new Error("Database pool is closed.");
+    }
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -117,6 +163,7 @@ export class Database implements Transactional {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.pool.removeListener("error", this.poolErrorListener);
     await this.pool.end();
   }
 }
