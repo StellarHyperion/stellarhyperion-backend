@@ -12,6 +12,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import { deriveHistoryState, resolveHistoryCoverage } from "../coverage.js";
 import type { ServerDeps } from "../server.js";
 
 export type TransferLifecycleStage =
@@ -480,16 +481,31 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       params.push(parsedOffset);
       const offsetClause = `OFFSET $${String(params.length)}`;
 
-      const { rows } = await db.query(
-        `${TRANSFER_QUERY} ${whereClause} ORDER BY t.id DESC ${limitClause} ${offsetClause}`,
-        params,
-      );
+      const [{ rows }, coverage] = await Promise.all([
+        db.query(
+          `${TRANSFER_QUERY} ${whereClause} ORDER BY t.id DESC ${limitClause} ${offsetClause}`,
+          params,
+        ),
+        resolveHistoryCoverage(
+          {
+            config: deps.config,
+            db,
+            readiness: deps.readiness,
+            now: deps.now,
+          },
+          originChain,
+        ),
+      ]);
+
+      const transfers = rows.map((row) => formatRow(row, deps.config));
 
       return reply.send({
-        transfers: rows.map((row) => formatRow(row, deps.config)),
+        transfers,
         limit: parsedLimit,
         offset: parsedOffset,
-        count: rows.length,
+        count: transfers.length,
+        historyState: deriveHistoryState(transfers.length, coverage),
+        coverage,
       });
     },
   );

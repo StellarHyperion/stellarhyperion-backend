@@ -5,10 +5,11 @@
  * and blocker states (such as paused or flow limit exceeded).
  */
 import { describeBlocker, type QuoteBlocker } from "@hyperion/protocol";
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import { deriveHistoryState, resolveHistoryCoverage } from "../coverage.js";
 import type { ServerDeps } from "../server.js";
 
 export interface FormattedRouteHealth {
@@ -29,42 +30,72 @@ export interface FormattedRouteHealth {
 export function registerRouteHealthRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
 
-  app.get("/v1/routes/health", async (_request, reply: FastifyReply) => {
-    // Return latest sample per (origin_chain, destination_chain, route, token)
-    const { rows } = await db.query(
-      `SELECT DISTINCT ON (origin_chain, destination_chain, route, token)
-              origin_chain,
-              destination_chain,
-              route,
-              token,
-              available,
-              blocker,
-              flow_available,
-              sampled_at AS observed_at
-         FROM route_health
-        ORDER BY origin_chain, destination_chain, route, token, id DESC`,
-    );
+  app.get(
+    "/v1/routes/health",
+    async (
+      request: FastifyRequest<{ Querystring: { originChain?: string } }>,
+      reply: FastifyReply,
+    ) => {
+      const originChain = request.query.originChain?.trim()
+        ? request.query.originChain.trim()
+        : undefined;
+      const whereClause = originChain !== undefined ? "WHERE origin_chain = $1" : "";
+      const params = originChain !== undefined ? [originChain] : [];
 
-    const routes: FormattedRouteHealth[] = rows.map((row) => {
-      const blockerCode = integer(row, "blocker") as QuoteBlocker;
-      const blockerInfo = describeBlocker(blockerCode);
+      // Return latest sample per (origin_chain, destination_chain, route, token)
+      const [{ rows }, coverage] = await Promise.all([
+        db.query(
+          `SELECT DISTINCT ON (origin_chain, destination_chain, route, token)
+                  origin_chain,
+                  destination_chain,
+                  route,
+                  token,
+                  available,
+                  blocker,
+                  flow_available,
+                  sampled_at AS observed_at
+             FROM route_health
+            ${whereClause}
+            ORDER BY origin_chain, destination_chain, route, token, id DESC`,
+          params,
+        ),
+        resolveHistoryCoverage(
+          {
+            config: deps.config,
+            db,
+            readiness: deps.readiness,
+            now: deps.now,
+          },
+          originChain,
+        ),
+      ]);
 
-      return {
-        originChain: text(row, "origin_chain"),
-        destinationChain: text(row, "destination_chain"),
-        route: integer(row, "route"),
-        token: text(row, "token"),
-        available: row.available === true,
-        blocker: {
-          code: blockerCode,
-          label: blockerInfo.label,
-          detail: blockerInfo.detail,
-        },
-        flowAvailable: textOrNull(row, "flow_available"),
-        observedAt: new Date(row.observed_at as string | number | Date).toISOString(),
-      };
-    });
+      const routes: FormattedRouteHealth[] = rows.map((row) => {
+        const blockerCode = integer(row, "blocker") as QuoteBlocker;
+        const blockerInfo = describeBlocker(blockerCode);
 
-    return reply.send({ routes, count: routes.length });
-  });
+        return {
+          originChain: text(row, "origin_chain"),
+          destinationChain: text(row, "destination_chain"),
+          route: integer(row, "route"),
+          token: text(row, "token"),
+          available: row.available === true,
+          blocker: {
+            code: blockerCode,
+            label: blockerInfo.label,
+            detail: blockerInfo.detail,
+          },
+          flowAvailable: textOrNull(row, "flow_available"),
+          observedAt: new Date(row.observed_at as string | number | Date).toISOString(),
+        };
+      });
+
+      return reply.send({
+        routes,
+        count: routes.length,
+        historyState: deriveHistoryState(routes.length, coverage),
+        coverage,
+      });
+    },
+  );
 }

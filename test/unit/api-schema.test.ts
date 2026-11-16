@@ -124,4 +124,57 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     expect(response.json().destination.symbol).toBe("USDC");
     expect(response.json().origin.netAmount).toBe("9970000");
   });
+
+  it("exposes scoped coverage and stored-cursor freshness without claiming a live watcher", async () => {
+    const incomplete = await app.inject(
+      "/v1/transfers?originChain=stellar-testnet&search=no-such-transfer",
+    );
+    expect(incomplete.statusCode).toBe(200);
+    const incompleteBody = incomplete.json();
+    expect(incompleteBody.transfers).toHaveLength(0);
+    expect(incompleteBody.historyState).toBe("incomplete");
+    expect(incompleteBody.coverage.status).toBe("incomplete");
+    expect(incompleteBody.coverage.scope).toEqual({
+      mode: "requested_chain",
+      requestedChain: "stellar-testnet",
+      chains: ["stellar-testnet"],
+    });
+    expect(incompleteBody.coverage.freshness.mode).toBe("stored_cursor");
+    expect(incompleteBody.coverage.freshness.liveWatcherActive).toBe(false);
+    expect(incompleteBody.coverage.knownGaps.map((gap: { kind: string }) => gap.kind)).toEqual(
+      expect.arrayContaining(["contract_mismatch", "cursor_behind_start"]),
+    );
+
+    const stellarDeployment = config.deployments.networks["stellar-testnet"];
+    if (stellarDeployment?.family !== "stellar") throw new Error("Missing stellar test deployment");
+
+    await pg.query(
+      `UPDATE indexer_cursor
+          SET contract = $1,
+              last_processed = $2,
+              last_processed_hash = 'ledger-hash-1287500',
+              last_processed_at = '2026-10-29T12:00:00.000Z',
+              updated_at = '2026-10-29T12:00:05.000Z'
+        WHERE chain_key = 'stellar-testnet'`,
+      [stellarDeployment.router, stellarDeployment.deployedAt.ledger + 100],
+    );
+
+    const emptyComplete = await app.inject(
+      "/v1/transfers?originChain=stellar-testnet&search=no-such-transfer",
+    );
+    expect(emptyComplete.statusCode).toBe(200);
+    const emptyBody = emptyComplete.json();
+    expect(emptyBody.transfers).toHaveLength(0);
+    expect(emptyBody.historyState).toBe("empty");
+    expect(emptyBody.coverage.status).toBe("complete");
+    expect(emptyBody.coverage.knownGaps).toEqual([]);
+    expect(emptyBody.coverage.chains[0].scannedThrough).toEqual({
+      fromBlock: String(stellarDeployment.deployedAt.ledger),
+      throughBlock: String(stellarDeployment.deployedAt.ledger + 100),
+      throughHash: "ledger-hash-1287500",
+      throughTimestamp: "2026-10-29T12:00:00.000Z",
+    });
+    expect(emptyBody.coverage.chains[0].freshness.liveWatcherActive).toBe(false);
+    expect(emptyBody.coverage.chains[0].freshness.mode).toBe("stored_cursor");
+  });
 });

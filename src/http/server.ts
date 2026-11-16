@@ -23,6 +23,8 @@ export interface ServerDeps {
   readonly readiness: readonly ReadinessSource[];
   /** Set at boot so `/health` can report how long the process has been up. */
   readonly startedAt?: Date;
+  /** Optional deterministic clock for freshness age metadata in tests. */
+  readonly now?: () => Date;
 }
 
 export function buildServer(deps: ServerDeps): FastifyInstance {

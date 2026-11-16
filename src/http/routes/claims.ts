@@ -9,6 +9,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text } from "../../db/rows.js";
+import { deriveHistoryState, resolveHistoryCoverage } from "../coverage.js";
 import type { ServerDeps } from "../server.js";
 
 export interface FormattedClaim {
@@ -117,22 +118,37 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       params.push(parsedOffset);
       const offsetClause = `OFFSET $${String(params.length)}`;
 
-      const { rows } = await db.query(
-        `SELECT chain || ':' || claim_id::text AS id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
-                created_at, settled, observed_at
-           FROM pending_claim
-          ${whereClause}
-          ORDER BY chain ASC, claim_id DESC
-          ${limitClause}
-          ${offsetClause}`,
-        params,
-      );
+      const [{ rows }, coverage] = await Promise.all([
+        db.query(
+          `SELECT chain || ':' || claim_id::text AS id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
+                  created_at, settled, observed_at
+             FROM pending_claim
+            ${whereClause}
+            ORDER BY chain ASC, claim_id DESC
+            ${limitClause}
+            ${offsetClause}`,
+          params,
+        ),
+        resolveHistoryCoverage(
+          {
+            config: deps.config,
+            db,
+            readiness: deps.readiness,
+            now: deps.now,
+          },
+          chain,
+        ),
+      ]);
+
+      const claims = rows.map(formatClaimRow);
 
       return reply.send({
-        claims: rows.map(formatClaimRow),
+        claims,
         limit: parsedLimit,
         offset: parsedOffset,
-        count: rows.length,
+        count: claims.length,
+        historyState: deriveHistoryState(claims.length, coverage),
+        coverage,
       });
     },
   );
