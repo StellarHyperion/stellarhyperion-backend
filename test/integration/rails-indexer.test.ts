@@ -11,7 +11,12 @@ import { writeOutbound, writeInbound } from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
 import { outstandingForRail, pendingForRail } from "../../src/rails/queue.js";
 import { RailPass } from "../../src/rails/pass.js";
-import type { PendingTransfer, RailClient, RailLookup } from "../../src/rails/types.js";
+import {
+  DestinationBudgetPool,
+  type PendingTransfer,
+  type RailClient,
+  type RailLookup,
+} from "../../src/rails/types.js";
 import { capturingLogger } from "../stellar-fakes.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
@@ -214,5 +219,84 @@ suite("rail pollers against real Postgres", () => {
     // Outstanding should now be 0 for this transfer since delivered is terminal
     const outstanding = await outstandingForRail(db, 1);
     expect(outstanding).toBe(0);
+  });
+
+  it("interleaves destinations and enforces provider and per-destination concurrency budgets", async () => {
+    const { logger } = capturingLogger();
+    await clean();
+
+    for (let i = 0; i < 4; i += 1) {
+      const nonce = BigInt(300 + i);
+      const destinationChain = i < 3 ? "sepolia" : "arc-testnet";
+      await db.transaction(async (tx) => {
+        await writeOutbound(
+          tx,
+          {
+            chainKey: "stellar-testnet",
+            block: 5000n + BigInt(i),
+            txHash: `stellar-tx-${nonce.toString()}`,
+            logIndex: null,
+            observedAt: new Date(),
+          },
+          {
+            route: 0,
+            nonce,
+            sender: "GDXRQQETEZHGRJTE3U7DYGIWGGYGMM6EAS5NWGPGN2WXFXZYZ6QZIANA",
+            token: "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+            grossAmount: 1001000n,
+            fee: 1000n,
+            netAmount: 1000000n,
+            destinationChain,
+            destination: "0x0000000000000000000000001111111111111111111111111111111111111111",
+            railRef: null,
+          },
+        );
+      });
+    }
+
+    const interleaved = await pendingForRail(db, {
+      route: 0,
+      limit: 2,
+      notCheckedSince: new Date(Date.now() + 1000),
+      maxCheckFailures: 5,
+    });
+    expect(interleaved.map((entry) => entry.destinationChain).sort()).toEqual([
+      "arc-testnet",
+      "sepolia",
+    ]);
+
+    const pool = new DestinationBudgetPool({
+      defaultConcurrency: 2,
+      overrides: { sepolia: 1 },
+    });
+    const pass = new RailPass({
+      route: 0,
+      client: {
+        rail: "cctp",
+        look: (transfer) =>
+          Promise.resolve({
+            kind: "found",
+            report: {
+              status: "attested",
+              railStatus: "complete",
+              reference: `ref-${transfer.nonce.toString()}`,
+              attestedAt: new Date("2026-10-29T12:00:00Z"),
+              forwardTxHash: `0x${transfer.nonce.toString().padStart(64, "a")}`,
+            },
+          }),
+      },
+      db,
+      logger,
+      batchSize: 4,
+      recheckAfterMs: 10_000,
+      maxCheckFailures: 5,
+      providerConcurrency: 2,
+      destinationPool: pool,
+      verifyDelivery: () => Promise.resolve(null),
+    });
+
+    await pass.tick(new AbortController().signal);
+    expect(pass.providerBudgetStats.peak).toBeLessThanOrEqual(2);
+    expect(pool.stats("sepolia").peak).toBeLessThanOrEqual(1);
   });
 });

@@ -29,7 +29,7 @@ import { RouteKind } from "@hyperion/protocol";
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
 import { IrisClient } from "../rails/cctp/iris.js";
 import { RailPass } from "../rails/pass.js";
-import type { RailClient } from "../rails/types.js";
+import { DestinationBudgetPool, TransferOwnershipGuard, type RailClient } from "../rails/types.js";
 import { KeeperWorker } from "../keeper/worker.js";
 import { viemClient } from "./evm/client.js";
 import { EvmWatcher } from "./evm/watcher.js";
@@ -261,6 +261,12 @@ function railWorkers(
     },
   ];
 
+  const sharedDestinationPool = new DestinationBudgetPool({
+    defaultConcurrency: config.destinationConcurrency,
+    overrides: config.destinationBudgets,
+  });
+  const sharedOwnershipGuard = new TransferOwnershipGuard();
+
   return clients.map(({ route, client }) => {
     const child = logger.child({ rail: client.rail, route });
     const pass = new RailPass({
@@ -272,6 +278,9 @@ function railWorkers(
       batchSize: config.batchSize,
       recheckAfterMs: config.recheckAfterMs,
       maxCheckFailures: config.maxCheckFailures,
+      providerConcurrency: config.providerConcurrency,
+      destinationPool: sharedDestinationPool,
+      ownershipGuard: sharedOwnershipGuard,
     });
     return new PolledWorker(pass, config.pollIntervalMs, child);
   });

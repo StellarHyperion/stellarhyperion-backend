@@ -14,6 +14,8 @@
  * every transfer in flight look broken and would spend the backoff on the normal case.
  */
 
+import type { InboundRow, Position } from "../chains/writers.js";
+
 /**
  * Hyperion's own five words.
  *
@@ -106,4 +108,204 @@ export interface RailClient {
   readonly rail: string;
   /** Throws `RailError`; returns `missing` rather than throwing for a transfer not yet indexed. */
   look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup>;
+}
+
+export interface VerifiedRailDelivery {
+  readonly at: Position;
+  readonly row: InboundRow;
+}
+
+export type DeliveryVerifier = (
+  transfer: PendingTransfer,
+  report: RailReport,
+  signal?: AbortSignal,
+) => Promise<VerifiedRailDelivery | null>;
+
+export interface SemaphoreStats {
+  readonly limit: number;
+  readonly active: number;
+  readonly queued: number;
+  readonly peak: number;
+}
+
+export class BudgetAbortedError extends Error {
+  constructor() {
+    super("rail concurrency slot acquisition aborted");
+    this.name = "BudgetAbortedError";
+  }
+}
+
+interface QueuedPermit {
+  cancelled: boolean;
+  readonly resolve: () => void;
+  readonly reject: (error: Error) => void;
+  cleanup: () => void;
+}
+
+/**
+ * Bounded async semaphore with direct permit handoff and AbortSignal cancellation.
+ */
+export class AsyncSemaphore {
+  readonly limit: number;
+  private activeCount = 0;
+  private peakCount = 0;
+  private readonly waiters: QueuedPermit[] = [];
+
+  constructor(limit: number) {
+    if (!Number.isInteger(limit) || limit < 1) {
+      throw new RangeError(`concurrency limit must be a positive integer, got ${String(limit)}`);
+    }
+    this.limit = limit;
+  }
+
+  get stats(): SemaphoreStats {
+    return {
+      limit: this.limit,
+      active: this.activeCount,
+      queued: this.waiters.filter((entry) => !entry.cancelled).length,
+      peak: this.peakCount,
+    };
+  }
+
+  async run<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    await this.acquire(signal);
+    try {
+      return await fn();
+    } finally {
+      this.release();
+    }
+  }
+
+  private acquire(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      return Promise.reject(new BudgetAbortedError());
+    }
+
+    if (this.activeCount < this.limit) {
+      this.activeCount += 1;
+      if (this.activeCount > this.peakCount) {
+        this.peakCount = this.activeCount;
+      }
+      return Promise.resolve();
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      const entry: QueuedPermit = {
+        cancelled: false,
+        resolve,
+        reject,
+        cleanup: () => undefined,
+      };
+
+      if (signal) {
+        const onAbort = () => {
+          if (entry.cancelled) return;
+          entry.cancelled = true;
+          entry.cleanup();
+          reject(new BudgetAbortedError());
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        entry.cleanup = () => {
+          signal.removeEventListener("abort", onAbort);
+        };
+      }
+
+      this.waiters.push(entry);
+    });
+  }
+
+  private release(): void {
+    while (this.waiters.length > 0) {
+      const next = this.waiters.shift();
+      if (next && !next.cancelled) {
+        next.cleanup();
+        next.resolve();
+        return;
+      }
+    }
+    this.activeCount -= 1;
+  }
+}
+
+export interface DestinationBudgetPoolOptions {
+  readonly defaultConcurrency: number;
+  readonly overrides?: Readonly<Record<string, number>> | undefined;
+}
+
+/**
+ * Keyed per-destination concurrency limiter shared across rail pollers so slow or rate-limited
+ * destination RPCs cannot exhaust healthy destinations or exceed per-chain RPC budgets.
+ */
+export class DestinationBudgetPool {
+  private readonly defaultConcurrency: number;
+  private readonly overrides: Readonly<Record<string, number>>;
+  private readonly semaphores = new Map<string, AsyncSemaphore>();
+
+  constructor(options: DestinationBudgetPoolOptions) {
+    if (!Number.isInteger(options.defaultConcurrency) || options.defaultConcurrency < 1) {
+      throw new RangeError(
+        `default destination concurrency must be >= 1, got ${String(options.defaultConcurrency)}`,
+      );
+    }
+    this.defaultConcurrency = options.defaultConcurrency;
+    this.overrides = options.overrides ?? {};
+    for (const [chain, budget] of Object.entries(this.overrides)) {
+      if (!Number.isInteger(budget) || budget < 1) {
+        throw new RangeError(
+          `destination concurrency override for ${chain} must be >= 1, got ${String(budget)}`,
+        );
+      }
+    }
+  }
+
+  limitFor(destinationChain: string): number {
+    return this.overrides[destinationChain] ?? this.defaultConcurrency;
+  }
+
+  stats(destinationChain: string): SemaphoreStats {
+    const existing = this.semaphores.get(destinationChain);
+    if (existing !== undefined) return existing.stats;
+    return {
+      limit: this.limitFor(destinationChain),
+      active: 0,
+      queued: 0,
+      peak: 0,
+    };
+  }
+
+  run<T>(destinationChain: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    let semaphore = this.semaphores.get(destinationChain);
+    if (semaphore === undefined) {
+      semaphore = new AsyncSemaphore(this.limitFor(destinationChain));
+      this.semaphores.set(destinationChain, semaphore);
+    }
+    return semaphore.run(fn, signal);
+  }
+}
+
+/**
+ * In-process ownership set preventing overlapping passes or slots from checking the same transfer
+ * concurrently.
+ */
+export class TransferOwnershipGuard {
+  private readonly activeKeys = new Set<string>();
+
+  tryAcquire(
+    transfer: Pick<PendingTransfer, "transferId" | "originChain" | "nonce">,
+  ): (() => void) | null {
+    const idKey = `id:${transfer.transferId.toString()}`;
+    const hopKey = `hop:${transfer.originChain}:${transfer.nonce.toString()}`;
+    if (this.activeKeys.has(idKey) || this.activeKeys.has(hopKey)) {
+      return null;
+    }
+    this.activeKeys.add(idKey);
+    this.activeKeys.add(hopKey);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.activeKeys.delete(idKey);
+      this.activeKeys.delete(hopKey);
+    };
+  }
 }

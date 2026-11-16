@@ -84,6 +84,9 @@ export interface RailsConfig {
   readonly batchSize: number;
   readonly recheckAfterMs: number;
   readonly maxCheckFailures: number;
+  readonly providerConcurrency: number;
+  readonly destinationConcurrency: number;
+  readonly destinationBudgets: Readonly<Record<string, number>>;
 }
 
 export interface IndexerConfig {
@@ -284,6 +287,28 @@ const RAIL_MAX_CHECK_FAILURES: VarSpec = {
     "Consecutive failures before the queue stops offering a transfer. Per transfer, not per rail: one unanswerable transfer must not back off the whole rail.",
 };
 
+const RAIL_PROVIDER_CONCURRENCY: VarSpec = {
+  name: "RAIL_PROVIDER_CONCURRENCY",
+  kind: "integer",
+  required: false,
+  fallback: "4",
+  min: 1,
+  max: 32,
+  printable: true,
+  purpose: "Maximum parallel status lookups sent to a single rail provider during a pass.",
+};
+
+const RAIL_DESTINATION_CONCURRENCY: VarSpec = {
+  name: "RAIL_DESTINATION_CONCURRENCY",
+  kind: "integer",
+  required: false,
+  fallback: "2",
+  min: 1,
+  max: 16,
+  printable: true,
+  purpose: "Default maximum parallel receipt verifications against a single destination chain RPC.",
+};
+
 const KEEPER_ENABLED: VarSpec = {
   name: "KEEPER_ENABLED",
   kind: "boolean",
@@ -434,6 +459,18 @@ function rpcUrlsOverrideSpec(chain: ChainKey): VarSpec {
   };
 }
 
+function railDestinationConcurrencySpec(chain: ChainKey): VarSpec {
+  return {
+    name: `RAIL_DESTINATION_CONCURRENCY_${envSuffixFor(chain)}`,
+    kind: "integer",
+    required: false,
+    min: 1,
+    max: 16,
+    printable: true,
+    purpose: `Maximum parallel destination receipt verifications for ${CHAINS[chain].name}.`,
+  };
+}
+
 /**
  * Read the environment and the deployment record, or explain why not.
  *
@@ -465,6 +502,17 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const railBatchSize = reader.integer(RAIL_BATCH_SIZE);
   const railRecheckAfterMs = reader.integer(RAIL_RECHECK_AFTER_MS);
   const railMaxCheckFailures = reader.integer(RAIL_MAX_CHECK_FAILURES);
+  const railProviderConcurrency = reader.integer(RAIL_PROVIDER_CONCURRENCY);
+  const railDestinationConcurrency = reader.integer(RAIL_DESTINATION_CONCURRENCY);
+  const railDestinationBudgets: Record<string, number> = {};
+  if (!reader.failed(HYPERION_NETWORK)) {
+    for (const entry of chainsFor(network)) {
+      const spec = railDestinationConcurrencySpec(entry.key);
+      if (reader.has(spec.name)) {
+        railDestinationBudgets[entry.key] = reader.integer(spec);
+      }
+    }
+  }
 
   const keeperPollIntervalMs = reader.integer(KEEPER_POLL_INTERVAL_MS);
   const keeperConcurrency = reader.integer(KEEPER_CONCURRENCY);
@@ -520,6 +568,9 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       batchSize: railBatchSize,
       recheckAfterMs: railRecheckAfterMs,
       maxCheckFailures: railMaxCheckFailures,
+      providerConcurrency: railProviderConcurrency,
+      destinationConcurrency: railDestinationConcurrency,
+      destinationBudgets: railDestinationBudgets,
     },
     keeper: {
       enabled: keeperEnabled,
