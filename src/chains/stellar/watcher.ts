@@ -26,11 +26,18 @@ import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
-import { completeThrough, endOfLedgerCursor, parseEventCursor } from "./cursor.js";
+import {
+  EventCursorError,
+  completeThrough,
+  endOfLedgerCursor,
+  parseEventCursor,
+} from "./cursor.js";
 import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
 import type { EventSource, EventsQuery } from "./rpc.js";
-import { StellarRpcError } from "./rpc.js";
+import { StellarRpcError, redactStellarDiagnostic } from "./rpc.js";
 import {
+  computeRepairProposalId,
+  isStellarEventMaterialized,
   readCursor,
   recordActionQueued,
   recordActionSettled,
@@ -42,7 +49,9 @@ import {
   recordRouteConfigured,
   recordTokenRegistered,
   writeCursor,
+  type CursorSnapshot,
   type EventContext,
+  type StellarCursorRepairProposal,
 } from "./store.js";
 
 /**
@@ -386,6 +395,378 @@ export class StellarWatcher {
         return assertNever(event);
     }
   }
+
+  planCursorRepair(
+    signal: AbortSignal,
+    overrides: { readonly targetLedger?: number; readonly maxPages?: number } = {},
+  ): Promise<StellarCursorRepairPlanResult> {
+    return planStellarCursorRepair(
+      {
+        chainKey: this.options.chainKey,
+        router: this.options.router,
+        startLedger: this.options.startLedger,
+        pageSize: this.options.pageSize,
+        rpc: this.options.rpc,
+        db: this.options.db,
+        ...(overrides.targetLedger === undefined ? {} : { targetLedger: overrides.targetLedger }),
+        ...(overrides.maxPages === undefined ? {} : { maxPages: overrides.maxPages }),
+      },
+      signal,
+    );
+  }
+}
+
+export type CursorRepairBlockedReason =
+  | "contract_mismatch"
+  | "rpc_error"
+  | "retention_gap"
+  | "unverified_cursor"
+  | "unverified_range"
+  | "unmaterialized_event";
+
+export type StellarCursorRepairPlanResult =
+  | {
+      readonly kind: "proposal";
+      readonly proposal: StellarCursorRepairProposal;
+    }
+  | {
+      readonly kind: "noop";
+      readonly beforeState: CursorSnapshot;
+      readonly verifiedThroughLedger: number;
+      readonly justification: string;
+    }
+  | {
+      readonly kind: "blocked";
+      readonly reason: CursorRepairBlockedReason;
+      readonly beforeState: CursorSnapshot;
+      readonly justification: string;
+    };
+
+export interface StellarCursorRepairPlanOptions {
+  readonly chainKey: string;
+  readonly router: string;
+  readonly startLedger: number;
+  readonly pageSize?: number;
+  readonly targetLedger?: number;
+  readonly maxPages?: number;
+  readonly rpc: EventSource;
+  readonly db: Queryable;
+}
+
+const DEFAULT_REPAIR_MAX_PAGES = 50;
+
+/**
+ * Generate a read-only, unsigned Stellar cursor repair proposal from verified completed ledger
+ * boundaries, retained-history checks, and database event materialization proofs.
+ */
+export async function planStellarCursorRepair(
+  options: StellarCursorRepairPlanOptions,
+  signal: AbortSignal,
+): Promise<StellarCursorRepairPlanResult> {
+  const { chainKey, router, startLedger, rpc, db } = options;
+  const pageSize = options.pageSize ?? 200;
+  const maxPages = options.maxPages ?? DEFAULT_REPAIR_MAX_PAGES;
+
+  const stored = await readCursor(db, chainKey);
+  const beforeState: CursorSnapshot =
+    stored === null
+      ? { exists: false, contract: null, position: null, observedAt: null, revision: 0n }
+      : {
+          exists: true,
+          contract: stored.contract,
+          position: stored.position,
+          observedAt: stored.observedAt,
+          revision: stored.revision,
+        };
+
+  if (stored !== null && stored.contract !== router) {
+    return {
+      kind: "blocked",
+      reason: "contract_mismatch",
+      beforeState,
+      justification: `stored cursor belongs to router ${stored.contract} rather than ${router}`,
+    };
+  }
+
+  const base = stored === null ? startLedger - 1 : Number(stored.position);
+  if (options.targetLedger !== undefined && options.targetLedger <= base) {
+    return {
+      kind: "noop",
+      beforeState,
+      verifiedThroughLedger: base,
+      justification: `cursor at ledger ${String(base)} already covers target ledger ${String(options.targetLedger)}`,
+    };
+  }
+
+  let verifiedThrough = base;
+  let pagesRead = 0;
+  let pagesVerified = 0;
+  let rpcOldestLedger = 0;
+  let rpcLatestLedger = 0;
+  let terminalCursor = base >= 0 ? endOfLedgerCursor(base) : "";
+  let materializedEventsVerified = 0;
+  let proposedObservedAt = stored?.observedAt ?? null;
+  let previousPageCursor: string | null = null;
+  let previousEventId: string | null = stored === null ? null : endOfLedgerCursor(base);
+  let blockedReason: CursorRepairBlockedReason | null = null;
+  let blockedDetail = "";
+  let stoppedAtUnmaterialized: { readonly ledger: number; readonly eventId: string } | null = null;
+
+  let pagination: Pick<EventsQuery, "startLedger" | "cursor"> =
+    stored === null ? { startLedger } : { cursor: endOfLedgerCursor(base) };
+
+  while (pagesRead < maxPages) {
+    const segmentStart = verifiedThrough + 1;
+    let page;
+    try {
+      page = await rpc.events({ ...pagination, contractIds: [router], limit: pageSize }, signal);
+    } catch (error) {
+      const msg = redactStellarDiagnostic(error instanceof Error ? error.message : String(error));
+      const isRetention =
+        error instanceof StellarRpcError &&
+        !error.retryable &&
+        /ledger range|must be within/i.test(error.message);
+      blockedReason = isRetention ? "retention_gap" : "rpc_error";
+      blockedDetail = `rpc event verification failed at ledger ${String(segmentStart)}: ${msg}`;
+      break;
+    }
+    pagesRead += 1;
+
+    if (
+      !Number.isInteger(page.oldestLedger) ||
+      !Number.isInteger(page.latestLedger) ||
+      page.oldestLedger < 0 ||
+      page.latestLedger < 0 ||
+      page.oldestLedger > page.latestLedger
+    ) {
+      blockedReason = "unverified_range";
+      blockedDetail = `rpc returned invalid ledger bounds oldest=${String(page.oldestLedger)} latest=${String(page.latestLedger)}`;
+      break;
+    }
+
+    rpcOldestLedger = page.oldestLedger;
+    rpcLatestLedger = page.latestLedger;
+
+    if (page.oldestLedger > segmentStart) {
+      blockedReason = "retention_gap";
+      blockedDetail = `provider oldest retained ledger ${String(page.oldestLedger)} is ahead of required ledger ${String(segmentStart)}`;
+      break;
+    }
+
+    if (page.cursor === null) {
+      blockedReason = "unverified_cursor";
+      blockedDetail = "rpc page omitted a completion cursor";
+      break;
+    }
+
+    let parsedCursor;
+    try {
+      parsedCursor = parseEventCursor(page.cursor);
+    } catch (error) {
+      const msg = error instanceof EventCursorError ? error.message : String(error);
+      blockedReason = "unverified_cursor";
+      blockedDetail = `rpc returned malformed cursor: ${redactStellarDiagnostic(msg)}`;
+      break;
+    }
+
+    if (parsedCursor.ledger > page.latestLedger) {
+      blockedReason = "unverified_cursor";
+      blockedDetail = `rpc cursor ledger ${String(parsedCursor.ledger)} exceeds latestLedger ${String(page.latestLedger)}`;
+      break;
+    }
+
+    let pageRangeInvalid = false;
+    let pageSafeCap: number | null = null;
+
+    for (const entry of page.events) {
+      if (!isRawEventEnvelope(entry)) {
+        blockedReason = "unverified_range";
+        blockedDetail = "rpc page contained a malformed event envelope";
+        pageRangeInvalid = true;
+        break;
+      }
+      const raw = entry;
+      if (
+        raw.contractId !== router ||
+        !Number.isInteger(raw.ledger) ||
+        raw.ledger < segmentStart ||
+        raw.ledger > page.latestLedger ||
+        raw.id.length === 0
+      ) {
+        blockedReason = "unverified_range";
+        blockedDetail =
+          "rpc page contained an event outside the requested contract or ledger bounds";
+        pageRangeInvalid = true;
+        break;
+      }
+      if (previousEventId !== null && raw.id <= previousEventId) {
+        blockedReason = "unverified_range";
+        blockedDetail = `rpc events were not strictly ordered at event ${raw.id}`;
+        pageRangeInvalid = true;
+        break;
+      }
+      if (page.cursor < raw.id) {
+        blockedReason = "unverified_cursor";
+        blockedDetail = `rpc page cursor ${page.cursor} precedes returned event ${raw.id}`;
+        pageRangeInvalid = true;
+        break;
+      }
+      previousEventId = raw.id;
+
+      if (options.targetLedger !== undefined && raw.ledger > options.targetLedger) {
+        continue;
+      }
+
+      if (raw.type !== "contract" || raw.inSuccessfulContractCall === false) {
+        continue;
+      }
+
+      let decoded;
+      try {
+        decoded = decodeStellarEvent(raw);
+      } catch {
+        stoppedAtUnmaterialized = { ledger: raw.ledger, eventId: raw.id };
+        pageSafeCap = raw.ledger - 1;
+        break;
+      }
+
+      const materialized = await isStellarEventMaterialized(db, chainKey, decoded);
+      if (!materialized) {
+        stoppedAtUnmaterialized = { ledger: raw.ledger, eventId: raw.id };
+        pageSafeCap = raw.ledger - 1;
+        break;
+      }
+
+      if (decoded.kind !== "ignored") {
+        materializedEventsVerified += 1;
+      }
+      proposedObservedAt = new Date(raw.ledgerClosedAt);
+    }
+
+    if (pageRangeInvalid) {
+      break;
+    }
+
+    let candidate = completeThrough(parsedCursor);
+    if (options.targetLedger !== undefined && candidate > options.targetLedger) {
+      candidate = options.targetLedger;
+    }
+    if (pageSafeCap !== null && candidate > pageSafeCap) {
+      candidate = pageSafeCap;
+    }
+
+    if (candidate > verifiedThrough) {
+      const clamped = candidate < completeThrough(parsedCursor);
+      verifiedThrough = candidate;
+      terminalCursor = clamped ? endOfLedgerCursor(verifiedThrough) : page.cursor;
+      pagesVerified += 1;
+    }
+
+    if (stoppedAtUnmaterialized !== null) {
+      break;
+    }
+    if (options.targetLedger !== undefined && verifiedThrough >= options.targetLedger) {
+      break;
+    }
+    if (verifiedThrough >= page.latestLedger) {
+      break;
+    }
+    if (page.cursor === previousPageCursor) {
+      break;
+    }
+
+    previousPageCursor = page.cursor;
+    pagination = { cursor: page.cursor };
+  }
+
+  if (verifiedThrough <= base) {
+    if (blockedReason !== null) {
+      return {
+        kind: "blocked",
+        reason: blockedReason,
+        beforeState,
+        justification: blockedDetail,
+      };
+    }
+    if (stoppedAtUnmaterialized !== null) {
+      return {
+        kind: "blocked",
+        reason: "unmaterialized_event",
+        beforeState,
+        justification: `unmaterialized or undecodable router event ${stoppedAtUnmaterialized.eventId} at ledger ${String(stoppedAtUnmaterialized.ledger)} prevents advancing past ledger ${String(base)}`,
+      };
+    }
+    if (rpcLatestLedger > 0 && rpcLatestLedger <= base) {
+      return {
+        kind: "noop",
+        beforeState,
+        verifiedThroughLedger: base,
+        justification: `cursor at ledger ${String(base)} is already at the chain head ${String(rpcLatestLedger)}`,
+      };
+    }
+    return {
+      kind: "blocked",
+      reason: "unverified_range",
+      beforeState,
+      justification: `could not complete a whole ledger boundary beyond ledger ${String(base)} within ${String(pagesRead)} pages`,
+    };
+  }
+
+  const verifiedFromLedger = base + 1;
+  const action = stored === null ? "initialize" : "advance";
+  const expectedRevision = stored === null ? 0n : stored.revision;
+  const stopSuffix =
+    stoppedAtUnmaterialized !== null
+      ? `; clamped before unmaterialized event ${stoppedAtUnmaterialized.eventId} at ledger ${String(stoppedAtUnmaterialized.ledger)}`
+      : blockedReason !== null
+        ? `; stopped before unverified boundary (${blockedReason})`
+        : "";
+  const justification =
+    `verified completed ledgers ${String(verifiedFromLedger)}..${String(verifiedThrough)} ` +
+    `for router ${router} across ${String(pagesVerified)} rpc page(s) ` +
+    `(retained ${String(rpcOldestLedger)}..${String(rpcLatestLedger)}, ` +
+    `${String(materializedEventsVerified)} materialized event(s) confirmed)${stopSuffix}`;
+
+  const draft: Omit<StellarCursorRepairProposal, "proposalId"> = {
+    unsigned: true,
+    chainKey,
+    contract: router,
+    action,
+    expectedRevision,
+    beforeState,
+    proposedPosition: BigInt(verifiedThrough),
+    proposedObservedAt,
+    evidence: {
+      verifiedFromLedger,
+      verifiedThroughLedger: verifiedThrough,
+      rpcOldestLedger,
+      rpcLatestLedger,
+      pagesVerified,
+      terminalCursor,
+      materializedEventsVerified,
+    },
+    justification,
+  };
+
+  return {
+    kind: "proposal",
+    proposal: {
+      proposalId: computeRepairProposalId(draft),
+      ...draft,
+    },
+  };
+}
+
+function isRawEventEnvelope(entry: unknown): entry is RawStellarEvent {
+  if (typeof entry !== "object" || entry === null) return false;
+  const candidate = entry as Record<string, unknown>;
+  return (
+    typeof candidate.contractId === "string" &&
+    typeof candidate.ledger === "number" &&
+    typeof candidate.id === "string" &&
+    typeof candidate.type === "string" &&
+    typeof candidate.ledgerClosedAt === "string"
+  );
 }
 
 /** A compile time exhaustiveness check. The runtime throw is a formality. */

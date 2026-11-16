@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { PGlite } from "@electric-sql/pglite";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Database } from "../../src/db/pool.js";
@@ -39,11 +40,11 @@ const app = buildServer({
   redis: { ping: () => Promise.resolve("PONG") },
 });
 beforeAll(async () => {
-  for (const name of [
-    "1790900000000_initial-schema.sql",
-    "1791000000000_cursor-block-hash.sql",
-    "1791100000000_cursor-autovacuum-tuning.sql",
-  ]) {
+  const migrationsDir = fileURLToPath(new URL("../../migrations", import.meta.url));
+  const migrationNames = readdirSync(migrationsDir)
+    .filter((name) => name.endsWith(".sql"))
+    .sort();
+  for (const name of migrationNames) {
     const sql = readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8").split(
       "-- Down Migration",
     )[0]!;

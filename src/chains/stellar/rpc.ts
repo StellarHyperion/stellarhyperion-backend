@@ -151,7 +151,11 @@ export class StellarRpc {
       });
     } catch (cause) {
       const aborted = signal?.aborted === true;
-      throw new StellarRpcError(method, aborted ? "cancelled" : describe(cause), !aborted);
+      throw new StellarRpcError(
+        method,
+        aborted ? "cancelled" : redactStellarDiagnostic(describe(cause)),
+        !aborted,
+      );
     }
 
     if (!response.ok) {
@@ -165,11 +169,15 @@ export class StellarRpc {
     try {
       body = (await response.json()) as RpcResponse;
     } catch (cause) {
-      throw new StellarRpcError(method, `response was not json: ${describe(cause)}`, true);
+      throw new StellarRpcError(
+        method,
+        `response was not json: ${redactStellarDiagnostic(describe(cause))}`,
+        true,
+      );
     }
 
     if (body.error !== undefined) {
-      const message = body.error.message ?? "unspecified";
+      const message = redactStellarDiagnostic(body.error.message ?? "unspecified");
       // The one error worth recognising by content. It means the cursor or start ledger has fallen
       // out of the node's retention window, which no amount of retrying fixes.
       const outOfWindow = /ledger range|must be within/i.test(message);
@@ -180,6 +188,21 @@ export class StellarRpc {
     }
     return body.result;
   }
+}
+
+export function redactStellarDiagnostic(raw: string): string {
+  return raw
+    .replace(/https?:\/\/[^\s"'<>]+/gi, (match) => {
+      try {
+        const parsed = new URL(match);
+        const auth = parsed.username || parsed.password ? "[redacted]@" : "";
+        return `${parsed.protocol}//${auth}${parsed.host}`;
+      } catch {
+        return "[redacted-url]";
+      }
+    })
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    .replace(/\b(api[_-]?key|token|secret|password)=([^\s&"']+)/gi, "$1=[redacted]");
 }
 
 function describe(cause: unknown): string {

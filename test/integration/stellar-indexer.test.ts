@@ -17,7 +17,11 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { StellarWatcher } from "../../src/chains/stellar/watcher.js";
+import {
+  applyStellarCursorRepair,
+  readStellarCursorRepairAudits,
+} from "../../src/chains/stellar/store.js";
+import { StellarWatcher, planStellarCursorRepair } from "../../src/chains/stellar/watcher.js";
 import { Database } from "../../src/db/pool.js";
 import { FakeRpc, LIVE_ROUTER, ROUTER_HISTORY, capturingLogger } from "../stellar-fakes.js";
 
@@ -32,6 +36,7 @@ const FIRST_EVENT_LEDGER = 4_965_951;
 const HEAD = 4_994_010;
 
 const TABLES = [
+  ["stellar_cursor_repair_audit", "chain_key"],
   ["admin_action", "chain"],
   ["route_health", "origin_chain"],
   ["outbound_transfer", "origin_chain"],
@@ -230,6 +235,35 @@ suite("replaying the live router's history", () => {
     await expect(other.tick(AbortSignal.timeout(20_000))).rejects.toThrow(
       /needs its cursor reset rather than reused/,
     );
+  });
+
+  it("plans and applies a revision-checked cursor repair with audit history", async () => {
+    await clean();
+    await drain();
+    await db.query("UPDATE indexer_cursor SET last_processed = $2 WHERE chain_key = $1", [
+      CHAIN,
+      String(FIRST_EVENT_LEDGER + 25),
+    ]);
+
+    const planned = await planStellarCursorRepair(
+      {
+        chainKey: CHAIN,
+        router: LIVE_ROUTER,
+        startLedger: FIRST_EVENT_LEDGER,
+        rpc: new FakeRpc({ events: ROUTER_HISTORY, latestLedger: HEAD }),
+        db,
+      },
+      AbortSignal.timeout(20_000),
+    );
+    expect(planned.kind).toBe("proposal");
+    if (planned.kind !== "proposal") throw new Error("expected proposal");
+
+    const audit = await applyStellarCursorRepair(db, planned.proposal, {
+      reviewedBy: "integration-reviewer",
+      reviewNote: "verified against materialized replay state",
+    });
+    expect(audit.proposedPosition).toBe(BigInt(HEAD));
+    expect(await readStellarCursorRepairAudits(db, CHAIN)).toHaveLength(1);
   });
 });
 

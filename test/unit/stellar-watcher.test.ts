@@ -6,11 +6,23 @@
  * even when it finds nothing, a page and the cursor advance commit together, and a cursor is never
  * reused across routers.
  */
+import { readdirSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { PGlite } from "@electric-sql/pglite";
 import { describe, expect, it } from "vitest";
 
 import { endOfLedgerCursor } from "../../src/chains/stellar/cursor.js";
 import type { RawStellarEvent } from "../../src/chains/stellar/events.js";
-import { StellarWatcher } from "../../src/chains/stellar/watcher.js";
+import { StellarRpcError, type EventSource } from "../../src/chains/stellar/rpc.js";
+import {
+  CursorRepairConflictError,
+  applyStellarCursorRepair,
+  readCursor,
+  readStellarCursorRepairAudits,
+  writeCursor,
+} from "../../src/chains/stellar/store.js";
+import { StellarWatcher, planStellarCursorRepair } from "../../src/chains/stellar/watcher.js";
+import type { Queryable, Transactional } from "../../src/db/pool.js";
 import {
   FakeRpc,
   LIVE_ROUTER,
@@ -342,5 +354,260 @@ describe("gaps it cannot close", () => {
 
     const warnings = lines.filter((line) => line.message.includes("running ahead of the indexer"));
     expect(warnings).toHaveLength(1);
+  });
+});
+
+async function openMigratedPgLite(): Promise<{
+  readonly db: Transactional;
+  readonly close: () => Promise<void>;
+}> {
+  const pg = new PGlite();
+  const migrationsDir = fileURLToPath(new URL("../../migrations", import.meta.url));
+  const migrationNames = readdirSync(migrationsDir)
+    .filter((name) => name.endsWith(".sql"))
+    .sort();
+  for (const name of migrationNames) {
+    const sql = readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8").split(
+      "-- Down Migration",
+    )[0]!;
+    await pg.exec(sql);
+  }
+
+  const queryable: Queryable = {
+    query: async (sql: string, params: readonly unknown[] = []) => {
+      const result = await pg.query(sql, [...params]);
+      const int8 = result.fields
+        .filter((field) => field.dataTypeID === 20)
+        .map((field) => field.name);
+      const rows = result.rows.map((raw) => {
+        const row = { ...(raw as Record<string, unknown>) };
+        for (const column of int8) {
+          const value = row[column];
+          if (typeof value === "number" || typeof value === "bigint") row[column] = String(value);
+        }
+        return row;
+      });
+      return {
+        rows,
+        rowCount: result.rows.length > 0 ? result.rows.length : (result.affectedRows ?? 0),
+      };
+    },
+  };
+
+  const db: Transactional = {
+    query: (sql, params) => queryable.query(sql, params),
+    transaction: async <T>(work: (tx: Queryable) => Promise<T>): Promise<T> => {
+      await pg.exec("BEGIN");
+      try {
+        const out = await work(queryable);
+        await pg.exec("COMMIT");
+        return out;
+      } catch (error) {
+        await pg.exec("ROLLBACK");
+        throw error;
+      }
+    },
+  };
+
+  return { db, close: () => pg.close() };
+}
+
+describe("read-only cursor repair planner", () => {
+  it("generates an unsigned proposal with before-state and justification without writing to the database", async () => {
+    const { watcher, db } = harness({ startLedger: 4_990_000, latestLedger: 4_994_000 });
+    db.cursorRow = {
+      ...cursorRow(4_991_000),
+      revision: "3",
+    };
+
+    const result = await watcher.planCursorRepair(AbortSignal.timeout(5_000));
+
+    expect(result.kind).toBe("proposal");
+    if (result.kind !== "proposal") throw new Error("expected proposal");
+    expect(result.proposal.unsigned).toBe(true);
+    expect(result.proposal.action).toBe("advance");
+    expect(result.proposal.expectedRevision).toBe(3n);
+    expect(result.proposal.beforeState).toEqual({
+      exists: true,
+      contract: LIVE_ROUTER,
+      position: 4_991_000n,
+      observedAt: new Date("2026-10-01T12:00:00.000Z"),
+      revision: 3n,
+    });
+    expect(result.proposal.proposedPosition).toBe(4_994_000n);
+    expect(result.proposal.justification).toContain("verified completed ledgers 4991001..4994000");
+    expect(db.commits).toEqual([]);
+    expect(db.matching("INSERT")).toEqual([]);
+    expect(db.matching("UPDATE")).toEqual([]);
+  });
+
+  it("never advances a cursor across retention gaps, missing cursors, or unmaterialized events", async () => {
+    const gapCase = harness({
+      startLedger: 4_900_000,
+      latestLedger: 4_994_000,
+      oldestLedger: 4_980_000,
+    });
+    gapCase.db.cursorRow = cursorRow(4_970_000);
+    const gapPlan = await gapCase.watcher.planCursorRepair(AbortSignal.timeout(5_000));
+    expect(gapPlan).toMatchObject({ kind: "blocked", reason: "retention_gap" });
+
+    const nullCursorRpc: EventSource = {
+      events: () =>
+        Promise.resolve({
+          events: [],
+          cursor: null,
+          latestLedger: 4_994_000,
+          oldestLedger: 4_900_000,
+        }),
+    };
+    const db = new RecordingDb();
+    db.cursorRow = cursorRow(4_990_000);
+    const nullCursorPlan = await planStellarCursorRepair(
+      {
+        chainKey: CHAIN,
+        router: LIVE_ROUTER,
+        startLedger: 4_990_000,
+        rpc: nullCursorRpc,
+        db,
+      },
+      AbortSignal.timeout(5_000),
+    );
+    expect(nullCursorPlan).toMatchObject({ kind: "blocked", reason: "unverified_cursor" });
+
+    const credentialErrorRpc: EventSource = {
+      events: () =>
+        Promise.reject(
+          new StellarRpcError(
+            "getEvents",
+            "connect failed for https://svc:topsecret@rpc.example.org/v1/key123?api_key=leak999",
+            true,
+          ),
+        ),
+    };
+    const credPlan = await planStellarCursorRepair(
+      {
+        chainKey: CHAIN,
+        router: LIVE_ROUTER,
+        startLedger: 4_990_000,
+        rpc: credentialErrorRpc,
+        db,
+      },
+      AbortSignal.timeout(5_000),
+    );
+    expect(credPlan.kind).toBe("blocked");
+    if (credPlan.kind === "blocked") {
+      expect(credPlan.justification).not.toContain("topsecret");
+      expect(credPlan.justification).not.toContain("leak999");
+      expect(credPlan.justification).not.toContain("key123");
+    }
+
+    const queuedAtBoundary = ROUTER_HISTORY.find(
+      (entry) => entry.topicJson[1]?.symbol === "queued",
+    );
+    if (!queuedAtBoundary) throw new Error("expected queued event in fixture");
+    const unmaterializedCase = harness({
+      events: [
+        {
+          ...queuedAtBoundary,
+          ledger: FIRST_EVENT_LEDGER + 5,
+          id: `${toid(FIRST_EVENT_LEDGER + 5)
+            .toString()
+            .padStart(19, "0")}-0000000000`,
+        },
+      ],
+      startLedger: FIRST_EVENT_LEDGER,
+      latestLedger: FIRST_EVENT_LEDGER + 100,
+    });
+    unmaterializedCase.db.cursorRow = cursorRow(FIRST_EVENT_LEDGER);
+    const clampedPlan = await unmaterializedCase.watcher.planCursorRepair(
+      AbortSignal.timeout(5_000),
+    );
+    expect(clampedPlan.kind).toBe("proposal");
+    if (clampedPlan.kind === "proposal") {
+      expect(clampedPlan.proposal.proposedPosition).toBe(BigInt(FIRST_EVENT_LEDGER + 4));
+      expect(clampedPlan.proposal.justification).toContain("clamped before unmaterialized event");
+    }
+  });
+
+  it("enforces compare-and-swap revisions and writes an audit record when applying a reviewed repair", async () => {
+    const { db, close } = await openMigratedPgLite();
+    try {
+      const { logger } = capturingLogger();
+      const head = 4_994_010;
+      const rpc = new FakeRpc({ events: ROUTER_HISTORY, latestLedger: head });
+      const watcher = new StellarWatcher({
+        chainKey: CHAIN,
+        router: LIVE_ROUTER,
+        startLedger: FIRST_EVENT_LEDGER,
+        pageSize: 200,
+        rpc,
+        db,
+        logger,
+      });
+      while (await watcher.tick(AbortSignal.timeout(5_000))) {
+        // catch up across windows
+      }
+
+      // Simulate a cursor lagging behind already materialized events.
+      await db.query("UPDATE indexer_cursor SET last_processed = $2 WHERE chain_key = $1", [
+        CHAIN,
+        String(FIRST_EVENT_LEDGER + 10),
+      ]);
+      const beforeRepair = await readCursor(db, CHAIN);
+      expect(beforeRepair?.position).toBe(BigInt(FIRST_EVENT_LEDGER + 10));
+
+      const planned = await watcher.planCursorRepair(AbortSignal.timeout(5_000));
+      expect(planned.kind).toBe("proposal");
+      if (planned.kind !== "proposal") throw new Error("expected repair proposal");
+
+      // Planner remained strictly read-only.
+      const stillUnchanged = await readCursor(db, CHAIN);
+      expect(stillUnchanged?.position).toBe(BigInt(FIRST_EVENT_LEDGER + 10));
+      expect(stillUnchanged?.revision).toBe(beforeRepair?.revision);
+
+      // Tampered proposals are rejected.
+      await expect(
+        applyStellarCursorRepair(
+          db,
+          { ...planned.proposal, proposedPosition: BigInt(head + 1) },
+          { reviewedBy: "ops-alice", reviewNote: "verified against archive" },
+        ),
+      ).rejects.toThrow(CursorRepairConflictError);
+
+      // Valid reviewed application advances the cursor and records audit metadata.
+      const audit = await applyStellarCursorRepair(db, planned.proposal, {
+        reviewedBy: "ops-alice",
+        reviewNote: "verified completed boundaries and materialized actions",
+      });
+      expect(audit.proposedPosition).toBe(BigInt(head));
+      expect(audit.appliedRevision).toBe((beforeRepair?.revision ?? 0n) + 1n);
+
+      const repaired = await readCursor(db, CHAIN);
+      expect(repaired?.position).toBe(BigInt(head));
+      expect(repaired?.revision).toBe(audit.appliedRevision);
+
+      const audits = await readStellarCursorRepairAudits(db, CHAIN);
+      expect(audits).toHaveLength(1);
+      expect(audits[0]?.reviewedBy).toBe("ops-alice");
+      expect(audits[0]?.proposalId).toBe(planned.proposal.proposalId);
+
+      // Re-applying or applying after a concurrent write fails the revision check.
+      await writeCursor(db, {
+        chainKey: CHAIN,
+        family: "stellar",
+        contract: LIVE_ROUTER,
+        position: BigInt(head + 1),
+        observedAt: new Date(),
+        hash: null,
+      });
+      await expect(
+        applyStellarCursorRepair(db, planned.proposal, {
+          reviewedBy: "ops-bob",
+          reviewNote: "duplicate attempt",
+        }),
+      ).rejects.toThrow(CursorRepairConflictError);
+    } finally {
+      await close();
+    }
   });
 });
