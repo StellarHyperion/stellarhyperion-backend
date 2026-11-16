@@ -30,9 +30,16 @@ export function isTerminal(status: AttestationStatus): boolean {
   return TERMINAL.includes(status);
 }
 
+export interface RailExecutionCandidate {
+  readonly txHash: `0x${string}`;
+  readonly commandId: `0x${string}`;
+  readonly reference?: string | null;
+}
+
 export interface RailReport {
   readonly forwardTxHash?: `0x${string}`;
   readonly execution?: { readonly txHash: `0x${string}`; readonly commandId: `0x${string}` };
+  readonly executions?: readonly RailExecutionCandidate[];
   readonly status: AttestationStatus;
   /**
    * The rail's own word for it, verbatim.

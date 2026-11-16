@@ -20,14 +20,65 @@ import {
 import { createPublicClient, http, stringToHex } from "viem";
 import type { AppConfig } from "../../config/config.js";
 import type { Transactional } from "../../db/pool.js";
-import { bigintOf, text } from "../../db/rows.js";
+import { bigintOf, text, textOrNull } from "../../db/rows.js";
 import type { InboundRow, Position } from "../../chains/writers.js";
-import type { PendingTransfer, RailReport } from "../types.js";
+import type { PendingTransfer, RailExecutionCandidate, RailReport } from "../types.js";
 
-import { ITS_ABI, matchingPayment } from "./events.js";
+import { ITS_ABI, matchItsCandidateInReceipt } from "./events.js";
+export {
+  matchItsCandidateInReceipt,
+  matchingPayment,
+  type CandidateReceiptMatch,
+} from "./events.js";
+
 export interface VerifiedDelivery {
   readonly at: Position;
   readonly row: InboundRow;
+}
+
+function resolveReportCandidates(
+  report: RailReport,
+  railRef: string | null,
+): readonly RailExecutionCandidate[] | null {
+  const rawList: readonly RailExecutionCandidate[] =
+    report.executions ?? (report.execution ? [report.execution] : []);
+  if (rawList.length === 0) {
+    return [];
+  }
+
+  const txByCmd = new Map<string, string>();
+  const deduped = new Map<string, RailExecutionCandidate>();
+  for (const item of rawList) {
+    const cmdKey = item.commandId.toLowerCase();
+    const txKey = item.txHash.toLowerCase();
+    const prevTx = txByCmd.get(cmdKey);
+    if (prevTx !== undefined && prevTx !== txKey) {
+      // Conflicting destination receipts reported for the same commandId remain unverified.
+      return null;
+    }
+    txByCmd.set(cmdKey, txKey);
+    const pairKey = `${cmdKey}:${txKey}`;
+    if (!deduped.has(pairKey)) {
+      deduped.set(pairKey, item);
+    }
+  }
+
+  const all = [...deduped.values()].sort((a, b) =>
+    a.commandId.toLowerCase().localeCompare(b.commandId.toLowerCase()),
+  );
+
+  if (railRef !== null && railRef.trim().length > 0) {
+    const refNorm = railRef.trim().toLowerCase();
+    const pinned = all.filter(
+      (item) =>
+        item.commandId.toLowerCase() === refNorm || item.reference?.toLowerCase() === refNorm,
+    );
+    if (pinned.length === 1) {
+      return pinned;
+    }
+  }
+
+  return all;
 }
 
 // The rail API supplies a candidate receipt. Only matching confirmed chain events establish delivery.
@@ -37,10 +88,8 @@ export async function verifyItsDelivery(
   transfer: PendingTransfer,
   report: RailReport,
 ): Promise<VerifiedDelivery | null> {
-  const execution = report.execution;
   const source = config.indexer.stellar;
   if (
-    !execution ||
     !source ||
     transfer.route !== RouteKind.AxelarIts ||
     transfer.originChain !== source.chain ||
@@ -51,11 +100,14 @@ export async function verifyItsDelivery(
   const its = RAIL_CONTRACTS[transfer.destinationChain]?.axelar?.interchainTokenService;
   if (!isEvmChain(destination) || !its?.startsWith("0x")) return null;
   const { rows } = await db.query(
-    "SELECT sender, token, net_amount, destination FROM outbound_transfer WHERE id = $1",
+    "SELECT sender, token, net_amount, destination, rail_ref FROM outbound_transfer WHERE id = $1",
     [String(transfer.transferId)],
   );
   const stored = rows[0];
   if (!stored) return null;
+  const candidates = resolveReportCandidates(report, textOrNull(stored, "rail_ref"));
+  if (!candidates || candidates.length === 0) return null;
+
   const token = text(stored, "token");
   const amount = bigintOf(stored, "net_amount");
   const recipient = toEvmAddress(text(stored, "destination") as `0x${string}`);
@@ -90,51 +142,83 @@ export async function verifyItsDelivery(
   });
   if ((await client.getChainId()) !== destination.chainId)
     throw new Error("Destination RPC chain mismatch.");
-  const receipt = await client.getTransactionReceipt({ hash: execution.txHash });
-  if (receipt.status !== "success") return null;
-  const head = await client.getBlockNumber();
-  if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations)) return null;
+
+  const adapterConfig = (await view(adapter, "get_config")) as { its?: string };
+  if (!adapterConfig.its) return null;
+  const sourceName = await view(adapterConfig.its, "chain_name");
+  if (typeof sourceName !== "string") return null;
+
   const destinationToken = await client.readContract({
     address: its as `0x${string}`,
     abi: ITS_ABI,
     functionName: "registeredTokenAddress",
     args: [tokenId],
   });
-  const adapterConfig = (await view(adapter, "get_config")) as { its?: string };
-  if (!adapterConfig.its) return null;
-  const sourceName = await view(adapterConfig.its, "chain_name");
-  if (typeof sourceName !== "string") return null;
-  const payment = matchingPayment(receipt.logs, {
-    its,
-    token: destinationToken,
-    commandId: execution.commandId,
-    tokenId,
-    sourceChain: sourceName,
-    sourceAddress: stringToHex(text(stored, "sender")),
-    recipient,
-    amount,
-  });
-  if (!payment) return null;
-  const block = await client.getBlock({ blockNumber: receipt.blockNumber });
-  if (block.hash !== receipt.blockHash) return null;
-  return {
-    at: {
-      chainKey: transfer.destinationChain,
-      block: receipt.blockNumber,
-      txHash: receipt.transactionHash,
-      logIndex: payment.logIndex,
-      observedAt: new Date(Number(block.timestamp) * 1000),
-    },
-    row: {
-      route: transfer.route,
-      sourceChain: transfer.originChain,
-      sourceNonce: transfer.nonce,
-      railMessageId: execution.commandId,
-      recipient: recipient.toLowerCase(),
-      token: destinationToken.toLowerCase(),
+
+  const head = await client.getBlockNumber();
+  const receiptCache = new Map<string, Awaited<ReturnType<typeof client.getTransactionReceipt>>>();
+  const blockCache = new Map<bigint, Awaited<ReturnType<typeof client.getBlock>>>();
+
+  const verifiedMatches: VerifiedDelivery[] = [];
+  const senderHex = stringToHex(text(stored, "sender"));
+
+  for (const execution of candidates) {
+    const txKey = execution.txHash.toLowerCase();
+    let receipt = receiptCache.get(txKey);
+    if (!receipt) {
+      receipt = await client.getTransactionReceipt({ hash: execution.txHash });
+      receiptCache.set(txKey, receipt);
+    }
+    if (receipt.status !== "success") continue;
+    if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations)) continue;
+
+    const match = matchItsCandidateInReceipt(receipt.logs, {
+      its,
+      token: destinationToken,
+      commandId: execution.commandId,
+      tokenId,
+      sourceChain: sourceName,
+      sourceAddress: senderHex,
+      recipient,
       amount,
-      delivered: true,
-      claimId: null,
-    },
-  };
+    });
+    if (match.status === "conflicting" || match.status === "ambiguous") {
+      return null;
+    }
+    if (match.status !== "matched") continue;
+
+    let block = blockCache.get(receipt.blockNumber);
+    if (!block) {
+      block = await client.getBlock({ blockNumber: receipt.blockNumber });
+      blockCache.set(receipt.blockNumber, block);
+    }
+    if (block.hash !== receipt.blockHash) continue;
+
+    verifiedMatches.push({
+      at: {
+        chainKey: transfer.destinationChain,
+        block: receipt.blockNumber,
+        txHash: receipt.transactionHash,
+        logIndex: match.paymentLog.logIndex,
+        observedAt: new Date(Number(block.timestamp) * 1000),
+      },
+      row: {
+        route: transfer.route,
+        sourceChain: transfer.originChain,
+        sourceNonce: transfer.nonce,
+        railMessageId: execution.commandId,
+        recipient: recipient.toLowerCase(),
+        token: destinationToken.toLowerCase(),
+        amount,
+        delivered: true,
+        claimId: null,
+      },
+    });
+  }
+
+  // Multiple distinct candidate commands matching the same transfer cannot be disambiguated safely.
+  if (verifiedMatches.length !== 1) {
+    return null;
+  }
+  return verifiedMatches[0] ?? null;
 }

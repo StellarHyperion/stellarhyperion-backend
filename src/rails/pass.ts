@@ -198,7 +198,10 @@ export class RailPass {
     }
 
     const { report } = lookup;
-    if (this.options.config && (report.execution || report.forwardTxHash)) {
+    const hasItsCandidates =
+      report.execution !== undefined ||
+      (report.executions !== undefined && report.executions.length > 0);
+    if (this.options.config && (hasItsCandidates || report.forwardTxHash)) {
       const verified =
         (await verifyItsDelivery(this.options.config, this.options.db, transfer, report)) ??
         (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report));
@@ -209,7 +212,7 @@ export class RailPass {
         await this.write(transfer, {
           status: "delivered",
           railStatus: report.railStatus,
-          reference: report.reference,
+          reference: report.reference ?? verified.row.railMessageId,
           attestedAt: report.attestedAt,
           checkedAt: at,
           failures: 0,

@@ -3,6 +3,7 @@ import type {
   AttestationStatus,
   PendingTransfer,
   RailClient,
+  RailExecutionCandidate,
   RailLookup,
   RailReport,
 } from "../types.js";
@@ -105,33 +106,152 @@ export class AxelarGmpClient implements RailClient {
           : undefined,
       ].some((value) => normalized(value) === hash),
     );
-    const executed = matched.find((item) => this.reportFor(item).execution !== undefined);
-    if (executed) return { kind: "found", report: this.reportFor(executed) };
+    const executedRows: GmpRow[] = matched.filter(
+      (item) => this.reportFor(item).execution !== undefined,
+    );
+
     let selected = matched[0];
     // A Stellar ITS call executes first on the hub. The source lookup may return only that row.
     // Follow the explicitly linked child, and require its parent and message id to match.
-    let remaining = 4;
-    for (const parent of matched) {
-      const parentId = typeof parent.message_id === "string" ? parent.message_id : parent.id;
-      const children = parent.executed?.childMessageIDs;
-      if (typeof parentId !== "string" || !Array.isArray(children)) continue;
-      for (const childId of children) {
-        if (remaining <= 0) break;
-        if (typeof childId !== "string" || !/^0x[0-9a-fA-F]{64}-\d+$/.test(childId)) continue;
-        remaining -= 1;
-        const forwarded = await this.rowsFor(childId.split("-")[0] ?? "", signal);
-        const child = forwarded.find(
-          (item) =>
-            normalized(item.call?.parentMessageID) === normalized(parentId) &&
-            normalized(item.message_id ?? item.id) === normalized(childId),
-        );
-        if (!child) continue;
-        if (this.reportFor(child).execution)
-          return { kind: "found", report: this.reportFor(child) };
-        selected = child;
+    if (executedRows.length === 0) {
+      let remaining = 4;
+      for (const parent of matched) {
+        const parentId = typeof parent.message_id === "string" ? parent.message_id : parent.id;
+        const children = parent.executed?.childMessageIDs;
+        if (typeof parentId !== "string" || !Array.isArray(children)) continue;
+        for (const childId of children) {
+          if (remaining <= 0) break;
+          if (typeof childId !== "string" || !/^0x[0-9a-fA-F]{64}-\d+$/.test(childId)) continue;
+          remaining -= 1;
+          const forwarded = await this.rowsFor(childId.split("-")[0] ?? "", signal);
+          const matchingChildren = forwarded.filter(
+            (item) =>
+              normalized(item.call?.parentMessageID) === normalized(parentId) &&
+              normalized(item.message_id ?? item.id) === normalized(childId),
+          );
+          for (const child of matchingChildren) {
+            if (this.reportFor(child).execution !== undefined) {
+              executedRows.push(child);
+            } else {
+              selected = child;
+            }
+          }
+        }
       }
     }
+
+    if (executedRows.length > 0) {
+      return { kind: "found", report: this.combineExecutedRows(executedRows) };
+    }
     return selected ? { kind: "found", report: this.reportFor(selected) } : { kind: "missing" };
+  }
+
+  private combineExecutedRows(rows: readonly GmpRow[]): RailReport {
+    const firstRow = rows[0];
+    if (firstRow === undefined) {
+      throw new Error("combineExecutedRows requires at least one row");
+    }
+    const base = this.reportFor(firstRow);
+    const withoutExecution: RailReport = {
+      status: base.status,
+      railStatus: base.railStatus,
+      reference: base.reference,
+      attestedAt: base.attestedAt,
+    };
+
+    // Group by commandId and message reference to detect conflicting provider execution claims
+    // while collapsing exact duplicate records deterministically.
+    const txByCommand = new Map<string, string>();
+    const conflictedCommands = new Set<string>();
+    const pairByRef = new Map<string, string>();
+    const conflictedRefs = new Set<string>();
+    const deduped = new Map<string, { candidate: RailExecutionCandidate; row: GmpRow }>();
+
+    for (const row of rows) {
+      const report = this.reportFor(row);
+      const exec = report.execution;
+      if (exec === undefined) continue;
+
+      const cmdKey = exec.commandId.toLowerCase();
+      const txKey = exec.txHash.toLowerCase();
+      const pairKey = `${cmdKey}:${txKey}`;
+      const refRaw =
+        typeof row.message_id === "string"
+          ? row.message_id
+          : typeof row.id === "string"
+            ? row.id
+            : null;
+      const refKey = refRaw !== null ? refRaw.toLowerCase() : null;
+
+      const prevTx = txByCommand.get(cmdKey);
+      if (prevTx !== undefined && prevTx !== txKey) {
+        conflictedCommands.add(cmdKey);
+      } else {
+        txByCommand.set(cmdKey, txKey);
+      }
+
+      if (refKey !== null) {
+        const prevPair = pairByRef.get(refKey);
+        if (prevPair !== undefined && prevPair !== pairKey) {
+          conflictedRefs.add(refKey);
+        } else {
+          pairByRef.set(refKey, pairKey);
+        }
+      }
+
+      if (!deduped.has(pairKey)) {
+        deduped.set(pairKey, {
+          candidate: {
+            txHash: exec.txHash,
+            commandId: exec.commandId,
+            ...(refRaw !== null ? { reference: refRaw } : {}),
+          },
+          row,
+        });
+      }
+    }
+
+    const validEntries = [...deduped.values()]
+      .filter(({ candidate }) => {
+        if (conflictedCommands.has(candidate.commandId.toLowerCase())) {
+          return false;
+        }
+        if (
+          candidate.reference !== undefined &&
+          candidate.reference !== null &&
+          conflictedRefs.has(candidate.reference.toLowerCase())
+        ) {
+          return false;
+        }
+        return true;
+      })
+      .sort((a, b) => {
+        const cmdCmp = a.candidate.commandId
+          .toLowerCase()
+          .localeCompare(b.candidate.commandId.toLowerCase());
+        if (cmdCmp !== 0) return cmdCmp;
+        return a.candidate.txHash.toLowerCase().localeCompare(b.candidate.txHash.toLowerCase());
+      });
+
+    if (validEntries.length === 0) {
+      return withoutExecution;
+    }
+
+    if (validEntries.length === 1) {
+      const single = validEntries[0];
+      if (single === undefined) return withoutExecution;
+      const singleReport = this.reportFor(single.row);
+      return {
+        ...singleReport,
+        executions: [single.candidate],
+      };
+    }
+
+    return {
+      ...withoutExecution,
+      reference: null,
+      executions: validEntries.map((entry) => entry.candidate),
+    };
   }
 
   private async rowsFor(txHash: string, signal?: AbortSignal): Promise<GmpRow[]> {
