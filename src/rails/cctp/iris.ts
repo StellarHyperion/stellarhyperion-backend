@@ -83,6 +83,8 @@ export interface IrisMessage {
   readonly isFastTransfer?: unknown;
   readonly fastTransfer?: unknown;
   readonly attestationType?: unknown;
+  readonly replacesMessageHash?: unknown;
+  readonly originalMessageHash?: unknown;
   // Both levels nullable, because the reference says `decodedMessage` is null when decoding
   // fails and `decodedMessageBody` is itself nullable inside it.
   readonly decodedMessage?: {
@@ -115,6 +117,8 @@ export function isIrisMessage(value: unknown): value is IrisMessage {
     "isFastTransfer",
     "fastTransfer",
     "attestationType",
+    "replacesMessageHash",
+    "originalMessageHash",
     "decodedMessage",
   ];
   if (!recognizedKeys.some((k) => k in msg)) return false;
@@ -291,12 +295,19 @@ export class IrisClient implements RailClient {
     if (rawList.length > 0 && messages.length === 0) {
       throw new RailError(this.rail, "transient", "invalid iris message in response payload");
     }
-    const message = messages[0];
+    const candidates = messages.map((entry) => reportFor(entry));
+    const primary = selectPrimaryCandidate(candidates);
     // A 200 with no messages is the same situation as a 404 and both happen. Reporting it as a
     // failure would be reporting the normal case.
-    if (message === undefined) return { kind: "missing" };
+    if (primary === undefined) return { kind: "missing" };
 
-    return { kind: "found", report: reportFor(message) };
+    return {
+      kind: "found",
+      report: {
+        ...primary,
+        versionCandidates: candidates,
+      },
+    };
   }
 
   private async send(url: string, signal?: AbortSignal): Promise<Response> {
@@ -419,6 +430,17 @@ export function reportFor(message: IrisMessage): RailReport {
   let railStatus = delay === null ? rawStatus : `${rawStatus}/${delay}`;
   railStatus = appendExpiry(railStatus, message);
 
+  const replacesHashRaw =
+    typeof message.replacesMessageHash === "string"
+      ? message.replacesMessageHash
+      : typeof message.originalMessageHash === "string"
+        ? message.originalMessageHash
+        : null;
+  const replacesMessageHash =
+    replacesHashRaw !== null && /^0x[0-9a-fA-F]{64}$/.test(replacesHashRaw)
+      ? replacesHashRaw.toLowerCase()
+      : null;
+
   return {
     ...(typeof message.forwardTxHash === "string" &&
     /^0x[0-9a-fA-F]{64}$/.test(message.forwardTxHash)
@@ -434,7 +456,29 @@ export function reportFor(message: IrisMessage): RailReport {
     attestationSignature,
     attestationTimestamp,
     fastTransfer: isFast,
+    ...(replacesMessageHash !== null ? { replacesMessageHash } : {}),
   };
+}
+
+function candidatePriority(report: RailReport): number {
+  if (report.status === "attested" && report.forwardTxHash !== undefined) return 4;
+  if (report.status === "attested") return 3;
+  if (report.status === "pending") return 2;
+  if (report.status === "expired") return 1;
+  return 0;
+}
+
+function selectPrimaryCandidate(candidates: readonly RailReport[]): RailReport | undefined {
+  let chosen: RailReport | undefined;
+  let bestScore = -1;
+  for (const candidate of candidates) {
+    const score = candidatePriority(candidate);
+    if (score >= bestScore) {
+      chosen = candidate;
+      bestScore = score;
+    }
+  }
+  return chosen;
 }
 
 /**

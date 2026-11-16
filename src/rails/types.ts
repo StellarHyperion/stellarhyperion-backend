@@ -52,6 +52,8 @@ export interface RailReport {
   readonly attestationSignature?: string | null;
   readonly attestationTimestamp?: Date | null;
   readonly fastTransfer?: boolean;
+  readonly replacesMessageHash?: string | null | undefined;
+  readonly versionCandidates?: readonly RailReport[] | undefined;
 }
 
 export type RailLookup =

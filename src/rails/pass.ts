@@ -198,9 +198,15 @@ export class RailPass {
     }
 
     const { report } = lookup;
-    if (this.options.config && (report.execution || report.forwardTxHash)) {
+    const hasCctpEvidence =
+      Boolean(report.forwardTxHash) ||
+      Boolean(report.messageBytes) ||
+      (report.versionCandidates?.length ?? 0) > 0;
+    if (this.options.config && (report.execution || hasCctpEvidence)) {
       const verified =
-        (await verifyItsDelivery(this.options.config, this.options.db, transfer, report)) ??
+        (report.execution
+          ? await verifyItsDelivery(this.options.config, this.options.db, transfer, report)
+          : null) ??
         (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report));
       if (verified) {
         await this.options.db.transaction(async (tx) => {
