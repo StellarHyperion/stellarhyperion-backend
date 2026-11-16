@@ -30,9 +30,15 @@ export function isTerminal(status: AttestationStatus): boolean {
   return TERMINAL.includes(status);
 }
 
+export interface AxelarExecutionCandidate {
+  readonly txHash: `0x${string}`;
+  readonly commandId: `0x${string}`;
+}
+
 export interface RailReport {
   readonly forwardTxHash?: `0x${string}`;
-  readonly execution?: { readonly txHash: `0x${string}`; readonly commandId: `0x${string}` };
+  readonly execution?: AxelarExecutionCandidate;
+  readonly executionCandidates?: readonly AxelarExecutionCandidate[] | undefined;
   readonly status: AttestationStatus;
   /**
    * The rail's own word for it, verbatim.

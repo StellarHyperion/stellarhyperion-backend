@@ -24,7 +24,7 @@ import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
-import { writeInbound, writeAttestation } from "../chains/writers.js";
+import { writeInbound, writeItsPaymentProof, writeAttestation } from "../chains/writers.js";
 import { outstandingForRail, pendingForRail } from "./queue.js";
 import { RailError, isTerminal, type PendingTransfer, type RailClient } from "./types.js";
 
@@ -198,13 +198,19 @@ export class RailPass {
     }
 
     const { report } = lookup;
-    if (this.options.config && (report.execution || report.forwardTxHash)) {
+    if (
+      this.options.config &&
+      (report.execution || report.executionCandidates || report.forwardTxHash)
+    ) {
       const verified =
         (await verifyItsDelivery(this.options.config, this.options.db, transfer, report)) ??
         (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report));
       if (verified) {
         await this.options.db.transaction(async (tx) => {
           await writeInbound(tx, verified.at, verified.row);
+          if ("itsPaymentProof" in verified && verified.itsPaymentProof) {
+            await writeItsPaymentProof(tx, verified.itsPaymentProof);
+          }
         });
         await this.write(transfer, {
           status: "delivered",

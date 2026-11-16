@@ -57,6 +57,7 @@ suite("the schema", () => {
       "admin_action",
       "inbound_delivery",
       "indexer_cursor",
+      "its_payment_proof",
       "outbound_transfer",
       "pending_claim",
       "rail_attestation",

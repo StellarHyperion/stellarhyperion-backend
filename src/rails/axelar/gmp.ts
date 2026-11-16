@@ -1,6 +1,7 @@
 /** Axelar status lookup uses the API root and a searchGMP JSON method. */
 import type {
   AttestationStatus,
+  AxelarExecutionCandidate,
   PendingTransfer,
   RailClient,
   RailLookup,
@@ -105,11 +106,30 @@ export class AxelarGmpClient implements RailClient {
           : undefined,
       ].some((value) => normalized(value) === hash),
     );
-    const executed = matched.find((item) => this.reportFor(item).execution !== undefined);
-    if (executed) return { kind: "found", report: this.reportFor(executed) };
+    const candidates: AxelarExecutionCandidate[] = [];
+    const seenCandidates = new Set<string>();
+    const recordCandidate = (candidate: AxelarExecutionCandidate | undefined) => {
+      if (!candidate) return;
+      const key = `${candidate.txHash.toLowerCase()}:${candidate.commandId.toLowerCase()}`;
+      if (!seenCandidates.has(key)) {
+        seenCandidates.add(key);
+        candidates.push(candidate);
+      }
+    };
+
+    let primaryExecuted: RailReport | null = null;
+    for (const item of matched) {
+      const report = this.reportFor(item);
+      if (report.execution !== undefined) {
+        recordCandidate(report.execution);
+        primaryExecuted ??= report;
+      }
+    }
+
     let selected = matched[0];
-    // A Stellar ITS call executes first on the hub. The source lookup may return only that row.
-    // Follow the explicitly linked child, and require its parent and message id to match.
+    // A Stellar ITS call executes first on the hub. The source lookup may return only that row,
+    // or a destination reorg may produce a replacement child execution alongside an older one.
+    // Follow explicitly linked children, requiring parent and message id to match.
     let remaining = 4;
     for (const parent of matched) {
       const parentId = typeof parent.message_id === "string" ? parent.message_id : parent.id;
@@ -120,16 +140,31 @@ export class AxelarGmpClient implements RailClient {
         if (typeof childId !== "string" || !/^0x[0-9a-fA-F]{64}-\d+$/.test(childId)) continue;
         remaining -= 1;
         const forwarded = await this.rowsFor(childId.split("-")[0] ?? "", signal);
-        const child = forwarded.find(
-          (item) =>
-            normalized(item.call?.parentMessageID) === normalized(parentId) &&
-            normalized(item.message_id ?? item.id) === normalized(childId),
-        );
-        if (!child) continue;
-        if (this.reportFor(child).execution)
-          return { kind: "found", report: this.reportFor(child) };
-        selected = child;
+        for (const item of forwarded) {
+          if (
+            normalized(item.call?.parentMessageID) !== normalized(parentId) ||
+            normalized(item.message_id ?? item.id) !== normalized(childId)
+          ) {
+            continue;
+          }
+          const childReport = this.reportFor(item);
+          if (childReport.execution !== undefined) {
+            recordCandidate(childReport.execution);
+            primaryExecuted ??= childReport;
+          } else {
+            selected = item;
+          }
+        }
       }
+    }
+    if (primaryExecuted !== null) {
+      return {
+        kind: "found",
+        report:
+          candidates.length > 0
+            ? { ...primaryExecuted, executionCandidates: candidates }
+            : primaryExecuted,
+      };
     }
     return selected ? { kind: "found", report: this.reportFor(selected) } : { kind: "missing" };
   }

@@ -68,6 +68,24 @@ export interface InboundRow {
   readonly claimId: bigint | null;
 }
 
+export interface ItsPaymentProofRow {
+  readonly transferId: bigint;
+  readonly destinationChain: string;
+  readonly route: number;
+  readonly sourceChain: string;
+  readonly sourceNonce: bigint;
+  readonly commandId: string;
+  readonly tokenId: string;
+  readonly token: string;
+  readonly recipient: string;
+  readonly amount: bigint;
+  readonly proofBlock: bigint;
+  readonly proofBlockHash: string;
+  readonly proofTx: string;
+  readonly proofLogIndex: number | null;
+  readonly verifiedAt: Date;
+}
+
 export interface ClaimRow {
   readonly claimId: bigint;
   readonly recipient: string;
@@ -177,6 +195,67 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
       at.txHash,
       at.logIndex,
       at.observedAt,
+    ],
+  );
+}
+
+export async function writeItsPaymentProof(db: Queryable, row: ItsPaymentProofRow): Promise<void> {
+  await db.query(
+    `INSERT INTO its_payment_proof
+       (transfer_id, destination_chain, route, source_chain, source_nonce, command_id, token_id,
+        token, recipient, amount, proof_block, proof_block_hash, proof_tx, proof_log_index,
+        proof_state, orphaned_block_hash, orphaned_tx, verified_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'canonical', NULL, NULL, $15)
+     ON CONFLICT (transfer_id) DO UPDATE
+       SET destination_chain = EXCLUDED.destination_chain,
+           route = EXCLUDED.route,
+           source_chain = EXCLUDED.source_chain,
+           source_nonce = EXCLUDED.source_nonce,
+           command_id = EXCLUDED.command_id,
+           token_id = EXCLUDED.token_id,
+           token = EXCLUDED.token,
+           recipient = EXCLUDED.recipient,
+           amount = EXCLUDED.amount,
+           proof_block = EXCLUDED.proof_block,
+           proof_block_hash = EXCLUDED.proof_block_hash,
+           proof_tx = EXCLUDED.proof_tx,
+           proof_log_index = EXCLUDED.proof_log_index,
+           proof_state = 'canonical',
+           reconciled_count = CASE
+             WHEN its_payment_proof.proof_state = 'orphaned'
+               OR its_payment_proof.proof_block_hash <> EXCLUDED.proof_block_hash
+               OR its_payment_proof.proof_tx <> EXCLUDED.proof_tx
+             THEN its_payment_proof.reconciled_count + 1
+             ELSE its_payment_proof.reconciled_count
+           END,
+           orphaned_block_hash = CASE
+             WHEN its_payment_proof.proof_block_hash <> EXCLUDED.proof_block_hash
+             THEN its_payment_proof.proof_block_hash
+             ELSE its_payment_proof.orphaned_block_hash
+           END,
+           orphaned_tx = CASE
+             WHEN its_payment_proof.proof_tx <> EXCLUDED.proof_tx
+             THEN its_payment_proof.proof_tx
+             ELSE its_payment_proof.orphaned_tx
+           END,
+           verified_at = EXCLUDED.verified_at,
+           revalidated_at = EXCLUDED.verified_at`,
+    [
+      row.transferId.toString(),
+      row.destinationChain,
+      row.route,
+      row.sourceChain,
+      row.sourceNonce.toString(),
+      row.commandId,
+      row.tokenId,
+      row.token,
+      row.recipient,
+      row.amount.toString(),
+      row.proofBlock.toString(),
+      row.proofBlockHash,
+      row.proofTx,
+      row.proofLogIndex,
+      row.verifiedAt,
     ],
   );
 }
