@@ -30,6 +30,15 @@ export function isTerminal(status: AttestationStatus): boolean {
   return TERMINAL.includes(status);
 }
 
+export interface CctpFullIdentitySummary {
+  readonly sourceDomain: number;
+  readonly destinationDomain: number;
+  readonly fullNonce: `0x${string}`;
+  readonly messageDigest: `0x${string}`;
+  readonly bodyDigest: `0x${string}`;
+  readonly displayedNonce: string;
+}
+
 export interface RailReport {
   readonly forwardTxHash?: `0x${string}`;
   readonly execution?: { readonly txHash: `0x${string}`; readonly commandId: `0x${string}` };
@@ -52,6 +61,8 @@ export interface RailReport {
   readonly attestationSignature?: string | null;
   readonly attestationTimestamp?: Date | null;
   readonly fastTransfer?: boolean;
+  readonly messageIdentity?: CctpFullIdentitySummary | null | undefined;
+  readonly candidates?: readonly RailReport[] | undefined;
 }
 
 export type RailLookup =

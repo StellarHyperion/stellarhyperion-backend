@@ -33,6 +33,7 @@ import type {
   AttestationStatus,
 } from "../types.js";
 import { RailError } from "../types.js";
+import { cctpIdentityKey, deriveCctpMessageIdentity } from "./events.js";
 
 /** Circle's own status values. */
 const PENDING = "pending_confirmations";
@@ -291,12 +292,21 @@ export class IrisClient implements RailClient {
     if (rawList.length > 0 && messages.length === 0) {
       throw new RailError(this.rail, "transient", "invalid iris message in response payload");
     }
-    const message = messages[0];
+    const dedupedCandidates = deduplicateReportsByFullIdentity(
+      messages.map((entry) => reportFor(entry)),
+    );
+    const message = dedupedCandidates[0];
     // A 200 with no messages is the same situation as a 404 and both happen. Reporting it as a
     // failure would be reporting the normal case.
     if (message === undefined) return { kind: "missing" };
 
-    return { kind: "found", report: reportFor(message) };
+    return {
+      kind: "found",
+      report: {
+        ...message,
+        candidates: dedupedCandidates,
+      },
+    };
   }
 
   private async send(url: string, signal?: AbortSignal): Promise<Response> {
@@ -419,6 +429,11 @@ export function reportFor(message: IrisMessage): RailReport {
   let railStatus = delay === null ? rawStatus : `${rawStatus}/${delay}`;
   railStatus = appendExpiry(railStatus, message);
 
+  const messageIdentity =
+    typeof messageBytes === "string" && /^0x[0-9a-fA-F]+$/.test(messageBytes)
+      ? deriveCctpMessageIdentity(messageBytes as `0x${string}`)
+      : null;
+
   return {
     ...(typeof message.forwardTxHash === "string" &&
     /^0x[0-9a-fA-F]{64}$/.test(message.forwardTxHash)
@@ -434,6 +449,7 @@ export function reportFor(message: IrisMessage): RailReport {
     attestationSignature,
     attestationTimestamp,
     fastTransfer: isFast,
+    messageIdentity,
   };
 }
 
@@ -536,6 +552,60 @@ async function describeError(response: Response): Promise<string> {
 
 function describe(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+/**
+ * Deduplicates provider reports strictly by full `(sourceDomain, destinationDomain, fullNonce,
+ * messageDigest)` identity. Two messages sharing the same shortened `eventNonce` or `displayNonce`
+ * have distinct full identities and remain distinct.
+ */
+export function deduplicateReportsByFullIdentity(
+  reports: readonly RailReport[],
+): readonly RailReport[] {
+  const result: RailReport[] = [];
+  const indexByFullKey = new Map<string, number>();
+
+  for (const report of reports) {
+    const identity = report.messageIdentity ?? null;
+    if (identity === null) {
+      result.push(report);
+      continue;
+    }
+    const key = cctpIdentityKey(identity);
+    const existingIdx = indexByFullKey.get(key);
+    if (existingIdx === undefined) {
+      indexByFullKey.set(key, result.length);
+      result.push(report);
+      continue;
+    }
+    const existing = result[existingIdx];
+    if (!existing) continue;
+
+    const forwardTxHash = existing.forwardTxHash ?? report.forwardTxHash;
+    const status: AttestationStatus =
+      existing.status === "attested" || report.status === "attested" ? "attested" : existing.status;
+    const attestationSignature =
+      existing.attestationSignature ?? report.attestationSignature ?? null;
+    const attestationTimestamp =
+      existing.attestationTimestamp ?? report.attestationTimestamp ?? null;
+    const attestedAt = existing.attestedAt ?? report.attestedAt;
+
+    result[existingIdx] = {
+      ...existing,
+      ...(forwardTxHash !== undefined ? { forwardTxHash } : {}),
+      status,
+      railStatus: existing.status === "attested" ? existing.railStatus : report.railStatus,
+      reference: existing.reference ?? report.reference,
+      attestedAt,
+      attestation: attestationSignature,
+      attestationSignature,
+      attestationTimestamp,
+      fastTransfer: Boolean(existing.fastTransfer) || Boolean(report.fastTransfer),
+      messageIdentity: existing.messageIdentity ?? report.messageIdentity,
+    };
+  }
+
+  return result;
 }
 
 export { PENDING as IRIS_PENDING, COMPLETE as IRIS_COMPLETE, RATE_LIMIT_COOLDOWN_MS };
