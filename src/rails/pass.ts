@@ -19,7 +19,7 @@
  */
 import type { AppConfig } from "../config/config.js";
 import { verifyItsDelivery } from "./axelar/delivery.js";
-import { verifyCctpDelivery } from "./cctp/delivery.js";
+import { reconcileCctpTransferReport, verifyCctpDelivery } from "./cctp/delivery.js";
 import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
@@ -197,7 +197,24 @@ export class RailPass {
       return false;
     }
 
-    const { report } = lookup;
+    let report = lookup.report;
+    if (
+      this.options.config &&
+      transfer.route === 0 &&
+      report.candidates &&
+      report.candidates.length > 1
+    ) {
+      const reconciled = await reconcileCctpTransferReport(
+        this.options.config,
+        this.options.db,
+        transfer,
+        report,
+      );
+      if (reconciled) {
+        report = reconciled.report;
+      }
+    }
+
     if (this.options.config && (report.execution || report.forwardTxHash)) {
       const verified =
         (await verifyItsDelivery(this.options.config, this.options.db, transfer, report)) ??

@@ -26,11 +26,12 @@
 import { CHAINS, IRIS_API, isChainKey, type NetworkMode } from "@hyperion/protocol";
 
 import type {
+  AttestationStatus,
+  CctpCandidateReport,
   PendingTransfer,
   RailClient,
   RailLookup,
   RailReport,
-  AttestationStatus,
 } from "../types.js";
 import { RailError } from "../types.js";
 
@@ -291,12 +292,46 @@ export class IrisClient implements RailClient {
     if (rawList.length > 0 && messages.length === 0) {
       throw new RailError(this.rail, "transient", "invalid iris message in response payload");
     }
-    const message = messages[0];
     // A 200 with no messages is the same situation as a 404 and both happen. Reporting it as a
     // failure would be reporting the normal case.
-    if (message === undefined) return { kind: "missing" };
+    if (messages.length === 0) return { kind: "missing" };
 
-    return { kind: "found", report: reportFor(message) };
+    const parsedCandidates = deduplicateExactIrisReports(messages.map((item) => reportFor(item)));
+    const first = parsedCandidates[0];
+    if (first === undefined) return { kind: "missing" };
+    if (parsedCandidates.length === 1) {
+      return {
+        kind: "found",
+        report: {
+          ...first,
+          candidates: parsedCandidates,
+        },
+      };
+    }
+
+    const hasAttested = parsedCandidates.some((item) => item.status === "attested");
+    const hasPending = parsedCandidates.some((item) => item.status === "pending");
+    const aggregateStatus: AttestationStatus = hasAttested
+      ? "attested"
+      : hasPending
+        ? "pending"
+        : first.status;
+    const earliestAttestedAt =
+      parsedCandidates
+        .map((item) => item.attestedAt)
+        .filter((stamp): stamp is Date => stamp !== null)
+        .sort((a, b) => a.getTime() - b.getTime())[0] ?? null;
+
+    return {
+      kind: "found",
+      report: {
+        status: aggregateStatus,
+        railStatus: `multi_candidate(${String(parsedCandidates.length)})`,
+        reference: null,
+        attestedAt: hasAttested ? earliestAttestedAt : null,
+        candidates: parsedCandidates,
+      },
+    };
   }
 
   private async send(url: string, signal?: AbortSignal): Promise<Response> {
@@ -536,6 +571,73 @@ async function describeError(response: Response): Promise<string> {
 
 function describe(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+/**
+ * Collapses byte-identical duplicate Iris entries for the same canonical message while keeping any
+ * distinct or conflicting entries separate so downstream burn reconciliation sees every candidate.
+ */
+function deduplicateExactIrisReports(
+  reports: readonly CctpCandidateReport[],
+): readonly CctpCandidateReport[] {
+  const result: CctpCandidateReport[] = [];
+  const byBytesIndex = new Map<string, number>();
+
+  for (const current of reports) {
+    const rawBytes =
+      typeof current.messageBytes === "string" && /^0x[0-9a-fA-F]+$/.test(current.messageBytes)
+        ? current.messageBytes.toLowerCase()
+        : null;
+    if (rawBytes === null) {
+      result.push(current);
+      continue;
+    }
+
+    const existingIdx = byBytesIndex.get(rawBytes);
+    if (existingIdx === undefined) {
+      byBytesIndex.set(rawBytes, result.length);
+      result.push(current);
+      continue;
+    }
+
+    const existing = result[existingIdx];
+    if (existing === undefined) continue;
+    // Only collapse when references do not conflict.
+    if (
+      existing.reference !== null &&
+      current.reference !== null &&
+      existing.reference !== current.reference
+    ) {
+      result.push(current);
+      continue;
+    }
+
+    const forwardTxHash = existing.forwardTxHash ?? current.forwardTxHash;
+    const status: AttestationStatus =
+      existing.status === "attested" || current.status === "attested"
+        ? "attested"
+        : existing.status;
+    const attestationSignature =
+      existing.attestationSignature ?? current.attestationSignature ?? null;
+    const attestationTimestamp =
+      existing.attestationTimestamp ?? current.attestationTimestamp ?? null;
+    const attestedAt = existing.attestedAt ?? current.attestedAt;
+
+    result[existingIdx] = {
+      ...existing,
+      ...(forwardTxHash !== undefined ? { forwardTxHash } : {}),
+      status,
+      railStatus: existing.status === "attested" ? existing.railStatus : current.railStatus,
+      reference: existing.reference ?? current.reference,
+      attestedAt,
+      attestation: attestationSignature,
+      attestationSignature,
+      attestationTimestamp,
+      fastTransfer: Boolean(existing.fastTransfer) || Boolean(current.fastTransfer),
+    };
+  }
+
+  return result;
 }
 
 export { PENDING as IRIS_PENDING, COMPLETE as IRIS_COMPLETE, RATE_LIMIT_COOLDOWN_MS };

@@ -30,20 +30,10 @@ export function isTerminal(status: AttestationStatus): boolean {
   return TERMINAL.includes(status);
 }
 
-export interface RailReport {
+export interface CctpCandidateReport {
   readonly forwardTxHash?: `0x${string}`;
-  readonly execution?: { readonly txHash: `0x${string}`; readonly commandId: `0x${string}` };
   readonly status: AttestationStatus;
-  /**
-   * The rail's own word for it, verbatim.
-   *
-   * Where a rail also explains a delay, the explanation is appended rather than dropped:
-   * `pending_confirmations/insufficient_fee` is still Circle's vocabulary, and the reason is the
-   * difference between a transfer that is progressing and one that will sit forever until somebody
-   * tops up a fee.
-   */
   readonly railStatus: string;
-  /** The identifier to quote at the rail's support. Circle's event nonce, Axelar's message id. */
   readonly reference: string | null;
   readonly attestedAt: Date | null;
   readonly message?: string | null;
@@ -52,6 +42,11 @@ export interface RailReport {
   readonly attestationSignature?: string | null;
   readonly attestationTimestamp?: Date | null;
   readonly fastTransfer?: boolean;
+}
+
+export interface RailReport extends CctpCandidateReport {
+  readonly execution?: { readonly txHash: `0x${string}`; readonly commandId: `0x${string}` };
+  readonly candidates?: readonly CctpCandidateReport[] | undefined;
 }
 
 export type RailLookup =
