@@ -25,6 +25,28 @@ import type { InboundRow, Position } from "../../chains/writers.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 
 import { ITS_ABI, matchingPayment } from "./events.js";
+export {
+  ItsReconcileValidationError,
+  ReadOnlyViolationError,
+  executeItsReconcileCommand,
+  parseItsReconcileCliArgs,
+  reconcileItsTransfer,
+  scrubDiagnosticText,
+  wrapReadOnlyQueryable,
+  type BindingCheckStatus,
+  type ItsBindingCheck,
+  type ItsHistoryPresence,
+  type ItsReceiptInspectionSummary,
+  type ItsReceiptProofInput,
+  type ItsReconcileCommandResult,
+  type ItsReconcileSelector,
+  type ItsReconciliationBindings,
+  type ItsReconciliationReport,
+  type ItsReconciliationVerdict,
+  type MissingHistoryItem,
+  type ParsedItsReconcileCli,
+  type ReconcileItsOptions,
+} from "./reconcile.js";
 export interface VerifiedDelivery {
   readonly at: Position;
   readonly row: InboundRow;

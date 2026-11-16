@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { encodeAbiParameters, encodeEventTopics, stringToHex, type Hex } from "viem";
 import {
   ITS_ABI,
+  inspectItsReceiptLogs,
   matchingPayment,
   type DeliveryLog,
   type ExpectedDelivery,
@@ -70,5 +71,13 @@ describe("Destination delivery evidence", () => {
   it("does not lose a matching receipt event when another transfer shares the transaction", () => {
     const unrelated = { ...received, address: token as Hex };
     expect(matchingPayment([received, unrelated, paid], expected)).toBe(paid);
+  });
+  it("inspects both command and payment logs for source-to-payout reconciliation", () => {
+    const inspected = inspectItsReceiptLogs([received, paid], expected);
+    expect(inspected).not.toBeNull();
+    expect(inspected?.commandLog).toBe(received);
+    expect(inspected?.paymentLog).toBe(paid);
+    expect(inspected?.commandId.toLowerCase()).toBe(commandId.toLowerCase());
+    expect(inspected?.amount).toBe(expected.amount);
   });
 });

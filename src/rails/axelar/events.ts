@@ -20,12 +20,33 @@ export interface ExpectedDelivery {
   recipient: string;
   amount: bigint;
 }
-export function matchingPayment<T extends DeliveryLog>(
+
+export interface MatchedItsReceipt<T extends DeliveryLog = DeliveryLog> {
+  readonly commandLog: T;
+  readonly paymentLog: T;
+  readonly commandId: Hex;
+  readonly tokenId: Hex;
+  readonly sourceChain: string;
+  readonly sourceAddress: Hex;
+  readonly destinationAddress: Hex;
+  readonly amount: bigint;
+}
+
+export function inspectItsReceiptLogs<T extends DeliveryLog>(
   logs: readonly T[],
   expected: ExpectedDelivery,
-): T | null {
-  let received = false;
+): MatchedItsReceipt<T> | null {
+  let matchedCommand: {
+    readonly log: T;
+    readonly commandId: Hex;
+    readonly tokenId: Hex;
+    readonly sourceChain: string;
+    readonly sourceAddress: Hex;
+    readonly destinationAddress: Hex;
+    readonly amount: bigint;
+  } | null = null;
   let payment: T | null = null;
+
   for (const log of logs) {
     try {
       const event = decodeEventLog({ abi: ITS_ABI, topics: log.topics, data: log.data });
@@ -34,24 +55,57 @@ export function matchingPayment<T extends DeliveryLog>(
         log.address.toLowerCase() === expected.its.toLowerCase()
       ) {
         const args = event.args;
-        received ||=
+        const matches =
           args.commandId.toLowerCase() === expected.commandId.toLowerCase() &&
           args.tokenId.toLowerCase() === expected.tokenId.toLowerCase() &&
           args.sourceChain === expected.sourceChain &&
           args.sourceAddress.toLowerCase() === expected.sourceAddress.toLowerCase() &&
           args.destinationAddress.toLowerCase() === expected.recipient.toLowerCase() &&
           args.amount === expected.amount;
+        if (matches && matchedCommand === null) {
+          matchedCommand = {
+            log,
+            commandId: args.commandId,
+            tokenId: args.tokenId,
+            sourceChain: args.sourceChain,
+            sourceAddress: args.sourceAddress,
+            destinationAddress: args.destinationAddress,
+            amount: args.amount,
+          };
+        }
       }
       if (
         event.eventName === "Transfer" &&
         log.address.toLowerCase() === expected.token.toLowerCase() &&
         event.args.to.toLowerCase() === expected.recipient.toLowerCase() &&
         event.args.value === expected.amount
-      )
+      ) {
         payment = log;
+      }
     } catch {
       /* Receipts contain unrelated events; they cannot establish this delivery. */
     }
   }
-  return received ? payment : null;
+
+  if (matchedCommand === null || payment === null) {
+    return null;
+  }
+
+  return {
+    commandLog: matchedCommand.log,
+    paymentLog: payment,
+    commandId: matchedCommand.commandId,
+    tokenId: matchedCommand.tokenId,
+    sourceChain: matchedCommand.sourceChain,
+    sourceAddress: matchedCommand.sourceAddress,
+    destinationAddress: matchedCommand.destinationAddress,
+    amount: matchedCommand.amount,
+  };
+}
+
+export function matchingPayment<T extends DeliveryLog>(
+  logs: readonly T[],
+  expected: ExpectedDelivery,
+): T | null {
+  return inspectItsReceiptLogs(logs, expected)?.paymentLog ?? null;
 }
