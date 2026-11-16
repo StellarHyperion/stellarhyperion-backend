@@ -1,0 +1,277 @@
+{
+  "corpusVersion": "1.0.0",
+  "cases": [
+    {
+      "caseId": "cctp_baseline_valid",
+      "rail": "cctp",
+      "mutationKind": "valid_baseline",
+      "mutatedField": "none",
+      "expectedAccepted": true,
+      "expectedLogIndex": 3
+    },
+    {
+      "caseId": "cctp_harmless_unrelated_logs_interleaved",
+      "rail": "cctp",
+      "mutationKind": "harmless_noise",
+      "mutatedField": "receipt.logs[unrelated]",
+      "expectedAccepted": true,
+      "expectedLogIndex": 3
+    },
+    {
+      "caseId": "cctp_harmless_other_recipient_mint_in_same_tx",
+      "rail": "cctp",
+      "mutationKind": "harmless_noise",
+      "mutatedField": "receipt.logs[other_mint]",
+      "expectedAccepted": true,
+      "expectedLogIndex": 3
+    },
+    {
+      "caseId": "cctp_mutated_mint_recipient",
+      "rail": "cctp",
+      "mutationKind": "recipient_mismatch",
+      "mutatedField": "burnMessage.mintRecipient",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "cctp_mutated_transfer_to_recipient",
+      "rail": "cctp",
+      "mutationKind": "recipient_mismatch",
+      "mutatedField": "Transfer.to",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "cctp_mutated_burn_amount",
+      "rail": "cctp",
+      "mutationKind": "amount_mismatch",
+      "mutatedField": "burnMessage.amount",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "cctp_mutated_payout_transfer_amount",
+      "rail": "cctp",
+      "mutationKind": "amount_mismatch",
+      "mutatedField": "Transfer.value",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "cctp_mutated_excessive_fee",
+      "rail": "cctp",
+      "mutationKind": "amount_mismatch",
+      "mutatedField": "burnMessage.feeExecuted",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "cctp_mutated_burn_source_token",
+      "rail": "cctp",
+      "mutationKind": "token_mismatch",
+      "mutatedField": "burnMessage.burnToken",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "cctp_mutated_destination_token_contract",
+      "rail": "cctp",
+      "mutationKind": "token_mismatch",
+      "mutatedField": "Transfer.address",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "cctp_mutated_ordinary_non_mint_transfer",
+      "rail": "cctp",
+      "mutationKind": "non_mint_transfer",
+      "mutatedField": "Transfer.from",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "cctp_mutated_source_domain",
+      "rail": "cctp",
+      "mutationKind": "domain_mismatch",
+      "mutatedField": "message.sourceDomain",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "cctp_mutated_destination_domain",
+      "rail": "cctp",
+      "mutationKind": "domain_mismatch",
+      "mutatedField": "message.destinationDomain",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "cctp_mutated_source_adapter",
+      "rail": "cctp",
+      "mutationKind": "sender_mismatch",
+      "mutatedField": "burnMessage.messageSender",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "cctp_mutated_finality_threshold",
+      "rail": "cctp",
+      "mutationKind": "finality_violation",
+      "mutatedField": "message.finalityThresholdExecuted",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "cctp_mutated_canonical_block_hash",
+      "rail": "cctp",
+      "mutationKind": "canonical_hash_mismatch",
+      "mutatedField": "block.hash",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "cctp_mutated_reverted_receipt",
+      "rail": "cctp",
+      "mutationKind": "receipt_reverted",
+      "mutatedField": "receipt.status",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "cctp_mutated_insufficient_confirmations",
+      "rail": "cctp",
+      "mutationKind": "insufficient_confirmations",
+      "mutatedField": "headBlockNumber",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "its_baseline_valid",
+      "rail": "axelar-its",
+      "mutationKind": "valid_baseline",
+      "mutatedField": "none",
+      "expectedAccepted": true,
+      "expectedLogIndex": 5
+    },
+    {
+      "caseId": "its_harmless_unrelated_logs_interleaved",
+      "rail": "axelar-its",
+      "mutationKind": "harmless_noise",
+      "mutatedField": "receipt.logs[unrelated]",
+      "expectedAccepted": true,
+      "expectedLogIndex": 5
+    },
+    {
+      "caseId": "its_mutated_event_recipient",
+      "rail": "axelar-its",
+      "mutationKind": "recipient_mismatch",
+      "mutatedField": "InterchainTransferReceived.destinationAddress",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "its_mutated_transfer_recipient",
+      "rail": "axelar-its",
+      "mutationKind": "recipient_mismatch",
+      "mutatedField": "Transfer.to",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "its_mutated_event_amount",
+      "rail": "axelar-its",
+      "mutationKind": "amount_mismatch",
+      "mutatedField": "InterchainTransferReceived.amount",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "its_mutated_transfer_amount",
+      "rail": "axelar-its",
+      "mutationKind": "amount_mismatch",
+      "mutatedField": "Transfer.value",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "its_mutated_token_id",
+      "rail": "axelar-its",
+      "mutationKind": "token_mismatch",
+      "mutatedField": "InterchainTransferReceived.tokenId",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "its_mutated_destination_token_contract",
+      "rail": "axelar-its",
+      "mutationKind": "token_mismatch",
+      "mutatedField": "Transfer.address",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "its_mutated_its_contract_address",
+      "rail": "axelar-its",
+      "mutationKind": "token_mismatch",
+      "mutatedField": "InterchainTransferReceived.address",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "its_mutated_source_chain_domain",
+      "rail": "axelar-its",
+      "mutationKind": "domain_mismatch",
+      "mutatedField": "InterchainTransferReceived.sourceChain",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "its_mutated_source_address",
+      "rail": "axelar-its",
+      "mutationKind": "sender_mismatch",
+      "mutatedField": "InterchainTransferReceived.sourceAddress",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "its_mutated_command_id",
+      "rail": "axelar-its",
+      "mutationKind": "command_id_mismatch",
+      "mutatedField": "InterchainTransferReceived.commandId",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "its_missing_transfer_log",
+      "rail": "axelar-its",
+      "mutationKind": "incomplete_receipt",
+      "mutatedField": "receipt.logs[Transfer]",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "its_missing_received_log",
+      "rail": "axelar-its",
+      "mutationKind": "incomplete_receipt",
+      "mutatedField": "receipt.logs[InterchainTransferReceived]",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "its_mutated_canonical_block_hash",
+      "rail": "axelar-its",
+      "mutationKind": "canonical_hash_mismatch",
+      "mutatedField": "block.hash",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    },
+    {
+      "caseId": "its_mutated_reverted_receipt",
+      "rail": "axelar-its",
+      "mutationKind": "receipt_reverted",
+      "mutatedField": "receipt.status",
+      "expectedAccepted": false,
+      "expectedLogIndex": null
+    }
+  ]
+}

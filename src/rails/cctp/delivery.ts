@@ -13,14 +13,37 @@ import type { AppConfig } from "../../config/config.js";
 import type { Transactional } from "../../db/pool.js";
 import { bigintOf, text } from "../../db/rows.js";
 import type { PendingTransfer, RailReport } from "../types.js";
+import type { DeliveryLog } from "../axelar/events.js";
 import type { VerifiedDelivery } from "../axelar/delivery.js";
 import { matchingCctpPayment, verifiedCctpMessage, type ExpectedCctpTransfer } from "./events.js";
+
+export interface CctpDeliveryReceipt {
+  readonly status: "success" | "reverted";
+  readonly blockNumber: bigint;
+  readonly blockHash: Hex;
+  readonly transactionHash: Hex;
+  readonly logs: readonly DeliveryLog[];
+}
+
+export interface CctpDeliveryRpcClient {
+  getChainId(): Promise<number>;
+  getTransactionReceipt(args: { readonly hash: Hex }): Promise<CctpDeliveryReceipt>;
+  getBlockNumber(): Promise<bigint>;
+  getBlock(args: {
+    readonly blockNumber: bigint;
+  }): Promise<{ readonly hash: Hex | null; readonly timestamp: bigint }>;
+}
+
+export interface CctpDeliveryDeps {
+  readonly evmClient?: CctpDeliveryRpcClient;
+}
 
 export async function verifyCctpDelivery(
   config: AppConfig,
   db: Transactional,
   transfer: PendingTransfer,
   report: RailReport,
+  deps: CctpDeliveryDeps = {},
 ): Promise<VerifiedDelivery | null> {
   if (
     transfer.route !== RouteKind.Cctp ||
@@ -69,9 +92,11 @@ export async function verifyCctpDelivery(
   const raw = report.messageBytes as Hex;
   const message = verifiedCctpMessage(raw, expected);
   if (!message) return null;
-  const client = createPublicClient({
-    transport: http(destination.defaultRpcUrl, { timeout: 15000, retryCount: 0 }),
-  });
+  const client: CctpDeliveryRpcClient =
+    deps.evmClient ??
+    createPublicClient({
+      transport: http(destination.defaultRpcUrl, { timeout: 15000, retryCount: 0 }),
+    });
   if ((await client.getChainId()) !== destination.chainId)
     throw new Error("CCTP destination RPC chain mismatch.");
   const receipt = await client.getTransactionReceipt({ hash: report.forwardTxHash });

@@ -17,17 +17,51 @@ import {
   toHex,
   toEvmAddress,
 } from "@hyperion/protocol";
-import { createPublicClient, http, stringToHex } from "viem";
+import { createPublicClient, http, stringToHex, type Hex } from "viem";
 import type { AppConfig } from "../../config/config.js";
 import type { Transactional } from "../../db/pool.js";
 import { bigintOf, text } from "../../db/rows.js";
 import type { InboundRow, Position } from "../../chains/writers.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 
-import { ITS_ABI, matchingPayment } from "./events.js";
+import { ITS_ABI, matchingPayment, type DeliveryLog } from "./events.js";
 export interface VerifiedDelivery {
   readonly at: Position;
   readonly row: InboundRow;
+}
+
+export interface ItsDeliveryReceipt {
+  readonly status: "success" | "reverted";
+  readonly blockNumber: bigint;
+  readonly blockHash: Hex;
+  readonly transactionHash: Hex;
+  readonly logs: readonly DeliveryLog[];
+}
+
+export interface ItsDeliveryRpcClient {
+  getChainId(): Promise<number>;
+  getTransactionReceipt(args: { readonly hash: Hex }): Promise<ItsDeliveryReceipt>;
+  getBlockNumber(): Promise<bigint>;
+  readContract(args: {
+    readonly address: Hex;
+    readonly abi: typeof ITS_ABI;
+    readonly functionName: "registeredTokenAddress";
+    readonly args: readonly [Hex];
+  }): Promise<Hex>;
+  getBlock(args: {
+    readonly blockNumber: bigint;
+  }): Promise<{ readonly hash: Hex | null; readonly timestamp: bigint }>;
+}
+
+export type StellarContractView = (
+  contract: string,
+  method: string,
+  args?: ReturnType<typeof nativeToScVal>[],
+) => Promise<unknown>;
+
+export interface ItsDeliveryDeps {
+  readonly evmClient?: ItsDeliveryRpcClient;
+  readonly stellarView?: StellarContractView;
 }
 
 // The rail API supplies a candidate receipt. Only matching confirmed chain events establish delivery.
@@ -36,6 +70,7 @@ export async function verifyItsDelivery(
   db: Transactional,
   transfer: PendingTransfer,
   report: RailReport,
+  deps: ItsDeliveryDeps = {},
 ): Promise<VerifiedDelivery | null> {
   const execution = report.execution;
   const source = config.indexer.stellar;
@@ -63,12 +98,12 @@ export async function verifyItsDelivery(
   if (!deployment) return null;
   const adapter = deployment.adapters[RouteKind.AxelarIts];
   if (!adapter) return null;
-  const stellar = new rpc.Server(source.rpcUrl, { timeout: 15_000 });
-  const view = async (
+  const defaultView: StellarContractView = async (
     contract: string,
     method: string,
     args: ReturnType<typeof nativeToScVal>[] = [],
   ) => {
+    const stellar = new rpc.Server(source.rpcUrl, { timeout: 15_000 });
     const tx = new TransactionBuilder(new Account(deployment.admin, "0"), {
       fee: BASE_FEE,
       networkPassphrase: source.networkPassphrase,
@@ -81,13 +116,16 @@ export async function verifyItsDelivery(
       throw new Error("Source lane cannot be verified.");
     return scValToNative(result.result.retval) as unknown;
   };
+  const view = deps.stellarView ?? defaultView;
   const id = await view(adapter, "token_id_for", [new Address(token).toScVal()]);
   if (!(id instanceof Uint8Array) || id.length !== 32)
     throw new Error("Source token id is invalid.");
   const tokenId = toHex(id);
-  const client = createPublicClient({
-    transport: http(destination.defaultRpcUrl, { timeout: 15_000, retryCount: 0 }),
-  });
+  const client: ItsDeliveryRpcClient =
+    deps.evmClient ??
+    createPublicClient({
+      transport: http(destination.defaultRpcUrl, { timeout: 15_000, retryCount: 0 }),
+    });
   if ((await client.getChainId()) !== destination.chainId)
     throw new Error("Destination RPC chain mismatch.");
   const receipt = await client.getTransactionReceipt({ hash: execution.txHash });
