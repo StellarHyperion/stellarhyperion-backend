@@ -22,9 +22,10 @@ async function getApp(): Promise<FastifyInstance> {
   const logger = createLogger(config);
   const startedAt = new Date();
 
-  const db = Database.open(config.databaseUrl, {
+  const db = Database.open(config.database.apiUrl, {
     applicationName: "hyperion-vercel-api",
     connectionTimeoutMs: 2000,
+    readOnly: config.database.apiReadOnly,
   });
 
   app = buildServer({

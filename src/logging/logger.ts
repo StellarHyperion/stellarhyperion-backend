@@ -27,6 +27,12 @@ export type { Logger };
  */
 const REDACTED_PATHS = [
   "databaseUrl",
+  "apiDatabaseUrl",
+  "indexerDatabaseUrl",
+  "migrationDatabaseUrl",
+  "apiUrl",
+  "indexerUrl",
+  "migrationUrl",
   "redisUrl",
   "connectionString",
   "password",
@@ -34,11 +40,20 @@ const REDACTED_PATHS = [
   "*.stellarSecret",
   "config.keeper.stellarSecret",
   "*.databaseUrl",
+  "*.apiDatabaseUrl",
+  "*.indexerDatabaseUrl",
+  "*.migrationDatabaseUrl",
+  "*.apiUrl",
+  "*.indexerUrl",
+  "*.migrationUrl",
   "*.redisUrl",
   "*.connectionString",
   "*.password",
   "err.connectionString",
   "config.databaseUrl",
+  "config.database.apiUrl",
+  "config.database.indexerUrl",
+  "config.database.migrationUrl",
   "config.redisUrl",
 ];
 

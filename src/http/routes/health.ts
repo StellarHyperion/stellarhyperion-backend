@@ -15,6 +15,7 @@
  */
 import type { FastifyInstance } from "fastify";
 
+import { stripUrlCredentials } from "../../config/env.js";
 import type { ServerDeps } from "../server.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { checkRedisHealth, worstOf } from "../../runtime/readiness.js";
@@ -76,7 +77,11 @@ async function checkDatabase(deps: ServerDeps): Promise<ReadinessReport> {
   } catch (error) {
     // The message is from pg and can name a host and a database but never a password, because
     // the pool was built from a connection string pg does not echo back.
-    return { name: "postgres", state: "down", detail: `not answering: ${messageOf(error)}` };
+    return {
+      name: "postgres",
+      state: "down",
+      detail: `not answering: ${stripUrlCredentials(messageOf(error))}`,
+    };
   }
 }
 

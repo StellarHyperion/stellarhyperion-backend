@@ -19,7 +19,8 @@ ENV NODE_ENV=production \
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./
+COPY scripts ./scripts
 COPY migrations ./migrations
 COPY deployments/testnet.json ./deployments/testnet.json
 USER node
-CMD ["sh", "-c", "npm run migrate:up && exec node dist/main.js"]
+CMD ["sh", "-c", "if [ -n \"${MIGRATION_DATABASE_URL:-}${DATABASE_URL:-}\" ]; then npm run migrate:up; fi && exec node dist/main.js"]

@@ -17,7 +17,7 @@
     "dev": "node --watch --experimental-strip-types src/main.ts",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/main.js",
-    "migrate": "node-pg-migrate --envPath .env --migrations-dir migrations --migrations-table pgmigrations",
+    "migrate": "node scripts/migrate.mjs",
     "migrate:up": "npm run migrate -- up",
     "migrate:down": "npm run migrate -- down",
     "typecheck": "tsc -p tsconfig.json --noEmit",

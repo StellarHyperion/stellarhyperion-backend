@@ -34,8 +34,22 @@ async function main(): Promise<void> {
   const shutdown = new Shutdown(logger, config.shutdownTimeoutMs);
   installSignalHandlers(shutdown, logger);
 
-  const db = Database.open(config.databaseUrl, { applicationName: "hyperion-backend" });
-  shutdown.add("postgres", () => db.close());
+  const apiDb = Database.open(config.database.apiUrl, {
+    applicationName: "hyperion-api",
+    readOnly: config.database.apiReadOnly,
+  });
+  shutdown.add("postgres-api", () => apiDb.close());
+
+  const indexerDb =
+    (config.indexer.enabled || config.keeper.enabled) && config.database.indexerUrl !== null
+      ? Database.open(config.database.indexerUrl, {
+          applicationName: "hyperion-indexer",
+          readOnly: false,
+        })
+      : apiDb;
+  if (indexerDb !== apiDb) {
+    shutdown.add("postgres-indexer", () => indexerDb.close());
+  }
 
   const redis = config.keeper.enabled ? createKeeperRedis(config.redisUrl) : undefined;
   if (redis)
@@ -46,13 +60,13 @@ async function main(): Promise<void> {
   // Registered between the pool and the server, because shutdown runs in reverse: the server
   // stops accepting requests, the watchers finish the page they are on, and only then does the
   // pool close under them.
-  const indexer = buildIndexer({ config, logger, db });
+  const indexer = buildIndexer({ config, logger, db: indexerDb });
   shutdown.add("indexer", () => indexer.stop());
 
   const server = buildServer({
     config,
     logger,
-    db,
+    db: apiDb,
     ...(redis ? { redis } : {}),
     readiness: indexer.readiness,
     startedAt,

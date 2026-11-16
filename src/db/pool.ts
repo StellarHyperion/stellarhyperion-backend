@@ -44,14 +44,41 @@ export interface OpenOptions {
   readonly connectionTimeoutMs?: number;
   readonly statementTimeoutMs?: number;
   readonly applicationName?: string;
+  /** Enforce read-only sessions and reject write statements on API-hosted pools. */
+  readonly readOnly?: boolean;
+}
+
+export class ReadOnlyDatabaseError extends Error {
+  constructor(operation: string) {
+    super(`read-only database handle refused mutating SQL operation (${operation})`);
+    this.name = "ReadOnlyDatabaseError";
+  }
+}
+
+const MUTATING_SQL_HEAD =
+  /^(?:insert|update|delete|create|alter|drop|truncate|grant|revoke|vacuum|reindex|copy|call|do)\b/i;
+
+/**
+ * Guard any `Queryable` or `Transactional` handle against write statements on API read paths.
+ */
+export function assertReadOnlySql(text: string): void {
+  const stripped = stripLeadingSqlTrivia(text);
+  const match = MUTATING_SQL_HEAD.exec(stripped);
+  if (match?.[0] !== undefined) {
+    throw new ReadOnlyDatabaseError(match[0].toUpperCase());
+  }
 }
 
 export class Database implements Transactional {
   private closed = false;
 
-  private constructor(private readonly pool: Pool) {}
+  private constructor(
+    private readonly pool: Pool,
+    readonly isReadOnly: boolean,
+  ) {}
 
   static open(connectionString: string, options: OpenOptions = {}): Database {
+    const readOnly = options.readOnly ?? false;
     const config: PoolConfig = {
       connectionString,
       max: options.maxConnections ?? 10,
@@ -62,11 +89,15 @@ export class Database implements Transactional {
       // A watcher query that has not finished in thirty seconds is wedged, not slow, and holding
       // the connection does not help it.
       statement_timeout: options.statementTimeoutMs ?? 30_000,
+      ...(readOnly ? { options: "-c default_transaction_read_only=on" } : {}),
     };
-    return new Database(new Pool(config));
+    return new Database(new Pool(config), readOnly);
   }
 
   async query(text: string, params: readonly unknown[] = []): Promise<QueryResultRows> {
+    if (this.isReadOnly) {
+      assertReadOnlySql(text);
+    }
     const result = await this.pool.query(text, params as unknown[]);
     return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount ?? 0 };
   }
@@ -81,8 +112,8 @@ export class Database implements Transactional {
   async transaction<T>(work: (tx: Queryable) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
     try {
-      await client.query("BEGIN");
-      const value = await work(wrapClient(client));
+      await client.query(this.isReadOnly ? "BEGIN READ ONLY" : "BEGIN");
+      const value = await work(wrapClient(client, this.isReadOnly));
       await client.query("COMMIT");
       return value;
     } catch (error) {
@@ -154,11 +185,37 @@ export function startMaintenanceTask(
   };
 }
 
-function wrapClient(client: PoolClient): Queryable {
+function wrapClient(client: PoolClient, readOnly: boolean): Queryable {
   return {
     async query(text: string, params: readonly unknown[] = []): Promise<QueryResultRows> {
+      if (readOnly) {
+        assertReadOnlySql(text);
+      }
       const result = await client.query(text, params as unknown[]);
       return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount ?? 0 };
     },
   };
+}
+
+function stripLeadingSqlTrivia(sql: string): string {
+  let index = 0;
+  while (index < sql.length) {
+    while (index < sql.length && /\s/.test(sql[index] ?? "")) {
+      index += 1;
+    }
+    if (sql.startsWith("--", index)) {
+      const nextNewline = sql.indexOf("\n", index + 2);
+      if (nextNewline === -1) return "";
+      index = nextNewline + 1;
+      continue;
+    }
+    if (sql.startsWith("/*", index)) {
+      const closing = sql.indexOf("*/", index + 2);
+      if (closing === -1) return "";
+      index = closing + 2;
+      continue;
+    }
+    break;
+  }
+  return sql.slice(index);
 }

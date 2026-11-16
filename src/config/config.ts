@@ -100,11 +100,23 @@ export interface KeeperConfig {
   readonly stellarSecret: string | null;
 }
 
+export interface DatabaseRoleConfig {
+  /** Connection string for public HTTP API queries (`API_DATABASE_URL` or fallback). */
+  readonly apiUrl: string;
+  /** HTTP API connections always run with read-only transaction enforcement. */
+  readonly apiReadOnly: boolean;
+  /** Separate connection string for background worker writes, or null on API-only replicas. */
+  readonly indexerUrl: string | null;
+  /** Separate connection string reserved for explicit schema migrations, or null when unset. */
+  readonly migrationUrl: string | null;
+}
+
 export interface AppConfig {
   readonly nodeEnv: NodeEnv;
   readonly logLevel: LogLevel;
   readonly http: { readonly host: string; readonly port: number };
   readonly databaseUrl: string;
+  readonly database: DatabaseRoleConfig;
   readonly redisUrl: string;
   readonly network: NetworkMode;
   readonly deploymentsFile: string;
@@ -170,6 +182,36 @@ const DATABASE_URL: VarSpec = {
   required: true,
   printable: false,
   purpose: "Postgres connection string. docker compose publishes one on 127.0.0.1:5433.",
+};
+
+const API_DATABASE_URL: VarSpec = {
+  name: "API_DATABASE_URL",
+  kind: "url",
+  protocols: ["postgres", "postgresql"],
+  required: false,
+  printable: false,
+  purpose:
+    "Least-privilege read-only Postgres connection string for public API hosting without indexer or DDL grants.",
+};
+
+const INDEXER_DATABASE_URL: VarSpec = {
+  name: "INDEXER_DATABASE_URL",
+  kind: "url",
+  protocols: ["postgres", "postgresql"],
+  required: false,
+  printable: false,
+  purpose:
+    "Dedicated read-write Postgres connection string for chain watchers, rail status pollers and keeper jobs.",
+};
+
+const MIGRATION_DATABASE_URL: VarSpec = {
+  name: "MIGRATION_DATABASE_URL",
+  kind: "url",
+  protocols: ["postgres", "postgresql"],
+  required: false,
+  printable: false,
+  purpose:
+    "Dedicated schema-owner Postgres connection string reserved for explicit migrate:up / migrate:down runs.",
 };
 
 const REDIS_URL: VarSpec = {
@@ -450,12 +492,15 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const logLevel = reader.choice(LOG_LEVEL);
   const host = reader.string(HTTP_HOST);
   const port = reader.integer(HTTP_PORT);
-  const databaseUrl = reader.url(DATABASE_URL);
   const keeperEnabled = reader.boolean(KEEPER_ENABLED);
+  const indexerEnabled = reader.boolean(INDEXER_ENABLED);
+  const database = resolveDatabaseRoles(reader, {
+    workerWritesEnabled: indexerEnabled || keeperEnabled,
+  });
+  const databaseUrl = database.indexerUrl ?? database.apiUrl;
   const redisUrl = reader.url({ ...REDIS_URL, required: keeperEnabled });
   const network = reader.choice(HYPERION_NETWORK);
   const deploymentsPath = reader.string(DEPLOYMENTS_FILE);
-  const indexerEnabled = reader.boolean(INDEXER_ENABLED);
   const shutdownTimeoutMs = reader.integer(SHUTDOWN_TIMEOUT_MS);
 
   const railsEnabled = reader.boolean(RAILS_ENABLED);
@@ -507,6 +552,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     logLevel,
     http: { host, port },
     databaseUrl,
+    database,
     redisUrl,
     network,
     deploymentsFile: absoluteDeployments,
@@ -528,6 +574,137 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       stellarSecret: keeperStellarSecret,
     },
     shutdownTimeoutMs,
+  };
+}
+
+export interface MigrationConnectionSelection {
+  readonly envVar: "MIGRATION_DATABASE_URL" | "DATABASE_URL";
+  readonly url: string;
+}
+
+/**
+ * Resolve and validate the schema-migration database credential without permitting API or worker
+ * credentials to run DDL silently.
+ */
+export function resolveMigrationDatabaseUrl(
+  options: Pick<LoadOptions, "env"> = {},
+): MigrationConnectionSelection {
+  const env = options.env ?? process.env;
+  const reader = new EnvReader(env);
+  const hasMigration = reader.has(MIGRATION_DATABASE_URL.name);
+  const hasShared = reader.has(DATABASE_URL.name);
+  const apiUrl = reader.has(API_DATABASE_URL.name) ? reader.url(API_DATABASE_URL) : "";
+
+  if (hasMigration) {
+    const url = reader.url({ ...MIGRATION_DATABASE_URL, required: true });
+    if (url !== "" && apiUrl !== "" && url === apiUrl) {
+      reader.reject(
+        MIGRATION_DATABASE_URL,
+        "must not reuse the read-only API_DATABASE_URL credential for schema migrations",
+      );
+    }
+    reader.finish();
+    return { envVar: "MIGRATION_DATABASE_URL", url };
+  }
+
+  if (hasShared) {
+    const url = reader.url(DATABASE_URL);
+    reader.finish();
+    return { envVar: "DATABASE_URL", url };
+  }
+
+  if (reader.has(API_DATABASE_URL.name) || reader.has(INDEXER_DATABASE_URL.name)) {
+    reader.reject(
+      MIGRATION_DATABASE_URL,
+      "not set; schema migrations require MIGRATION_DATABASE_URL (or DATABASE_URL) and cannot use API_DATABASE_URL or INDEXER_DATABASE_URL",
+    );
+  } else {
+    reader.reject(
+      MIGRATION_DATABASE_URL,
+      "not set; supply MIGRATION_DATABASE_URL or DATABASE_URL before running migrations",
+    );
+  }
+  reader.finish();
+  return { envVar: "MIGRATION_DATABASE_URL", url: "" };
+}
+
+function resolveDatabaseRoles(
+  reader: EnvReader,
+  input: { readonly workerWritesEnabled: boolean },
+): DatabaseRoleConfig {
+  const hasShared = reader.has(DATABASE_URL.name);
+  const hasApi = reader.has(API_DATABASE_URL.name);
+  const hasIndexer = reader.has(INDEXER_DATABASE_URL.name);
+  const hasMigration = reader.has(MIGRATION_DATABASE_URL.name);
+
+  const sharedUrl = hasShared ? reader.url(DATABASE_URL) : "";
+  const apiExplicitUrl = hasApi ? reader.url(API_DATABASE_URL) : "";
+  const indexerExplicitUrl = hasIndexer ? reader.url(INDEXER_DATABASE_URL) : "";
+  const migrationExplicitUrl = hasMigration ? reader.url(MIGRATION_DATABASE_URL) : "";
+
+  if (
+    hasApi &&
+    hasIndexer &&
+    apiExplicitUrl !== "" &&
+    indexerExplicitUrl !== "" &&
+    apiExplicitUrl === indexerExplicitUrl
+  ) {
+    reader.reject(
+      INDEXER_DATABASE_URL,
+      "must use a separate write role rather than duplicating API_DATABASE_URL",
+    );
+  }
+
+  if (
+    hasApi &&
+    hasMigration &&
+    apiExplicitUrl !== "" &&
+    migrationExplicitUrl !== "" &&
+    apiExplicitUrl === migrationExplicitUrl
+  ) {
+    reader.reject(
+      MIGRATION_DATABASE_URL,
+      "must not reuse the read-only API_DATABASE_URL credential",
+    );
+  }
+
+  if (!input.workerWritesEnabled) {
+    if (!hasApi && !hasShared) {
+      reader.reject(
+        API_DATABASE_URL,
+        "not set; supply a read-only API_DATABASE_URL (or fallback DATABASE_URL) for API hosting",
+      );
+    }
+    return {
+      apiUrl: apiExplicitUrl !== "" ? apiExplicitUrl : sharedUrl,
+      apiReadOnly: true,
+      indexerUrl: indexerExplicitUrl !== "" ? indexerExplicitUrl : null,
+      migrationUrl:
+        migrationExplicitUrl !== "" ? migrationExplicitUrl : sharedUrl !== "" ? sharedUrl : null,
+    };
+  }
+
+  if (!hasIndexer && !hasShared) {
+    if (hasApi) {
+      reader.reject(
+        INDEXER_DATABASE_URL,
+        "not set while background workers are enabled; worker writes cannot use the read-only API_DATABASE_URL",
+      );
+    } else {
+      reader.url(DATABASE_URL);
+    }
+  }
+
+  const indexerUrl = indexerExplicitUrl !== "" ? indexerExplicitUrl : sharedUrl;
+  const apiUrl =
+    apiExplicitUrl !== "" ? apiExplicitUrl : sharedUrl !== "" ? sharedUrl : indexerExplicitUrl;
+
+  return {
+    apiUrl,
+    apiReadOnly: true,
+    indexerUrl: indexerUrl !== "" ? indexerUrl : null,
+    migrationUrl:
+      migrationExplicitUrl !== "" ? migrationExplicitUrl : sharedUrl !== "" ? sharedUrl : null,
   };
 }
 
