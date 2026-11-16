@@ -107,3 +107,13 @@ export interface RailClient {
   /** Throws `RailError`; returns `missing` rather than throwing for a transfer not yet indexed. */
   look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup>;
 }
+
+export type {
+  CommitRailTransitionInput,
+  CommitRailTransitionResult,
+  JoinedRailLifecycleTransition,
+  ListTransitionsQuery,
+  NormalizedRailTransitionEvidence,
+  RailTransitionEvidence,
+} from "./transitions.js";
+export { InvalidRailTransitionError, isBackwardRailTransition } from "./transitions.js";

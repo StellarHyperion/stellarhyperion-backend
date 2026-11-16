@@ -107,3 +107,10 @@ function readStatus(value: string | null): AttestationStatus | null {
   }
   return value as AttestationStatus;
 }
+
+export {
+  commitRailTransition,
+  listRailLifecycleTransitions,
+  reconcileRailTransition,
+  sanitizePublicField,
+} from "./transitions.js";

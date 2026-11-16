@@ -23,10 +23,22 @@ import { verifyCctpDelivery } from "./cctp/delivery.js";
 import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
+import { textOrNull } from "../db/rows.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
-import { writeInbound, writeAttestation } from "../chains/writers.js";
+import { writeInbound } from "../chains/writers.js";
 import { outstandingForRail, pendingForRail } from "./queue.js";
-import { RailError, isTerminal, type PendingTransfer, type RailClient } from "./types.js";
+import {
+  commitRailTransition,
+  isBackwardRailTransition,
+  type RailTransitionEvidence,
+} from "./transitions.js";
+import {
+  RailError,
+  isTerminal,
+  type AttestationStatus,
+  type PendingTransfer,
+  type RailClient,
+} from "./types.js";
 
 /**
  * How many outstanding transfers still counts as keeping up.
@@ -170,14 +182,38 @@ export class RailPass {
     if (transfer.delivered) {
       // Our own inbound index already says the money arrived, which outranks anything the rail
       // would tell us. No request, and the transfer leaves the queue for good.
-      await this.write(transfer, {
-        status: "delivered",
-        railStatus: null,
-        reference: null,
-        attestedAt: null,
-        checkedAt: at,
-        failures: 0,
-        error: null,
+      await this.options.db.transaction(async (tx: Queryable) => {
+        const inboundRes = await tx.query(
+          `SELECT destination_tx, rail_message_id
+             FROM inbound_delivery
+            WHERE destination_chain = $1
+              AND route = $2
+              AND source_chain = $3
+              AND source_nonce = $4
+            LIMIT 1`,
+          [
+            transfer.destinationChain,
+            transfer.route,
+            transfer.originChain,
+            transfer.nonce.toString(),
+          ],
+        );
+        const inboundRow = inboundRes.rows[0];
+        await commitRailTransition(tx, {
+          transferId: transfer.transferId,
+          route: transfer.route,
+          nextStatus: "delivered",
+          reason: "inbound_delivery_observed",
+          evidence: {
+            destinationTx:
+              inboundRow === undefined ? null : textOrNull(inboundRow, "destination_tx"),
+            railMessageId:
+              inboundRow === undefined ? null : textOrNull(inboundRow, "rail_message_id"),
+          },
+          checkedAt: at,
+          checkFailures: 0,
+          lastError: null,
+        });
       });
       return true;
     }
@@ -187,8 +223,9 @@ export class RailPass {
       // Normal. The rail has not indexed the burn yet, which is where every transfer starts.
       await this.write(transfer, {
         status: transfer.status ?? "pending",
-        railStatus: null,
-        reference: null,
+        reason: "awaiting_provider_index",
+        preserveIfUnchanged: transfer.status !== null,
+        evidence: {},
         attestedAt: null,
         checkedAt: at,
         failures: 0,
@@ -205,29 +242,91 @@ export class RailPass {
       if (verified) {
         await this.options.db.transaction(async (tx) => {
           await writeInbound(tx, verified.at, verified.row);
-        });
-        await this.write(transfer, {
-          status: "delivered",
-          railStatus: report.railStatus,
-          reference: report.reference,
-          attestedAt: report.attestedAt,
-          checkedAt: at,
-          failures: 0,
-          error: null,
+          await commitRailTransition(tx, {
+            transferId: transfer.transferId,
+            route: transfer.route,
+            nextStatus: "delivered",
+            reason: "destination_delivery_verified",
+            evidence: {
+              railStatus: report.railStatus,
+              railReference: report.reference,
+              destinationTx: verified.at.txHash,
+              commandId: report.execution?.commandId ?? null,
+              railMessageId: verified.row.railMessageId,
+            },
+            attestedAt: report.attestedAt,
+            checkedAt: at,
+            checkFailures: 0,
+            lastError: null,
+          });
         });
         return true;
       }
     }
+
+    // Provider status alone must never establish destination delivery.
+    let candidateStatus: AttestationStatus = report.status;
+    if (candidateStatus === "delivered") {
+      this.options.logger.warn(
+        {
+          rail: this.options.client.rail,
+          transferId: transfer.transferId.toString(),
+          railStatus: report.railStatus,
+        },
+        "provider reported delivered without verified destination proof; clamping to attested",
+      );
+      candidateStatus = "attested";
+    }
+
+    if (isBackwardRailTransition(transfer.status, candidateStatus)) {
+      const currentStatus = transfer.status ?? "pending";
+      this.options.logger.warn(
+        {
+          rail: this.options.client.rail,
+          transferId: transfer.transferId.toString(),
+          previousStatus: currentStatus,
+          attemptedStatus: candidateStatus,
+          railStatus: report.railStatus,
+        },
+        "ignoring un-reconciled backward rail status regression",
+      );
+      await this.write(transfer, {
+        status: currentStatus,
+        reason: "backward_status_ignored",
+        preserveIfUnchanged: true,
+        evidence: {},
+        attestedAt: report.attestedAt,
+        checkedAt: at,
+        failures: 0,
+        error: null,
+      });
+      return isTerminal(currentStatus);
+    }
+
+    const reason =
+      candidateStatus === "attested"
+        ? "provider_attested"
+        : candidateStatus === "failed"
+          ? "provider_failed"
+          : candidateStatus === "expired"
+            ? "provider_expired"
+            : "provider_pending";
+
     await this.write(transfer, {
-      status: report.status,
-      railStatus: report.railStatus,
-      reference: report.reference,
+      status: candidateStatus,
+      reason,
+      evidence: {
+        railStatus: report.railStatus,
+        railReference: report.reference,
+        destinationTx: report.execution?.txHash ?? report.forwardTxHash ?? null,
+        commandId: report.execution?.commandId ?? null,
+      },
       attestedAt: report.attestedAt,
       checkedAt: at,
       failures: 0,
       error: null,
     });
-    return isTerminal(report.status);
+    return isTerminal(candidateStatus);
   }
 
   private async recordFailure(transfer: PendingTransfer, error: unknown): Promise<void> {
@@ -256,8 +355,8 @@ export class RailPass {
       // and writing `failed` here would claim the money did not move on the strength of our own
       // inability to get an answer.
       status: transfer.status ?? "pending",
-      railStatus: null,
-      reference: null,
+      reason: permanent ? "lookup_permanent_error" : "lookup_transient_error",
+      evidence: {},
       attestedAt: null,
       checkedAt: this.now(),
       failures,
@@ -268,9 +367,10 @@ export class RailPass {
   private async write(
     transfer: PendingTransfer,
     fields: {
-      readonly status: string;
-      readonly railStatus: string | null;
-      readonly reference: string | null;
+      readonly status: AttestationStatus;
+      readonly reason: string;
+      readonly preserveIfUnchanged?: boolean;
+      readonly evidence: RailTransitionEvidence;
       readonly attestedAt: Date | null;
       readonly checkedAt: Date;
       readonly failures: number;
@@ -278,12 +378,15 @@ export class RailPass {
     },
   ): Promise<void> {
     await this.options.db.transaction(async (tx: Queryable) => {
-      await writeAttestation(tx, {
+      await commitRailTransition(tx, {
         transferId: transfer.transferId,
         route: transfer.route,
-        status: fields.status,
-        railStatus: fields.railStatus,
-        railReference: fields.reference,
+        nextStatus: fields.status,
+        reason: fields.reason,
+        ...(fields.preserveIfUnchanged !== undefined
+          ? { preserveIfUnchanged: fields.preserveIfUnchanged }
+          : {}),
+        evidence: fields.evidence,
         attestedAt: fields.attestedAt,
         checkedAt: fields.checkedAt,
         checkFailures: fields.failures,

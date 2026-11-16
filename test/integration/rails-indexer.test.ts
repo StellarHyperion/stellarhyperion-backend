@@ -9,9 +9,19 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { writeOutbound, writeInbound } from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
-import { outstandingForRail, pendingForRail } from "../../src/rails/queue.js";
+import {
+  listRailLifecycleTransitions,
+  outstandingForRail,
+  pendingForRail,
+  reconcileRailTransition,
+} from "../../src/rails/queue.js";
 import { RailPass } from "../../src/rails/pass.js";
-import type { PendingTransfer, RailClient, RailLookup } from "../../src/rails/types.js";
+import {
+  InvalidRailTransitionError,
+  type PendingTransfer,
+  type RailClient,
+  type RailLookup,
+} from "../../src/rails/types.js";
 import { capturingLogger } from "../stellar-fakes.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
@@ -214,5 +224,23 @@ suite("rail pollers against real Postgres", () => {
     // Outstanding should now be 0 for this transfer since delivered is terminal
     const outstanding = await outstandingForRail(db, 1);
     expect(outstanding).toBe(0);
+
+    const history = await listRailLifecycleTransitions(db, {
+      originChain: ORIGIN_CHAIN,
+      nonce: 202n,
+    });
+    expect(history).toHaveLength(1);
+    expect(history[0]?.nextStatus).toBe("delivered");
+    expect(history[0]?.evidence.destinationTx).toBe("0xdest202");
+    expect(history[0]?.evidence.railMessageId).toBe("0xmsg202");
+
+    await expect(
+      reconcileRailTransition(db, {
+        transferId: history[0]?.transferId ?? 0n,
+        nextStatus: "attested",
+        reconciliationReason: "   ",
+      }),
+    ).rejects.toThrow();
+    expect(InvalidRailTransitionError).toBeDefined();
   });
 });
