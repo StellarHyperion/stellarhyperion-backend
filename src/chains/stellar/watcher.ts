@@ -77,6 +77,9 @@ export interface StellarWatcherOptions {
   readonly db: Transactional;
   readonly logger: Logger;
   readonly maxPagesPerTick?: number;
+  readonly minPageSize?: number;
+  readonly maxPageSize?: number;
+  readonly targetResponseTimeMs?: number;
 }
 
 export interface WatcherProgress {
@@ -93,11 +96,24 @@ export class StellarWatcher {
   private lastProgress: WatcherProgress | null = null;
   /** Tags seen once and logged once. A contract ahead of this build should not be a log flood. */
   private readonly reportedUnknown = new Set<string>();
+  private currentWindowSize: number;
+  private readonly minWindowSize: number;
+  private readonly maxWindowSize: number;
+  private readonly targetResponseTimeMs: number;
 
-  constructor(private readonly options: StellarWatcherOptions) {}
+  constructor(private readonly options: StellarWatcherOptions) {
+    this.currentWindowSize = options.pageSize;
+    this.minWindowSize = options.minPageSize ?? Math.min(10, options.pageSize);
+    this.maxWindowSize = options.maxPageSize ?? Math.max(options.pageSize * 2, 1_000);
+    this.targetResponseTimeMs = options.targetResponseTimeMs ?? 2_000;
+  }
 
   get name(): string {
     return this.options.chainKey;
+  }
+
+  get windowSize(): number {
+    return this.currentWindowSize;
   }
 
   get progress(): WatcherProgress | null {
@@ -247,7 +263,7 @@ export class StellarWatcher {
     readonly oldestLedger: number;
     readonly pages: number;
   }> {
-    const { router, pageSize, logger, chainKey } = this.options;
+    const { router, logger, chainKey } = this.options;
     const maxPages = this.options.maxPagesPerTick ?? MAX_PAGES_PER_TICK;
 
     const events: RawStellarEvent[] = [];
@@ -262,10 +278,12 @@ export class StellarWatcher {
       : { cursor: endOfLedgerCursor(base) };
 
     while (pages < maxPages) {
+      const start = Date.now();
       const page = await this.fetch(
-        { ...pagination, contractIds: [router], limit: pageSize },
+        { ...pagination, contractIds: [router], limit: this.currentWindowSize },
         signal,
       );
+      const elapsedMs = Date.now() - start;
       pages += 1;
       events.push(...(page.events as readonly RawStellarEvent[]));
       latestLedger = page.latestLedger;
@@ -280,6 +298,8 @@ export class StellarWatcher {
         break;
       }
 
+      this.adjustWindow(page.events.length, elapsedMs);
+
       const candidate = completeThrough(parseEventCursor(page.cursor));
       if (candidate > through) {
         through = candidate;
@@ -291,12 +311,37 @@ export class StellarWatcher {
 
     if (pages >= maxPages && through <= base) {
       logger.error(
-        { chain: chainKey, ledger: base + 1, pages, pageSize },
+        { chain: chainKey, ledger: base + 1, pages, pageSize: this.currentWindowSize },
         "a single ledger holds more router events than this many pages could drain; raise STELLAR_EVENT_PAGE_SIZE",
       );
     }
 
     return { events, through, latestLedger, oldestLedger, pages };
+  }
+
+  private adjustWindow(receivedCount: number, elapsedMs: number): void {
+    if (elapsedMs > this.targetResponseTimeMs * 1.5 || receivedCount >= this.currentWindowSize) {
+      const reduced = Math.max(Math.floor(this.currentWindowSize / 2), this.minWindowSize);
+      if (reduced < this.currentWindowSize) {
+        this.options.logger.debug(
+          { chain: this.options.chainKey, from: this.currentWindowSize, to: reduced, elapsedMs },
+          "reducing stellar scan window",
+        );
+        this.currentWindowSize = reduced;
+      }
+    } else if (
+      elapsedMs < this.targetResponseTimeMs * 0.5 &&
+      receivedCount < this.currentWindowSize / 2
+    ) {
+      const increased = Math.min(Math.floor(this.currentWindowSize * 1.5), this.maxWindowSize);
+      if (increased > this.currentWindowSize) {
+        this.options.logger.debug(
+          { chain: this.options.chainKey, from: this.currentWindowSize, to: increased, elapsedMs },
+          "increasing stellar scan window",
+        );
+        this.currentWindowSize = increased;
+      }
+    }
   }
 
   private async fetch(query: EventsQuery, signal: AbortSignal) {

@@ -40,6 +40,9 @@ function harness(
     readonly latestLedger?: number;
     readonly maxPagesPerTick?: number;
     readonly oldestLedger?: number;
+    readonly minPageSize?: number;
+    readonly maxPageSize?: number;
+    readonly targetResponseTimeMs?: number;
   } = {},
 ): Harness {
   const db = new RecordingDb();
@@ -61,6 +64,11 @@ function harness(
     db,
     logger,
     ...(options.maxPagesPerTick === undefined ? {} : { maxPagesPerTick: options.maxPagesPerTick }),
+    ...(options.minPageSize === undefined ? {} : { minPageSize: options.minPageSize }),
+    ...(options.maxPageSize === undefined ? {} : { maxPageSize: options.maxPageSize }),
+    ...(options.targetResponseTimeMs === undefined
+      ? {}
+      : { targetResponseTimeMs: options.targetResponseTimeMs }),
   });
   return { watcher, db, rpc, lines };
 }
@@ -342,5 +350,63 @@ describe("gaps it cannot close", () => {
 
     const warnings = lines.filter((line) => line.message.includes("running ahead of the indexer"));
     expect(warnings).toHaveLength(1);
+  });
+});
+
+describe("adaptive scan-window sizing", () => {
+  it("never skips an uncompleted ledger when window size is reduced", async () => {
+    const crowded = [1, 2, 3, 4, 5].map((i) =>
+      syntheticEvent({
+        ledger: FIRST_EVENT_LEDGER + 1,
+        operationIndex: i,
+      }),
+    );
+    const { watcher, db } = harness({
+      events: crowded,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 2,
+      minPageSize: 1,
+    });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    const writes = cursorWrites(db);
+    expect(writes.length).toBeGreaterThan(0);
+    const lastWrittenLedger = writes[writes.length - 1]?.ledger;
+    expect(lastWrittenLedger).toBeLessThanOrEqual(FIRST_EVENT_LEDGER + 1);
+  });
+
+  it("increases window size within configured bounds when provider is stable", async () => {
+    const { watcher } = harness({
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 50,
+      maxPageSize: 100,
+      targetResponseTimeMs: 10_000,
+    });
+
+    const initial = watcher.windowSize;
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    expect(watcher.windowSize).toBeGreaterThanOrEqual(initial);
+  });
+
+  it("resumes from the correct event cursor after a partial page", async () => {
+    const partial = [1, 2].map((i) =>
+      syntheticEvent({
+        ledger: FIRST_EVENT_LEDGER,
+        operationIndex: i,
+      }),
+    );
+    const { watcher, rpc } = harness({
+      events: partial,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 1,
+    });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    expect(rpc.requests.length).toBeGreaterThan(1);
+    expect(rpc.requests[1]?.cursor).toBeDefined();
+    expect(rpc.requests[1]?.cursor).not.toContain("4294967295");
   });
 });
