@@ -13,7 +13,15 @@
 import { ROUTE_KINDS } from "@hyperion/protocol";
 
 import type { Queryable } from "../../db/pool.js";
-import { bigintOf, maybeOne, text, textOrNull, timestampOrNull } from "../../db/rows.js";
+import {
+  bigintOf,
+  booleanOrNull,
+  integerOrNull,
+  maybeOne,
+  text,
+  textOrNull,
+  timestampOrNull,
+} from "../../db/rows.js";
 import type { Position } from "../writers.js";
 import {
   settleAction,
@@ -36,6 +44,15 @@ import type {
   TokenRegisteredEvent,
 } from "./events.js";
 
+export interface CursorFinalitySnapshot {
+  readonly mode: "confirmations" | "safe" | "finalized";
+  readonly confirmations: number;
+  readonly allowFallback: boolean;
+  readonly evidence: "confirmation_depth" | "safe_block" | "finalized_block";
+  readonly finalityTag: "safe" | "finalized" | null;
+  readonly usedFallback: boolean;
+}
+
 /** Where a watcher has read up to. */
 export interface ChainCursor {
   readonly position: bigint;
@@ -43,21 +60,45 @@ export interface ChainCursor {
   readonly observedAt: Date | null;
   /** EVM only. Null on Stellar, where a closed ledger cannot change. */
   readonly hash: string | null;
+  /** EVM only. Policy and settlement evidence from the last committed pass. */
+  readonly finality: CursorFinalitySnapshot | null;
 }
 
 export async function readCursor(db: Queryable, chainKey: string): Promise<ChainCursor | null> {
   const { rows } = await db.query(
-    `SELECT last_processed, contract, last_processed_at, last_processed_hash
+    `SELECT last_processed, contract, last_processed_at, last_processed_hash,
+            finality_mode, finality_confirmations, finality_allow_fallback,
+            finality_evidence, finality_tag, finality_used_fallback
        FROM indexer_cursor WHERE chain_key = $1`,
     [chainKey],
   );
   const row = maybeOne(rows, `cursor for ${chainKey}`);
   if (row === null) return null;
+  const mode = textOrNull(row, "finality_mode");
+  const confirmations = integerOrNull(row, "finality_confirmations");
+  const evidence = textOrNull(row, "finality_evidence");
+  const finalityTag = textOrNull(row, "finality_tag");
+  const finality: CursorFinalitySnapshot | null =
+    (mode === "confirmations" || mode === "safe" || mode === "finalized") &&
+    confirmations !== null &&
+    (evidence === "confirmation_depth" ||
+      evidence === "safe_block" ||
+      evidence === "finalized_block")
+      ? {
+          mode,
+          confirmations,
+          allowFallback: booleanOrNull(row, "finality_allow_fallback") ?? false,
+          evidence,
+          finalityTag: finalityTag === "safe" || finalityTag === "finalized" ? finalityTag : null,
+          usedFallback: booleanOrNull(row, "finality_used_fallback") ?? false,
+        }
+      : null;
   return {
     position: bigintOf(row, "last_processed"),
     contract: text(row, "contract"),
     observedAt: timestampOrNull(row, "last_processed_at"),
     hash: textOrNull(row, "last_processed_hash"),
+    finality,
   };
 }
 
@@ -77,18 +118,52 @@ export async function writeCursor(
     readonly position: bigint;
     readonly observedAt: Date | null;
     readonly hash: string | null;
+    readonly finality?: CursorFinalitySnapshot | null;
   },
 ): Promise<void> {
+  const finality = entry.finality ?? null;
+  if (finality === null) {
+    await db.query(
+      `INSERT INTO indexer_cursor
+         (chain_key, family, contract, last_processed, last_processed_at, last_processed_hash)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (chain_key) DO UPDATE
+         SET contract = EXCLUDED.contract,
+             family = EXCLUDED.family,
+             last_processed = EXCLUDED.last_processed,
+             last_processed_at = EXCLUDED.last_processed_at,
+             last_processed_hash = EXCLUDED.last_processed_hash,
+             updated_at = now()`,
+      [
+        entry.chainKey,
+        entry.family,
+        entry.contract,
+        entry.position.toString(),
+        entry.observedAt,
+        entry.hash,
+      ],
+    );
+    return;
+  }
+
   await db.query(
     `INSERT INTO indexer_cursor
-       (chain_key, family, contract, last_processed, last_processed_at, last_processed_hash)
-     VALUES ($1, $2, $3, $4, $5, $6)
+       (chain_key, family, contract, last_processed, last_processed_at, last_processed_hash,
+        finality_mode, finality_confirmations, finality_allow_fallback,
+        finality_evidence, finality_tag, finality_used_fallback)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
      ON CONFLICT (chain_key) DO UPDATE
        SET contract = EXCLUDED.contract,
            family = EXCLUDED.family,
            last_processed = EXCLUDED.last_processed,
            last_processed_at = EXCLUDED.last_processed_at,
            last_processed_hash = EXCLUDED.last_processed_hash,
+           finality_mode = EXCLUDED.finality_mode,
+           finality_confirmations = EXCLUDED.finality_confirmations,
+           finality_allow_fallback = EXCLUDED.finality_allow_fallback,
+           finality_evidence = EXCLUDED.finality_evidence,
+           finality_tag = EXCLUDED.finality_tag,
+           finality_used_fallback = EXCLUDED.finality_used_fallback,
            updated_at = now()`,
     [
       entry.chainKey,
@@ -97,6 +172,12 @@ export async function writeCursor(
       entry.position.toString(),
       entry.observedAt,
       entry.hash,
+      finality.mode,
+      finality.confirmations,
+      finality.allowFallback,
+      finality.evidence,
+      finality.finalityTag,
+      finality.usedFallback,
     ],
   );
 }

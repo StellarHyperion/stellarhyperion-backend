@@ -7,10 +7,21 @@
  * rather than pointed at anvil, which will mine on demand but will not rewrite history underneath
  * a running watcher.
  */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+import { PGlite } from "@electric-sql/pglite";
 import { describe, expect, it } from "vitest";
 
+import {
+  readDeliveryProvenance,
+  readPolicyChanges,
+  readScanProvenance,
+  type EvmFinalityPolicy,
+} from "../../src/chains/evm/store.js";
 import { EvmWatcher } from "../../src/chains/evm/watcher.js";
 import { viemClient, type EvmClient } from "../../src/chains/evm/client.js";
+import type { Queryable, QueryResultRows, Transactional } from "../../src/db/pool.js";
 import {
   ANVIL_HISTORY,
   ANVIL_CHAIN_ID,
@@ -545,5 +556,394 @@ describe("RPC endpoint failover", () => {
 
     // Cursor now advances properly from cursorRow(20n)
     expect(cursorWrites(db)).toEqual([{ block: 57n, family: "evm", hash: expect.any(String) }]);
+  });
+});
+
+async function openMigratedPglite(): Promise<{ db: Transactional; close: () => Promise<void> }> {
+  const pg = new PGlite();
+  for (const name of [
+    "1790900000000_initial-schema.sql",
+    "1791000000000_cursor-block-hash.sql",
+    "1791100000000_cursor-autovacuum-tuning.sql",
+    "1791200000000_evm-finality-provenance.sql",
+  ]) {
+    const migrationPath = fileURLToPath(new URL(`../../migrations/${name}`, import.meta.url));
+    const upSql = readFileSync(migrationPath, "utf8").split("-- Down Migration")[0] ?? "";
+    await pg.exec(upSql);
+  }
+
+  const runQuery = async (
+    sql: string,
+    params: readonly unknown[] = [],
+  ): Promise<QueryResultRows> => {
+    const result = await pg.query(sql, [...params]);
+    const int8Columns = result.fields
+      .filter((field) => field.dataTypeID === 20)
+      .map((field) => field.name);
+    const rows = result.rows.map((raw) => {
+      const copy = { ...(raw as Record<string, unknown>) };
+      for (const column of int8Columns) {
+        const value = copy[column];
+        if (typeof value === "number" || typeof value === "bigint") {
+          copy[column] = String(value);
+        }
+      }
+      return copy;
+    });
+    return { rows, rowCount: result.affectedRows ?? result.rows.length };
+  };
+
+  const queryable: Queryable = { query: runQuery };
+  const db: Transactional = {
+    query: runQuery,
+    async transaction<T>(work: (tx: Queryable) => Promise<T>): Promise<T> {
+      await pg.exec("BEGIN");
+      try {
+        const out = await work(queryable);
+        await pg.exec("COMMIT");
+        return out;
+      } catch (error) {
+        await pg.exec("ROLLBACK");
+        throw error;
+      }
+    },
+  };
+
+  return {
+    db,
+    close: () => pg.close(),
+  };
+}
+
+describe("finality policy provenance and transitions", () => {
+  const RECIPIENT = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8";
+  const TOKEN = "0x5fbdb2315678afecb367f032d93f642f64180aa3";
+  const MESSAGE_A = `0x${"11".repeat(32)}` as const;
+  const MESSAGE_B = `0x${"22".repeat(32)}` as const;
+  const TX_A = `0x${"aa".repeat(32)}` as const;
+  const TX_B = `0x${"bb".repeat(32)}` as const;
+
+  function makeWatcher(
+    db: Transactional,
+    client: EvmClient,
+    policy: EvmFinalityPolicy,
+    confirmations = policy.confirmations,
+  ) {
+    const { logger, lines } = capturingLogger();
+    const watcher = new EvmWatcher({
+      chainKey: CHAIN,
+      router: ANVIL_ROUTER,
+      chainId: ANVIL_CHAIN_ID,
+      startBlock: ANVIL_START_BLOCK,
+      confirmations,
+      reorgDepth: 5,
+      logRange: 2_000,
+      finalityPolicy: policy,
+      client,
+      db,
+      logger,
+    });
+    return { watcher, lines };
+  }
+
+  it("distinguishes confirmation depth from finalized-block settlement evidence", async () => {
+    const { db, close } = await openMigratedPglite();
+    try {
+      const arrivalAt20 = encodedLog(
+        "BridgeIn",
+        {
+          route: 0,
+          recipient: RECIPIENT,
+          token: TOKEN,
+          amount: 250_000n,
+          sourceChain: "stellar-testnet",
+          sourceNonce: 101n,
+          messageId: MESSAGE_A,
+        },
+        { blockNumber: 20n, logIndex: 0, txHash: TX_A },
+      );
+      const arrivalAt45 = encodedLog(
+        "BridgeIn",
+        {
+          route: 0,
+          recipient: RECIPIENT,
+          token: TOKEN,
+          amount: 350_000n,
+          sourceChain: "stellar-testnet",
+          sourceNonce: 102n,
+          messageId: MESSAGE_B,
+        },
+        { blockNumber: 45n, logIndex: 0, txHash: TX_B },
+      );
+
+      const client = new FakeEvmClient({
+        logs: [arrivalAt20, arrivalAt45],
+        head: 50n,
+        finalityBlocks: { finalized: 48n },
+      });
+
+      // Pass 1 settles up to block 38 via confirmation depth (50 - 12).
+      const depthRun = makeWatcher(db, client, { mode: "confirmations", confirmations: 12 });
+      await depthRun.watcher.tick(AbortSignal.timeout(5_000));
+
+      const firstDelivery = await readDeliveryProvenance(db, {
+        destinationChain: CHAIN,
+        route: 0,
+        sourceChain: "stellar-testnet",
+        sourceNonce: 101n,
+      });
+      expect(firstDelivery).toMatchObject({
+        delivered: true,
+        destinationBlock: 20n,
+        evidence: "confirmation_depth",
+        confirmationDepth: 12,
+        finalityTag: null,
+        boundaryBlock: 38n,
+        usedFallback: false,
+      });
+
+      // Pass 2 switches to explicit finalized-block evidence and settles 39..48.
+      const finalizedRun = makeWatcher(db, client, { mode: "finalized", confirmations: 12 });
+      await finalizedRun.watcher.tick(AbortSignal.timeout(5_000));
+      expect(finalizedRun.watcher.readiness().detail).toContain("settled by finalized block 48");
+
+      const secondDelivery = await readDeliveryProvenance(db, {
+        destinationChain: CHAIN,
+        route: 0,
+        sourceChain: "stellar-testnet",
+        sourceNonce: 102n,
+      });
+      expect(secondDelivery).toMatchObject({
+        delivered: true,
+        destinationBlock: 45n,
+        evidence: "finalized_block",
+        confirmationDepth: null,
+        finalityTag: "finalized",
+        boundaryBlock: 48n,
+        boundaryHash: client.stampFor(48n).hash,
+        usedFallback: false,
+      });
+
+      const scans = await readScanProvenance(db, CHAIN);
+      expect(scans).toHaveLength(2);
+      expect(scans[0]).toMatchObject({
+        fromBlock: 39n,
+        toBlock: 48n,
+        configuredMode: "finalized",
+        evidence: "finalized_block",
+        finalityTag: "finalized",
+        confirmationDepth: null,
+        policyChanged: true,
+        policyChangeKind: "stronger",
+        previousMode: "confirmations",
+        previousConfirmations: 12,
+      });
+      expect(scans[1]).toMatchObject({
+        fromBlock: ANVIL_START_BLOCK,
+        toBlock: 38n,
+        configuredMode: "confirmations",
+        evidence: "confirmation_depth",
+        confirmationDepth: 12,
+        finalityTag: null,
+        policyChanged: false,
+      });
+    } finally {
+      await close();
+    }
+  });
+
+  it("exposes weaker policy changes without downgrading prior delivery provenance", async () => {
+    const { db, close } = await openMigratedPglite();
+    try {
+      const arrival = encodedLog(
+        "BridgeIn",
+        {
+          route: 0,
+          recipient: RECIPIENT,
+          token: TOKEN,
+          amount: 500_000n,
+          sourceChain: "stellar-testnet",
+          sourceNonce: 202n,
+          messageId: MESSAGE_A,
+        },
+        { blockNumber: 25n, logIndex: 0, txHash: TX_A },
+      );
+      const client = new FakeEvmClient({
+        logs: [arrival],
+        head: 60n,
+        finalityBlocks: { finalized: 30n },
+      });
+
+      // Establish delivery under finalized-block evidence at block 30.
+      const strongRun = makeWatcher(db, client, { mode: "finalized", confirmations: 12 });
+      await strongRun.watcher.tick(AbortSignal.timeout(5_000));
+
+      // Restart under a weaker 2-confirmation policy and advance to block 58.
+      const weakRun = makeWatcher(db, client, { mode: "confirmations", confirmations: 2 });
+      await weakRun.watcher.tick(AbortSignal.timeout(5_000));
+
+      expect(weakRun.watcher.policyChanges).toEqual([
+        {
+          kind: "weaker",
+          previous: { mode: "finalized", confirmations: 12, allowConfirmationFallback: false },
+          current: { mode: "confirmations", confirmations: 2, allowConfirmationFallback: false },
+        },
+      ]);
+      expect(
+        weakRun.lines.some((line) => line.message.includes("weaker evm finality policy")),
+      ).toBe(true);
+
+      const changes = await readPolicyChanges(db, CHAIN);
+      expect(changes).toHaveLength(1);
+      expect(changes[0]).toMatchObject({
+        policyChanged: true,
+        policyChangeKind: "weaker",
+        previousMode: "finalized",
+        previousConfirmations: 12,
+        configuredMode: "confirmations",
+        configuredConfirmations: 2,
+      });
+
+      // Even if the cursor is reset and the range is re-indexed under the weaker policy on the
+      // same canonical transaction, the delivery retains its stronger finalized_block provenance.
+      await db.query("DELETE FROM indexer_cursor WHERE chain_key = $1", [CHAIN]);
+      const replayWeak = makeWatcher(db, client, { mode: "confirmations", confirmations: 2 });
+      await replayWeak.watcher.tick(AbortSignal.timeout(5_000));
+
+      const preserved = await readDeliveryProvenance(db, {
+        destinationChain: CHAIN,
+        route: 0,
+        sourceChain: "stellar-testnet",
+        sourceNonce: 202n,
+      });
+      expect(preserved).toMatchObject({
+        destinationBlock: 25n,
+        destinationTx: TX_A,
+        evidence: "finalized_block",
+        finalityTag: "finalized",
+        confirmationDepth: null,
+        boundaryBlock: 30n,
+        usedFallback: false,
+      });
+    } finally {
+      await close();
+    }
+  });
+
+  it("refuses unsupported finality tags unless fallback is explicitly configured and scrubs credentials", async () => {
+    const { db, close } = await openMigratedPglite();
+    try {
+      const mockFetch: typeof globalThis.fetch = (input, init) => {
+        const bodyText = typeof init?.body === "string" ? init.body : "";
+        const payload = JSON.parse(bodyText) as { method: string; params?: unknown[] };
+        if (payload.method === "eth_chainId") {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({ jsonrpc: "2.0", id: 1, result: `0x${ANVIL_CHAIN_ID.toString(16)}` }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            ),
+          );
+        }
+        if (payload.method === "eth_blockNumber") {
+          return Promise.resolve(
+            new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "0x3c" }), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            }),
+          );
+        }
+        if (payload.method === "eth_getBlockByNumber" && payload.params?.[0] === "finalized") {
+          const url = typeof input === "string" ? input : input instanceof URL ? input.href : "";
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                error: {
+                  code: -32602,
+                  message: `invalid block tag finalized at ${url}`,
+                },
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            ),
+          );
+        }
+        if (payload.method === "eth_getLogs") {
+          return Promise.resolve(
+            new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: [] }), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            }),
+          );
+        }
+        if (payload.method === "eth_getBlockByNumber") {
+          const firstParam = payload.params?.[0];
+          const blockHex = typeof firstParam === "string" ? firstParam : "0x0";
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                result: {
+                  number: blockHex,
+                  hash: `0x${blockHex.slice(2).padStart(64, "0")}`,
+                  timestamp: "0x69000000",
+                  transactions: [],
+                },
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            ),
+          );
+        }
+        return Promise.reject(new Error(`unexpected method ${payload.method}`));
+      };
+
+      const rpcClient = viemClient(
+        "https://operator:secret-pass@rpc.example.invalid/v1?api_key=leak-me-not",
+        { fetchFn: mockFetch },
+      );
+
+      // Without explicit fallback configuration, unsupported finality tags fail closed.
+      const strict = makeWatcher(db, rpcClient, {
+        mode: "finalized",
+        confirmations: 6,
+      });
+      let caughtMessage = "";
+      try {
+        await strict.watcher.tick(AbortSignal.timeout(5_000));
+      } catch (error) {
+        caughtMessage = error instanceof Error ? error.message : String(error);
+      }
+      expect(caughtMessage).toContain("does not support finality tag");
+      expect(caughtMessage).not.toContain("secret-pass");
+      expect(caughtMessage).not.toContain("leak-me-not");
+      expect(await readScanProvenance(db, CHAIN)).toEqual([]);
+
+      // With explicit allowConfirmationFallback: true, falls back to confirmation_depth and marks usedFallback.
+      const fallbackAllowed = makeWatcher(db, rpcClient, {
+        mode: "finalized",
+        confirmations: 6,
+        allowConfirmationFallback: true,
+      });
+      await fallbackAllowed.watcher.tick(AbortSignal.timeout(5_000));
+
+      const scans = await readScanProvenance(db, CHAIN);
+      expect(scans).toHaveLength(1);
+      expect(scans[0]).toMatchObject({
+        configuredMode: "finalized",
+        configuredConfirmations: 6,
+        allowFallback: true,
+        evidence: "confirmation_depth",
+        finalityTag: null,
+        confirmationDepth: 6,
+        boundaryBlock: 54n,
+        usedFallback: true,
+      });
+      expect(fallbackAllowed.watcher.readiness().detail).toContain(
+        "fallback from unsupported finalized tag",
+      );
+    } finally {
+      await close();
+    }
   });
 });

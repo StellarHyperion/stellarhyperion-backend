@@ -79,6 +79,12 @@ export function boolean(row: Row, column: string): boolean {
   return value;
 }
 
+export function booleanOrNull(row: Row, column: string): boolean | null {
+  const value = row[column];
+  if (value === null || value === undefined) return null;
+  return boolean(row, column);
+}
+
 export function timestamp(row: Row, column: string): Date {
   const value = row[column];
   if (value instanceof Date) return value;

@@ -10,6 +10,18 @@
 import { ROUTE_KINDS } from "@hyperion/protocol";
 
 import type { Queryable } from "../../db/pool.js";
+import {
+  bigintOf,
+  bigintOrNull,
+  boolean,
+  booleanOrNull,
+  integer,
+  integerOrNull,
+  maybeOne,
+  text,
+  textOrNull,
+  timestamp,
+} from "../../db/rows.js";
 import type { Position } from "../writers.js";
 import {
   settleAction,
@@ -20,6 +32,7 @@ import {
   writeInbound,
   writeOutbound,
 } from "../writers.js";
+import type { EvmFinalityTag } from "./client.js";
 import {
   type DecodedLog,
   requireAddress,
@@ -31,6 +44,318 @@ import {
   secondsOrNull,
   wordOrNull,
 } from "./logs.js";
+
+export type EvmFinalityMode = "confirmations" | "safe" | "finalized";
+
+export type EvmFinalityEvidence = "confirmation_depth" | "safe_block" | "finalized_block";
+
+export interface EvmFinalityPolicy {
+  readonly mode: EvmFinalityMode;
+  readonly confirmations: number;
+  /**
+   * When true, an endpoint that rejects `safe` or `finalized` falls back to
+   * `head - confirmations` and records `usedFallback = true` with `confirmation_depth` evidence.
+   * Defaults to false so unsupported tags fail closed.
+   */
+  readonly allowConfirmationFallback?: boolean;
+}
+
+export interface NormalizedFinalityPolicy {
+  readonly mode: EvmFinalityMode;
+  readonly confirmations: number;
+  readonly allowConfirmationFallback: boolean;
+}
+
+export type FinalityPolicyChangeKind = "stronger" | "weaker";
+
+export interface FinalityPolicyChange {
+  readonly kind: FinalityPolicyChangeKind;
+  readonly previous: NormalizedFinalityPolicy;
+  readonly current: NormalizedFinalityPolicy;
+}
+
+export interface ScanFinalityProvenance {
+  readonly chainKey: string;
+  readonly contract: string;
+  readonly fromBlock: bigint;
+  readonly toBlock: bigint;
+  readonly toBlockHash: string;
+  readonly headBlock: bigint;
+  readonly policy: NormalizedFinalityPolicy;
+  readonly evidence: EvmFinalityEvidence;
+  readonly finalityTag: EvmFinalityTag | null;
+  readonly confirmationDepth: number | null;
+  readonly boundaryBlock: bigint;
+  readonly boundaryHash: string | null;
+  readonly usedFallback: boolean;
+  readonly policyChange: FinalityPolicyChange | null;
+}
+
+export interface PersistedScanProvenance {
+  readonly id: bigint;
+  readonly chainKey: string;
+  readonly contract: string;
+  readonly fromBlock: bigint;
+  readonly toBlock: bigint;
+  readonly toBlockHash: string;
+  readonly headBlock: bigint;
+  readonly configuredMode: EvmFinalityMode;
+  readonly configuredConfirmations: number;
+  readonly allowFallback: boolean;
+  readonly evidence: EvmFinalityEvidence;
+  readonly finalityTag: EvmFinalityTag | null;
+  readonly confirmationDepth: number | null;
+  readonly boundaryBlock: bigint;
+  readonly boundaryHash: string | null;
+  readonly usedFallback: boolean;
+  readonly policyChanged: boolean;
+  readonly policyChangeKind: FinalityPolicyChangeKind | null;
+  readonly previousMode: EvmFinalityMode | null;
+  readonly previousConfirmations: number | null;
+  readonly previousAllowFallback: boolean | null;
+  readonly committedAt: Date;
+}
+
+export interface DeliveryFinalityProvenance {
+  readonly destinationChain: string;
+  readonly route: number;
+  readonly sourceChain: string;
+  readonly sourceNonce: bigint;
+  readonly delivered: boolean;
+  readonly claimId: bigint | null;
+  readonly destinationBlock: bigint;
+  readonly destinationTx: string;
+  readonly evidence: EvmFinalityEvidence | null;
+  readonly confirmationDepth: number | null;
+  readonly finalityTag: EvmFinalityTag | null;
+  readonly boundaryBlock: bigint | null;
+  readonly boundaryHash: string | null;
+  readonly usedFallback: boolean | null;
+}
+
+export function normalizeFinalityPolicy(
+  policy: EvmFinalityPolicy | undefined,
+  defaultConfirmations: number,
+): NormalizedFinalityPolicy {
+  const mode = policy?.mode ?? "confirmations";
+  const confirmations = policy?.confirmations ?? defaultConfirmations;
+  if (!Number.isInteger(confirmations) || confirmations < 0) {
+    throw new Error(
+      `EVM finality confirmations must be a non-negative integer, received ${String(confirmations)}`,
+    );
+  }
+  return {
+    mode,
+    confirmations,
+    allowConfirmationFallback: policy?.allowConfirmationFallback ?? false,
+  };
+}
+
+function finalityModeRank(mode: EvmFinalityMode): number {
+  switch (mode) {
+    case "finalized":
+      return 3;
+    case "safe":
+      return 2;
+    case "confirmations":
+      return 1;
+  }
+}
+
+export function compareFinalityPolicy(
+  previous: NormalizedFinalityPolicy,
+  current: NormalizedFinalityPolicy,
+): FinalityPolicyChange | null {
+  const previousRank = finalityModeRank(previous.mode);
+  const currentRank = finalityModeRank(current.mode);
+  if (currentRank > previousRank) {
+    return { kind: "stronger", previous, current };
+  }
+  if (currentRank < previousRank) {
+    return { kind: "weaker", previous, current };
+  }
+  if (current.mode === "confirmations") {
+    if (current.confirmations > previous.confirmations) {
+      return { kind: "stronger", previous, current };
+    }
+    if (current.confirmations < previous.confirmations) {
+      return { kind: "weaker", previous, current };
+    }
+    return null;
+  }
+  if (previous.allowConfirmationFallback && !current.allowConfirmationFallback) {
+    return { kind: "stronger", previous, current };
+  }
+  if (!previous.allowConfirmationFallback && current.allowConfirmationFallback) {
+    return { kind: "weaker", previous, current };
+  }
+  if (current.confirmations > previous.confirmations) {
+    return { kind: "stronger", previous, current };
+  }
+  if (current.confirmations < previous.confirmations) {
+    return { kind: "weaker", previous, current };
+  }
+  return null;
+}
+
+export async function writeScanProvenance(
+  db: Queryable,
+  scan: ScanFinalityProvenance,
+): Promise<void> {
+  const change = scan.policyChange;
+  await db.query(
+    `INSERT INTO evm_scan_provenance
+       (chain_key, contract, from_block, to_block, to_block_hash, head_block,
+        configured_mode, configured_confirmations, allow_fallback,
+        finality_evidence, finality_tag, confirmation_depth,
+        finality_boundary_block, finality_boundary_hash, used_fallback,
+        policy_changed, policy_change_kind, previous_mode,
+        previous_confirmations, previous_allow_fallback)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)`,
+    [
+      scan.chainKey,
+      scan.contract,
+      scan.fromBlock.toString(),
+      scan.toBlock.toString(),
+      scan.toBlockHash,
+      scan.headBlock.toString(),
+      scan.policy.mode,
+      scan.policy.confirmations,
+      scan.policy.allowConfirmationFallback,
+      scan.evidence,
+      scan.finalityTag,
+      scan.confirmationDepth,
+      scan.boundaryBlock.toString(),
+      scan.boundaryHash,
+      scan.usedFallback,
+      change !== null,
+      change?.kind ?? null,
+      change?.previous.mode ?? null,
+      change?.previous.confirmations ?? null,
+      change?.previous.allowConfirmationFallback ?? null,
+    ],
+  );
+}
+
+function parseScanProvenanceRow(row: Record<string, unknown>): PersistedScanProvenance {
+  const configuredMode = text(row, "configured_mode") as EvmFinalityMode;
+  const evidence = text(row, "finality_evidence") as EvmFinalityEvidence;
+  const rawTag = textOrNull(row, "finality_tag");
+  const rawChangeKind = textOrNull(row, "policy_change_kind");
+  const rawPrevMode = textOrNull(row, "previous_mode");
+  return {
+    id: bigintOf(row, "id"),
+    chainKey: text(row, "chain_key"),
+    contract: text(row, "contract"),
+    fromBlock: bigintOf(row, "from_block"),
+    toBlock: bigintOf(row, "to_block"),
+    toBlockHash: text(row, "to_block_hash"),
+    headBlock: bigintOf(row, "head_block"),
+    configuredMode,
+    configuredConfirmations: integer(row, "configured_confirmations"),
+    allowFallback: boolean(row, "allow_fallback"),
+    evidence,
+    finalityTag: rawTag === "safe" || rawTag === "finalized" ? rawTag : null,
+    confirmationDepth: integerOrNull(row, "confirmation_depth"),
+    boundaryBlock: bigintOf(row, "finality_boundary_block"),
+    boundaryHash: textOrNull(row, "finality_boundary_hash"),
+    usedFallback: boolean(row, "used_fallback"),
+    policyChanged: boolean(row, "policy_changed"),
+    policyChangeKind:
+      rawChangeKind === "stronger" || rawChangeKind === "weaker" ? rawChangeKind : null,
+    previousMode:
+      rawPrevMode === "confirmations" || rawPrevMode === "safe" || rawPrevMode === "finalized"
+        ? rawPrevMode
+        : null,
+    previousConfirmations: integerOrNull(row, "previous_confirmations"),
+    previousAllowFallback: booleanOrNull(row, "previous_allow_fallback"),
+    committedAt: timestamp(row, "committed_at"),
+  };
+}
+
+export async function readScanProvenance(
+  db: Queryable,
+  chainKey: string,
+  limit = 50,
+): Promise<readonly PersistedScanProvenance[]> {
+  const { rows } = await db.query(
+    `SELECT id, chain_key, contract, from_block, to_block, to_block_hash, head_block,
+            configured_mode, configured_confirmations, allow_fallback,
+            finality_evidence, finality_tag, confirmation_depth,
+            finality_boundary_block, finality_boundary_hash, used_fallback,
+            policy_changed, policy_change_kind, previous_mode,
+            previous_confirmations, previous_allow_fallback, committed_at
+       FROM evm_scan_provenance
+      WHERE chain_key = $1
+      ORDER BY id DESC
+      LIMIT $2`,
+    [chainKey, limit],
+  );
+  return rows.map((row) => parseScanProvenanceRow(row));
+}
+
+export async function readPolicyChanges(
+  db: Queryable,
+  chainKey: string,
+): Promise<readonly PersistedScanProvenance[]> {
+  const { rows } = await db.query(
+    `SELECT id, chain_key, contract, from_block, to_block, to_block_hash, head_block,
+            configured_mode, configured_confirmations, allow_fallback,
+            finality_evidence, finality_tag, confirmation_depth,
+            finality_boundary_block, finality_boundary_hash, used_fallback,
+            policy_changed, policy_change_kind, previous_mode,
+            previous_confirmations, previous_allow_fallback, committed_at
+       FROM evm_scan_provenance
+      WHERE chain_key = $1 AND policy_changed
+      ORDER BY id ASC`,
+    [chainKey],
+  );
+  return rows.map((row) => parseScanProvenanceRow(row));
+}
+
+export async function readDeliveryProvenance(
+  db: Queryable,
+  hop: {
+    readonly destinationChain: string;
+    readonly route: number;
+    readonly sourceChain: string;
+    readonly sourceNonce: bigint;
+  },
+): Promise<DeliveryFinalityProvenance | null> {
+  const { rows } = await db.query(
+    `SELECT destination_chain, route, source_chain, source_nonce, delivered, claim_id,
+            destination_block, destination_tx, finality_evidence, finality_confirmations,
+            finality_tag, finality_boundary_block, finality_boundary_hash, finality_used_fallback
+       FROM inbound_delivery
+      WHERE destination_chain = $1 AND route = $2 AND source_chain = $3 AND source_nonce = $4`,
+    [hop.destinationChain, hop.route, hop.sourceChain, hop.sourceNonce.toString()],
+  );
+  const row = maybeOne(rows, "inbound delivery provenance");
+  if (row === null) return null;
+  const rawEvidence = textOrNull(row, "finality_evidence");
+  const rawTag = textOrNull(row, "finality_tag");
+  return {
+    destinationChain: text(row, "destination_chain"),
+    route: integer(row, "route"),
+    sourceChain: text(row, "source_chain"),
+    sourceNonce: bigintOf(row, "source_nonce"),
+    delivered: boolean(row, "delivered"),
+    claimId: bigintOrNull(row, "claim_id"),
+    destinationBlock: bigintOf(row, "destination_block"),
+    destinationTx: text(row, "destination_tx"),
+    evidence:
+      rawEvidence === "confirmation_depth" ||
+      rawEvidence === "safe_block" ||
+      rawEvidence === "finalized_block"
+        ? rawEvidence
+        : null,
+    confirmationDepth: integerOrNull(row, "finality_confirmations"),
+    finalityTag: rawTag === "safe" || rawTag === "finalized" ? rawTag : null,
+    boundaryBlock: bigintOrNull(row, "finality_boundary_block"),
+    boundaryHash: textOrNull(row, "finality_boundary_hash"),
+    usedFallback: booleanOrNull(row, "finality_used_fallback"),
+  };
+}
 
 /** How a log was applied, so the watcher can count and report rather than guess. */
 export type Applied =

@@ -35,6 +35,24 @@ export interface BlockStamp {
   readonly timestamp: bigint;
 }
 
+export type EvmFinalityTag = "safe" | "finalized";
+
+export interface TaggedBlock {
+  readonly number: bigint;
+  readonly hash: Hex;
+  readonly timestamp: bigint;
+}
+
+export class UnsupportedFinalityTagError extends Error {
+  readonly tag: EvmFinalityTag;
+
+  constructor(tag: EvmFinalityTag, detail: string) {
+    super(`finality tag "${tag}" is unsupported: ${scrubRpcDetail(detail)}`);
+    this.name = "UnsupportedFinalityTagError";
+    this.tag = tag;
+  }
+}
+
 export interface LogQuery {
   readonly address: Hex;
   readonly fromBlock: bigint;
@@ -52,6 +70,12 @@ export interface EvmClient {
    */
   chainId(signal?: AbortSignal): Promise<number>;
   blockNumber(signal?: AbortSignal): Promise<bigint>;
+  /**
+   * Read the canonical block reported by the node for an explicit settlement tag (`safe` or
+   * `finalized`). Throws `UnsupportedFinalityTagError` when the endpoint does not implement the
+   * requested tag, while allowing transient transport errors to surface unmodified.
+   */
+  finalityBlock?(tag: EvmFinalityTag, signal?: AbortSignal): Promise<TaggedBlock>;
   /**
    * Logs from one address over an inclusive block range.
    *
@@ -139,6 +163,32 @@ export function viemClient(
 
     blockNumber: () => client.getBlockNumber({ cacheTime: 0 }),
 
+    finalityBlock: async (tag) => {
+      try {
+        const block = await client.getBlock({ blockTag: tag, includeTransactions: false });
+        if (typeof block.hash !== "string" || typeof block.number !== "bigint") {
+          throw new UnsupportedFinalityTagError(
+            tag,
+            "endpoint returned an incomplete block header for tag",
+          );
+        }
+        return {
+          number: block.number,
+          hash: block.hash,
+          timestamp: block.timestamp,
+        };
+      } catch (error) {
+        if (error instanceof UnsupportedFinalityTagError) {
+          throw error;
+        }
+        if (isUnsupportedTagFailure(error)) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw new UnsupportedFinalityTagError(tag, message);
+        }
+        throw error;
+      }
+    },
+
     logs: async (query) => {
       const logs = await client.getLogs({
         address: query.address,
@@ -184,4 +234,45 @@ export function viemClient(
       return found;
     },
   };
+}
+
+function isUnsupportedTagFailure(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const name = "name" in error && typeof error.name === "string" ? error.name : "";
+  if (name === "BlockNotFoundError" || name === "InvalidInputRpcError") {
+    return true;
+  }
+  const code = "code" in error && typeof error.code === "number" ? error.code : null;
+  const message =
+    "message" in error && typeof error.message === "string" ? error.message.toLowerCase() : "";
+  const details =
+    "details" in error && typeof error.details === "string" ? error.details.toLowerCase() : "";
+  const combined = `${message} ${details}`;
+  if (
+    code === -32602 ||
+    combined.includes("invalid block tag") ||
+    combined.includes("unknown block") ||
+    combined.includes("unsupported block") ||
+    combined.includes("block tag") ||
+    combined.includes("safe block not supported") ||
+    combined.includes("finalized block not supported") ||
+    combined.includes("block not found")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function scrubRpcDetail(input: string): string {
+  return input
+    .replace(/https?:\/\/[^\s"'<>]+/gi, (rawUrl) => {
+      try {
+        const parsed = new URL(rawUrl);
+        return `${parsed.protocol}//${parsed.host}`;
+      } catch {
+        return "[redacted-url]";
+      }
+    })
+    .replace(/(bearer\s+)[a-z0-9._~+/-]+=*/gi, "$1[redacted]")
+    .replace(/([?&](?:api[_-]?key|key|token|secret|auth)=)[^&\s"'<>]+/gi, "$1[redacted]");
 }

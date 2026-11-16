@@ -30,10 +30,25 @@ import type { Hex } from "viem";
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
-import type { Position } from "../writers.js";
-import { ClaimPairing, applyRouterLog } from "./store.js";
+import type { EventFinalityProvenance, Position } from "../writers.js";
+import {
+  ClaimPairing,
+  type EvmFinalityEvidence,
+  type EvmFinalityPolicy,
+  type FinalityPolicyChange,
+  type NormalizedFinalityPolicy,
+  applyRouterLog,
+  compareFinalityPolicy,
+  normalizeFinalityPolicy,
+  writeScanProvenance,
+} from "./store.js";
 import { decodeRouterLog, signatureOf } from "./logs.js";
-import type { EvmClient, RawEvmLog } from "./client.js";
+import {
+  UnsupportedFinalityTagError,
+  type EvmClient,
+  type EvmFinalityTag,
+  type RawEvmLog,
+} from "./client.js";
 
 /**
  * How far behind the confirmation line still counts as current.
@@ -58,9 +73,26 @@ export interface EvmWatcherOptions {
   readonly reorgDepth: number;
   /** Blocks per `getLogs` call. Public endpoints reject wide ranges. */
   readonly logRange: number;
+  /**
+   * Configured settlement boundary policy (`confirmations`, `safe`, or `finalized`).
+   * Defaults to confirmation depth using `confirmations` with fallback disabled.
+   */
+  readonly finalityPolicy?: EvmFinalityPolicy;
   readonly client: EvmClient;
   readonly db: Transactional;
   readonly logger: Logger;
+}
+
+export interface ResolvedScanFinality {
+  readonly configuredMode: EvmFinalityPolicy["mode"];
+  readonly configuredConfirmations: number;
+  readonly allowConfirmationFallback: boolean;
+  readonly evidence: EvmFinalityEvidence;
+  readonly finalityTag: EvmFinalityTag | null;
+  readonly confirmationDepth: number | null;
+  readonly boundaryBlock: bigint;
+  readonly boundaryHash: string | null;
+  readonly usedFallback: boolean;
 }
 
 export interface EvmProgress {
@@ -72,6 +104,8 @@ export interface EvmProgress {
   /** Blocks between the cursor and the deepest block this watcher will read. */
   readonly behind: number;
   readonly reorgs: number;
+  readonly finality: ResolvedScanFinality;
+  readonly policyChange: FinalityPolicyChange | null;
   readonly at: Date;
 }
 
@@ -82,8 +116,13 @@ export class EvmWatcher {
   private chainConfirmed = false;
   /** Signatures seen once and logged once. A router ahead of this build is not a log flood. */
   private readonly reportedUnknown = new Set<string>();
+  private readonly policy: NormalizedFinalityPolicy;
+  private readonly recordedPolicyChanges: FinalityPolicyChange[] = [];
+  private lastLoggedPolicyTransitionKey: string | null = null;
 
-  constructor(private readonly options: EvmWatcherOptions) {}
+  constructor(private readonly options: EvmWatcherOptions) {
+    this.policy = normalizeFinalityPolicy(options.finalityPolicy, options.confirmations);
+  }
 
   get name(): string {
     return this.options.chainKey;
@@ -91,6 +130,14 @@ export class EvmWatcher {
 
   get progress(): EvmProgress | null {
     return this.lastProgress;
+  }
+
+  get finalityPolicy(): NormalizedFinalityPolicy {
+    return this.policy;
+  }
+
+  get policyChanges(): readonly FinalityPolicyChange[] {
+    return this.recordedPolicyChanges;
   }
 
   /**
@@ -119,12 +166,21 @@ export class EvmWatcher {
       };
     }
     const reorgNote = progress.reorgs === 0 ? "" : `, ${String(progress.reorgs)} reorgs handled`;
+    const fallbackNote = progress.finality.usedFallback
+      ? `, fallback from unsupported ${progress.finality.configuredMode} tag`
+      : "";
+    const changeNote =
+      progress.policyChange === null ? "" : `, policy changed (${progress.policyChange.kind})`;
+    const settlementDetail =
+      progress.finality.evidence === "finalized_block"
+        ? `settled by finalized block ${progress.finality.boundaryBlock.toString()}`
+        : progress.finality.evidence === "safe_block"
+          ? `settled by safe block ${progress.finality.boundaryBlock.toString()}`
+          : `${String(progress.finality.confirmationDepth ?? this.policy.confirmations)} confirmations behind the chain head`;
     return {
       name: this.name,
       state: "ready",
-      detail:
-        `current at block ${progress.block.toString()}, ` +
-        `${String(this.options.confirmations)} confirmations behind the chain head${reorgNote}`,
+      detail: `current at block ${progress.block.toString()}, ${settlementDetail}${fallbackNote}${changeNote}${reorgNote}`,
     };
   }
 
@@ -133,7 +189,7 @@ export class EvmWatcher {
    * a watcher starting from a deployment block months back catches up without sleeping per range.
    */
   async tick(signal: AbortSignal): Promise<boolean> {
-    const { chainKey, router, db, logger, client, confirmations } = this.options;
+    const { chainKey, router, db, logger, client } = this.options;
 
     const stored = await readCursor(db, chainKey);
     if (stored !== null && stored.contract.toLowerCase() !== router.toLowerCase()) {
@@ -145,12 +201,45 @@ export class EvmWatcher {
       );
     }
 
+    const policyChange =
+      stored?.finality === null || stored?.finality === undefined
+        ? null
+        : compareFinalityPolicy(
+            {
+              mode: stored.finality.mode,
+              confirmations: stored.finality.confirmations,
+              allowConfirmationFallback: stored.finality.allowFallback,
+            },
+            this.policy,
+          );
+    if (policyChange !== null) {
+      const transitionKey =
+        `${policyChange.previous.mode}:${String(policyChange.previous.confirmations)}:${String(policyChange.previous.allowConfirmationFallback)}->` +
+        `${policyChange.current.mode}:${String(policyChange.current.confirmations)}:${String(policyChange.current.allowConfirmationFallback)}`;
+      if (this.lastLoggedPolicyTransitionKey !== transitionKey) {
+        this.lastLoggedPolicyTransitionKey = transitionKey;
+        this.recordedPolicyChanges.push(policyChange);
+        logger.warn(
+          {
+            chain: chainKey,
+            changeKind: policyChange.kind,
+            previousPolicy: policyChange.previous,
+            currentPolicy: policyChange.current,
+          },
+          policyChange.kind === "weaker"
+            ? "weaker evm finality policy configured; prior deliveries retain their stronger recorded provenance"
+            : "stronger evm finality policy configured for subsequent scans",
+        );
+      }
+    } else {
+      this.lastLoggedPolicyTransitionKey = null;
+    }
+
     await this.confirmChain(signal);
 
-    const head = await client.blockNumber(signal);
-    // The deepest block this chain considers settled. Nothing past it is read, so nothing past it
-    // can be written and then taken back.
-    const confirmed = head - BigInt(confirmations);
+    const resolved = await this.resolveBoundary(signal);
+    const head = resolved.head;
+    const confirmed = resolved.finality.boundaryBlock;
 
     let from = stored === null ? this.options.startBlock : stored.position + 1n;
     if (stored !== null && stored.hash !== null) {
@@ -159,14 +248,17 @@ export class EvmWatcher {
     }
 
     if (from > confirmed) {
-      // Caught up to the confirmation line. Normal, and the common case on a fast chain.
+      // Caught up to the settlement line. Normal, and the common case on a fast chain.
+      const cursorBlock = stored?.position ?? this.options.startBlock - 1n;
       this.lastProgress = {
-        block: stored?.position ?? this.options.startBlock - 1n,
+        block: cursorBlock,
         written: 0,
         ignored: 0,
         head,
-        behind: Number(confirmed - (stored?.position ?? this.options.startBlock - 1n)),
+        behind: Math.max(0, Number(confirmed - cursorBlock)),
         reorgs: this.reorgs,
+        finality: resolved.finality,
+        policyChange,
         at: new Date(),
       };
       return false;
@@ -192,6 +284,32 @@ export class EvmWatcher {
       return false;
     }
 
+    if (
+      to === resolved.finality.boundaryBlock &&
+      resolved.finality.boundaryHash !== null &&
+      endHash.toLowerCase() !== resolved.finality.boundaryHash.toLowerCase()
+    ) {
+      logger.warn(
+        {
+          chain: chainKey,
+          block: to.toString(),
+          expectedBoundaryHash: resolved.finality.boundaryHash,
+          actualHash: endHash,
+        },
+        "the finality boundary block hash changed mid pass, so nothing was committed",
+      );
+      return false;
+    }
+
+    const eventFinality: EventFinalityProvenance = {
+      evidence: resolved.finality.evidence,
+      confirmationDepth: resolved.finality.confirmationDepth,
+      finalityTag: resolved.finality.finalityTag,
+      boundaryBlock: resolved.finality.boundaryBlock,
+      boundaryHash: resolved.finality.boundaryHash ?? endHash,
+      usedFallback: resolved.finality.usedFallback,
+    };
+
     let written = 0;
     let ignored = 0;
     const pairing = new ClaimPairing();
@@ -212,9 +330,26 @@ export class EvmWatcher {
             `no timestamp for block ${log.blockNumber.toString()} on ${chainKey}, which three columns need`,
           );
         }
-        if (await this.apply(tx, log, timestamp, pairing)) written += 1;
+        if (await this.apply(tx, log, timestamp, pairing, eventFinality)) written += 1;
         else ignored += 1;
       }
+
+      await writeScanProvenance(tx, {
+        chainKey,
+        contract: router,
+        fromBlock: from,
+        toBlock: to,
+        toBlockHash: endHash,
+        headBlock: head,
+        policy: this.policy,
+        evidence: resolved.finality.evidence,
+        finalityTag: resolved.finality.finalityTag,
+        confirmationDepth: resolved.finality.confirmationDepth,
+        boundaryBlock: resolved.finality.boundaryBlock,
+        boundaryHash: resolved.finality.boundaryHash ?? endHash,
+        usedFallback: resolved.finality.usedFallback,
+        policyChange,
+      });
 
       await writeCursor(tx, {
         chainKey,
@@ -225,10 +360,18 @@ export class EvmWatcher {
         // The whole reason the column exists. Without it the next pass cannot tell advancing from
         // being handed a different history.
         hash: endHash,
+        finality: {
+          mode: this.policy.mode,
+          confirmations: this.policy.confirmations,
+          allowFallback: this.policy.allowConfirmationFallback,
+          evidence: resolved.finality.evidence,
+          finalityTag: resolved.finality.finalityTag,
+          usedFallback: resolved.finality.usedFallback,
+        },
       });
     });
 
-    const behind = Number(confirmed - to);
+    const behind = Math.max(0, Number(confirmed - to));
     this.lastProgress = {
       block: to,
       written,
@@ -236,6 +379,11 @@ export class EvmWatcher {
       head,
       behind,
       reorgs: this.reorgs,
+      finality: {
+        ...resolved.finality,
+        boundaryHash: resolved.finality.boundaryHash ?? endHash,
+      },
+      policyChange,
       at: new Date(),
     };
     logger.info(
@@ -246,11 +394,97 @@ export class EvmWatcher {
         written,
         ignored,
         behind,
+        finalityEvidence: resolved.finality.evidence,
+        finalityTag: resolved.finality.finalityTag,
+        confirmationDepth: resolved.finality.confirmationDepth,
+        usedFallback: resolved.finality.usedFallback,
+        policyChanged: policyChange !== null,
+        policyChangeKind: policyChange?.kind ?? null,
       },
       "evm range indexed",
     );
 
     return behind > 0;
+  }
+
+  private async resolveBoundary(
+    signal: AbortSignal,
+  ): Promise<{ readonly head: bigint; readonly finality: ResolvedScanFinality }> {
+    const { chainKey, client, logger } = this.options;
+    const head = await client.blockNumber(signal);
+
+    if (this.policy.mode === "confirmations") {
+      const boundaryBlock = head - BigInt(this.policy.confirmations);
+      return {
+        head,
+        finality: {
+          configuredMode: this.policy.mode,
+          configuredConfirmations: this.policy.confirmations,
+          allowConfirmationFallback: this.policy.allowConfirmationFallback,
+          evidence: "confirmation_depth",
+          finalityTag: null,
+          confirmationDepth: this.policy.confirmations,
+          boundaryBlock,
+          boundaryHash: null,
+          usedFallback: false,
+        },
+      };
+    }
+
+    const tag: EvmFinalityTag = this.policy.mode;
+    try {
+      if (client.finalityBlock === undefined) {
+        throw new UnsupportedFinalityTagError(tag, "client does not implement finality block tags");
+      }
+      const tagged = await client.finalityBlock(tag, signal);
+      const effectiveHead = tagged.number > head ? tagged.number : head;
+      return {
+        head: effectiveHead,
+        finality: {
+          configuredMode: this.policy.mode,
+          configuredConfirmations: this.policy.confirmations,
+          allowConfirmationFallback: this.policy.allowConfirmationFallback,
+          evidence: tag === "finalized" ? "finalized_block" : "safe_block",
+          finalityTag: tag,
+          confirmationDepth: null,
+          boundaryBlock: tagged.number,
+          boundaryHash: tagged.hash,
+          usedFallback: false,
+        },
+      };
+    } catch (error) {
+      if (!(error instanceof UnsupportedFinalityTagError)) {
+        throw error;
+      }
+      if (!this.policy.allowConfirmationFallback) {
+        throw new Error(
+          `the endpoint for ${chainKey} does not support finality tag "${tag}" and confirmation fallback is not enabled (${error.message})`,
+        );
+      }
+      logger.warn(
+        {
+          chain: chainKey,
+          requestedTag: tag,
+          fallbackConfirmations: this.policy.confirmations,
+          reason: error.message,
+        },
+        "finality tag unsupported by endpoint; falling back to confirmation depth by explicit configuration",
+      );
+      return {
+        head,
+        finality: {
+          configuredMode: this.policy.mode,
+          configuredConfirmations: this.policy.confirmations,
+          allowConfirmationFallback: true,
+          evidence: "confirmation_depth",
+          finalityTag: null,
+          confirmationDepth: this.policy.confirmations,
+          boundaryBlock: head - BigInt(this.policy.confirmations),
+          boundaryHash: null,
+          usedFallback: true,
+        },
+      };
+    }
   }
 
   /**
@@ -316,6 +550,7 @@ export class EvmWatcher {
     log: RawEvmLog,
     timestamp: bigint,
     pairing: ClaimPairing,
+    finality: EventFinalityProvenance,
   ): Promise<boolean> {
     const { chainKey, logger } = this.options;
     const decoded = decodeRouterLog(log);
@@ -338,6 +573,7 @@ export class EvmWatcher {
       // Unlike Soroban, which orders events within a transaction instead.
       logIndex: log.logIndex,
       observedAt: new Date(Number(timestamp) * 1000),
+      finality,
     };
 
     const applied = await applyRouterLog(tx, at, decoded, pairing);

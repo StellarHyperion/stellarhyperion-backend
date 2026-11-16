@@ -19,7 +19,15 @@ import { join } from "node:path";
 import { encodeEventTopics, encodeAbiParameters, type AbiEvent, type Hex } from "viem";
 import { hyperionRouterAbi } from "@hyperion/protocol/abi";
 
-import type { BlockStamp, EvmClient, LogQuery, RawEvmLog } from "../src/chains/evm/client.js";
+import {
+  UnsupportedFinalityTagError,
+  type BlockStamp,
+  type EvmClient,
+  type EvmFinalityTag,
+  type LogQuery,
+  type RawEvmLog,
+  type TaggedBlock,
+} from "../src/chains/evm/client.js";
 import { FIXTURES_DIR } from "./helpers.js";
 
 interface CapturedFixture {
@@ -77,17 +85,24 @@ export interface FakeEvmClientOptions {
   readonly chainId?: number;
   /** Blocks the node no longer has, which is how a vanished block is expressed. */
   readonly missing?: readonly bigint[];
+  /** Explicit safe/finalized block heights reported by the node. */
+  readonly finalityBlocks?: Partial<Record<EvmFinalityTag, bigint>>;
+  /** Finality tags that this node refuses as unsupported. */
+  readonly unsupportedFinalityTags?: readonly EvmFinalityTag[];
 }
 
 export class FakeEvmClient implements EvmClient {
   readonly logQueries: LogQuery[] = [];
   readonly blockQueries: bigint[][] = [];
+  readonly finalityQueries: EvmFinalityTag[] = [];
   /** Counted, because the watcher is supposed to ask this once per process and not once per pass. */
   chainIdCalls = 0;
 
   private log: RawEvmLog[];
   private head: bigint;
   private readonly missing = new Set<bigint>();
+  private readonly finalityHeights = new Map<EvmFinalityTag, bigint>();
+  private readonly unsupportedTags = new Set<EvmFinalityTag>();
   /** Bumped for a block range that has been rewritten, which changes every hash at or above it. */
   private reorgFrom: bigint | null = null;
   private epoch = 0;
@@ -100,6 +115,15 @@ export class FakeEvmClient implements EvmClient {
       options.head ??
       this.log.reduce((max, entry) => (entry.blockNumber > max ? entry.blockNumber : max), 0n) + 1n;
     for (const block of options.missing ?? []) this.missing.add(block);
+    if (options.finalityBlocks?.safe !== undefined) {
+      this.finalityHeights.set("safe", options.finalityBlocks.safe);
+    }
+    if (options.finalityBlocks?.finalized !== undefined) {
+      this.finalityHeights.set("finalized", options.finalityBlocks.finalized);
+    }
+    for (const tag of options.unsupportedFinalityTags ?? []) {
+      this.unsupportedTags.add(tag);
+    }
   }
 
   get latest(): bigint {
@@ -108,6 +132,15 @@ export class FakeEvmClient implements EvmClient {
 
   advanceHeadTo(block: bigint): void {
     this.head = block;
+  }
+
+  setFinalityBlock(tag: EvmFinalityTag, block: bigint): void {
+    this.unsupportedTags.delete(tag);
+    this.finalityHeights.set(tag, block);
+  }
+
+  rejectFinalityTag(tag: EvmFinalityTag): void {
+    this.unsupportedTags.add(tag);
   }
 
   /**
@@ -137,6 +170,22 @@ export class FakeEvmClient implements EvmClient {
 
   blockNumber(): Promise<bigint> {
     return Promise.resolve(this.head);
+  }
+
+  finalityBlock(tag: EvmFinalityTag): Promise<TaggedBlock> {
+    this.finalityQueries.push(tag);
+    if (this.unsupportedTags.has(tag)) {
+      return Promise.reject(new UnsupportedFinalityTagError(tag, `unknown block tag ${tag}`));
+    }
+    const configured = this.finalityHeights.get(tag);
+    const defaultOffset = tag === "finalized" ? 12n : 6n;
+    const height = configured ?? (this.head > defaultOffset ? this.head - defaultOffset : 0n);
+    const stamp = this.stampFor(height);
+    return Promise.resolve({
+      number: height,
+      hash: stamp.hash,
+      timestamp: stamp.timestamp,
+    });
   }
 
   logs(query: LogQuery): Promise<readonly RawEvmLog[]> {

@@ -21,6 +21,16 @@
  */
 import type { Queryable } from "../db/pool.js";
 
+/** Settlement provenance attached to an EVM-indexed event. Null/omitted for Stellar events. */
+export interface EventFinalityProvenance {
+  readonly evidence: "confirmation_depth" | "safe_block" | "finalized_block";
+  readonly confirmationDepth: number | null;
+  readonly finalityTag: "safe" | "finalized" | null;
+  readonly boundaryBlock: bigint;
+  readonly boundaryHash: string | null;
+  readonly usedFallback: boolean;
+}
+
 /** Where on a chain a row was observed. One shape for a ledger and for a block. */
 export interface Position {
   readonly chainKey: string;
@@ -31,6 +41,8 @@ export interface Position {
   readonly logIndex: number | null;
   /** The chain's own timestamp, never ours. Lag measured against our clock hides a stall. */
   readonly observedAt: Date;
+  /** Settlement policy evidence when observed on an EVM chain. */
+  readonly finality?: EventFinalityProvenance | null;
 }
 
 export interface OutboundRow {
@@ -105,13 +117,92 @@ export interface HealthSample {
   readonly flowAvailable: bigint | null;
 }
 
+function finalityRankSql(column: string): string {
+  return `(CASE ${column}
+    WHEN 'finalized_block' THEN 3
+    WHEN 'safe_block' THEN 2
+    WHEN 'confirmation_depth' THEN 1
+    ELSE 0
+  END)`;
+}
+
+function preserveStrongerFinalitySql(table: string, sameCanonicalExpr: string): string {
+  const currentRank = finalityRankSql(`${table}.finality_evidence`);
+  const incomingRank = finalityRankSql("EXCLUDED.finality_evidence");
+  return `(
+    (${sameCanonicalExpr})
+    AND ${table}.finality_evidence IS NOT NULL
+    AND (
+      EXCLUDED.finality_evidence IS NULL
+      OR ${currentRank} > ${incomingRank}
+      OR (
+        ${currentRank} = ${incomingRank}
+        AND COALESCE(${table}.finality_confirmations, -1) > COALESCE(EXCLUDED.finality_confirmations, -1)
+      )
+      OR (
+        ${currentRank} = ${incomingRank}
+        AND COALESCE(${table}.finality_confirmations, -1) = COALESCE(EXCLUDED.finality_confirmations, -1)
+        AND COALESCE(${table}.finality_used_fallback, false) = false
+        AND COALESCE(EXCLUDED.finality_used_fallback, false) = true
+      )
+    )
+  )`;
+}
+
 export async function writeOutbound(db: Queryable, at: Position, row: OutboundRow): Promise<void> {
+  const finality = at.finality ?? null;
+  if (finality === null) {
+    await db.query(
+      `INSERT INTO outbound_transfer
+         (origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
+          destination_chain, destination, rail_ref, origin_block, origin_tx, origin_log_index,
+          observed_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+       ON CONFLICT (origin_chain, nonce) DO UPDATE
+         SET route = EXCLUDED.route,
+             sender = EXCLUDED.sender,
+             token = EXCLUDED.token,
+             gross_amount = EXCLUDED.gross_amount,
+             fee = EXCLUDED.fee,
+             net_amount = EXCLUDED.net_amount,
+             destination_chain = EXCLUDED.destination_chain,
+             destination = EXCLUDED.destination,
+             rail_ref = COALESCE(EXCLUDED.rail_ref, outbound_transfer.rail_ref),
+             origin_block = EXCLUDED.origin_block,
+             origin_tx = EXCLUDED.origin_tx,
+             origin_log_index = EXCLUDED.origin_log_index`,
+      [
+        at.chainKey,
+        row.route,
+        row.nonce.toString(),
+        row.sender,
+        row.token,
+        row.grossAmount.toString(),
+        row.fee.toString(),
+        row.netAmount.toString(),
+        row.destinationChain,
+        row.destination,
+        row.railRef,
+        at.block.toString(),
+        at.txHash,
+        at.logIndex,
+        at.observedAt,
+      ],
+    );
+    return;
+  }
+
+  const keep = preserveStrongerFinalitySql(
+    "outbound_transfer",
+    "outbound_transfer.origin_block = EXCLUDED.origin_block AND outbound_transfer.origin_tx = EXCLUDED.origin_tx",
+  );
   await db.query(
     `INSERT INTO outbound_transfer
        (origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
         destination_chain, destination, rail_ref, origin_block, origin_tx, origin_log_index,
-        observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        observed_at, finality_evidence, finality_confirmations, finality_tag,
+        finality_boundary_block, finality_boundary_hash, finality_used_fallback)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
      ON CONFLICT (origin_chain, nonce) DO UPDATE
        SET route = EXCLUDED.route,
            sender = EXCLUDED.sender,
@@ -124,7 +215,13 @@ export async function writeOutbound(db: Queryable, at: Position, row: OutboundRo
            rail_ref = COALESCE(EXCLUDED.rail_ref, outbound_transfer.rail_ref),
            origin_block = EXCLUDED.origin_block,
            origin_tx = EXCLUDED.origin_tx,
-           origin_log_index = EXCLUDED.origin_log_index`,
+           origin_log_index = EXCLUDED.origin_log_index,
+           finality_evidence = CASE WHEN ${keep} THEN outbound_transfer.finality_evidence ELSE EXCLUDED.finality_evidence END,
+           finality_confirmations = CASE WHEN ${keep} THEN outbound_transfer.finality_confirmations ELSE EXCLUDED.finality_confirmations END,
+           finality_tag = CASE WHEN ${keep} THEN outbound_transfer.finality_tag ELSE EXCLUDED.finality_tag END,
+           finality_boundary_block = CASE WHEN ${keep} THEN outbound_transfer.finality_boundary_block ELSE EXCLUDED.finality_boundary_block END,
+           finality_boundary_hash = CASE WHEN ${keep} THEN outbound_transfer.finality_boundary_hash ELSE EXCLUDED.finality_boundary_hash END,
+           finality_used_fallback = CASE WHEN ${keep} THEN outbound_transfer.finality_used_fallback ELSE EXCLUDED.finality_used_fallback END`,
     [
       at.chainKey,
       row.route,
@@ -141,17 +238,66 @@ export async function writeOutbound(db: Queryable, at: Position, row: OutboundRo
       at.txHash,
       at.logIndex,
       at.observedAt,
+      finality.evidence,
+      finality.confirmationDepth,
+      finality.finalityTag,
+      finality.boundaryBlock.toString(),
+      finality.boundaryHash,
+      finality.usedFallback,
     ],
   );
 }
 
 export async function writeInbound(db: Queryable, at: Position, row: InboundRow): Promise<void> {
+  const finality = at.finality ?? null;
+  if (finality === null) {
+    await db.query(
+      `INSERT INTO inbound_delivery
+         (destination_chain, route, source_chain, source_nonce, rail_message_id, recipient, token,
+          amount, delivered, claim_id, destination_block, destination_tx, destination_log_index,
+          observed_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+       ON CONFLICT (destination_chain, route, source_chain, source_nonce) DO UPDATE
+         SET rail_message_id = COALESCE(EXCLUDED.rail_message_id, inbound_delivery.rail_message_id),
+             recipient = EXCLUDED.recipient,
+             token = EXCLUDED.token,
+             amount = EXCLUDED.amount,
+             delivered = EXCLUDED.delivered,
+             claim_id = EXCLUDED.claim_id,
+             destination_block = EXCLUDED.destination_block,
+             destination_tx = EXCLUDED.destination_tx,
+             destination_log_index = EXCLUDED.destination_log_index`,
+      [
+        at.chainKey,
+        row.route,
+        row.sourceChain,
+        row.sourceNonce.toString(),
+        row.railMessageId,
+        row.recipient,
+        row.token,
+        row.amount.toString(),
+        row.delivered,
+        row.claimId === null ? null : row.claimId.toString(),
+        at.block.toString(),
+        at.txHash,
+        at.logIndex,
+        at.observedAt,
+      ],
+    );
+    return;
+  }
+
+  const keep = preserveStrongerFinalitySql(
+    "inbound_delivery",
+    "inbound_delivery.destination_block = EXCLUDED.destination_block AND inbound_delivery.destination_tx = EXCLUDED.destination_tx",
+  );
   await db.query(
     `INSERT INTO inbound_delivery
        (destination_chain, route, source_chain, source_nonce, rail_message_id, recipient, token,
         amount, delivered, claim_id, destination_block, destination_tx, destination_log_index,
-        observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        observed_at, finality_evidence, finality_confirmations, finality_tag,
+        finality_boundary_block, finality_boundary_hash, finality_used_fallback)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
      ON CONFLICT (destination_chain, route, source_chain, source_nonce) DO UPDATE
        SET rail_message_id = COALESCE(EXCLUDED.rail_message_id, inbound_delivery.rail_message_id),
            recipient = EXCLUDED.recipient,
@@ -161,7 +307,13 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
            claim_id = EXCLUDED.claim_id,
            destination_block = EXCLUDED.destination_block,
            destination_tx = EXCLUDED.destination_tx,
-           destination_log_index = EXCLUDED.destination_log_index`,
+           destination_log_index = EXCLUDED.destination_log_index,
+           finality_evidence = CASE WHEN ${keep} THEN inbound_delivery.finality_evidence ELSE EXCLUDED.finality_evidence END,
+           finality_confirmations = CASE WHEN ${keep} THEN inbound_delivery.finality_confirmations ELSE EXCLUDED.finality_confirmations END,
+           finality_tag = CASE WHEN ${keep} THEN inbound_delivery.finality_tag ELSE EXCLUDED.finality_tag END,
+           finality_boundary_block = CASE WHEN ${keep} THEN inbound_delivery.finality_boundary_block ELSE EXCLUDED.finality_boundary_block END,
+           finality_boundary_hash = CASE WHEN ${keep} THEN inbound_delivery.finality_boundary_hash ELSE EXCLUDED.finality_boundary_hash END,
+           finality_used_fallback = CASE WHEN ${keep} THEN inbound_delivery.finality_used_fallback ELSE EXCLUDED.finality_used_fallback END`,
     [
       at.chainKey,
       row.route,
@@ -177,16 +329,58 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
       at.txHash,
       at.logIndex,
       at.observedAt,
+      finality.evidence,
+      finality.confirmationDepth,
+      finality.finalityTag,
+      finality.boundaryBlock.toString(),
+      finality.boundaryHash,
+      finality.usedFallback,
     ],
   );
 }
 
 export async function writeClaim(db: Queryable, at: Position, row: ClaimRow): Promise<void> {
+  const finality = at.finality ?? null;
+  if (finality === null) {
+    await db.query(
+      `INSERT INTO pending_claim
+         (chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
+          created_at, settled, observed_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, $10)
+       ON CONFLICT (chain, claim_id) DO UPDATE
+         SET recipient = EXCLUDED.recipient,
+             token = EXCLUDED.token,
+             amount = EXCLUDED.amount,
+             route = EXCLUDED.route,
+             source_chain = EXCLUDED.source_chain,
+             source_nonce = EXCLUDED.source_nonce,
+             created_at = EXCLUDED.created_at`,
+      [
+        at.chainKey,
+        row.claimId.toString(),
+        row.recipient,
+        row.token,
+        row.amount.toString(),
+        row.route,
+        row.sourceChain,
+        row.sourceNonce.toString(),
+        row.createdAt,
+        at.observedAt,
+      ],
+    );
+    return;
+  }
+
+  const keep = preserveStrongerFinalitySql(
+    "pending_claim",
+    "pending_claim.created_at = EXCLUDED.created_at",
+  );
   await db.query(
     `INSERT INTO pending_claim
        (chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
-        created_at, settled, observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, $10)
+        created_at, settled, observed_at, finality_evidence, finality_confirmations,
+        finality_tag, finality_boundary_block, finality_boundary_hash, finality_used_fallback)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, $10, $11, $12, $13, $14, $15, $16)
      ON CONFLICT (chain, claim_id) DO UPDATE
        SET recipient = EXCLUDED.recipient,
            token = EXCLUDED.token,
@@ -194,7 +388,13 @@ export async function writeClaim(db: Queryable, at: Position, row: ClaimRow): Pr
            route = EXCLUDED.route,
            source_chain = EXCLUDED.source_chain,
            source_nonce = EXCLUDED.source_nonce,
-           created_at = EXCLUDED.created_at`,
+           created_at = EXCLUDED.created_at,
+           finality_evidence = CASE WHEN ${keep} THEN pending_claim.finality_evidence ELSE EXCLUDED.finality_evidence END,
+           finality_confirmations = CASE WHEN ${keep} THEN pending_claim.finality_confirmations ELSE EXCLUDED.finality_confirmations END,
+           finality_tag = CASE WHEN ${keep} THEN pending_claim.finality_tag ELSE EXCLUDED.finality_tag END,
+           finality_boundary_block = CASE WHEN ${keep} THEN pending_claim.finality_boundary_block ELSE EXCLUDED.finality_boundary_block END,
+           finality_boundary_hash = CASE WHEN ${keep} THEN pending_claim.finality_boundary_hash ELSE EXCLUDED.finality_boundary_hash END,
+           finality_used_fallback = CASE WHEN ${keep} THEN pending_claim.finality_used_fallback ELSE EXCLUDED.finality_used_fallback END`,
     [
       at.chainKey,
       row.claimId.toString(),
@@ -206,6 +406,12 @@ export async function writeClaim(db: Queryable, at: Position, row: ClaimRow): Pr
       row.sourceNonce.toString(),
       row.createdAt,
       at.observedAt,
+      finality.evidence,
+      finality.confirmationDepth,
+      finality.finalityTag,
+      finality.boundaryBlock.toString(),
+      finality.boundaryHash,
+      finality.usedFallback,
     ],
   );
 }

@@ -16,6 +16,11 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import {
+  readPolicyChanges,
+  readScanProvenance,
+  type EvmFinalityPolicy,
+} from "../../src/chains/evm/store.js";
 import { EvmWatcher } from "../../src/chains/evm/watcher.js";
 import { Database } from "../../src/db/pool.js";
 import {
@@ -39,6 +44,7 @@ const TABLES = [
   ["outbound_transfer", "origin_chain"],
   ["inbound_delivery", "destination_chain"],
   ["pending_claim", "chain"],
+  ["evm_scan_provenance", "chain_key"],
 ] as const;
 
 suite("replaying the anvil deployment's logs", () => {
@@ -52,7 +58,11 @@ suite("replaying the anvil deployment's logs", () => {
   };
 
   /** Run the watcher to the confirmation line, the way the poller would. */
-  const drain = async (logRange = 2_000): Promise<number> => {
+  const drain = async (
+    logRange = 2_000,
+    finalityPolicy?: EvmFinalityPolicy,
+    client?: FakeEvmClient,
+  ): Promise<number> => {
     const { logger } = capturingLogger();
     const watcher = new EvmWatcher({
       chainKey: CHAIN,
@@ -62,7 +72,8 @@ suite("replaying the anvil deployment's logs", () => {
       confirmations: 0,
       reorgDepth: 5,
       logRange,
-      client: new FakeEvmClient({ head: ANVIL_HEAD }),
+      ...(finalityPolicy === undefined ? {} : { finalityPolicy }),
+      client: client ?? new FakeEvmClient({ head: ANVIL_HEAD }),
       db,
       logger,
     });
@@ -193,6 +204,38 @@ suite("replaying the anvil deployment's logs", () => {
 
     expect(passes).toBeGreaterThan(5);
     expect(narrow).toEqual(wide);
+
+    await clean();
+    await drain();
+  });
+
+  it("records scan finality provenance and preserves stronger transfer provenance across weaker policy changes", async () => {
+    await clean();
+    const client = new FakeEvmClient({
+      head: ANVIL_HEAD + 10n,
+      finalityBlocks: { finalized: ANVIL_HEAD },
+    });
+    await drain(2_000, { mode: "finalized", confirmations: 6 }, client);
+
+    const initialScans = await readScanProvenance(db, CHAIN);
+    expect(initialScans).toHaveLength(1);
+    expect(initialScans[0]?.evidence).toBe("finalized_block");
+    expect(initialScans[0]?.finalityTag).toBe("finalized");
+
+    // Advance under a weaker confirmation-depth policy and ensure the transition is exposed.
+    await drain(2_000, { mode: "confirmations", confirmations: 1 }, client);
+    const changes = await readPolicyChanges(db, CHAIN);
+    expect(changes).toHaveLength(1);
+    expect(changes[0]?.policyChangeKind).toBe("weaker");
+
+    const { rows } = await db.query(
+      "SELECT finality_evidence, finality_tag FROM outbound_transfer WHERE origin_chain = $1",
+      [CHAIN],
+    );
+    expect(rows[0]).toEqual({
+      finality_evidence: "finalized_block",
+      finality_tag: "finalized",
+    });
 
     await clean();
     await drain();
