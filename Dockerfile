@@ -22,4 +22,4 @@ COPY package.json ./
 COPY migrations ./migrations
 COPY deployments/testnet.json ./deployments/testnet.json
 USER node
-CMD ["sh", "-c", "npm run migrate:up && exec node dist/main.js"]
+CMD ["sh", "-c", "if [ \"${DATABASE_ROLE:-readwrite}\" != \"readonly\" ]; then npm run migrate:up; fi && exec node dist/main.js"]

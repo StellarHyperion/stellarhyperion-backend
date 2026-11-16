@@ -34,7 +34,10 @@ async function main(): Promise<void> {
   const shutdown = new Shutdown(logger, config.shutdownTimeoutMs);
   installSignalHandlers(shutdown, logger);
 
-  const db = Database.open(config.databaseUrl, { applicationName: "hyperion-backend" });
+  const db = Database.open(config.databaseUrl, {
+    applicationName: "hyperion-backend",
+    readOnly: config.database.readOnly,
+  });
   shutdown.add("postgres", () => db.close());
 
   const redis = config.keeper.enabled ? createKeeperRedis(config.redisUrl) : undefined;
@@ -69,6 +72,8 @@ async function main(): Promise<void> {
       host: config.http.host,
       port: config.http.port,
       network: config.network,
+      environment: config.deploymentEnv,
+      databaseRole: config.database.role,
       deploymentsFile: config.deploymentsFile,
       watchingStellar: config.indexer.stellar?.chain ?? null,
       watchingEvm: config.indexer.evm.map((entry) => entry.chain),

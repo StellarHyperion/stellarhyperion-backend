@@ -42,7 +42,18 @@ const AXELARSCAN_API: Readonly<Record<NetworkMode, string>> = {
 };
 
 export type NodeEnv = "development" | "test" | "production";
+export type DeploymentEnv = "local" | "test" | "preview" | "production";
+export type VercelEnv = "development" | "preview" | "production";
+export type DatabaseRole = "readonly" | "readwrite";
 export type LogLevel = "trace" | "debug" | "info" | "warn" | "error" | "fatal";
+
+export interface DatabaseSeparationConfig {
+  readonly deploymentEnv: DeploymentEnv;
+  readonly databaseEnv: DeploymentEnv;
+  readonly role: DatabaseRole;
+  readonly apiOnly: boolean;
+  readonly readOnly: boolean;
+}
 
 /** Everything the Soroban watcher needs. One instance, because there is one Stellar per network. */
 export interface StellarWatchConfig {
@@ -102,6 +113,8 @@ export interface KeeperConfig {
 
 export interface AppConfig {
   readonly nodeEnv: NodeEnv;
+  readonly deploymentEnv: DeploymentEnv;
+  readonly database: DatabaseSeparationConfig;
   readonly logLevel: LogLevel;
   readonly http: { readonly host: string; readonly port: number };
   readonly databaseUrl: string;
@@ -130,7 +143,57 @@ const NODE_ENV: EnumSpec<NodeEnv> = {
   fallback: "development",
   choices: ["development", "production", "test"],
   printable: true,
-  purpose: "Changes log formatting and nothing else. Behaviour is identical across all three.",
+  purpose: "Changes log formatting and defaults local/test/production environment identity.",
+};
+
+const DEPLOYMENT_ENV: EnumSpec<DeploymentEnv> = {
+  name: "DEPLOYMENT_ENV",
+  kind: "enum",
+  required: false,
+  choices: ["local", "test", "preview", "production"],
+  printable: true,
+  purpose:
+    "Explicit deployment environment identity used to isolate preview and test deployments from production.",
+};
+
+const VERCEL_ENV: EnumSpec<VercelEnv> = {
+  name: "VERCEL_ENV",
+  kind: "enum",
+  required: false,
+  choices: ["development", "preview", "production"],
+  printable: true,
+  purpose:
+    "Serverless platform environment identity supplied by Vercel (development, preview, production).",
+};
+
+const DATABASE_ENV: EnumSpec<DeploymentEnv> = {
+  name: "DATABASE_ENV",
+  kind: "enum",
+  required: false,
+  choices: ["local", "test", "preview", "production"],
+  printable: true,
+  purpose:
+    "Environment identity of DATABASE_URL. Preview deployments must set DATABASE_ENV=preview explicitly.",
+};
+
+const DATABASE_ROLE: EnumSpec<DatabaseRole> = {
+  name: "DATABASE_ROLE",
+  kind: "enum",
+  required: false,
+  choices: ["readonly", "readwrite"],
+  printable: true,
+  purpose:
+    "Database role policy for this process. API-only and serverless preview deployments must use readonly.",
+};
+
+const PRODUCTION_DATABASE_URL: VarSpec = {
+  name: "PRODUCTION_DATABASE_URL",
+  kind: "url",
+  protocols: ["postgres", "postgresql"],
+  required: false,
+  printable: false,
+  purpose:
+    "Optional production Postgres connection reference used to verify preview/test deployments never reuse production database or write credentials.",
 };
 
 const LOG_LEVEL: EnumSpec<LogLevel> = {
@@ -499,11 +562,23 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     env,
   });
 
+  const database = validateDatabaseSeparation(reader, {
+    nodeEnv,
+    network,
+    databaseUrl,
+    indexerEnabled,
+    railsEnabled,
+    keeperEnabled,
+    keeperStellarSecret,
+  });
+
   // One throw, after everything has had a chance to complain.
   reader.finish();
 
   return {
     nodeEnv,
+    deploymentEnv: database.deploymentEnv,
+    database,
     logLevel,
     http: { host, port },
     databaseUrl,
@@ -700,4 +775,186 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+interface SeparationInput {
+  readonly nodeEnv: NodeEnv;
+  readonly network: NetworkMode;
+  readonly databaseUrl: string;
+  readonly indexerEnabled: boolean;
+  readonly railsEnabled: boolean;
+  readonly keeperEnabled: boolean;
+  readonly keeperStellarSecret: string | null;
+}
+
+interface NormalizedPostgresIdentity {
+  readonly endpoint: string;
+  readonly database: string;
+  readonly username: string;
+}
+
+function parsePostgresIdentity(rawUrl: string): NormalizedPostgresIdentity | null {
+  if (rawUrl === "") return null;
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase();
+    const port = parsed.port === "" ? "5432" : parsed.port;
+    const database = decodeURIComponent(parsed.pathname.replace(/^\/+/, "")).toLowerCase();
+    const username = decodeURIComponent(parsed.username).toLowerCase();
+    return {
+      endpoint: `${host}:${port}`,
+      database,
+      username,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function mapNodeEnvToDeployment(nodeEnv: NodeEnv): DeploymentEnv {
+  if (nodeEnv === "development") return "local";
+  if (nodeEnv === "test") return "test";
+  return "production";
+}
+
+function mapVercelEnvToDeployment(vercelEnv: VercelEnv): DeploymentEnv {
+  if (vercelEnv === "development") return "local";
+  if (vercelEnv === "preview") return "preview";
+  return "production";
+}
+
+function validateDatabaseSeparation(
+  reader: EnvReader,
+  input: SeparationInput,
+): DatabaseSeparationConfig {
+  const hasDeploymentEnv = reader.has(DEPLOYMENT_ENV.name);
+  const explicitDeploymentEnv = hasDeploymentEnv ? reader.choice(DEPLOYMENT_ENV) : null;
+
+  const hasVercelEnv = reader.has(VERCEL_ENV.name);
+  const explicitVercelEnv = hasVercelEnv ? reader.choice(VERCEL_ENV) : null;
+  const mappedVercelEnv =
+    explicitVercelEnv !== null ? mapVercelEnvToDeployment(explicitVercelEnv) : null;
+
+  if (
+    explicitDeploymentEnv !== null &&
+    mappedVercelEnv !== null &&
+    !reader.failed(DEPLOYMENT_ENV) &&
+    !reader.failed(VERCEL_ENV)
+  ) {
+    const compatibleDevTest =
+      explicitDeploymentEnv === "test" && explicitVercelEnv === "development";
+    if (!compatibleDevTest && explicitDeploymentEnv !== mappedVercelEnv) {
+      reader.reject(
+        DEPLOYMENT_ENV,
+        `disagrees with VERCEL_ENV="${explicitVercelEnv}". Set matching deployment identities.`,
+      );
+    }
+  }
+
+  const deploymentEnv: DeploymentEnv =
+    explicitDeploymentEnv ?? mappedVercelEnv ?? mapNodeEnvToDeployment(input.nodeEnv);
+
+  const hasDatabaseEnv = reader.has(DATABASE_ENV.name);
+  const explicitDatabaseEnv = hasDatabaseEnv ? reader.choice(DATABASE_ENV) : null;
+
+  const apiOnly = !input.indexerEnabled && !input.railsEnabled && !input.keeperEnabled;
+  const hasDatabaseRole = reader.has(DATABASE_ROLE.name);
+  const explicitDatabaseRole = hasDatabaseRole ? reader.choice(DATABASE_ROLE) : null;
+  const role: DatabaseRole = explicitDatabaseRole ?? (apiOnly ? "readonly" : "readwrite");
+
+  const hasProdDbRef = reader.has(PRODUCTION_DATABASE_URL.name);
+  const productionDatabaseUrl = hasProdDbRef ? reader.url(PRODUCTION_DATABASE_URL) : "";
+
+  if (!reader.failed(DATABASE_ENV)) {
+    if (deploymentEnv === "preview") {
+      if (explicitDatabaseEnv === null) {
+        reader.reject(
+          DATABASE_ENV,
+          'must be explicitly set to "preview" for preview deployments so production credentials are never inherited silently',
+        );
+      } else if (explicitDatabaseEnv !== "preview") {
+        reader.reject(
+          DATABASE_ENV,
+          `must be "preview" when deployment environment is "preview", found "${explicitDatabaseEnv}"`,
+        );
+      }
+    } else if (deploymentEnv === "production") {
+      if (explicitDatabaseEnv !== null && explicitDatabaseEnv !== "production") {
+        reader.reject(
+          DATABASE_ENV,
+          `must be "production" when deployment environment is "production", found "${explicitDatabaseEnv}"`,
+        );
+      }
+    } else if (explicitDatabaseEnv === "production") {
+      reader.reject(
+        DATABASE_ENV,
+        `cannot use DATABASE_ENV="production" when running in "${deploymentEnv}" mode`,
+      );
+    }
+  }
+
+  if (!reader.failed(DATABASE_ROLE)) {
+    if (apiOnly && role === "readwrite") {
+      reader.reject(
+        DATABASE_ROLE,
+        'API-only deployments are restricted to DATABASE_ROLE="readonly" and cannot use write credentials',
+      );
+    } else if (!apiOnly && role === "readonly") {
+      reader.reject(
+        DATABASE_ROLE,
+        'DATABASE_ROLE="readonly" cannot be used while INDEXER_ENABLED, RAILS_ENABLED, or KEEPER_ENABLED is true',
+      );
+    }
+  }
+
+  if (deploymentEnv === "preview") {
+    if (!reader.failed(HYPERION_NETWORK) && input.network === "mainnet") {
+      reader.reject(HYPERION_NETWORK, 'preview deployments cannot run against "mainnet"');
+    }
+    if (input.keeperStellarSecret !== null) {
+      reader.reject(
+        KEEPER_STELLAR_SECRET,
+        "preview deployments must not hold a Stellar signing secret",
+      );
+    }
+  }
+
+  if (
+    deploymentEnv !== "production" &&
+    productionDatabaseUrl !== "" &&
+    !reader.failed(DATABASE_URL) &&
+    !reader.failed(PRODUCTION_DATABASE_URL)
+  ) {
+    const activeDb = parsePostgresIdentity(input.databaseUrl);
+    const prodDb = parsePostgresIdentity(productionDatabaseUrl);
+    if (activeDb !== null && prodDb !== null) {
+      const sameDatabaseTarget =
+        activeDb.endpoint === prodDb.endpoint && activeDb.database === prodDb.database;
+      const sameWriteIdentityOnCluster =
+        activeDb.endpoint === prodDb.endpoint &&
+        activeDb.username !== "" &&
+        activeDb.username === prodDb.username;
+
+      if (sameDatabaseTarget) {
+        reader.reject(
+          DATABASE_URL,
+          `points at the same database target as PRODUCTION_DATABASE_URL in "${deploymentEnv}" mode`,
+        );
+      } else if (sameWriteIdentityOnCluster) {
+        reader.reject(
+          DATABASE_URL,
+          `reuses the production database role identity from PRODUCTION_DATABASE_URL in "${deploymentEnv}" mode`,
+        );
+      }
+    }
+  }
+
+  const databaseEnv: DeploymentEnv = explicitDatabaseEnv ?? deploymentEnv;
+  return {
+    deploymentEnv,
+    databaseEnv,
+    role,
+    apiOnly,
+    readOnly: role === "readonly",
+  };
 }

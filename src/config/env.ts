@@ -249,7 +249,7 @@ export class EnvReader {
 
   /** Record a fault found by something other than a kind check, such as a file that is not there. */
   reject(spec: VarSpec, problem: string): void {
-    this.record(spec, problem);
+    this.record(spec, spec.printable ? problem : stripUrlCredentials(problem));
   }
 
   /**
@@ -294,4 +294,8 @@ export class EnvReader {
   private show(spec: VarSpec, raw: string): string {
     return spec.printable ? `"${raw}"` : `a ${raw.length} character value`;
   }
+}
+
+export function stripUrlCredentials(text: string): string {
+  return text.replace(/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s"'`<>]+/g, "[redacted-url]");
 }

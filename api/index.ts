@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { resolve as resolvePath } from "node:path";
 import type { FastifyInstance } from "fastify";
+import type { LoadOptions } from "../src/config/config.js";
 import { loadConfig } from "../src/config/config.js";
 import { Database } from "../src/db/pool.js";
 import { buildServer } from "../src/http/server.js";
@@ -8,26 +9,49 @@ import { createLogger } from "../src/logging/logger.js";
 
 let app: FastifyInstance | null = null;
 
-async function getApp(): Promise<FastifyInstance> {
-  if (app) return app;
+export interface ServerlessBootstrapOptions extends LoadOptions {
+  readonly openDatabase?: (
+    connectionString: string,
+    options: {
+      readonly applicationName: string;
+      readonly connectionTimeoutMs: number;
+      readonly readOnly: boolean;
+    },
+  ) => Database;
+}
 
-  process.env.HYPERION_NETWORK ??= "testnet";
-  process.env.HYPERION_DEPLOYMENTS_FILE ??= resolvePath(process.cwd(), "deployments/testnet.json");
-  process.env.REDIS_URL ??= "redis://127.0.0.1:6379";
-  process.env.INDEXER_ENABLED ??= "false";
-  process.env.RAILS_ENABLED ??= "false";
-  process.env.KEEPER_ENABLED ??= "false";
+export async function createServerlessApp(
+  options: ServerlessBootstrapOptions = {},
+): Promise<FastifyInstance> {
+  const baseEnv = options.env ?? process.env;
+  const resolvedEnv: Record<string, string | undefined> = {
+    ...baseEnv,
+    HYPERION_NETWORK: baseEnv.HYPERION_NETWORK ?? "testnet",
+    HYPERION_DEPLOYMENTS_FILE:
+      baseEnv.HYPERION_DEPLOYMENTS_FILE ??
+      resolvePath(options.cwd ?? process.cwd(), "deployments/testnet.json"),
+    REDIS_URL: baseEnv.REDIS_URL ?? "redis://127.0.0.1:6379",
+    INDEXER_ENABLED: baseEnv.INDEXER_ENABLED ?? "false",
+    RAILS_ENABLED: baseEnv.RAILS_ENABLED ?? "false",
+    KEEPER_ENABLED: baseEnv.KEEPER_ENABLED ?? "false",
+    DATABASE_ROLE: baseEnv.DATABASE_ROLE ?? "readonly",
+  };
 
-  const config = loadConfig();
+  const config = loadConfig({
+    ...options,
+    env: resolvedEnv,
+  });
   const logger = createLogger(config);
   const startedAt = new Date();
 
-  const db = Database.open(config.databaseUrl, {
+  const openDb = options.openDatabase ?? ((url, dbOptions) => Database.open(url, dbOptions));
+  const db = openDb(config.databaseUrl, {
     applicationName: "hyperion-vercel-api",
     connectionTimeoutMs: 2000,
+    readOnly: config.database.readOnly,
   });
 
-  app = buildServer({
+  const server = buildServer({
     config,
     logger,
     db,
@@ -35,7 +59,13 @@ async function getApp(): Promise<FastifyInstance> {
     startedAt,
   });
 
-  await app.ready();
+  await server.ready();
+  return server;
+}
+
+async function getApp(): Promise<FastifyInstance> {
+  if (app) return app;
+  app = await createServerlessApp();
   return app;
 }
 

@@ -35,7 +35,7 @@ The `hyperion-backend` Vercel project serves [stellarhyperion-backend.vercel.app
 
 The workflow is scheduled every five minutes and can be started manually. GitHub may delay scheduled runs; public Activity is eventually updated rather than an instant destination feed. Inspect its latest run and `/v1/metrics` cursor timestamps to check freshness. API `/ready` verifies its database access; the serverless API does not run chain watchers itself. The optional Dockerfile packages the same service for an always-running container host.
 
-Deploy the API with `vercel deploy --prod`. Preview environments require their own database. Database credentials stay in Vercel and GitHub secrets, never in browser configuration, Git or logs. The managed PostgreSQL database is the durable state; restarting a worker must not repeat source transfers.
+Deploy the API with `vercel deploy --prod`. Preview environments require their own database and explicit environment separation: when `VERCEL_ENV=preview` or `DEPLOYMENT_ENV=preview`, startup requires `DATABASE_ENV=preview`, enforces `DATABASE_ROLE=readonly` for API-only functions, and rejects `DATABASE_URL` if it reuses the `PRODUCTION_DATABASE_URL` target or write role identity. Local development and test runs continue to work through `NODE_ENV=development` or `NODE_ENV=test` (`DEPLOYMENT_ENV=local` or `DEPLOYMENT_ENV=test`) without requiring preview overrides. Database credentials stay in Vercel and GitHub secrets, never in browser configuration, Git or logs. The managed PostgreSQL database is the durable state; restarting a worker must not repeat source transfers.
 
 Vercel's installed Git integration publishes `main`. GitHub Actions runs validation and the scheduled indexer; it does not need a Vercel deployment token.
 
