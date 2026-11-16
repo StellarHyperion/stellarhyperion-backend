@@ -21,6 +21,7 @@ import type {
   StellarWatchConfig,
 } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
+import type { CatchUpPassHandle } from "../runtime/budget.js";
 import { Poller } from "../runtime/poller.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
 import { fixedReadiness } from "../runtime/readiness.js";
@@ -118,6 +119,34 @@ export interface BuildIndexerDeps {
   readonly config: AppConfig;
   readonly logger: Logger;
   readonly db: Transactional;
+}
+
+export interface CatchUpWorkloadPlan {
+  readonly sourcePasses: readonly CatchUpPassHandle[];
+  readonly proofPasses: readonly CatchUpPassHandle[];
+}
+
+export function buildCatchUpPlan(deps: BuildIndexerDeps): CatchUpWorkloadPlan {
+  const { config, logger, db } = deps;
+  const sourcePasses: CatchUpPassHandle[] = [];
+  const proofPasses: CatchUpPassHandle[] = [];
+
+  if (config.indexer.enabled) {
+    if (config.indexer.stellar !== null) {
+      sourcePasses.push(createStellarPass(config.indexer.stellar, db, logger));
+    }
+    for (const chain of config.indexer.evm) {
+      sourcePasses.push(createEvmPass(chain, db, logger));
+    }
+  }
+
+  if (config.rails.enabled) {
+    for (const { pass } of createRailPasses(config.rails, config.network, db, logger, config)) {
+      proofPasses.push(pass);
+    }
+  }
+
+  return { sourcePasses, proofPasses };
 }
 
 /**
@@ -236,13 +265,13 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
  * which the queue already settles without a request. A poller for it would make a request a tick
  * for an answer that does not exist.
  */
-function railWorkers(
+function createRailPasses(
   config: RailsConfig,
   network: AppConfig["network"],
   db: Transactional,
   logger: Logger,
   appConfig: AppConfig,
-): readonly Worker[] {
+): readonly { readonly pass: RailPass; readonly logger: Logger }[] {
   const clients: readonly { readonly route: RouteKind; readonly client: RailClient }[] = [
     {
       route: RouteKind.Cctp,
@@ -273,13 +302,25 @@ function railWorkers(
       recheckAfterMs: config.recheckAfterMs,
       maxCheckFailures: config.maxCheckFailures,
     });
-    return new PolledWorker(pass, config.pollIntervalMs, child);
+    return { pass, logger: child };
   });
 }
 
-function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): Worker {
+function railWorkers(
+  config: RailsConfig,
+  network: AppConfig["network"],
+  db: Transactional,
+  logger: Logger,
+  appConfig: AppConfig,
+): readonly Worker[] {
+  return createRailPasses(config, network, db, logger, appConfig).map(
+    ({ pass, logger: child }) => new PolledWorker(pass, config.pollIntervalMs, child),
+  );
+}
+
+function createEvmPass(config: EvmWatchConfig, db: Transactional, logger: Logger): EvmWatcher {
   const child = logger.child({ chain: config.chain, chainId: config.chainId });
-  const watcher = new EvmWatcher({
+  return new EvmWatcher({
     chainKey: config.chain,
     router: config.routerAddress,
     chainId: config.chainId,
@@ -291,12 +332,20 @@ function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): W
     db,
     logger: child,
   });
-  return new PolledWorker(watcher, config.pollIntervalMs, child);
 }
 
-function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Logger): Worker {
+function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): Worker {
+  const child = logger.child({ chain: config.chain, chainId: config.chainId });
+  return new PolledWorker(createEvmPass(config, db, logger), config.pollIntervalMs, child);
+}
+
+function createStellarPass(
+  config: StellarWatchConfig,
+  db: Transactional,
+  logger: Logger,
+): StellarWatcher {
   const child = logger.child({ chain: config.chain });
-  const watcher = new StellarWatcher({
+  return new StellarWatcher({
     chainKey: config.chain,
     router: config.routerContractId,
     startLedger: config.startLedger,
@@ -305,5 +354,9 @@ function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Lo
     db,
     logger: child,
   });
-  return new PolledWorker(watcher, config.pollIntervalMs, child);
+}
+
+function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Logger): Worker {
+  const child = logger.child({ chain: config.chain });
+  return new PolledWorker(createStellarPass(config, db, logger), config.pollIntervalMs, child);
 }

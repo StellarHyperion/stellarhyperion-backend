@@ -17,6 +17,8 @@ async function getApp(): Promise<FastifyInstance> {
   process.env.INDEXER_ENABLED ??= "false";
   process.env.RAILS_ENABLED ??= "false";
   process.env.KEEPER_ENABLED ??= "false";
+  // Serverless API functions answer HTTP reads only; scheduled catch-up budgets run in dist/main.js.
+  delete process.env.CATCHUP_RUN_BUDGET_MS;
 
   const config = loadConfig();
   const logger = createLogger(config);

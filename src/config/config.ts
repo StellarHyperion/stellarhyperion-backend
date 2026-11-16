@@ -27,6 +27,7 @@ import {
   parseDeploymentSet,
 } from "@hyperion/protocol";
 
+import type { CatchUpBudgetConfig } from "../runtime/budget.js";
 import type { EnumSpec, VarSpec } from "./env.js";
 import { EnvReader } from "./env.js";
 
@@ -112,6 +113,7 @@ export interface AppConfig {
   readonly indexer: IndexerConfig;
   readonly rails: RailsConfig;
   readonly keeper: KeeperConfig;
+  readonly catchUpBudget: CatchUpBudgetConfig | null;
   readonly shutdownTimeoutMs: number;
 }
 
@@ -333,6 +335,67 @@ const SHUTDOWN_TIMEOUT_MS: VarSpec = {
   purpose: "How long shutdown waits for in-flight work before it stops waiting.",
 };
 
+const CATCHUP_RUN_BUDGET_MS: VarSpec = {
+  name: "CATCHUP_RUN_BUDGET_MS",
+  kind: "integer",
+  required: false,
+  min: 2000,
+  max: 3_600_000,
+  printable: true,
+  purpose:
+    "Total wall-clock budget in milliseconds for a bounded scheduled catch-up run. Leave unset for continuous container execution.",
+};
+
+const CATCHUP_MIGRATION_BUDGET_MS: VarSpec = {
+  name: "CATCHUP_MIGRATION_BUDGET_MS",
+  kind: "integer",
+  required: false,
+  min: 100,
+  printable: true,
+  purpose:
+    "Maximum stage budget in milliseconds allocated to migrations during scheduled catch-up.",
+};
+
+const CATCHUP_SOURCE_SCAN_BUDGET_MS: VarSpec = {
+  name: "CATCHUP_SOURCE_SCAN_BUDGET_MS",
+  kind: "integer",
+  required: false,
+  min: 100,
+  printable: true,
+  purpose:
+    "Maximum stage budget in milliseconds allocated to source chain event scans during scheduled catch-up.",
+};
+
+const CATCHUP_PROOF_POLL_BUDGET_MS: VarSpec = {
+  name: "CATCHUP_PROOF_POLL_BUDGET_MS",
+  kind: "integer",
+  required: false,
+  min: 100,
+  printable: true,
+  purpose:
+    "Maximum stage budget in milliseconds allocated to rail proof polling and destination verification during scheduled catch-up.",
+};
+
+const CATCHUP_DRAIN_MARGIN_MS: VarSpec = {
+  name: "CATCHUP_DRAIN_MARGIN_MS",
+  kind: "integer",
+  required: false,
+  min: 250,
+  printable: true,
+  purpose:
+    "Reserved graceful drain safety margin in milliseconds that earlier catch-up stages are never allowed to consume.",
+};
+
+const CATCHUP_RUN_MIGRATIONS: VarSpec = {
+  name: "CATCHUP_RUN_MIGRATIONS",
+  kind: "boolean",
+  required: false,
+  fallback: "false",
+  printable: true,
+  purpose:
+    "When true, executes pending SQL migrations inside the bounded catch-up migration stage before scanning chains.",
+};
+
 const STELLAR_RPC_URL: VarSpec = {
   name: "STELLAR_RPC_URL",
   kind: "url",
@@ -498,6 +561,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     reorgDepthOverride,
     env,
   });
+  const catchUpBudget = planCatchUpBudget(reader, shutdownTimeoutMs);
 
   // One throw, after everything has had a chance to complain.
   reader.finish();
@@ -527,7 +591,74 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       concurrency: keeperConcurrency,
       stellarSecret: keeperStellarSecret,
     },
+    catchUpBudget,
     shutdownTimeoutMs,
+  };
+}
+
+function planCatchUpBudget(
+  reader: EnvReader,
+  shutdownTimeoutMs: number,
+): CatchUpBudgetConfig | null {
+  if (!reader.has(CATCHUP_RUN_BUDGET_MS.name)) {
+    return null;
+  }
+
+  const totalBudgetMs = reader.integer(CATCHUP_RUN_BUDGET_MS);
+  const runMigrationsInProcess = reader.boolean(CATCHUP_RUN_MIGRATIONS);
+  const explicitDrain = reader.has(CATCHUP_DRAIN_MARGIN_MS.name)
+    ? reader.integer(CATCHUP_DRAIN_MARGIN_MS)
+    : null;
+  const explicitMig = reader.has(CATCHUP_MIGRATION_BUDGET_MS.name)
+    ? reader.integer(CATCHUP_MIGRATION_BUDGET_MS)
+    : null;
+  const explicitScan = reader.has(CATCHUP_SOURCE_SCAN_BUDGET_MS.name)
+    ? reader.integer(CATCHUP_SOURCE_SCAN_BUDGET_MS)
+    : null;
+  const explicitProof = reader.has(CATCHUP_PROOF_POLL_BUDGET_MS.name)
+    ? reader.integer(CATCHUP_PROOF_POLL_BUDGET_MS)
+    : null;
+
+  if (reader.failed(CATCHUP_RUN_BUDGET_MS)) {
+    return null;
+  }
+
+  const defaultDrain = Math.min(
+    Math.max(shutdownTimeoutMs, Math.floor(totalBudgetMs * 0.15)),
+    Math.floor(totalBudgetMs * 0.35),
+  );
+  const drainMarginMs = explicitDrain ?? Math.max(250, defaultDrain);
+  const usableWorkMs = totalBudgetMs - drainMarginMs;
+
+  if (usableWorkMs < 500) {
+    reader.reject(
+      CATCHUP_DRAIN_MARGIN_MS,
+      `leaves only ${String(usableWorkMs)}ms of work budget out of CATCHUP_RUN_BUDGET_MS=${String(totalBudgetMs)}; at least 500ms is required`,
+    );
+    return null;
+  }
+
+  const migrationBudgetMs = explicitMig ?? Math.max(100, Math.floor(usableWorkMs * 0.15));
+  const sourceScanBudgetMs = explicitScan ?? Math.max(100, Math.floor(usableWorkMs * 0.5));
+  const proofPollBudgetMs =
+    explicitProof ?? Math.max(100, usableWorkMs - migrationBudgetMs - sourceScanBudgetMs);
+
+  const allocatedTotal = migrationBudgetMs + sourceScanBudgetMs + proofPollBudgetMs + drainMarginMs;
+  if (allocatedTotal > totalBudgetMs) {
+    reader.reject(
+      CATCHUP_RUN_BUDGET_MS,
+      `stage budgets (${String(migrationBudgetMs)} + ${String(sourceScanBudgetMs)} + ${String(proofPollBudgetMs)}) plus drain margin (${String(drainMarginMs)}) equal ${String(allocatedTotal)}ms, exceeding total budget ${String(totalBudgetMs)}ms`,
+    );
+    return null;
+  }
+
+  return {
+    totalBudgetMs,
+    migrationBudgetMs,
+    sourceScanBudgetMs,
+    proofPollBudgetMs,
+    drainMarginMs,
+    runMigrationsInProcess,
   };
 }
 

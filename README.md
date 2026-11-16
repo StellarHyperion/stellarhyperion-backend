@@ -35,6 +35,15 @@ The `hyperion-backend` Vercel project serves [stellarhyperion-backend.vercel.app
 
 The workflow is scheduled every five minutes and can be started manually. GitHub may delay scheduled runs; public Activity is eventually updated rather than an instant destination feed. Inspect its latest run and `/v1/metrics` cursor timestamps to check freshness. API `/ready` verifies its database access; the serverless API does not run chain watchers itself. The optional Dockerfile packages the same service for an always-running container host.
 
+### Bounded scheduled catch-up runtime budgeting
+
+Setting `CATCHUP_RUN_BUDGET_MS` (for example `150000`) runs `dist/main.js` as a bounded four-stage catch-up job instead of an unbounded daemon:
+
+- `migrations` (`CATCHUP_MIGRATION_BUDGET_MS`, optional `CATCHUP_RUN_MIGRATIONS=true`), `source_scans` (`CATCHUP_SOURCE_SCAN_BUDGET_MS`), `proof_polling` (`CATCHUP_PROOF_POLL_BUDGET_MS`) and a reserved `graceful_drain` safety margin (`CATCHUP_DRAIN_MARGIN_MS`).
+- Stage ceilings never cross `CATCHUP_RUN_BUDGET_MS - CATCHUP_DRAIN_MARGIN_MS`, so a slow migration or RPC scan cannot consume the shutdown safety margin.
+- Each completed source window and rail batch commits its own PostgreSQL transaction immediately, preserving cursor and delivery progress if a subsequent pass hits budget expiration.
+- Every run logs a structured `catchUpReport` recording `stopReason`, `stoppedStages`, `drainSafety` and `remainingEligibleWork` (stored cursors, incomplete source chains, eligible rail transfers by route and unsettled claims) without exposing credentials.
+
 Deploy the API with `vercel deploy --prod`. Preview environments require their own database. Database credentials stay in Vercel and GitHub secrets, never in browser configuration, Git or logs. The managed PostgreSQL database is the durable state; restarting a worker must not repeat source transfers.
 
 Vercel's installed Git integration publishes `main`. GitHub Actions runs validation and the scheduled indexer; it does not need a Vercel deployment token.

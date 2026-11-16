@@ -6,13 +6,14 @@
  * message on stderr is worth more to whoever is staring at a crash loop than a single line of
  * JSON with the whole explanation escaped inside one field.
  */
-import { buildIndexer } from "./chains/runner.js";
+import { buildCatchUpPlan, buildIndexer } from "./chains/runner.js";
 import { loadConfig } from "./config/config.js";
 import { ConfigError } from "./config/env.js";
 import { Database } from "./db/pool.js";
 import { buildServer } from "./http/server.js";
 import { createKeeperRedis } from "./keeper/queue.js";
 import { createLogger } from "./logging/logger.js";
+import { runBoundedCatchUp } from "./runtime/budget.js";
 import { Shutdown, installSignalHandlers } from "./runtime/shutdown.js";
 
 async function main(): Promise<void> {
@@ -61,6 +62,39 @@ async function main(): Promise<void> {
   shutdown.add("http", () => server.close());
 
   await server.listen({ host: config.http.host, port: config.http.port });
+
+  if (config.catchUpBudget !== null) {
+    const signalController = new AbortController();
+    const onStopSignal = (): void => {
+      signalController.abort(new Error("catch-up interrupted by process signal"));
+    };
+    process.once("SIGTERM", onStopSignal);
+    process.once("SIGINT", onStopSignal);
+
+    try {
+      const workload = buildCatchUpPlan({ config, logger, db });
+      const report = await runBoundedCatchUp({
+        budget: config.catchUpBudget,
+        config,
+        db,
+        logger,
+        sourcePasses: workload.sourcePasses,
+        proofPasses: workload.proofPasses,
+        drain: () => shutdown.run("catchup-drain"),
+        externalSignal: signalController.signal,
+      });
+      logger.info({ catchUpReport: report }, "scheduled catch-up run finished");
+      process.exitCode =
+        report.stopReason === "migration_failed" || report.stopReason === "migration_timeout"
+          ? 1
+          : 0;
+    } finally {
+      process.removeListener("SIGTERM", onStopSignal);
+      process.removeListener("SIGINT", onStopSignal);
+    }
+    return;
+  }
+
   // After listen, so the probes are answering before the first page is read. A watcher that
   // starts first makes its initial RPC calls while nothing can report on them.
   indexer.start();
