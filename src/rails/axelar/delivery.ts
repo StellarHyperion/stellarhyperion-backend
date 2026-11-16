@@ -20,7 +20,13 @@ import {
 import { createPublicClient, http, stringToHex } from "viem";
 import type { AppConfig } from "../../config/config.js";
 import type { Transactional } from "../../db/pool.js";
-import { bigintOf, text } from "../../db/rows.js";
+import {
+  LEGACY_UNSPECIFIED_ROUTER,
+  bigintOf,
+  normalizeDeploymentRouter,
+  text,
+  textOrNull,
+} from "../../db/rows.js";
 import type { InboundRow, Position } from "../../chains/writers.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 
@@ -51,11 +57,21 @@ export async function verifyItsDelivery(
   const its = RAIL_CONTRACTS[transfer.destinationChain]?.axelar?.interchainTokenService;
   if (!isEvmChain(destination) || !its?.startsWith("0x")) return null;
   const { rows } = await db.query(
-    "SELECT sender, token, net_amount, destination FROM outbound_transfer WHERE id = $1",
+    "SELECT sender, token, net_amount, destination, origin_router FROM outbound_transfer WHERE id = $1",
     [String(transfer.transferId)],
   );
   const stored = rows[0];
   if (!stored) return null;
+  const originRouter =
+    stored.origin_router === undefined
+      ? normalizeDeploymentRouter(source.routerContractId)
+      : normalizeDeploymentRouter(textOrNull(stored, "origin_router"));
+  if (
+    originRouter !== normalizeDeploymentRouter(source.routerContractId) &&
+    originRouter !== LEGACY_UNSPECIFIED_ROUTER
+  ) {
+    return null;
+  }
   const token = text(stored, "token");
   const amount = bigintOf(stored, "net_amount");
   const recipient = toEvmAddress(text(stored, "destination") as `0x${string}`);
@@ -120,6 +136,7 @@ export async function verifyItsDelivery(
   return {
     at: {
       chainKey: transfer.destinationChain,
+      contract: its.toLowerCase(),
       block: receipt.blockNumber,
       txHash: receipt.transactionHash,
       logIndex: payment.logIndex,
@@ -128,6 +145,7 @@ export async function verifyItsDelivery(
     row: {
       route: transfer.route,
       sourceChain: transfer.originChain,
+      sourceRouter: originRouter,
       sourceNonce: transfer.nonce,
       railMessageId: execution.commandId,
       recipient: recipient.toLowerCase(),

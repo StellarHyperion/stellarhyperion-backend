@@ -22,12 +22,12 @@ export async function processTtlBump(
         .map((token) => (token as { sacId: string }).sacId)
     : [];
   const claimRows = await ctx.db.query(
-    "SELECT claim_id FROM pending_claim WHERE chain = $1 AND NOT settled ORDER BY claim_id DESC LIMIT $2",
-    [chain.chain, payload.maxClaims ?? 50],
+    "SELECT claim_id FROM pending_claim WHERE chain = $1 AND router IN ($2, 'legacy-unspecified-router') AND NOT settled ORDER BY claim_id DESC LIMIT $3",
+    [chain.chain, chain.routerContractId, payload.maxClaims ?? 50],
   );
   const transferRows = await ctx.db.query(
-    "SELECT nonce FROM outbound_transfer WHERE origin_chain = $1 ORDER BY id DESC LIMIT $2",
-    [chain.chain, payload.maxTransfers ?? 50],
+    "SELECT nonce FROM outbound_transfer WHERE origin_chain = $1 AND origin_router IN ($2, 'legacy-unspecified-router') ORDER BY id DESC LIMIT $3",
+    [chain.chain, chain.routerContractId, payload.maxTransfers ?? 50],
   );
   const claims = claimRows.rows.map((row) => bigintOf(row, "claim_id"));
   const transfers = transferRows.rows.map((row) => bigintOf(row, "nonce"));

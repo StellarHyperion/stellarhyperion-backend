@@ -40,6 +40,7 @@ export async function pendingForRail(
     `SELECT t.id,
             t.route,
             t.origin_chain,
+            t.origin_router,
             t.destination_chain,
             t.nonce,
             t.origin_tx,
@@ -50,6 +51,19 @@ export async function pendingForRail(
                WHERE d.destination_chain = t.destination_chain
                  AND d.route = t.route
                  AND d.source_chain = t.origin_chain
+                 AND (
+                   d.source_router = t.origin_router
+                   OR (
+                     d.source_router = 'legacy-unspecified-router'
+                     AND NOT EXISTS (
+                       SELECT 1 FROM outbound_transfer t_alt
+                        WHERE t_alt.origin_chain = t.origin_chain
+                          AND t_alt.route = t.route
+                          AND t_alt.nonce = t.nonce
+                          AND t_alt.id <> t.id
+                     )
+                   )
+                 )
                  AND d.source_nonce = t.nonce
             ) AS delivered
        FROM outbound_transfer t
@@ -67,6 +81,7 @@ export async function pendingForRail(
     transferId: bigintOf(row, "id"),
     route: integer(row, "route"),
     originChain: text(row, "origin_chain"),
+    originRouter: textOrNull(row, "origin_router") ?? undefined,
     destinationChain: text(row, "destination_chain"),
     nonce: bigintOf(row, "nonce"),
     originTx: text(row, "origin_tx"),

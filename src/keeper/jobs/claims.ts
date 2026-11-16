@@ -16,8 +16,8 @@ export async function processClaimSettlement(
       detail: "No Stellar deployment configured.",
     };
   const { rows } = await ctx.db.query(
-    "SELECT claim_id FROM pending_claim WHERE chain = $1 AND NOT settled ORDER BY claim_id ASC LIMIT $2",
-    [chain.chain, payload.limit ?? 20],
+    "SELECT claim_id FROM pending_claim WHERE chain = $1 AND router IN ($2, 'legacy-unspecified-router') AND NOT settled ORDER BY claim_id ASC LIMIT $3",
+    [chain.chain, chain.routerContractId, payload.limit ?? 20],
   );
   if (!ctx.config.keeper.stellarSecret)
     return {

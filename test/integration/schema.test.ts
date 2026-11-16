@@ -190,6 +190,48 @@ suite("outbound_transfer", () => {
     await run();
     await expect(run()).rejects.toSatisfy((error: unknown) => codeOf(error) === UNIQUE_VIOLATION);
   });
+
+  it("allows two router deployments on one chain to reuse the same nonce without colliding", async () => {
+    nonce += 1;
+    for (const router of [
+      "0x1111111111111111111111111111111111111111",
+      "0x2222222222222222222222222222222222222222",
+    ]) {
+      await db.query(
+        `INSERT INTO public.outbound_transfer
+           (origin_chain, origin_router, route, nonce, sender, token, gross_amount, fee, net_amount,
+            destination_chain, destination, origin_block, origin_tx)
+         VALUES ('base-sepolia', $1, 0, $2, '0xsender', '0xtoken', 1000, 3, 997,
+                 'stellar-testnet', 'GA5ZYIIV', 1, $3)`,
+        [router, String(nonce), `0xtx-${router.slice(-4)}-${String(nonce)}`],
+      );
+    }
+
+    const { rows } = await db.query(
+      `SELECT origin_router FROM public.outbound_transfer
+        WHERE origin_chain = 'base-sepolia' AND nonce = $1
+        ORDER BY origin_router`,
+      [String(nonce)],
+    );
+    expect(rows.map((r) => r.origin_router)).toEqual([
+      "0x1111111111111111111111111111111111111111",
+      "0x2222222222222222222222222222222222222222",
+    ]);
+  });
+
+  it("refuses an un-normalized mixed-case hex origin_router", async () => {
+    nonce += 1;
+    await expect(
+      db.query(
+        `INSERT INTO public.outbound_transfer
+           (origin_chain, origin_router, route, nonce, sender, token, gross_amount, fee, net_amount,
+            destination_chain, destination, origin_block, origin_tx)
+         VALUES ('base-sepolia', '0xAbCdEf0000000000000000000000000000000001', 0, $1,
+                 '0xsender', '0xtoken', 1000, 3, 997, 'stellar-testnet', 'GA5ZYIIV', 1, $2)`,
+        [String(nonce), `0xtx-mixed-${String(nonce)}`],
+      ),
+    ).rejects.toSatisfy((error: unknown) => codeOf(error) === CHECK_VIOLATION);
+  });
 });
 
 suite("inbound_delivery", () => {
@@ -300,7 +342,7 @@ suite("maintenance and pruning", () => {
                'stellar-testnet', 'GA5ZYIIV', 1, '0xtx-2'),
               (999993, 'prune-test-3', 0, 999993, '0xsender', '0xtoken', 100, 0, 100,
                'stellar-testnet', 'GA5ZYIIV', 1, '0xtx-3')
-       ON CONFLICT (origin_chain, nonce) DO NOTHING`,
+       ON CONFLICT (origin_chain, origin_router, nonce) DO NOTHING`,
     );
 
     // Old completed attestation (40 days old)

@@ -11,7 +11,13 @@ import type { AppConfig } from "../../config/config.js";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
-import { integer, text, textOrNull } from "../../db/rows.js";
+import {
+  integer,
+  normalizeDeploymentRouter,
+  publicRouterOrNull,
+  text,
+  textOrNull,
+} from "../../db/rows.js";
 import type { ServerDeps } from "../server.js";
 
 export type TransferLifecycleStage =
@@ -30,6 +36,7 @@ export interface FormattedTransfer {
   readonly route: number;
   readonly origin: {
     readonly chain: string;
+    readonly router: string | null;
     readonly nonce: string;
     readonly sender: string;
     readonly token: string;
@@ -48,6 +55,7 @@ export interface FormattedTransfer {
     readonly symbol: string | null;
     readonly decimals: number | null;
     readonly chain: string;
+    readonly router: string | null;
     readonly recipient: string;
     readonly delivered: boolean;
     readonly block: string | null;
@@ -63,6 +71,7 @@ export interface FormattedTransfer {
   } | null;
   readonly claim: {
     readonly id: string;
+    readonly router: string | null;
     readonly settled: boolean;
   } | null;
 }
@@ -137,6 +146,7 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
     route: integer(row, "route"),
     origin: {
       chain: text(row, "origin_chain"),
+      router: publicRouterOrNull(row, "origin_router"),
       nonce: text(row, "nonce"),
       sender: text(row, "sender"),
       token,
@@ -155,6 +165,7 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
       symbol: receivedMetadata?.symbol ?? null,
       decimals: receivedMetadata?.decimals ?? null,
       chain: destinationChain,
+      router: publicRouterOrNull(row, "destination_router"),
       recipient,
       delivered,
       block: textOrNull(row, "destination_block"),
@@ -178,6 +189,7 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
     claim: hasClaim
       ? {
           id: text(row, "claim_id"),
+          router: publicRouterOrNull(row, "claim_router"),
           settled: claimSettled,
         }
       : null,
@@ -187,6 +199,7 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
 const TRANSFER_QUERY = `
   SELECT t.id,
          t.origin_chain,
+         t.origin_router,
          t.route,
          t.nonce,
          t.sender,
@@ -205,12 +218,14 @@ const TRANSFER_QUERY = `
          a.rail_reference,
          a.attested_at,
          a.last_error,
+         d.destination_router,
          d.delivered AS inbound_delivered,
          d.destination_block,
          d.destination_tx,
          d.token AS received_token,
          d.amount AS received_amount,
          d.observed_at AS delivered_at,
+         c.router AS claim_router,
          c.claim_id,
          c.settled AS claim_settled
     FROM outbound_transfer t
@@ -219,11 +234,39 @@ const TRANSFER_QUERY = `
       ON d.destination_chain = t.destination_chain
      AND d.route = t.route
      AND d.source_chain = t.origin_chain
+     AND (
+       d.source_router = t.origin_router
+       OR (
+         d.source_router = 'legacy-unspecified-router'
+         AND NOT EXISTS (
+           SELECT 1 FROM outbound_transfer t_alt
+            WHERE t_alt.origin_chain = t.origin_chain
+              AND t_alt.route = t.route
+              AND t_alt.nonce = t.nonce
+              AND t_alt.id <> t.id
+         )
+       )
+     )
      AND d.source_nonce = t.nonce
     LEFT JOIN pending_claim c
       ON c.chain = t.destination_chain
+     AND (d.destination_router IS NULL OR c.router = d.destination_router)
+     AND (d.claim_id IS NULL OR c.claim_id = d.claim_id)
      AND c.route = t.route
      AND c.source_chain = t.origin_chain
+     AND (
+       c.source_router = t.origin_router
+       OR (
+         c.source_router = 'legacy-unspecified-router'
+         AND NOT EXISTS (
+           SELECT 1 FROM outbound_transfer t_alt
+            WHERE t_alt.origin_chain = t.origin_chain
+              AND t_alt.route = t.route
+              AND t_alt.nonce = t.nonce
+              AND t_alt.id <> t.id
+         )
+       )
+     )
      AND c.source_nonce = t.nonce
 `;
 
@@ -242,18 +285,55 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     return row !== undefined ? formatRow(row, deps.config) : null;
   };
 
-  // 1. Look up by originChain and nonce
+  // 1. Look up by originChain, explicit router deployment, and nonce
+  app.get(
+    "/v1/transfers/:originChain/:originRouter/:nonce",
+    async (
+      request: FastifyRequest<{
+        Params: { originChain: string; originRouter: string; nonce: string };
+      }>,
+      reply: FastifyReply,
+    ) => {
+      const { originChain, originRouter, nonce } = request.params;
+      const normalizedRouter = normalizeDeploymentRouter(originRouter);
+      const { rows } = await db.query(
+        `${TRANSFER_QUERY} WHERE t.origin_chain = $1 AND t.origin_router = $2 AND t.nonce = $3 LIMIT 1`,
+        [originChain, normalizedRouter, nonce],
+      );
+
+      const row = rows[0];
+      if (row === undefined) {
+        return reply.code(404).send({
+          error: "not_found",
+          message: `no transfer found for chain ${originChain}, router ${originRouter}, and nonce ${nonce}`,
+        });
+      }
+
+      return reply.send(formatRow(row, deps.config));
+    },
+  );
+
+  // 1b. Look up by originChain and nonce (with optional ?router= deployment filter)
   app.get(
     "/v1/transfers/:originChain/:nonce",
     async (
-      request: FastifyRequest<{ Params: { originChain: string; nonce: string } }>,
+      request: FastifyRequest<{
+        Params: { originChain: string; nonce: string };
+        Querystring: { router?: string };
+      }>,
       reply: FastifyReply,
     ) => {
       const { originChain, nonce } = request.params;
-      const { rows } = await db.query(
-        `${TRANSFER_QUERY} WHERE t.origin_chain = $1 AND t.nonce = $2 LIMIT 1`,
-        [originChain, nonce],
-      );
+      const routerFilter = request.query.router?.trim();
+      const { rows } = routerFilter
+        ? await db.query(
+            `${TRANSFER_QUERY} WHERE t.origin_chain = $1 AND t.origin_router = $2 AND t.nonce = $3 ORDER BY t.id DESC LIMIT 1`,
+            [originChain, normalizeDeploymentRouter(routerFilter), nonce],
+          )
+        : await db.query(
+            `${TRANSFER_QUERY} WHERE t.origin_chain = $1 AND t.nonce = $2 ORDER BY t.id DESC LIMIT 1`,
+            [originChain, nonce],
+          );
 
       const row = rows[0];
       if (row === undefined) {
@@ -425,7 +505,10 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       request: FastifyRequest<{
         Querystring: {
           originChain?: string;
+          originRouter?: string;
+          router?: string;
           destinationChain?: string;
+          destinationRouter?: string;
           route?: string;
           sender?: string;
           recipient?: string;
@@ -436,8 +519,19 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       }>,
       reply: FastifyReply,
     ) => {
-      const { originChain, destinationChain, route, sender, recipient, search, limit, offset } =
-        request.query;
+      const {
+        originChain,
+        originRouter,
+        router,
+        destinationChain,
+        destinationRouter,
+        route,
+        sender,
+        recipient,
+        search,
+        limit,
+        offset,
+      } = request.query;
 
       const conditions: string[] = [];
       const params: unknown[] = [];
@@ -446,9 +540,18 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         params.push(originChain);
         conditions.push(`t.origin_chain = $${String(params.length)}`);
       }
+      const effectiveOriginRouter = originRouter ?? router;
+      if (effectiveOriginRouter?.trim()) {
+        params.push(normalizeDeploymentRouter(effectiveOriginRouter));
+        conditions.push(`t.origin_router = $${String(params.length)}`);
+      }
       if (destinationChain) {
         params.push(destinationChain);
         conditions.push(`t.destination_chain = $${String(params.length)}`);
+      }
+      if (destinationRouter?.trim()) {
+        params.push(normalizeDeploymentRouter(destinationRouter));
+        conditions.push(`d.destination_router = $${String(params.length)}`);
       }
       if (route !== undefined) {
         params.push(Number(route));
@@ -467,7 +570,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         params.push(`%${search.trim()}%`);
         const parameter = `$${String(params.length)}`;
         conditions.push(
-          `(t.origin_tx ILIKE ${parameter} OR d.destination_tx ILIKE ${parameter} OR t.sender ILIKE ${parameter} OR t.destination ILIKE ${parameter} OR t.nonce::text ILIKE ${parameter})`,
+          `(t.origin_tx ILIKE ${parameter} OR d.destination_tx ILIKE ${parameter} OR t.sender ILIKE ${parameter} OR t.destination ILIKE ${parameter} OR t.origin_router ILIKE ${parameter} OR t.nonce::text ILIKE ${parameter})`,
         );
       }
 

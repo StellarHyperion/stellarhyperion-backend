@@ -333,6 +333,7 @@ export class EvmWatcher {
 
     const at: Position = {
       chainKey,
+      contract: this.options.router.toLowerCase(),
       block: log.blockNumber,
       txHash: log.transactionHash,
       // Unlike Soroban, which orders events within a transaction instead.

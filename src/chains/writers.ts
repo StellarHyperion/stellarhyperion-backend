@@ -20,10 +20,13 @@
  * this indexer first saw the row, and a reorg does not change that.
  */
 import type { Queryable } from "../db/pool.js";
+import { normalizeDeploymentRouter } from "../db/rows.js";
 
 /** Where on a chain a row was observed. One shape for a ledger and for a block. */
 export interface Position {
   readonly chainKey: string;
+  /** Router contract address or strkey that emitted or verified the event, when known. */
+  readonly contract?: string | null | undefined;
   /** Ledger sequence on Stellar, block number on an EVM chain. */
   readonly block: bigint;
   readonly txHash: string;
@@ -57,6 +60,8 @@ export interface OutboundRow {
 export interface InboundRow {
   readonly route: number;
   readonly sourceChain: string;
+  /** Originating router deployment when known; resolved from unique hop history when omitted. */
+  readonly sourceRouter?: string | null | undefined;
   readonly sourceNonce: bigint;
   /** The rail's own id for the message. EVM only; the Soroban event does not emit one. */
   readonly railMessageId: string | null;
@@ -75,6 +80,8 @@ export interface ClaimRow {
   readonly amount: bigint;
   readonly route: number;
   readonly sourceChain: string;
+  /** Originating router deployment when known; resolved from unique hop history when omitted. */
+  readonly sourceRouter?: string | null | undefined;
   readonly sourceNonce: bigint;
   readonly createdAt: Date;
 }
@@ -105,14 +112,19 @@ export interface HealthSample {
   readonly flowAvailable: bigint | null;
 }
 
+function explicitRouterOrNull(router: string | null | undefined): string | null {
+  if (router === null || router === undefined || router.trim() === "") return null;
+  return normalizeDeploymentRouter(router);
+}
+
 export async function writeOutbound(db: Queryable, at: Position, row: OutboundRow): Promise<void> {
   await db.query(
     `INSERT INTO outbound_transfer
        (origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
         destination_chain, destination, rail_ref, origin_block, origin_tx, origin_log_index,
-        observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-     ON CONFLICT (origin_chain, nonce) DO UPDATE
+        observed_at, origin_router)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+     ON CONFLICT (origin_chain, origin_router, nonce) DO UPDATE
        SET route = EXCLUDED.route,
            sender = EXCLUDED.sender,
            token = EXCLUDED.token,
@@ -141,6 +153,7 @@ export async function writeOutbound(db: Queryable, at: Position, row: OutboundRo
       at.txHash,
       at.logIndex,
       at.observedAt,
+      normalizeDeploymentRouter(at.contract),
     ],
   );
 }
@@ -150,9 +163,54 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
     `INSERT INTO inbound_delivery
        (destination_chain, route, source_chain, source_nonce, rail_message_id, recipient, token,
         amount, delivered, claim_id, destination_block, destination_tx, destination_log_index,
-        observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-     ON CONFLICT (destination_chain, route, source_chain, source_nonce) DO UPDATE
+        observed_at, destination_router, source_router)
+     VALUES (
+       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+       COALESCE(
+         $16,
+         (
+           SELECT d_existing.source_router
+             FROM inbound_delivery d_existing
+            WHERE d_existing.destination_chain = $1
+              AND d_existing.destination_router = $15
+              AND d_existing.route = $2
+              AND d_existing.source_chain = $3
+              AND d_existing.source_nonce = $4
+              AND d_existing.destination_tx = $12
+            LIMIT 1
+         ),
+         (
+           SELECT CASE WHEN count(*) = 1 THEN max(t.origin_router) END
+             FROM outbound_transfer t
+            WHERE t.origin_chain = $3
+              AND t.route = $2
+              AND t.nonce = $4
+              AND NOT EXISTS (
+                SELECT 1 FROM inbound_delivery d_other
+                 WHERE d_other.destination_chain = $1
+                   AND d_other.destination_router = $15
+                   AND d_other.route = $2
+                   AND d_other.source_chain = $3
+                   AND d_other.source_router = t.origin_router
+                   AND d_other.source_nonce = $4
+              )
+         ),
+         (
+           SELECT CASE WHEN count(*) = 1 THEN max(origin_router) END
+             FROM outbound_transfer
+            WHERE origin_chain = $3 AND route = $2 AND nonce = $4
+         ),
+         'legacy-unspecified-router'
+       )
+     )
+     ON CONFLICT (
+       destination_chain,
+       destination_router,
+       route,
+       source_chain,
+       source_router,
+       source_nonce
+     ) DO UPDATE
        SET rail_message_id = COALESCE(EXCLUDED.rail_message_id, inbound_delivery.rail_message_id),
            recipient = EXCLUDED.recipient,
            token = EXCLUDED.token,
@@ -177,6 +235,8 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
       at.txHash,
       at.logIndex,
       at.observedAt,
+      normalizeDeploymentRouter(at.contract),
+      explicitRouterOrNull(row.sourceRouter),
     ],
   );
 }
@@ -185,9 +245,44 @@ export async function writeClaim(db: Queryable, at: Position, row: ClaimRow): Pr
   await db.query(
     `INSERT INTO pending_claim
        (chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
-        created_at, settled, observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, $10)
-     ON CONFLICT (chain, claim_id) DO UPDATE
+        created_at, settled, observed_at, router, source_router)
+     VALUES (
+       $1, $2, $3, $4, $5, $6, $7, $8, $9, false, $10, $11,
+       COALESCE(
+         $12,
+         (
+           SELECT p_existing.source_router
+             FROM pending_claim p_existing
+            WHERE p_existing.chain = $1
+              AND p_existing.router = $11
+              AND p_existing.claim_id = $2
+            LIMIT 1
+         ),
+         (
+           SELECT CASE WHEN count(*) = 1 THEN max(t.origin_router) END
+             FROM outbound_transfer t
+            WHERE t.origin_chain = $7
+              AND t.route = $6
+              AND t.nonce = $8
+              AND NOT EXISTS (
+                SELECT 1 FROM pending_claim p_other
+                 WHERE p_other.chain = $1
+                   AND p_other.router = $11
+                   AND p_other.route = $6
+                   AND p_other.source_chain = $7
+                   AND p_other.source_router = t.origin_router
+                   AND p_other.source_nonce = $8
+              )
+         ),
+         (
+           SELECT CASE WHEN count(*) = 1 THEN max(origin_router) END
+             FROM outbound_transfer
+            WHERE origin_chain = $7 AND route = $6 AND nonce = $8
+         ),
+         'legacy-unspecified-router'
+       )
+     )
+     ON CONFLICT (chain, router, claim_id) DO UPDATE
        SET recipient = EXCLUDED.recipient,
            token = EXCLUDED.token,
            amount = EXCLUDED.amount,
@@ -206,6 +301,8 @@ export async function writeClaim(db: Queryable, at: Position, row: ClaimRow): Pr
       row.sourceNonce.toString(),
       row.createdAt,
       at.observedAt,
+      normalizeDeploymentRouter(at.contract),
+      explicitRouterOrNull(row.sourceRouter),
     ],
   );
 }
@@ -227,8 +324,15 @@ export async function settleClaim(
   const { rowCount } = await db.query(
     `UPDATE pending_claim
         SET settled = true, settled_at = $3, settled_by = $4, settled_tx = $5
-      WHERE chain = $1 AND claim_id = $2 AND NOT settled`,
-    [at.chainKey, claimId.toString(), at.observedAt, settledBy, at.txHash],
+      WHERE chain = $1 AND claim_id = $2 AND router = $6 AND NOT settled`,
+    [
+      at.chainKey,
+      claimId.toString(),
+      at.observedAt,
+      settledBy,
+      at.txHash,
+      normalizeDeploymentRouter(at.contract),
+    ],
   );
   return rowCount > 0;
 }
@@ -244,9 +348,9 @@ export async function settleClaim(
 export async function writeAction(db: Queryable, at: Position, row: ActionRow): Promise<void> {
   await db.query(
     `INSERT INTO admin_action
-       (chain, action_id, kind, state, payload, eta, expires_at, queued_at, observed_at)
-     VALUES ($1, $2, $3, 'queued', $4, $5, $6, $7, $8)
-     ON CONFLICT (chain, action_id) DO UPDATE
+       (chain, action_id, kind, state, payload, eta, expires_at, queued_at, observed_at, router)
+     VALUES ($1, $2, $3, 'queued', $4, $5, $6, $7, $8, $9)
+     ON CONFLICT (chain, router, action_id) DO UPDATE
        SET kind = EXCLUDED.kind,
            payload = EXCLUDED.payload,
            eta = EXCLUDED.eta,
@@ -261,6 +365,7 @@ export async function writeAction(db: Queryable, at: Position, row: ActionRow): 
       row.expiresAt,
       at.observedAt,
       at.observedAt,
+      normalizeDeploymentRouter(at.contract),
     ],
   );
 }
@@ -282,8 +387,15 @@ export async function settleAction(
   const { rowCount } = await db.query(
     `UPDATE admin_action
         SET state = $3, settled_at = $4, actor = COALESCE($5, actor)
-      WHERE chain = $1 AND action_id = $2 AND state = 'queued'`,
-    [at.chainKey, actionId.toString(), state, at.observedAt, actor],
+      WHERE chain = $1 AND action_id = $2 AND router = $6 AND state = 'queued'`,
+    [
+      at.chainKey,
+      actionId.toString(),
+      state,
+      at.observedAt,
+      actor,
+      normalizeDeploymentRouter(at.contract),
+    ],
   );
   return rowCount > 0;
 }

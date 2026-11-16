@@ -91,6 +91,7 @@ export interface PendingTransfer {
   readonly transferId: bigint;
   readonly route: number;
   readonly originChain: string;
+  readonly originRouter?: string | null | undefined;
   readonly destinationChain: string;
   readonly nonce: bigint;
   readonly originTx: string;

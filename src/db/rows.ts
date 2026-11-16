@@ -18,6 +18,19 @@ export class RowError extends Error {
   }
 }
 
+export const LEGACY_UNSPECIFIED_ROUTER = "legacy-unspecified-router";
+
+/**
+ * Normalizes a router deployment identifier so EVM hex addresses always compare in lowercase while
+ * Stellar contract strkeys retain their canonical base32 spelling.
+ */
+export function normalizeDeploymentRouter(router: string | null | undefined): string {
+  if (router === null || router === undefined) return LEGACY_UNSPECIFIED_ROUTER;
+  const trimmed = router.trim();
+  if (trimmed === "") return LEGACY_UNSPECIFIED_ROUTER;
+  return /^0x[0-9a-fA-F]+$/.test(trimmed) ? trimmed.toLowerCase() : trimmed;
+}
+
 export type Row = Record<string, unknown>;
 
 export function text(row: Row, column: string): string {
@@ -33,6 +46,12 @@ export function textOrNull(row: Row, column: string): string | null {
   if (typeof value !== "string")
     throw new RowError(column, `is not a string, it is ${typeOf(value)}`);
   return value;
+}
+
+export function publicRouterOrNull(row: Row, column: string): string | null {
+  const raw = textOrNull(row, column);
+  if (raw === null || raw === LEGACY_UNSPECIFIED_ROUTER) return null;
+  return normalizeDeploymentRouter(raw);
 }
 
 export function integer(row: Row, column: string): number {

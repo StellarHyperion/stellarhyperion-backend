@@ -11,7 +11,13 @@ import {
 import { createPublicClient, http, type Hex } from "viem";
 import type { AppConfig } from "../../config/config.js";
 import type { Transactional } from "../../db/pool.js";
-import { bigintOf, text } from "../../db/rows.js";
+import {
+  LEGACY_UNSPECIFIED_ROUTER,
+  bigintOf,
+  normalizeDeploymentRouter,
+  text,
+  textOrNull,
+} from "../../db/rows.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 import type { VerifiedDelivery } from "../axelar/delivery.js";
 import { matchingCctpPayment, verifiedCctpMessage, type ExpectedCctpTransfer } from "./events.js";
@@ -50,11 +56,21 @@ export async function verifyCctpDelivery(
   )
     return null;
   const { rows } = await db.query(
-    "SELECT token, net_amount, destination FROM outbound_transfer WHERE id = $1",
+    "SELECT token, net_amount, destination, origin_router FROM outbound_transfer WHERE id = $1",
     [String(transfer.transferId)],
   );
   const stored = rows[0];
   if (!stored || text(stored, "token") !== sourceToken.sacId) return null;
+  const originRouter =
+    stored.origin_router === undefined
+      ? normalizeDeploymentRouter(source.router)
+      : normalizeDeploymentRouter(textOrNull(stored, "origin_router"));
+  if (
+    originRouter !== normalizeDeploymentRouter(source.router) &&
+    originRouter !== LEGACY_UNSPECIFIED_ROUTER
+  ) {
+    return null;
+  }
   const expected: ExpectedCctpTransfer = {
     sourceToken: sourceToken.sacId,
     sourceAdapter: adapter,
@@ -85,6 +101,7 @@ export async function verifyCctpDelivery(
   return {
     at: {
       chainKey: transfer.destinationChain,
+      contract: contracts.messageTransmitterV2.toLowerCase(),
       block: receipt.blockNumber,
       txHash: receipt.transactionHash,
       logIndex: payment.logIndex,
@@ -93,6 +110,7 @@ export async function verifyCctpDelivery(
     row: {
       route: transfer.route,
       sourceChain: transfer.originChain,
+      sourceRouter: originRouter,
       sourceNonce: transfer.nonce,
       railMessageId: message.message.nonce,
       recipient: expected.recipient.toLowerCase(),
