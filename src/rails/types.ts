@@ -32,6 +32,7 @@ export function isTerminal(status: AttestationStatus): boolean {
 
 export interface RailReport {
   readonly forwardTxHash?: `0x${string}`;
+  readonly candidateForwardTxHashes?: readonly `0x${string}`[] | undefined;
   readonly execution?: { readonly txHash: `0x${string}`; readonly commandId: `0x${string}` };
   readonly status: AttestationStatus;
   /**

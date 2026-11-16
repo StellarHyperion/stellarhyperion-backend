@@ -5,8 +5,10 @@ import {
   cctpBody,
   parseCctpBurnMessage,
   parseCctpMessage,
-  toHex,
   toEvmAddress,
+  toHex,
+  type CctpBurnMessage,
+  type CctpMessage,
 } from "@hyperion/protocol";
 import { decodeEventLog, parseAbi, type Hex } from "viem";
 import type { DeliveryLog } from "../axelar/events.js";
@@ -16,6 +18,7 @@ export const CCTP_RECEIPT_ABI = parseAbi([
   "event MessageReceived(address indexed caller,uint32 sourceDomain,bytes32 indexed nonce,bytes32 sender,uint32 indexed finalityThresholdExecuted,bytes messageBody)",
   "event Transfer(address indexed from,address indexed to,uint256 value)",
 ]);
+
 export interface ExpectedCctpTransfer {
   sourceToken: string;
   sourceAdapter: string;
@@ -27,12 +30,36 @@ export interface ExpectedCctpTransfer {
   recipient: string;
   sourceAmount: bigint;
 }
-export function verifiedCctpMessage(raw: Hex, expected: ExpectedCctpTransfer) {
-  const message = parseCctpMessage(raw);
-  const body = cctpBody(raw);
-  const burn = parseCctpBurnMessage(body);
-  assertSupportedMessage(message);
-  assertSupportedBurn(burn);
+
+export interface VerifiedCctpMessageData {
+  readonly message: CctpMessage;
+  readonly burn: CctpBurnMessage;
+  readonly body: Hex;
+  readonly amount: bigint;
+}
+
+export interface LocatedCctpPaymentLogs<T extends DeliveryLog> {
+  readonly messageLog: T;
+  readonly mintLog: T;
+  readonly verified: VerifiedCctpMessageData;
+}
+
+export function verifiedCctpMessage(
+  raw: Hex,
+  expected: ExpectedCctpTransfer,
+): VerifiedCctpMessageData | null {
+  let message: CctpMessage;
+  let body: Uint8Array;
+  let burn: CctpBurnMessage;
+  try {
+    message = parseCctpMessage(raw);
+    body = cctpBody(raw);
+    burn = parseCctpBurnMessage(body);
+    assertSupportedMessage(message);
+    assertSupportedBurn(burn);
+  } catch {
+    return null;
+  }
   const word = (address: string) => `0x${address.slice(2).padStart(64, "0")}`.toLowerCase();
   if (
     message.sourceDomain !== 27 ||
@@ -51,32 +78,34 @@ export function verifiedCctpMessage(raw: Hex, expected: ExpectedCctpTransfer) {
     burn.feeExecuted < 0n ||
     burn.feeExecuted >= burn.amount ||
     message.finalityThresholdExecuted < 2000
-  )
+  ) {
     return null;
-  return { message, body: toHex(body), amount: burn.amount - burn.feeExecuted };
+  }
+  return { message, burn, body: toHex(body), amount: burn.amount - burn.feeExecuted };
 }
-export function matchingCctpPayment<T extends DeliveryLog>(
+
+export function locateCctpPaymentLogs<T extends DeliveryLog>(
   logs: readonly T[],
   raw: Hex,
   expected: ExpectedCctpTransfer,
-): T | null {
+): LocatedCctpPaymentLogs<T> | null {
   const verified = verifiedCctpMessage(raw, expected);
   if (!verified) return null;
-  let received = false;
-  let payment: T | null = null;
+  let messageLog: T | null = null;
+  let mintLog: T | null = null;
   for (const log of logs) {
     try {
       const event = decodeEventLog({ abi: CCTP_RECEIPT_ABI, topics: log.topics, data: log.data });
       if (
         event.eventName === "MessageReceived" &&
-        log.address.toLowerCase() === expected.transmitter.toLowerCase()
+        log.address.toLowerCase() === expected.transmitter.toLowerCase() &&
+        event.args.sourceDomain === 27 &&
+        event.args.nonce.toLowerCase() === verified.message.nonce.toLowerCase() &&
+        event.args.sender.toLowerCase() === verified.message.sender.toLowerCase() &&
+        event.args.finalityThresholdExecuted === verified.message.finalityThresholdExecuted &&
+        event.args.messageBody.toLowerCase() === verified.body.toLowerCase()
       ) {
-        received ||=
-          event.args.sourceDomain === 27 &&
-          event.args.nonce.toLowerCase() === verified.message.nonce.toLowerCase() &&
-          event.args.sender.toLowerCase() === verified.message.sender.toLowerCase() &&
-          event.args.finalityThresholdExecuted === verified.message.finalityThresholdExecuted &&
-          event.args.messageBody.toLowerCase() === verified.body.toLowerCase();
+        messageLog = log;
       }
       if (
         event.eventName === "Transfer" &&
@@ -84,11 +113,21 @@ export function matchingCctpPayment<T extends DeliveryLog>(
         /^0x0{40}$/.test(event.args.from) &&
         event.args.to.toLowerCase() === expected.recipient.toLowerCase() &&
         event.args.value === verified.amount
-      )
-        payment = log;
+      ) {
+        mintLog = log;
+      }
     } catch {
       /* Unrelated receipt events do not establish this transfer's delivery. */
     }
   }
-  return received ? payment : null;
+  if (!messageLog || !mintLog) return null;
+  return { messageLog, mintLog, verified };
+}
+
+export function matchingCctpPayment<T extends DeliveryLog>(
+  logs: readonly T[],
+  raw: Hex,
+  expected: ExpectedCctpTransfer,
+): T | null {
+  return locateCctpPaymentLogs(logs, raw, expected)?.mintLog ?? null;
 }

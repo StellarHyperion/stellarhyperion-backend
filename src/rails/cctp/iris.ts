@@ -64,6 +64,7 @@ export interface FastAttestationMetadata {
 
 export interface IrisMessage {
   readonly forwardTxHash?: unknown;
+  readonly forwardTxHashes?: unknown;
   readonly message?: unknown;
   readonly messageBytes?: unknown;
   readonly rawMessage?: unknown;
@@ -96,6 +97,7 @@ export function isIrisMessage(value: unknown): value is IrisMessage {
 
   const recognizedKeys = [
     "forwardTxHash",
+    "forwardTxHashes",
     "status",
     "message",
     "messageBytes",
@@ -418,12 +420,12 @@ export function reportFor(message: IrisMessage): RailReport {
 
   let railStatus = delay === null ? rawStatus : `${rawStatus}/${delay}`;
   railStatus = appendExpiry(railStatus, message);
+  const candidateHashes = collectCandidateForwardHashes(message);
+  const primaryForward = candidateHashes[0];
 
   return {
-    ...(typeof message.forwardTxHash === "string" &&
-    /^0x[0-9a-fA-F]{64}$/.test(message.forwardTxHash)
-      ? { forwardTxHash: message.forwardTxHash as `0x${string}` }
-      : {}),
+    ...(primaryForward !== undefined ? { forwardTxHash: primaryForward } : {}),
+    ...(candidateHashes.length > 0 ? { candidateForwardTxHashes: candidateHashes } : {}),
     status: mapped,
     railStatus,
     reference: nonce,
@@ -435,6 +437,24 @@ export function reportFor(message: IrisMessage): RailReport {
     attestationTimestamp,
     fastTransfer: isFast,
   };
+}
+
+function collectCandidateForwardHashes(message: IrisMessage): readonly `0x${string}`[] {
+  const seen = new Set<`0x${string}`>();
+  if (
+    typeof message.forwardTxHash === "string" &&
+    /^0x[0-9a-fA-F]{64}$/.test(message.forwardTxHash)
+  ) {
+    seen.add(message.forwardTxHash as `0x${string}`);
+  }
+  if (Array.isArray(message.forwardTxHashes)) {
+    for (const item of message.forwardTxHashes) {
+      if (typeof item === "string" && /^0x[0-9a-fA-F]{64}$/.test(item)) {
+        seen.add(item as `0x${string}`);
+      }
+    }
+  }
+  return [...seen];
 }
 
 /**

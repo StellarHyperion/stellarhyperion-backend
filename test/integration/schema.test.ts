@@ -55,6 +55,7 @@ suite("the schema", () => {
     const names = rows.map((row) => String(row.table_name));
     for (const table of [
       "admin_action",
+      "cctp_delivery_proof",
       "inbound_delivery",
       "indexer_cursor",
       "outbound_transfer",
