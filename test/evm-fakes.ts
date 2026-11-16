@@ -19,7 +19,13 @@ import { join } from "node:path";
 import { encodeEventTopics, encodeAbiParameters, type AbiEvent, type Hex } from "viem";
 import { hyperionRouterAbi } from "@hyperion/protocol/abi";
 
-import type { BlockStamp, EvmClient, LogQuery, RawEvmLog } from "../src/chains/evm/client.js";
+import type {
+  BlockStamp,
+  EvmClient,
+  EvmTransactionReceipt,
+  LogQuery,
+  RawEvmLog,
+} from "../src/chains/evm/client.js";
 import { FIXTURES_DIR } from "./helpers.js";
 
 interface CapturedFixture {
@@ -82,12 +88,14 @@ export interface FakeEvmClientOptions {
 export class FakeEvmClient implements EvmClient {
   readonly logQueries: LogQuery[] = [];
   readonly blockQueries: bigint[][] = [];
+  readonly receiptQueries: Hex[][] = [];
   /** Counted, because the watcher is supposed to ask this once per process and not once per pass. */
   chainIdCalls = 0;
 
   private log: RawEvmLog[];
   private head: bigint;
   private readonly missing = new Set<bigint>();
+  private readonly receiptOverrides = new Map<string, EvmTransactionReceipt | null>();
   /** Bumped for a block range that has been rewritten, which changes every hash at or above it. */
   private reorgFrom: bigint | null = null;
   private epoch = 0;
@@ -130,6 +138,15 @@ export class FakeEvmClient implements EvmClient {
     this.missing.add(block);
   }
 
+  /** Override or remove (`null`) a transaction receipt to simulate provider inconsistencies. */
+  overrideReceipt(txHash: Hex, receipt: EvmTransactionReceipt | null): void {
+    this.receiptOverrides.set(txHash.toLowerCase(), receipt);
+  }
+
+  clearReceiptOverrides(): void {
+    this.receiptOverrides.clear();
+  }
+
   chainId(): Promise<number> {
     this.chainIdCalls += 1;
     return Promise.resolve(this.chain);
@@ -149,6 +166,10 @@ export class FakeEvmClient implements EvmClient {
             entry.blockNumber >= query.fromBlock &&
             entry.blockNumber <= query.toBlock,
         )
+        .map((entry) => ({
+          ...entry,
+          blockHash: entry.blockHash ?? this.stampFor(entry.blockNumber).hash,
+        }))
         // Ascending by block then log index, which is the order a node returns them in and the
         // order the claim pairing depends on.
         .sort((a, b) =>
@@ -165,6 +186,45 @@ export class FakeEvmClient implements EvmClient {
     for (const number of numbers) {
       if (this.missing.has(number) || number > this.head) continue;
       found.set(number, this.stampFor(number));
+    }
+    return Promise.resolve(found);
+  }
+
+  receipts(txHashes: readonly Hex[]): Promise<Map<string, EvmTransactionReceipt>> {
+    this.receiptQueries.push([...txHashes]);
+    const found = new Map<string, EvmTransactionReceipt>();
+    for (const txHash of txHashes) {
+      const key = txHash.toLowerCase();
+      if (this.receiptOverrides.has(key)) {
+        const override = this.receiptOverrides.get(key) ?? null;
+        if (override !== null) {
+          found.set(key, override);
+        }
+        continue;
+      }
+      const matchingLogs = this.log
+        .filter((entry) => entry.transactionHash.toLowerCase() === key)
+        .sort((a, b) => a.logIndex - b.logIndex);
+      const first = matchingLogs[0];
+      if (first === undefined) continue;
+      if (this.missing.has(first.blockNumber) || first.blockNumber > this.head) continue;
+      const blockHash = this.stampFor(first.blockNumber).hash;
+      found.set(key, {
+        transactionHash: first.transactionHash,
+        blockHash,
+        blockNumber: first.blockNumber,
+        status: "success",
+        logs: matchingLogs.map((entry) => ({
+          address: entry.address,
+          blockHash,
+          blockNumber: entry.blockNumber,
+          transactionHash: entry.transactionHash,
+          logIndex: entry.logIndex,
+          data: entry.data,
+          topics: entry.topics,
+          removed: entry.removed,
+        })),
+      });
     }
     return Promise.resolve(found);
   }

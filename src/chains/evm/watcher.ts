@@ -32,8 +32,13 @@ import type { ReadinessReport } from "../../runtime/readiness.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
 import type { Position } from "../writers.js";
 import { ClaimPairing, applyRouterLog } from "./store.js";
-import { decodeRouterLog, signatureOf } from "./logs.js";
-import type { EvmClient, RawEvmLog } from "./client.js";
+import {
+  ReceiptConsistencyError,
+  decodeRouterLog,
+  signatureOf,
+  verifyRangeReceiptConsistency,
+} from "./logs.js";
+import type { BlockStamp, EvmClient, RawEvmLog } from "./client.js";
 
 /**
  * How far behind the confirmation line still counts as current.
@@ -58,6 +63,11 @@ export interface EvmWatcherOptions {
   readonly reorgDepth: number;
   /** Blocks per `getLogs` call. Public endpoints reject wide ranges. */
   readonly logRange: number;
+  /**
+   * Require canonical successful transaction receipt verification for every accepted router log.
+   * Enabled automatically whenever the client implements `receipts`.
+   */
+  readonly requireReceipts?: boolean;
   readonly client: EvmClient;
   readonly db: Transactional;
   readonly logger: Logger;
@@ -174,10 +184,11 @@ export class EvmWatcher {
 
     const to = min(from + BigInt(this.options.logRange) - 1n, confirmed);
     const logs = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
+    const activeLogs = logs.filter((log) => !log.removed);
 
     // Block timestamps, which `getLogs` does not return and three columns need. One call per block
     // that actually has logs, plus the range end for its hash, rather than one per block in range.
-    const wanted = new Set<bigint>(logs.map((log) => log.blockNumber));
+    const wanted = new Set<bigint>(activeLogs.map((log) => log.blockNumber));
     wanted.add(to);
     const blocks = await client.blocks([...wanted], signal);
 
@@ -190,6 +201,45 @@ export class EvmWatcher {
         "the block at the end of this range disappeared mid pass, so nothing was committed",
       );
       return false;
+    }
+
+    const mustVerifyReceipts = this.options.requireReceipts ?? client.receipts !== undefined;
+    if (activeLogs.length > 0 && mustVerifyReceipts) {
+      try {
+        if (client.receipts === undefined) {
+          throw new ReceiptConsistencyError(
+            "client does not provide transaction receipts required for log verification",
+          );
+        }
+        const receipts = await client.receipts(
+          activeLogs.map((log) => log.transactionHash),
+          signal,
+        );
+        verifyRangeReceiptConsistency({
+          router,
+          fromBlock: from,
+          toBlock: to,
+          logs: activeLogs,
+          blocks,
+          receipts,
+        });
+      } catch (error) {
+        if (error instanceof ReceiptConsistencyError) {
+          logger.error(
+            {
+              chain: chainKey,
+              from: from.toString(),
+              to: to.toString(),
+              txHash: error.txHash,
+              block: error.blockNumber === null ? null : error.blockNumber.toString(),
+              logIndex: error.logIndex,
+              reason: error.message,
+            },
+            "evm receipt consistency check failed; leaving range uncommitted",
+          );
+        }
+        throw error;
+      }
     }
 
     let written = 0;
@@ -206,13 +256,13 @@ export class EvmWatcher {
           ignored += 1;
           continue;
         }
-        const timestamp = blocks.get(log.blockNumber)?.timestamp;
-        if (timestamp === undefined) {
+        const stamp = blocks.get(log.blockNumber);
+        if (stamp === undefined) {
           throw new Error(
             `no timestamp for block ${log.blockNumber.toString()} on ${chainKey}, which three columns need`,
           );
         }
-        if (await this.apply(tx, log, timestamp, pairing)) written += 1;
+        if (await this.apply(tx, log, stamp, pairing)) written += 1;
         else ignored += 1;
       }
 
@@ -314,7 +364,7 @@ export class EvmWatcher {
   private async apply(
     tx: Queryable,
     log: RawEvmLog,
-    timestamp: bigint,
+    stamp: BlockStamp,
     pairing: ClaimPairing,
   ): Promise<boolean> {
     const { chainKey, logger } = this.options;
@@ -334,10 +384,11 @@ export class EvmWatcher {
     const at: Position = {
       chainKey,
       block: log.blockNumber,
+      blockHash: stamp.hash,
       txHash: log.transactionHash,
       // Unlike Soroban, which orders events within a transaction instead.
       logIndex: log.logIndex,
-      observedAt: new Date(Number(timestamp) * 1000),
+      observedAt: new Date(Number(stamp.timestamp) * 1000),
     };
 
     const applied = await applyRouterLog(tx, at, decoded, pairing);

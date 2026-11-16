@@ -26,6 +26,8 @@ export interface Position {
   readonly chainKey: string;
   /** Ledger sequence on Stellar, block number on an EVM chain. */
   readonly block: bigint;
+  /** Canonical block hash on EVM chains when bound to a verified receipt. */
+  readonly blockHash?: string | null;
   readonly txHash: string;
   /** Log index on an EVM chain. Null on Stellar, which orders events differently. */
   readonly logIndex: number | null;
@@ -106,12 +108,54 @@ export interface HealthSample {
 }
 
 export async function writeOutbound(db: Queryable, at: Position, row: OutboundRow): Promise<void> {
+  const blockHash = at.blockHash ?? null;
+  if (blockHash === null) {
+    await db.query(
+      `INSERT INTO outbound_transfer
+         (origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
+          destination_chain, destination, rail_ref, origin_block, origin_tx, origin_log_index,
+          observed_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+       ON CONFLICT (origin_chain, nonce) DO UPDATE
+         SET route = EXCLUDED.route,
+             sender = EXCLUDED.sender,
+             token = EXCLUDED.token,
+             gross_amount = EXCLUDED.gross_amount,
+             fee = EXCLUDED.fee,
+             net_amount = EXCLUDED.net_amount,
+             destination_chain = EXCLUDED.destination_chain,
+             destination = EXCLUDED.destination,
+             rail_ref = COALESCE(EXCLUDED.rail_ref, outbound_transfer.rail_ref),
+             origin_block = EXCLUDED.origin_block,
+             origin_tx = EXCLUDED.origin_tx,
+             origin_log_index = EXCLUDED.origin_log_index`,
+      [
+        at.chainKey,
+        row.route,
+        row.nonce.toString(),
+        row.sender,
+        row.token,
+        row.grossAmount.toString(),
+        row.fee.toString(),
+        row.netAmount.toString(),
+        row.destinationChain,
+        row.destination,
+        row.railRef,
+        at.block.toString(),
+        at.txHash,
+        at.logIndex,
+        at.observedAt,
+      ],
+    );
+    return;
+  }
+
   await db.query(
     `INSERT INTO outbound_transfer
        (origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
         destination_chain, destination, rail_ref, origin_block, origin_tx, origin_log_index,
-        observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        observed_at, origin_block_hash)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
      ON CONFLICT (origin_chain, nonce) DO UPDATE
        SET route = EXCLUDED.route,
            sender = EXCLUDED.sender,
@@ -124,7 +168,8 @@ export async function writeOutbound(db: Queryable, at: Position, row: OutboundRo
            rail_ref = COALESCE(EXCLUDED.rail_ref, outbound_transfer.rail_ref),
            origin_block = EXCLUDED.origin_block,
            origin_tx = EXCLUDED.origin_tx,
-           origin_log_index = EXCLUDED.origin_log_index`,
+           origin_log_index = EXCLUDED.origin_log_index,
+           origin_block_hash = EXCLUDED.origin_block_hash`,
     [
       at.chainKey,
       row.route,
@@ -141,17 +186,56 @@ export async function writeOutbound(db: Queryable, at: Position, row: OutboundRo
       at.txHash,
       at.logIndex,
       at.observedAt,
+      blockHash,
     ],
   );
 }
 
 export async function writeInbound(db: Queryable, at: Position, row: InboundRow): Promise<void> {
+  const blockHash = at.blockHash ?? null;
+  if (blockHash === null) {
+    await db.query(
+      `INSERT INTO inbound_delivery
+         (destination_chain, route, source_chain, source_nonce, rail_message_id, recipient, token,
+          amount, delivered, claim_id, destination_block, destination_tx, destination_log_index,
+          observed_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+       ON CONFLICT (destination_chain, route, source_chain, source_nonce) DO UPDATE
+         SET rail_message_id = COALESCE(EXCLUDED.rail_message_id, inbound_delivery.rail_message_id),
+             recipient = EXCLUDED.recipient,
+             token = EXCLUDED.token,
+             amount = EXCLUDED.amount,
+             delivered = EXCLUDED.delivered,
+             claim_id = EXCLUDED.claim_id,
+             destination_block = EXCLUDED.destination_block,
+             destination_tx = EXCLUDED.destination_tx,
+             destination_log_index = EXCLUDED.destination_log_index`,
+      [
+        at.chainKey,
+        row.route,
+        row.sourceChain,
+        row.sourceNonce.toString(),
+        row.railMessageId,
+        row.recipient,
+        row.token,
+        row.amount.toString(),
+        row.delivered,
+        row.claimId === null ? null : row.claimId.toString(),
+        at.block.toString(),
+        at.txHash,
+        at.logIndex,
+        at.observedAt,
+      ],
+    );
+    return;
+  }
+
   await db.query(
     `INSERT INTO inbound_delivery
        (destination_chain, route, source_chain, source_nonce, rail_message_id, recipient, token,
         amount, delivered, claim_id, destination_block, destination_tx, destination_log_index,
-        observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        observed_at, destination_block_hash)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
      ON CONFLICT (destination_chain, route, source_chain, source_nonce) DO UPDATE
        SET rail_message_id = COALESCE(EXCLUDED.rail_message_id, inbound_delivery.rail_message_id),
            recipient = EXCLUDED.recipient,
@@ -161,7 +245,8 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
            claim_id = EXCLUDED.claim_id,
            destination_block = EXCLUDED.destination_block,
            destination_tx = EXCLUDED.destination_tx,
-           destination_log_index = EXCLUDED.destination_log_index`,
+           destination_log_index = EXCLUDED.destination_log_index,
+           destination_block_hash = EXCLUDED.destination_block_hash`,
     [
       at.chainKey,
       row.route,
@@ -177,6 +262,7 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
       at.txHash,
       at.logIndex,
       at.observedAt,
+      blockHash,
     ],
   );
 }

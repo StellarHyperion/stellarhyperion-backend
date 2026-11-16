@@ -7,10 +7,17 @@
  * rather than pointed at anvil, which will mine on demand but will not rewrite history underneath
  * a running watcher.
  */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+import { PGlite } from "@electric-sql/pglite";
 import { describe, expect, it } from "vitest";
 
+import { ReceiptConsistencyError } from "../../src/chains/evm/logs.js";
 import { EvmWatcher } from "../../src/chains/evm/watcher.js";
 import { viemClient, type EvmClient } from "../../src/chains/evm/client.js";
+import { readCursor } from "../../src/chains/stellar/store.js";
+import type { Queryable, QueryResultRows, Transactional } from "../../src/db/pool.js";
 import {
   ANVIL_HISTORY,
   ANVIL_CHAIN_ID,
@@ -545,5 +552,325 @@ describe("RPC endpoint failover", () => {
 
     // Cursor now advances properly from cursorRow(20n)
     expect(cursorWrites(db)).toEqual([{ block: 57n, family: "evm", hash: expect.any(String) }]);
+  });
+});
+
+async function openMigratedPglite(): Promise<{ db: Transactional; close: () => Promise<void> }> {
+  const pg = new PGlite();
+  for (const name of [
+    "1790900000000_initial-schema.sql",
+    "1791000000000_cursor-block-hash.sql",
+    "1791100000000_cursor-autovacuum-tuning.sql",
+    "1791200000000_evm-receipt-provenance.sql",
+  ]) {
+    const migrationPath = fileURLToPath(new URL(`../../migrations/${name}`, import.meta.url));
+    const upSql = readFileSync(migrationPath, "utf8").split("-- Down Migration")[0] ?? "";
+    await pg.exec(upSql);
+  }
+
+  const runQuery = async (
+    sql: string,
+    params: readonly unknown[] = [],
+  ): Promise<QueryResultRows> => {
+    const result = await pg.query(sql, [...params]);
+    const int8Columns = result.fields
+      .filter((field) => field.dataTypeID === 20)
+      .map((field) => field.name);
+    const rows = result.rows.map((raw) => {
+      const copy = { ...(raw as Record<string, unknown>) };
+      for (const column of int8Columns) {
+        const value = copy[column];
+        if (typeof value === "number" || typeof value === "bigint") {
+          copy[column] = String(value);
+        }
+      }
+      return copy;
+    });
+    return { rows, rowCount: result.affectedRows ?? result.rows.length };
+  };
+
+  const queryable: Queryable = { query: runQuery };
+  const db: Transactional = {
+    query: runQuery,
+    async transaction<T>(work: (tx: Queryable) => Promise<T>): Promise<T> {
+      await pg.exec("BEGIN");
+      try {
+        const out = await work(queryable);
+        await pg.exec("COMMIT");
+        return out;
+      } catch (error) {
+        await pg.exec("ROLLBACK");
+        throw error;
+      }
+    },
+  };
+
+  return {
+    db,
+    close: () => pg.close(),
+  };
+}
+
+describe("receipt and log consistency before ingestion", () => {
+  const RECIPIENT = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8";
+  const TOKEN = "0x5fbdb2315678afecb367f032d93f642f64180aa3";
+  const MESSAGE = `0x${"55".repeat(32)}` as const;
+  const TX = `0x${"66".repeat(32)}` as const;
+
+  function sampleArrival(block = 20n) {
+    return encodedLog(
+      "BridgeIn",
+      {
+        route: 0,
+        recipient: RECIPIENT,
+        token: TOKEN,
+        amount: 900_000n,
+        sourceChain: "stellar-testnet",
+        sourceNonce: 88n,
+        messageId: MESSAGE,
+      },
+      { blockNumber: block, logIndex: 0, txHash: TX },
+    );
+  }
+
+  it("rejects removed, reverted, or payload-mismatched receipt logs without committing a transfer", async () => {
+    const { db, close } = await openMigratedPglite();
+    try {
+      const arrival = sampleArrival(20n);
+      const client = new FakeEvmClient({ logs: [arrival], head: 30n });
+      const blockHash = client.stampFor(20n).hash;
+      const { logger } = capturingLogger();
+      const watcher = new EvmWatcher({
+        chainKey: CHAIN,
+        router: ANVIL_ROUTER,
+        chainId: ANVIL_CHAIN_ID,
+        startBlock: ANVIL_START_BLOCK,
+        confirmations: 0,
+        reorgDepth: 5,
+        logRange: 2_000,
+        client,
+        db,
+        logger,
+      });
+
+      // Case 1: Receipt log marked removed while getLogs returned removed=false.
+      client.overrideReceipt(TX, {
+        transactionHash: TX,
+        blockHash,
+        blockNumber: 20n,
+        status: "success",
+        logs: [
+          {
+            address: arrival.address,
+            blockHash,
+            blockNumber: 20n,
+            transactionHash: TX,
+            logIndex: 0,
+            data: arrival.data,
+            topics: arrival.topics,
+            removed: true,
+          },
+        ],
+      });
+      await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+        ReceiptConsistencyError,
+      );
+      expect(await readCursor(db, CHAIN)).toBeNull();
+
+      // Case 2: Reverted transaction receipt cannot establish a transfer.
+      client.overrideReceipt(TX, {
+        transactionHash: TX,
+        blockHash,
+        blockNumber: 20n,
+        status: "reverted",
+        logs: [
+          {
+            address: arrival.address,
+            blockHash,
+            blockNumber: 20n,
+            transactionHash: TX,
+            logIndex: 0,
+            data: arrival.data,
+            topics: arrival.topics,
+            removed: false,
+          },
+        ],
+      });
+      await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(/reverted/);
+      expect(await readCursor(db, CHAIN)).toBeNull();
+
+      // Case 3: Receipt log data tampered relative to getLogs payload.
+      client.overrideReceipt(TX, {
+        transactionHash: TX,
+        blockHash,
+        blockNumber: 20n,
+        status: "success",
+        logs: [
+          {
+            address: arrival.address,
+            blockHash,
+            blockNumber: 20n,
+            transactionHash: TX,
+            logIndex: 0,
+            data: "0x1234",
+            topics: arrival.topics,
+            removed: false,
+          },
+        ],
+      });
+      await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(/data/);
+
+      const { rows } = await db.query(
+        "SELECT count(*)::int AS n FROM inbound_delivery WHERE destination_chain = $1",
+        [CHAIN],
+      );
+      expect(rows[0]?.n).toBe(0);
+    } finally {
+      await close();
+    }
+  });
+
+  it("enforces block hash and transaction identity agreement across log, receipt, and block header", async () => {
+    const { db, close } = await openMigratedPglite();
+    try {
+      const arrival = sampleArrival(20n);
+      const client = new FakeEvmClient({ logs: [arrival], head: 30n });
+      const wrongBlockHash = `0x${"ff".repeat(32)}` as const;
+      const { logger } = capturingLogger();
+      const watcher = new EvmWatcher({
+        chainKey: CHAIN,
+        router: ANVIL_ROUTER,
+        chainId: ANVIL_CHAIN_ID,
+        startBlock: ANVIL_START_BLOCK,
+        confirmations: 0,
+        reorgDepth: 5,
+        logRange: 2_000,
+        client,
+        db,
+        logger,
+      });
+
+      // Receipt reports a different block hash than getBlock(20).
+      client.overrideReceipt(TX, {
+        transactionHash: TX,
+        blockHash: wrongBlockHash,
+        blockNumber: 20n,
+        status: "success",
+        logs: [
+          {
+            address: arrival.address,
+            blockHash: wrongBlockHash,
+            blockNumber: 20n,
+            transactionHash: TX,
+            logIndex: 0,
+            data: arrival.data,
+            topics: arrival.topics,
+            removed: false,
+          },
+        ],
+      });
+      await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+        /receipt block hash .* disagrees/,
+      );
+      expect(await readCursor(db, CHAIN)).toBeNull();
+
+      // Receipt missing entirely (provider lag/inconsistency) leaves range uncommitted.
+      client.overrideReceipt(TX, null);
+      await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+        /missing transaction receipt/,
+      );
+      expect(await readCursor(db, CHAIN)).toBeNull();
+
+      // Once provider serves consistent evidence, ingestion succeeds and records canonical block hash.
+      client.clearReceiptOverrides();
+      expect(await watcher.tick(AbortSignal.timeout(5_000))).toBe(false);
+      expect((await readCursor(db, CHAIN))?.position).toBe(30n);
+
+      const { rows } = await db.query(
+        "SELECT destination_block_hash, destination_tx FROM inbound_delivery WHERE destination_chain = $1",
+        [CHAIN],
+      );
+      expect(rows).toEqual([
+        {
+          destination_block_hash: client.stampFor(20n).hash,
+          destination_tx: TX,
+        },
+      ]);
+    } finally {
+      await close();
+    }
+  });
+
+  it("rejects partial getLogs responses that omit a sibling ClaimParked log present in the receipt", async () => {
+    const { db, close } = await openMigratedPglite();
+    try {
+      const parked = encodedLog(
+        "ClaimParked",
+        {
+          id: 9n,
+          recipient: RECIPIENT,
+          token: TOKEN,
+          amount: 900_000n,
+          route: 0,
+          sourceChain: "stellar-testnet",
+          sourceNonce: 88n,
+        },
+        { blockNumber: 20n, logIndex: 0, txHash: TX },
+      );
+      const bridgeIn = encodedLog(
+        "BridgeIn",
+        {
+          route: 0,
+          recipient: RECIPIENT,
+          token: TOKEN,
+          amount: 900_000n,
+          sourceChain: "stellar-testnet",
+          sourceNonce: 88n,
+          messageId: MESSAGE,
+        },
+        { blockNumber: 20n, logIndex: 1, txHash: TX },
+      );
+
+      // Provider's getLogs omitted `parked` (logIndex 0) while receipt includes both logs 0 and 1.
+      const client = new FakeEvmClient({ logs: [bridgeIn], head: 30n });
+      const blockHash = client.stampFor(20n).hash;
+      client.overrideReceipt(TX, {
+        transactionHash: TX,
+        blockHash,
+        blockNumber: 20n,
+        status: "success",
+        logs: [parked, bridgeIn].map((entry) => ({
+          address: entry.address,
+          blockHash,
+          blockNumber: entry.blockNumber,
+          transactionHash: entry.transactionHash,
+          logIndex: entry.logIndex,
+          data: entry.data,
+          topics: entry.topics,
+          removed: false,
+        })),
+      });
+
+      const { logger } = capturingLogger();
+      const watcher = new EvmWatcher({
+        chainKey: CHAIN,
+        router: ANVIL_ROUTER,
+        chainId: ANVIL_CHAIN_ID,
+        startBlock: ANVIL_START_BLOCK,
+        confirmations: 0,
+        reorgDepth: 5,
+        logRange: 2_000,
+        client,
+        db,
+        logger,
+      });
+
+      await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+        /omitted canonical router log/,
+      );
+      expect(await readCursor(db, CHAIN)).toBeNull();
+    } finally {
+      await close();
+    }
   });
 });

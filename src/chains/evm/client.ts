@@ -15,6 +15,7 @@ import type { Hex } from "viem";
 export interface RawEvmLog {
   readonly address: Hex;
   readonly blockNumber: bigint;
+  readonly blockHash?: Hex;
   readonly transactionHash: Hex;
   readonly logIndex: number;
   readonly data: Hex;
@@ -28,6 +29,25 @@ export interface RawEvmLog {
   readonly topics: [] | [Hex, ...Hex[]];
   /** Set by the node when the log is from a block that is no longer canonical. */
   readonly removed: boolean;
+}
+
+export interface EvmReceiptLog {
+  readonly address: Hex;
+  readonly blockHash: Hex;
+  readonly blockNumber: bigint;
+  readonly transactionHash: Hex;
+  readonly logIndex: number;
+  readonly data: Hex;
+  readonly topics: [] | [Hex, ...Hex[]];
+  readonly removed: boolean;
+}
+
+export interface EvmTransactionReceipt {
+  readonly transactionHash: Hex;
+  readonly blockHash: Hex;
+  readonly blockNumber: bigint;
+  readonly status: "success" | "reverted";
+  readonly logs: readonly EvmReceiptLog[];
 }
 
 export interface BlockStamp {
@@ -63,6 +83,15 @@ export interface EvmClient {
   logs(query: LogQuery, signal?: AbortSignal): Promise<readonly RawEvmLog[]>;
   /** Hash and timestamp for each block asked for. A block missing from the map is gone. */
   blocks(numbers: readonly bigint[], signal?: AbortSignal): Promise<Map<bigint, BlockStamp>>;
+  /**
+   * Canonical transaction receipts keyed by lowercased transaction hash.
+   * Missing receipts are omitted from the returned map so the caller can detect mid-pass reorgs or
+   * provider inconsistencies explicitly.
+   */
+  receipts?(
+    txHashes: readonly Hex[],
+    signal?: AbortSignal,
+  ): Promise<Map<string, EvmTransactionReceipt>>;
 }
 
 export interface ViemClientOptions {
@@ -152,6 +181,7 @@ export function viemClient(
       return logs.map((log) => ({
         address: log.address,
         blockNumber: log.blockNumber,
+        blockHash: log.blockHash,
         transactionHash: log.transactionHash,
         logIndex: log.logIndex,
         data: log.data,
@@ -183,5 +213,56 @@ export function viemClient(
       }
       return found;
     },
+
+    receipts: async (txHashes) => {
+      const unique = new Map<string, Hex>();
+      for (const hash of txHashes) {
+        const key = hash.toLowerCase();
+        if (!unique.has(key)) unique.set(key, hash);
+      }
+      const found = new Map<string, EvmTransactionReceipt>();
+      const results = await Promise.all(
+        [...unique.entries()].map(async ([key, hash]) => {
+          try {
+            const receipt = await client.getTransactionReceipt({ hash });
+            return { key, receipt };
+          } catch (error) {
+            if (isReceiptNotFound(error)) {
+              return { key, receipt: null };
+            }
+            throw error;
+          }
+        }),
+      );
+      for (const { key, receipt } of results) {
+        if (receipt === null) continue;
+        found.set(key, {
+          transactionHash: receipt.transactionHash,
+          blockHash: receipt.blockHash,
+          blockNumber: receipt.blockNumber,
+          status: receipt.status,
+          logs: receipt.logs.map((entry) => ({
+            address: entry.address,
+            blockHash: entry.blockHash,
+            blockNumber: entry.blockNumber,
+            transactionHash: entry.transactionHash,
+            logIndex: entry.logIndex,
+            data: entry.data,
+            topics: entry.topics,
+            removed: entry.removed,
+          })),
+        });
+      }
+      return found;
+    },
   };
+}
+
+function isReceiptNotFound(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const name = "name" in error && typeof error.name === "string" ? error.name : "";
+  if (name === "TransactionReceiptNotFoundError") return true;
+  const message =
+    "message" in error && typeof error.message === "string" ? error.message.toLowerCase() : "";
+  return message.includes("transaction receipt") && message.includes("not be found");
 }

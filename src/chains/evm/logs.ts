@@ -25,6 +25,8 @@ import { hyperionRouterAbi } from "@hyperion/protocol/abi";
 import { decodeEventLog } from "viem";
 import type { Hex } from "viem";
 
+import type { BlockStamp, EvmTransactionReceipt, RawEvmLog } from "./client.js";
+
 /** A 32 byte word of zeroes, which is how the router spells "no rail reference yet". */
 const ZERO_WORD = `0x${"0".repeat(64)}` as const;
 
@@ -150,6 +152,220 @@ export class LogShapeError extends Error {
 /** The first topic, which is the event signature and the only thing to name an unknown log by. */
 export function signatureOf(log: Pick<RouterLogInput, "topics">): Hex {
   return log.topics[0] ?? "0x";
+}
+
+export class ReceiptConsistencyError extends Error {
+  readonly txHash: string | null;
+  readonly blockNumber: bigint | null;
+  readonly logIndex: number | null;
+
+  constructor(
+    reason: string,
+    context: {
+      readonly txHash?: string | null;
+      readonly blockNumber?: bigint | null;
+      readonly logIndex?: number | null;
+    } = {},
+  ) {
+    super(`EVM receipt consistency check failed: ${reason}`);
+    this.name = "ReceiptConsistencyError";
+    this.txHash = context.txHash ?? null;
+    this.blockNumber = context.blockNumber ?? null;
+    this.logIndex = context.logIndex ?? null;
+  }
+}
+
+export interface ReceiptConsistencyInput {
+  readonly router: Hex;
+  readonly fromBlock: bigint;
+  readonly toBlock: bigint;
+  readonly logs: readonly RawEvmLog[];
+  readonly blocks: ReadonlyMap<bigint, BlockStamp>;
+  readonly receipts: ReadonlyMap<string, EvmTransactionReceipt>;
+}
+
+/**
+ * Verify that every accepted router log in `[fromBlock, toBlock]` is backed by a successful
+ * canonical transaction receipt whose block number, block hash, transaction hash, contract address,
+ * log index, topics, data, and router log count agree across `getLogs`, `getBlock`, and
+ * `getTransactionReceipt`.
+ */
+export function verifyRangeReceiptConsistency(input: ReceiptConsistencyInput): void {
+  const expectedRouter = input.router.toLowerCase();
+  const nonRemovedByTx = new Map<string, RawEvmLog[]>();
+
+  for (const log of input.logs) {
+    if (log.removed) continue;
+
+    if (log.address.toLowerCase() !== expectedRouter) {
+      throw new ReceiptConsistencyError(
+        `log address ${log.address} does not match watched router ${input.router}`,
+        { txHash: log.transactionHash, blockNumber: log.blockNumber, logIndex: log.logIndex },
+      );
+    }
+
+    if (log.blockNumber < input.fromBlock || log.blockNumber > input.toBlock) {
+      throw new ReceiptConsistencyError(
+        `log block ${log.blockNumber.toString()} is outside requested range ${input.fromBlock.toString()}..${input.toBlock.toString()}`,
+        { txHash: log.transactionHash, blockNumber: log.blockNumber, logIndex: log.logIndex },
+      );
+    }
+
+    const blockStamp = input.blocks.get(log.blockNumber);
+    if (blockStamp === undefined) {
+      throw new ReceiptConsistencyError(
+        `block header for block ${log.blockNumber.toString()} is missing`,
+        { txHash: log.transactionHash, blockNumber: log.blockNumber, logIndex: log.logIndex },
+      );
+    }
+
+    const canonicalBlockHash = blockStamp.hash.toLowerCase();
+    if (log.blockHash !== undefined && log.blockHash.toLowerCase() !== canonicalBlockHash) {
+      throw new ReceiptConsistencyError(
+        `log block hash ${log.blockHash} disagrees with canonical block header ${blockStamp.hash}`,
+        { txHash: log.transactionHash, blockNumber: log.blockNumber, logIndex: log.logIndex },
+      );
+    }
+
+    const txKey = log.transactionHash.toLowerCase();
+    const receipt = input.receipts.get(txKey);
+    if (receipt === undefined) {
+      throw new ReceiptConsistencyError(`missing transaction receipt for ${log.transactionHash}`, {
+        txHash: log.transactionHash,
+        blockNumber: log.blockNumber,
+        logIndex: log.logIndex,
+      });
+    }
+
+    if (receipt.transactionHash.toLowerCase() !== txKey) {
+      throw new ReceiptConsistencyError(
+        `receipt transaction hash ${receipt.transactionHash} disagrees with log transaction hash ${log.transactionHash}`,
+        { txHash: log.transactionHash, blockNumber: log.blockNumber, logIndex: log.logIndex },
+      );
+    }
+
+    if (receipt.blockNumber !== log.blockNumber) {
+      throw new ReceiptConsistencyError(
+        `receipt block number ${receipt.blockNumber.toString()} disagrees with log block ${log.blockNumber.toString()}`,
+        { txHash: log.transactionHash, blockNumber: log.blockNumber, logIndex: log.logIndex },
+      );
+    }
+
+    if (receipt.blockHash.toLowerCase() !== canonicalBlockHash) {
+      throw new ReceiptConsistencyError(
+        `receipt block hash ${receipt.blockHash} disagrees with canonical block header ${blockStamp.hash}`,
+        { txHash: log.transactionHash, blockNumber: log.blockNumber, logIndex: log.logIndex },
+      );
+    }
+
+    if (receipt.status !== "success") {
+      throw new ReceiptConsistencyError(
+        `transaction ${log.transactionHash} has non-successful receipt status "${receipt.status}"`,
+        { txHash: log.transactionHash, blockNumber: log.blockNumber, logIndex: log.logIndex },
+      );
+    }
+
+    const matchingReceiptLogs = receipt.logs.filter((entry) => entry.logIndex === log.logIndex);
+    if (matchingReceiptLogs.length !== 1) {
+      throw new ReceiptConsistencyError(
+        `expected exactly one receipt log at logIndex ${String(log.logIndex)} in ${log.transactionHash}, found ${String(matchingReceiptLogs.length)}`,
+        { txHash: log.transactionHash, blockNumber: log.blockNumber, logIndex: log.logIndex },
+      );
+    }
+
+    const receiptLog = matchingReceiptLogs[0];
+    if (receiptLog === undefined) {
+      throw new ReceiptConsistencyError(`missing receipt log at logIndex ${String(log.logIndex)}`, {
+        txHash: log.transactionHash,
+        blockNumber: log.blockNumber,
+        logIndex: log.logIndex,
+      });
+    }
+
+    if (receiptLog.removed) {
+      throw new ReceiptConsistencyError(
+        `receipt log at logIndex ${String(log.logIndex)} in ${log.transactionHash} is marked removed`,
+        { txHash: log.transactionHash, blockNumber: log.blockNumber, logIndex: log.logIndex },
+      );
+    }
+
+    if (receiptLog.address.toLowerCase() !== expectedRouter) {
+      throw new ReceiptConsistencyError(
+        `receipt log address ${receiptLog.address} disagrees with watched router ${input.router}`,
+        { txHash: log.transactionHash, blockNumber: log.blockNumber, logIndex: log.logIndex },
+      );
+    }
+
+    if (receiptLog.transactionHash.toLowerCase() !== txKey) {
+      throw new ReceiptConsistencyError(
+        `receipt log transaction hash ${receiptLog.transactionHash} disagrees with ${log.transactionHash}`,
+        { txHash: log.transactionHash, blockNumber: log.blockNumber, logIndex: log.logIndex },
+      );
+    }
+
+    if (receiptLog.blockNumber !== log.blockNumber) {
+      throw new ReceiptConsistencyError(
+        `receipt log block number ${receiptLog.blockNumber.toString()} disagrees with ${log.blockNumber.toString()}`,
+        { txHash: log.transactionHash, blockNumber: log.blockNumber, logIndex: log.logIndex },
+      );
+    }
+
+    if (receiptLog.blockHash.toLowerCase() !== canonicalBlockHash) {
+      throw new ReceiptConsistencyError(
+        `receipt log block hash ${receiptLog.blockHash} disagrees with canonical block header ${blockStamp.hash}`,
+        { txHash: log.transactionHash, blockNumber: log.blockNumber, logIndex: log.logIndex },
+      );
+    }
+
+    if (receiptLog.data.toLowerCase() !== log.data.toLowerCase()) {
+      throw new ReceiptConsistencyError(
+        `receipt log data at logIndex ${String(log.logIndex)} disagrees with getLogs payload`,
+        { txHash: log.transactionHash, blockNumber: log.blockNumber, logIndex: log.logIndex },
+      );
+    }
+
+    if (!topicsEqual(receiptLog.topics, log.topics)) {
+      throw new ReceiptConsistencyError(
+        `receipt log topics at logIndex ${String(log.logIndex)} disagree with getLogs payload`,
+        { txHash: log.transactionHash, blockNumber: log.blockNumber, logIndex: log.logIndex },
+      );
+    }
+
+    const list = nonRemovedByTx.get(txKey) ?? [];
+    list.push(log);
+    nonRemovedByTx.set(txKey, list);
+  }
+
+  // Ensure getLogs did not omit a sibling router log from any accepted transaction receipt (such as
+  // a `ClaimParked` emitted immediately before `BridgeIn` in the same transaction).
+  for (const [txKey, txLogs] of nonRemovedByTx.entries()) {
+    const receipt = input.receipts.get(txKey);
+    if (receipt === undefined) continue;
+    const receiptRouterLogs = receipt.logs.filter(
+      (entry) => !entry.removed && entry.address.toLowerCase() === expectedRouter,
+    );
+    const seenIndices = new Set(txLogs.map((entry) => entry.logIndex));
+    for (const receiptEntry of receiptRouterLogs) {
+      if (!seenIndices.has(receiptEntry.logIndex)) {
+        throw new ReceiptConsistencyError(
+          `getLogs omitted canonical router log at logIndex ${String(receiptEntry.logIndex)} present in receipt ${receipt.transactionHash}`,
+          {
+            txHash: receipt.transactionHash,
+            blockNumber: receipt.blockNumber,
+            logIndex: receiptEntry.logIndex,
+          },
+        );
+      }
+    }
+  }
+}
+
+function topicsEqual(left: readonly Hex[], right: readonly Hex[]): boolean {
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i += 1) {
+    if (left[i]?.toLowerCase() !== right[i]?.toLowerCase()) return false;
+  }
+  return true;
 }
 
 function describe(value: unknown): string {

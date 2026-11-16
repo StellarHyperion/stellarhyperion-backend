@@ -197,6 +197,46 @@ suite("replaying the anvil deployment's logs", () => {
     await clean();
     await drain();
   });
+
+  it("binds outbound transfer rows to canonical receipt block hashes and aborts on inconsistent receipts", async () => {
+    const { rows } = await db.query(
+      "SELECT origin_tx, origin_block, origin_block_hash FROM outbound_transfer WHERE origin_chain = $1",
+      [CHAIN],
+    );
+    expect(rows).toHaveLength(1);
+    const referenceClient = new FakeEvmClient({ head: ANVIL_HEAD });
+    const expectedHash = referenceClient.stampFor(BigInt(String(rows[0]?.origin_block))).hash;
+    expect(rows[0]?.origin_block_hash).toBe(expectedHash);
+
+    await clean();
+    const inconsistentClient = new FakeEvmClient({ head: ANVIL_HEAD });
+    inconsistentClient.overrideReceipt(String(rows[0]?.origin_tx) as `0x${string}`, null);
+    const { logger } = capturingLogger();
+    const watcher = new EvmWatcher({
+      chainKey: CHAIN,
+      router: ANVIL_ROUTER,
+      chainId: ANVIL_CHAIN_ID,
+      startBlock: ANVIL_START_BLOCK,
+      confirmations: 0,
+      reorgDepth: 5,
+      logRange: 2_000,
+      client: inconsistentClient,
+      db,
+      logger,
+    });
+    await expect(watcher.tick(AbortSignal.timeout(20_000))).rejects.toThrow(
+      /missing transaction receipt/,
+    );
+
+    const cursorAfterFailure = await db.query(
+      "SELECT count(*)::int AS n FROM indexer_cursor WHERE chain_key = $1",
+      [CHAIN],
+    );
+    expect(cursorAfterFailure.rows[0]?.n).toBe(0);
+
+    await clean();
+    await drain();
+  });
 });
 
 /** Everything keyed, in a comparable shape. route_health is append only and deliberately absent. */
