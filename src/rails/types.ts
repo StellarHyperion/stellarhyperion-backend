@@ -86,6 +86,23 @@ export class RailError extends Error {
   }
 }
 
+export type RailRetryClass =
+  | "awaiting_index"
+  | "awaiting_delivery_proof"
+  | "transient_provider"
+  | "rate_limited"
+  | "terminal_evidence"
+  | "settled";
+
+export interface RetrySchedulePolicy {
+  /** Initial backoff for transient provider errors (default 5_000 ms). */
+  readonly baseBackoffMs?: number | undefined;
+  /** Maximum backoff cap for transient provider errors (default 300_000 ms). */
+  readonly maxBackoffMs?: number | undefined;
+  /** Default cooldown when a provider rate-limits without specifying retryAfterMs (default 60_000 ms). */
+  readonly defaultRateLimitMs?: number | undefined;
+}
+
 /** One transfer waiting on a rail, as the queue hands it over. */
 export interface PendingTransfer {
   readonly transferId: bigint;
@@ -99,7 +116,34 @@ export interface PendingTransfer {
   readonly checkFailures: number;
   /** True when an inbound delivery already exists, which settles it without asking the rail. */
   readonly delivered: boolean;
+  readonly retryClass?: RailRetryClass | null | undefined;
+  readonly nextAttemptAt?: Date | null | undefined;
 }
+
+export interface TerminalRetryRecoveryRequest {
+  readonly transferId: bigint;
+  readonly reviewedBy: string;
+  readonly reason: string;
+  readonly now?: Date | undefined;
+  readonly scheduleAt?: Date | undefined;
+}
+
+export type TerminalRetryRecoveryOutcome =
+  | {
+      readonly kind: "recovered";
+      readonly transferId: bigint;
+      readonly priorStatus: AttestationStatus;
+      readonly priorRetryClass: RailRetryClass | null;
+      readonly newStatus: "pending" | "attested";
+      readonly newRetryClass: "awaiting_index" | "awaiting_delivery_proof";
+      readonly nextAttemptAt: Date;
+      readonly recoveryNote: string;
+    }
+  | {
+      readonly kind: "refused";
+      readonly code: "not_found" | "already_delivered" | "not_terminal_evidence";
+      readonly detail: string;
+    };
 
 /** What a rail client has to offer the pass that polls it. */
 export interface RailClient {

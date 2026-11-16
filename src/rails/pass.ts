@@ -1,21 +1,6 @@
 /**
- * One pass over the transfers waiting on one rail.
- *
- * Shaped exactly like a chain watcher's pass, and joining the same `PolledWorker` list, because
- * the lifecycle problems are identical: one at a time, catch up without sleeping, back off on
- * failure, report readiness from cached state. What differs is what a failure means, and there are
- * two kinds of backoff here rather than one.
- *
- * The poller's backoff is about the rail being unreachable. `check_failures` on the row is about
- * one transfer being unanswerable while the rail is otherwise fine, which happens when a transfer
- * was filed under the wrong rail or its chain has no domain. Those are different situations and
- * conflating them means either one bad transfer backs off the whole rail, or a dead rail is
- * hammered once per transfer per tick. So a per transfer failure is counted on the row and the
- * queue stops offering it after `maxCheckFailures`; only a rail level failure reaches the poller.
- *
- * A rate limit is its own case again. Circle blocks every request for five minutes after one, so
- * the pass records a cooldown and returns without asking anything until it passes. Doubling from a
- * second would spend those five minutes refreshing the block.
+ * One pass over the transfers waiting on one rail, persisting normalized retry classifications and
+ * durable `next_attempt_at` schedules so restarts preserve backoff without retry storms.
  */
 import type { AppConfig } from "../config/config.js";
 import { verifyItsDelivery } from "./axelar/delivery.js";
@@ -24,17 +9,24 @@ import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
-import { writeInbound, writeAttestation } from "../chains/writers.js";
+import { writeInbound } from "../chains/writers.js";
 import { outstandingForRail, pendingForRail } from "./queue.js";
-import { RailError, isTerminal, type PendingTransfer, type RailClient } from "./types.js";
+import {
+  computeFailureSchedule,
+  computeHealthySchedule,
+  resolveRetryPolicy,
+  writeScheduledAttestation,
+} from "./retry-schedule.js";
+import {
+  RailError,
+  isTerminal,
+  type AttestationStatus,
+  type PendingTransfer,
+  type RailClient,
+  type RailRetryClass,
+  type RetrySchedulePolicy,
+} from "./types.js";
 
-/**
- * How many outstanding transfers still counts as keeping up.
- *
- * The batch is the limit on one tick, so a backlog larger than a batch means the rail is more than
- * one tick behind. A couple of batches is a busy minute; ten is something worth looking at, and
- * the number itself goes in the readiness detail either way.
- */
 const BACKLOG_MULTIPLE_BEFORE_DEGRADED = 3;
 
 export interface RailPassOptions {
@@ -48,6 +40,7 @@ export interface RailPassOptions {
   readonly maxCheckFailures: number;
   readonly now?: () => Date;
   readonly config?: AppConfig;
+  readonly retryPolicy?: RetrySchedulePolicy | undefined;
 }
 
 export interface RailProgress {
@@ -115,35 +108,61 @@ export class RailPass {
     if (cooldown !== null && cooldown > this.now()) return false;
     this.cooldownUntil = null;
 
+    const passTime = this.now();
     const queue = await pendingForRail(db, {
       route: this.options.route,
       limit: batchSize,
-      notCheckedSince: new Date(this.now().getTime() - this.options.recheckAfterMs),
+      notCheckedSince: new Date(passTime.getTime() - this.options.recheckAfterMs),
       maxCheckFailures: this.options.maxCheckFailures,
+      now: passTime,
     });
 
     let checked = 0;
     let settled = 0;
     let failures = 0;
 
-    for (const transfer of queue) {
+    for (let index = 0; index < queue.length; index += 1) {
+      const transfer = queue[index];
+      if (transfer === undefined) continue;
       if (signal.aborted) break;
       try {
-        if (await this.handle(transfer)) settled += 1;
+        if (await this.handle(transfer, signal)) settled += 1;
         checked += 1;
       } catch (error) {
         if (error instanceof RailError && error.kind === "rateLimited") {
-          // The whole rail, not this transfer. Stop the pass and hold off.
-          const waitMs = error.retryAfterMs ?? 60_000;
-          this.cooldownUntil = new Date(this.now().getTime() + waitMs);
+          const policy = resolveRetryPolicy(this.options.retryPolicy);
+          const waitMs = error.retryAfterMs ?? policy.defaultRateLimitMs;
+          const now = this.now();
+          this.cooldownUntil = new Date(now.getTime() + waitMs);
+          // Persist durable rate_limited schedule on the transfer and any remaining queued batch
+          // items that are not already delivered so a process restart respects the rate-limit window!
+          for (const queuedItem of queue.slice(index)) {
+            if (queuedItem.delivered) continue;
+            const schedule = computeFailureSchedule(
+              error,
+              queuedItem.checkFailures,
+              this.options.maxCheckFailures,
+              now,
+              this.options.retryPolicy,
+            );
+            await this.write(queuedItem, {
+              status: queuedItem.status ?? "pending",
+              railStatus: null,
+              reference: null,
+              attestedAt: null,
+              checkedAt: now,
+              failures: queuedItem.checkFailures,
+              error: error.message,
+              retryClass: schedule.retryClass,
+              nextAttemptAt: schedule.nextAttemptAt,
+            });
+          }
           logger.warn(
             { rail: client.rail, until: this.cooldownUntil.toISOString() },
             "the rail rate limited us, holding off rather than retrying",
           );
           break;
         }
-        // Everything else is this transfer's problem, recorded on its own row so one unanswerable
-        // transfer cannot back off the rest of the queue.
         failures += 1;
         await this.recordFailure(transfer, error);
       }
@@ -159,17 +178,20 @@ export class RailPass {
       );
     }
 
-    // A full batch means the queue is longer than one pass, so come straight back.
     return queue.length >= batchSize;
   }
 
   /** Returns true when the transfer reached a terminal state on this pass. */
-  private async handle(transfer: PendingTransfer): Promise<boolean> {
+  private async handle(transfer: PendingTransfer, signal: AbortSignal): Promise<boolean> {
     const at = this.now();
 
     if (transfer.delivered) {
-      // Our own inbound index already says the money arrived, which outranks anything the rail
-      // would tell us. No request, and the transfer leaves the queue for good.
+      const schedule = computeHealthySchedule(
+        "delivered",
+        "delivered",
+        at,
+        this.options.recheckAfterMs,
+      );
       await this.write(transfer, {
         status: "delivered",
         railStatus: null,
@@ -178,21 +200,26 @@ export class RailPass {
         checkedAt: at,
         failures: 0,
         error: null,
+        retryClass: schedule.retryClass,
+        nextAttemptAt: schedule.nextAttemptAt,
       });
       return true;
     }
 
-    const lookup = await this.options.client.look(transfer);
+    const lookup = await this.options.client.look(transfer, signal);
     if (lookup.kind === "missing") {
-      // Normal. The rail has not indexed the burn yet, which is where every transfer starts.
+      const status: AttestationStatus = transfer.status ?? "pending";
+      const schedule = computeHealthySchedule(status, "missing", at, this.options.recheckAfterMs);
       await this.write(transfer, {
-        status: transfer.status ?? "pending",
+        status,
         railStatus: null,
         reference: null,
         attestedAt: null,
         checkedAt: at,
         failures: 0,
         error: null,
+        retryClass: schedule.retryClass,
+        nextAttemptAt: schedule.nextAttemptAt,
       });
       return false;
     }
@@ -203,21 +230,38 @@ export class RailPass {
         (await verifyItsDelivery(this.options.config, this.options.db, transfer, report)) ??
         (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report));
       if (verified) {
+        const settledSchedule = computeHealthySchedule(
+          "delivered",
+          "delivered",
+          at,
+          this.options.recheckAfterMs,
+        );
         await this.options.db.transaction(async (tx) => {
           await writeInbound(tx, verified.at, verified.row);
-        });
-        await this.write(transfer, {
-          status: "delivered",
-          railStatus: report.railStatus,
-          reference: report.reference,
-          attestedAt: report.attestedAt,
-          checkedAt: at,
-          failures: 0,
-          error: null,
+          await writeScheduledAttestation(tx, {
+            transferId: transfer.transferId,
+            route: transfer.route,
+            status: "delivered",
+            railStatus: report.railStatus,
+            railReference: report.reference,
+            attestedAt: report.attestedAt,
+            checkedAt: at,
+            checkFailures: 0,
+            lastError: null,
+            retryClass: settledSchedule.retryClass,
+            nextAttemptAt: settledSchedule.nextAttemptAt,
+          });
         });
         return true;
       }
     }
+
+    const schedule = computeHealthySchedule(
+      report.status,
+      "found",
+      at,
+      this.options.recheckAfterMs,
+    );
     await this.write(transfer, {
       status: report.status,
       railStatus: report.railStatus,
@@ -226,23 +270,32 @@ export class RailPass {
       checkedAt: at,
       failures: 0,
       error: null,
+      retryClass: schedule.retryClass,
+      nextAttemptAt: schedule.nextAttemptAt,
     });
     return isTerminal(report.status);
   }
 
   private async recordFailure(transfer: PendingTransfer, error: unknown): Promise<void> {
+    const now = this.now();
     const failures = transfer.checkFailures + 1;
     const reason = error instanceof Error ? error.message : String(error);
     const permanent = error instanceof RailError && error.kind === "permanent";
+    const schedule = computeFailureSchedule(
+      error,
+      failures,
+      this.options.maxCheckFailures,
+      now,
+      this.options.retryPolicy,
+    );
 
     if (permanent || failures >= this.options.maxCheckFailures) {
-      // Said out loud, because the queue is about to stop offering this transfer and a transfer
-      // that quietly stops being chased is the thing somebody notices a week later.
       this.options.logger.error(
         {
           rail: this.options.client.rail,
           transferId: transfer.transferId.toString(),
           failures,
+          retryClass: schedule.retryClass,
           reason,
         },
         permanent
@@ -252,33 +305,34 @@ export class RailPass {
     }
 
     await this.write(transfer, {
-      // Still pending, not failed. A transfer we cannot ask about is not a transfer that failed,
-      // and writing `failed` here would claim the money did not move on the strength of our own
-      // inability to get an answer.
       status: transfer.status ?? "pending",
       railStatus: null,
       reference: null,
       attestedAt: null,
-      checkedAt: this.now(),
+      checkedAt: now,
       failures,
       error: reason,
+      retryClass: schedule.retryClass,
+      nextAttemptAt: schedule.nextAttemptAt,
     });
   }
 
   private async write(
     transfer: PendingTransfer,
     fields: {
-      readonly status: string;
+      readonly status: AttestationStatus;
       readonly railStatus: string | null;
       readonly reference: string | null;
       readonly attestedAt: Date | null;
       readonly checkedAt: Date;
       readonly failures: number;
       readonly error: string | null;
+      readonly retryClass: RailRetryClass;
+      readonly nextAttemptAt: Date | null;
     },
   ): Promise<void> {
     await this.options.db.transaction(async (tx: Queryable) => {
-      await writeAttestation(tx, {
+      await writeScheduledAttestation(tx, {
         transferId: transfer.transferId,
         route: transfer.route,
         status: fields.status,
@@ -288,6 +342,8 @@ export class RailPass {
         checkedAt: fields.checkedAt,
         checkFailures: fields.failures,
         lastError: fields.error,
+        retryClass: fields.retryClass,
+        nextAttemptAt: fields.nextAttemptAt,
       });
     });
   }

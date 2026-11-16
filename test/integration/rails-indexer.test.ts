@@ -9,9 +9,19 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { writeOutbound, writeInbound } from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
-import { outstandingForRail, pendingForRail } from "../../src/rails/queue.js";
+import {
+  outstandingForRail,
+  pendingForRail,
+  readRetrySchedule,
+  recoverTerminalRetrySchedule,
+} from "../../src/rails/queue.js";
 import { RailPass } from "../../src/rails/pass.js";
-import type { PendingTransfer, RailClient, RailLookup } from "../../src/rails/types.js";
+import {
+  RailError,
+  type PendingTransfer,
+  type RailClient,
+  type RailLookup,
+} from "../../src/rails/types.js";
 import { capturingLogger } from "../stellar-fakes.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
@@ -214,5 +224,66 @@ suite("rail pollers against real Postgres", () => {
     // Outstanding should now be 0 for this transfer since delivered is terminal
     const outstanding = await outstandingForRail(db, 1);
     expect(outstanding).toBe(0);
+  });
+
+  it("persists retry_class and next_attempt_at across passes and recovers terminal_evidence", async () => {
+    const { logger } = capturingLogger();
+    await db.transaction(async (tx) => {
+      await writeOutbound(
+        tx,
+        {
+          chainKey: ORIGIN_CHAIN,
+          block: 1090n,
+          txHash: "0xaaa701",
+          logIndex: 0,
+          observedAt: new Date(),
+        },
+        {
+          route: 0,
+          nonce: 701n,
+          sender: "0x1111111111111111111111111111111111111111",
+          token: "0x3333333333333333333333333333333333333333",
+          grossAmount: 1001000n,
+          fee: 1000n,
+          netAmount: 1000000n,
+          destinationChain: DESTINATION_CHAIN,
+          destination: "0x2222222222222222222222222222222222222222",
+          railRef: "0x0000",
+        },
+      );
+    });
+
+    const pass = new RailPass({
+      route: 0,
+      client: {
+        rail: "cctp",
+        look: (): Promise<RailLookup> =>
+          Promise.reject(new RailError("cctp", "permanent", "invalid domain")),
+      },
+      db,
+      logger,
+      batchSize: 10,
+      recheckAfterMs: 1000,
+      maxCheckFailures: 5,
+    });
+
+    await pass.tick(new AbortController().signal);
+    const idRes = await db.query(
+      "SELECT id FROM outbound_transfer WHERE origin_chain = $1 AND nonce = 701",
+      [ORIGIN_CHAIN],
+    );
+    const idVal = idRes.rows[0]?.id;
+    expect(typeof idVal === "string" || typeof idVal === "number").toBe(true);
+    const transferId = BigInt(typeof idVal === "string" || typeof idVal === "number" ? idVal : 0);
+
+    const halted = await readRetrySchedule(db, transferId);
+    expect(halted?.retryClass).toBe("terminal_evidence");
+
+    const rec = await recoverTerminalRetrySchedule(db, {
+      transferId,
+      reviewedBy: "integration-ops",
+      reason: "Domain configuration fixed",
+    });
+    expect(rec.kind).toBe("recovered");
   });
 });

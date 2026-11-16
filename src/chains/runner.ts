@@ -29,7 +29,12 @@ import { RouteKind } from "@hyperion/protocol";
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
 import { IrisClient } from "../rails/cctp/iris.js";
 import { RailPass } from "../rails/pass.js";
-import type { RailClient } from "../rails/types.js";
+import { recoverTerminalRetrySchedule } from "../rails/retry-schedule.js";
+import type {
+  RailClient,
+  TerminalRetryRecoveryOutcome,
+  TerminalRetryRecoveryRequest,
+} from "../rails/types.js";
 import { KeeperWorker } from "../keeper/worker.js";
 import { viemClient } from "./evm/client.js";
 import { EvmWatcher } from "./evm/watcher.js";
@@ -58,6 +63,9 @@ export interface IndexerHandle {
   /** Begin polling. Separate from building, the way `listen` is separate from `buildServer`. */
   start(): void;
   stop(): Promise<void>;
+  recoverTerminalTransfer(
+    request: TerminalRetryRecoveryRequest,
+  ): Promise<TerminalRetryRecoveryOutcome>;
 }
 
 /** One pass is one `tick`, and the component reports its own health. */
@@ -143,6 +151,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
       ],
       start: () => undefined,
       stop: () => Promise.resolve(),
+      recoverTerminalTransfer: (request) => recoverTerminalRetrySchedule(db, request),
     };
   }
 
@@ -225,6 +234,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
       // number of chains.
       await Promise.all(workers.map((worker) => worker.stop()));
     },
+    recoverTerminalTransfer: (request) => recoverTerminalRetrySchedule(db, request),
   };
 }
 
