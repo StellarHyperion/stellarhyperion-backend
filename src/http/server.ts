@@ -5,6 +5,7 @@ import type { Logger } from "pino";
 import rateLimit from "@fastify/rate-limit";
 
 import type { AppConfig } from "../config/config.js";
+import { isDatabaseSaturationError } from "../db/pool.js";
 import type { Database } from "../db/pool.js";
 import type { BullMQWorkerState, RedisPingable, ReadinessSource } from "../runtime/readiness.js";
 import { registerClaimRoutes } from "./routes/claims.js";
@@ -81,6 +82,27 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   app.setErrorHandler((error: FastifyError, request, reply) => {
+    if (isDatabaseSaturationError(error)) {
+      request.log.warn(
+        {
+          reason: error.reason,
+          lane: error.lane,
+          retryAfterSeconds: error.retryAfterSeconds,
+          status: 503,
+        },
+        "database pool saturated; shedding request",
+      );
+      void reply.header("Retry-After", String(error.retryAfterSeconds)).code(503).send({
+        error: "service_unavailable",
+        code: error.code,
+        retryable: true,
+        retryAfterSeconds: error.retryAfterSeconds,
+        message: "database capacity is temporarily saturated; retry after backoff",
+        requestId: request.id,
+      });
+      return;
+    }
+
     const status = error.statusCode ?? 500;
     // The log gets the error, the response does not. An internal error message is the kind of
     // thing that carries a table name, a file path or, on a bad day, a connection string.

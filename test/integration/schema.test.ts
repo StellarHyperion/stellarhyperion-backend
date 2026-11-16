@@ -335,4 +335,26 @@ suite("maintenance and pruning", () => {
     expect(ids).toContain(999992);
     expect(ids).toContain(999993);
   });
+
+  it("bounds background worker concurrency and preserves reserved probe capacity", async () => {
+    const boundedDb = Database.open(CONNECTION ?? "", {
+      maxConnections: 3,
+      reservedProbeConnections: 1,
+      maxWorkerConcurrency: 1,
+      maxWaitingRequests: 2,
+      acquireTimeoutMs: 150,
+      applicationName: "hyperion-backpressure-schema-test",
+    });
+    try {
+      const metrics = boundedDb.poolMetrics();
+      expect(metrics.maxConnections).toBe(3);
+      expect(metrics.reservedProbeConnections).toBe(1);
+      expect(metrics.maxApiConnections).toBe(2);
+      expect(metrics.maxWorkerConcurrency).toBe(1);
+      await boundedDb.ping();
+      await boundedDb.forWorkers().query("SELECT 1");
+    } finally {
+      await boundedDb.close();
+    }
+  });
 });
