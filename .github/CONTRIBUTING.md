@@ -124,3 +124,51 @@ Commits in this repository follow strict identity requirements:
 - Committer identity: `dotmantissa <negativemantissa@gmail.com>`.
 - Commit trailers (e.g. `Co-Authored-By`, `Signed-off-by`, or generator annotations) are forbidden.
 - Use imperative, concise commit summaries describing the technical change.
+
+## Locked dependency audits
+
+CI checks every committed npm lockfile version, including development and optional
+dependencies, with npm's official Bulk Advisory endpoint and blocks high or critical
+active advisories. No package scripts execute during the audit.
+The audit verifies each finding against GitHub's canonical advisory API. A finding
+is removed only when GitHub confirms that advisory was withdrawn; API errors,
+incomplete evidence, and active findings remain blocking. This handles stale npm
+reports without a repository allowlist or disabling security checks.
+
+Run the audit and its regression tests locally:
+
+```bash
+python3 -B .github/scripts/test_audit_npm_dependencies.py
+python3 -B .github/scripts/audit_npm_dependencies.py . --audit-level high
+```
+
+An optional `GITHUB_TOKEN` increases the API rate limit. It is sent only to the
+canonical GitHub API; npm's advisory endpoint receives no GitHub credential.
+
+Automatic Vercel Git deployments are disabled in `vercel.json` while the hosting
+project is paused. Build, test, and security checks continue to run in GitHub Actions.
+The Vercel GitHub app no longer has access to this repository because the paused
+account reported failed statuses before reading deployment settings. Regrant the
+app access and restore `git.deploymentEnabled` when hosting is ready to deploy again.
+
+Manage app repository access in the [organization integration settings](https://github.com/organizations/StellarHyperion/settings/installations).
+
+## Automatic pull request checks
+
+CI runs on opened, updated, and reopened pull requests. The `Automatic PR CI`
+action authorizes waiting fork CI when the author satisfies the issue assignment
+policy, including the documented bot, organization role, and code owner exemptions.
+It checks waiting runs every five minutes and when issues are assigned. GitHub
+may delay scheduled runs; maintainers can also dispatch the action manually.
+
+The authorization job uses only default-branch policy code. It never checks out PR
+code, downloads contributed artifacts, approves a code review, or merges a PR.
+Only the current fork head's `ci.yml` pull request run can be authorized; changed
+heads or unverifiable assignments remain unapproved. The approved CI jobs retain
+read-only permissions and receive no repository deployment or signing secrets.
+
+Run its regression tests locally:
+
+```bash
+python3 -B .github/scripts/test_approve_pr_ci.py
+```

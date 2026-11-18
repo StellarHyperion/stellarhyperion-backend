@@ -1,0 +1,71 @@
+name: Automatic PR CI
+
+on:
+  issues:
+    types: [assigned]
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  actions: write
+
+concurrency:
+  group: automatic-pr-ci-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    name: authorize assigned contributor CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Restrict authorization network access
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # verified upstream v2 snapshot
+        with:
+          egress-policy: block
+          disable-sudo-and-containers: true
+          disable-telemetry: true
+          allowed-endpoints: api.github.com:443
+
+      - name: Authorize CI with the trusted default-branch assignment policy
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          POLICY_REF: ${{ github.event.repository.default_branch }}
+          PR_ASSIGNMENT_HELPER_BOTS: ${{ vars.PR_ASSIGNMENT_HELPER_BOTS }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import sys
+          import types
+          import urllib.parse
+          import urllib.request
+
+          # No checkout, PR import, artifact download, or contributed code runs here.
+          # Both authorization modules are loaded only from the default branch.
+          for module in ["enforce_pr_assignments", "approve_pr_ci"]:
+              path = ".github/scripts/" + module + ".py"
+              query = urllib.parse.urlencode({"ref": os.environ["POLICY_REF"]})
+              request = urllib.request.Request(
+                  "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"]
+                  + "/contents/" + path + "?" + query,
+                  headers={
+                      "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "hyperion-pr-ci-bootstrap",
+                  },
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  content = json.load(response)
+              source = base64.b64decode(content["content"], validate=False)
+              loaded = types.ModuleType(module)
+              sys.modules[module] = loaded
+              exec(compile(source, path, "exec"), loaded.__dict__)
+          sys.exit(sys.modules["approve_pr_ci"].main())
+          PY

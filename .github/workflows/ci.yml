@@ -100,8 +100,8 @@ jobs:
             /usr/lib/postgresql/16/bin/pg_ctl --pgdata="$RUNNER_TEMP/hyperion-postgres" --mode=fast --wait stop
           fi
 
-  # Vercel's installed Git integration deploys main and reports its own deployment status.
-  # Keep deployment credentials out of Actions and avoid duplicate production deployments.
+  # The paused Vercel project has automatic Git deployments disabled in vercel.json.
+  # Build, test, and contribution security remain required by this gate.
   gate:
     name: gate
     runs-on: ubuntu-latest
