@@ -535,6 +535,26 @@ export class StellarWatcher {
       readonly jobKey?: string;
     },
   ): Promise<boolean> {
+    if (this.inFlightTick !== null) await this.inFlightTick;
+    if (this.draining) return false;
+    const effective = AbortSignal.any([signal, this.drainController.signal]);
+    const run = this.runBackfillTick(effective, explicitRange);
+    this.inFlightTick = run;
+    try {
+      return await run;
+    } finally {
+      this.inFlightTick = null;
+    }
+  }
+
+  private async runBackfillTick(
+    signal: AbortSignal,
+    explicitRange?: {
+      readonly startLedger: number;
+      readonly endLedger: number;
+      readonly jobKey?: string;
+    },
+  ): Promise<boolean> {
     if (signal.aborted || this.draining) return false;
     const historicalRpc = this.options.historicalRpc;
     if (historicalRpc === undefined) {
@@ -556,6 +576,7 @@ export class StellarWatcher {
       return false;
     }
 
+    const startedAt = new Date();
     const maxLedgers = this.options.backfillMaxLedgersPerTick ?? SCAN_WINDOW_LEDGERS;
     const maxPages = this.options.backfillMaxPagesPerTick ?? MAX_PAGES_PER_TICK;
 
@@ -581,7 +602,7 @@ export class StellarWatcher {
             ownerId: this.ownerId,
             ttlMs: this.leaseTtlMs,
           });
-          await this.applyEvents(
+          const applied = await this.applyEvents(
             tx,
             chainKey,
             scan.events.filter((raw) => raw.ledger <= scan.through),
@@ -602,6 +623,22 @@ export class StellarWatcher {
             nextLedger: scan.through + 1,
             status: completed ? "completed" : "running",
             expectedRevision: cursor === null ? null : cursor.revision,
+          });
+          await persistScanJournal(tx, router, {
+            chainKey,
+            startedAt,
+            finishedAt: new Date(),
+            requestedRange: { from: fromLedger, to: targetEnd },
+            committedRange:
+              scan.through >= fromLedger ? { from: fromLedger, to: scan.through } : null,
+            eventCounts: {
+              fetched: scan.events.length,
+              decoded: applied.decoded,
+              skipped: applied.skipped,
+              conflicts: applied.conflicts,
+            },
+            pages: scan.pages,
+            interruptionReason: scan.through < targetEnd ? "bounded_pass" : null,
           });
         });
 
@@ -633,7 +670,7 @@ export class StellarWatcher {
           ownerId: this.ownerId,
           ttlMs: this.leaseTtlMs,
         });
-        await this.applyEvents(
+        const applied = await this.applyEvents(
           tx,
           chainKey,
           scan.events.filter((raw) => raw.ledger <= scan.through),
@@ -649,6 +686,22 @@ export class StellarWatcher {
           id: gap.id,
           replayedThrough: scan.through,
           reconciled,
+        });
+        await persistScanJournal(tx, router, {
+          chainKey,
+          startedAt,
+          finishedAt: new Date(),
+          requestedRange: { from: fromLedger, to: targetEnd },
+          committedRange:
+            scan.through >= fromLedger ? { from: fromLedger, to: scan.through } : null,
+          eventCounts: {
+            fetched: scan.events.length,
+            decoded: applied.decoded,
+            skipped: applied.skipped,
+            conflicts: applied.conflicts,
+          },
+          pages: scan.pages,
+          interruptionReason: scan.through < targetEnd ? "bounded_pass" : null,
         });
       });
 
@@ -754,6 +807,7 @@ export class StellarWatcher {
   ): Promise<{
     readonly events: readonly RawStellarEvent[];
     readonly through: number;
+    readonly pages: number;
   }> {
     const { router, pageSize, logger, chainKey } = this.options;
     const events: RawStellarEvent[] = [];
@@ -801,7 +855,7 @@ export class StellarWatcher {
       pagination = { cursor: page.cursor, endLedger: endLedger + 1 };
     }
 
-    return { events, through: Math.max(through, fromLedger - 1) };
+    return { events, through: Math.max(through, fromLedger - 1), pages };
   }
 
   private async applyEvents(
