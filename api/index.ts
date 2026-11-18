@@ -11,12 +11,14 @@ let app: FastifyInstance | null = null;
 async function getApp(): Promise<FastifyInstance> {
   if (app) return app;
 
+  process.env.VERCEL_ENV ??= "production";
   process.env.HYPERION_NETWORK ??= "testnet";
   process.env.HYPERION_DEPLOYMENTS_FILE ??= resolvePath(process.cwd(), "deployments/testnet.json");
   process.env.REDIS_URL ??= "redis://127.0.0.1:6379";
   process.env.INDEXER_ENABLED ??= "false";
   process.env.RAILS_ENABLED ??= "false";
   process.env.KEEPER_ENABLED ??= "false";
+  process.env.HYPERION_DATABASE_ROLE ??= "read-only";
 
   const config = loadConfig();
   const logger = createLogger(config);
@@ -25,6 +27,7 @@ async function getApp(): Promise<FastifyInstance> {
   const db = Database.open(config.databaseUrl, {
     applicationName: "hyperion-vercel-api",
     connectionTimeoutMs: 2000,
+    readOnly: config.databaseRole === "read-only",
   });
 
   app = buildServer({

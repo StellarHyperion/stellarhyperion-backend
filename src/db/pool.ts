@@ -44,6 +44,8 @@ export interface OpenOptions {
   readonly connectionTimeoutMs?: number;
   readonly statementTimeoutMs?: number;
   readonly applicationName?: string;
+  /** Prevent an API-only pool from issuing writes if a route is accidentally changed. */
+  readonly readOnly?: boolean;
 }
 
 export class Database implements Transactional {
@@ -62,6 +64,7 @@ export class Database implements Transactional {
       // A watcher query that has not finished in thirty seconds is wedged, not slow, and holding
       // the connection does not help it.
       statement_timeout: options.statementTimeoutMs ?? 30_000,
+      ...(options.readOnly ? { options: "-c default_transaction_read_only=on" } : {}),
     };
     return new Database(new Pool(config));
   }

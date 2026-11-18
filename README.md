@@ -37,6 +37,12 @@ The workflow is scheduled every five minutes and can be started manually. GitHub
 
 Deploy the API with `vercel deploy --prod`. Preview environments require their own database. Database credentials stay in Vercel and GitHub secrets, never in browser configuration, Git or logs. The managed PostgreSQL database is the durable state; restarting a worker must not repeat source transfers.
 
+Set `HYPERION_DATABASE_ENV` to the same value as Vercel's `VERCEL_ENV` (`preview` or `production`).
+The API function also sets `HYPERION_DATABASE_ROLE=read-only`; its PostgreSQL sessions enforce
+that role with `default_transaction_read_only`. A worker with `INDEXER_ENABLED` or `KEEPER_ENABLED`
+must use `HYPERION_DATABASE_ROLE=read-write`. Mismatches fail startup instead of silently sharing a
+production write identity with a preview deployment. Local development defaults to a local identity.
+
 Vercel's installed Git integration publishes `main`. GitHub Actions runs validation and the scheduled indexer; it does not need a Vercel deployment token.
 
 ## What establishes status

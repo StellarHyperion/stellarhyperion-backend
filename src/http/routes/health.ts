@@ -33,6 +33,9 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
     meaning: LIVENESS_MEANING,
     service: "hyperion-backend",
     network: deps.config.network,
+    deploymentEnvironment: deps.config.deploymentEnvironment,
+    databaseEnvironment: deps.config.databaseEnvironment,
+    databaseRole: deps.config.databaseRole,
     uptimeSeconds: Math.floor((Date.now() - startedAt.getTime()) / 1000),
   }));
 
