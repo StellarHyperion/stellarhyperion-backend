@@ -25,7 +25,7 @@ import type { Logger } from "pino";
 import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
 import { writeInbound, writeAttestation } from "../chains/writers.js";
-import { outstandingForRail, pendingForRail } from "./queue.js";
+import { outstandingForRail, pendingForRail, pendingTransferById } from "./queue.js";
 import {
   RailError,
   isTerminal,
@@ -73,6 +73,14 @@ export class RailPass {
 
   get name(): string {
     return `rail:${this.options.client.rail}`;
+  }
+
+  get rail(): string {
+    return this.options.client.rail;
+  }
+
+  get route(): number {
+    return this.options.route;
   }
 
   get progress(): RailProgress | null {
@@ -171,6 +179,28 @@ export class RailPass {
 
     // A full batch means the queue is longer than one pass, so come straight back.
     return queue.length >= batchSize;
+  }
+
+  /** Re-evaluate one reopened transfer immediately, without changing its source identity. */
+  async evaluateTransfer(transferId: bigint, signal?: AbortSignal): Promise<boolean> {
+    if (signal?.aborted === true) return false;
+    const transfer = await pendingTransferById(this.options.db, this.options.route, transferId);
+    if (transfer === null) return false;
+
+    try {
+      return await this.handle(transfer);
+    } catch (error) {
+      if (error instanceof RailError && error.kind === "rateLimited") {
+        const waitMs = error.retryAfterMs ?? 60_000;
+        this.cooldownUntil = new Date(this.now().getTime() + waitMs);
+        this.options.logger.warn(
+          { rail: this.options.client.rail, until: this.cooldownUntil.toISOString() },
+          "the rail rate limited us, holding off rather than retrying",
+        );
+      }
+      await this.recordFailure(transfer, error);
+      return false;
+    }
   }
 
   /** Returns true when the transfer reached a terminal state on this pass. */

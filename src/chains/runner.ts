@@ -29,7 +29,12 @@ import { RouteKind } from "@hyperion/protocol";
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
 import { IrisClient } from "../rails/cctp/iris.js";
 import { RailPass } from "../rails/pass.js";
-import type { RailClient } from "../rails/types.js";
+import { requeueTerminalTransfer } from "../rails/requeue.js";
+import type {
+  RailClient,
+  RailRequeueRequest,
+  RailRequeueResult,
+} from "../rails/types.js";
 import { KeeperWorker } from "../keeper/worker.js";
 import { viemClient } from "./evm/client.js";
 import { EvmWatcher } from "./evm/watcher.js";
@@ -58,6 +63,10 @@ export interface IndexerHandle {
   /** Begin polling. Separate from building, the way `listen` is separate from `buildServer`. */
   start(): void;
   stop(): Promise<void>;
+  requeueTransfer(
+    request: RailRequeueRequest,
+    options?: { readonly evaluateNow?: boolean },
+  ): Promise<RailRequeueResult>;
 }
 
 /** One pass is one `tick`, and the component reports its own health. */
@@ -130,6 +139,21 @@ export interface BuildIndexerDeps {
  */
 export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   const { config, logger, db } = deps;
+  const passes = buildRailPasses(config.rails, config.network, db, logger, config);
+  const requeueTransfer: IndexerHandle["requeueTransfer"] = async (request, options) => {
+    if (options?.evaluateNow === true && !config.rails.enabled) {
+      throw new Error("immediate rail evaluation is disabled by configuration");
+    }
+    const result = await requeueTerminalTransfer(db, request);
+    if (options?.evaluateNow === true) {
+      const pass = passes.find((candidate) => candidate.route === result.route);
+      if (pass === undefined) {
+        throw new Error(`no rail evaluator is configured for route ${String(result.route)}`);
+      }
+      await pass.evaluateTransfer(result.transferId);
+    }
+    return result;
+  };
 
   if (!config.indexer.enabled) {
     return {
@@ -143,6 +167,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
       ],
       start: () => undefined,
       stop: () => Promise.resolve(),
+      requeueTransfer,
     };
   }
 
@@ -171,7 +196,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // They are not conditional on a router being watched: a transfer indexed by a previous run is
   // still waiting on its rail whether or not this replica is watching the chain it left.
   if (config.rails.enabled) {
-    for (const worker of railWorkers(config.rails, config.network, db, logger, config)) {
+    for (const worker of railWorkersFromPasses(passes, config.rails, logger)) {
       workers.push(worker);
     }
   } else {
@@ -225,6 +250,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
       // number of chains.
       await Promise.all(workers.map((worker) => worker.stop()));
     },
+    requeueTransfer,
   };
 }
 
@@ -236,13 +262,13 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
  * which the queue already settles without a request. A poller for it would make a request a tick
  * for an answer that does not exist.
  */
-function railWorkers(
+export function buildRailPasses(
   config: RailsConfig,
   network: AppConfig["network"],
   db: Transactional,
   logger: Logger,
   appConfig: AppConfig,
-): readonly Worker[] {
+): readonly RailPass[] {
   const clients: readonly { readonly route: RouteKind; readonly client: RailClient }[] = [
     {
       route: RouteKind.Cctp,
@@ -263,7 +289,7 @@ function railWorkers(
 
   return clients.map(({ route, client }) => {
     const child = logger.child({ rail: client.rail, route });
-    const pass = new RailPass({
+    return new RailPass({
       route,
       config: appConfig,
       client,
@@ -273,6 +299,16 @@ function railWorkers(
       recheckAfterMs: config.recheckAfterMs,
       maxCheckFailures: config.maxCheckFailures,
     });
+  });
+}
+
+function railWorkersFromPasses(
+  passes: readonly RailPass[],
+  config: RailsConfig,
+  logger: Logger,
+): readonly Worker[] {
+  return passes.map((pass) => {
+    const child = logger.child({ rail: pass.rail, route: pass.route });
     return new PolledWorker(pass, config.pollIntervalMs, child);
   });
 }
