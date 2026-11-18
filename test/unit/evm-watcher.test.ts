@@ -426,6 +426,37 @@ describe("an arrival, which the capture has none of", () => {
     expect(params[8]).toBe(true);
     expect(params[9]).toBeNull();
   });
+
+  it("quarantines an arrival that precedes its parked claim in the same transaction", async () => {
+    const [parked, arrival] = parkedDelivery(20n);
+    const misordered = [
+      { ...arrival!, logIndex: 0 },
+      { ...parked!, logIndex: 1 },
+    ];
+    const client = new FakeEvmClient({
+      logs: misordered,
+      head: 60n,
+    });
+    const { watcher, db } = harness({ client, confirmations: 3 });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    expect(db.matching("INSERT INTO evm_log_quarantine")).toHaveLength(2);
+    expect(db.matching("INSERT INTO inbound_delivery")).toHaveLength(0);
+    expect(db.matching("INSERT INTO pending_claim")).toHaveLength(0);
+  });
+
+  it("does not pair logs from the same hop when their blocks differ", async () => {
+    const [parked] = parkedDelivery(20n);
+    const later = { ...parked!, blockNumber: 21n };
+    const client = new FakeEvmClient({ logs: [later], head: 60n });
+    const { watcher, db } = harness({ client, confirmations: 3 });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    expect(db.matching("INSERT INTO pending_claim")).toHaveLength(1);
+    expect(db.matching("INSERT INTO evm_log_quarantine")).toHaveLength(0);
+  });
 });
 
 describe("RPC endpoint failover", () => {

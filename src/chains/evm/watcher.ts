@@ -31,7 +31,7 @@ import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
 import type { Position } from "../writers.js";
-import { ClaimPairing, applyRouterLog } from "./store.js";
+import { ClaimPairing, applyRouterLog, quarantineEvmLog } from "./store.js";
 import { decodeRouterLog, signatureOf } from "./logs.js";
 import type { EvmClient, RawEvmLog } from "./client.js";
 
@@ -44,6 +44,7 @@ import type { EvmClient, RawEvmLog } from "./client.js";
  * chain in the registry.
  */
 const CURRENT_WITHIN_BLOCKS = 2;
+const MAX_QUARANTINED_LOGS_PER_PASS = 100;
 
 export interface EvmWatcherOptions {
   readonly chainKey: string;
@@ -195,6 +196,7 @@ export class EvmWatcher {
     let written = 0;
     let ignored = 0;
     const pairing = new ClaimPairing();
+    const quarantined = this.findOrderingConflicts(logs);
 
     // One transaction for the range and the cursor advance past it. This is the restart guarantee,
     // and splitting it would turn every crash into either a lost range or a duplicated one.
@@ -203,6 +205,40 @@ export class EvmWatcher {
         if (log.removed) {
           // viem marks a log from an orphaned block. Indexing one would record a transfer that is
           // no longer on the chain.
+          ignored += 1;
+          continue;
+        }
+        const conflict = quarantined.get(logKey(log));
+        if (conflict !== undefined) {
+          const timestamp = blocks.get(log.blockNumber)?.timestamp;
+          if (timestamp === undefined) {
+            throw new Error(
+              `no timestamp for quarantined block ${log.blockNumber.toString()} on ${chainKey}`,
+            );
+          }
+          await quarantineEvmLog(
+            tx,
+            {
+              chainKey,
+              block: log.blockNumber,
+              txHash: log.transactionHash,
+              logIndex: log.logIndex,
+              eventName: conflict.eventName,
+              reason: conflict.reason,
+            },
+            new Date(Number(timestamp) * 1000),
+          );
+          logger.warn(
+            {
+              chain: chainKey,
+              block: log.blockNumber.toString(),
+              txHash: log.transactionHash,
+              logIndex: log.logIndex,
+              event: conflict.eventName,
+              reason: conflict.reason,
+            },
+            "quarantined EVM log with invalid lifecycle ordering",
+          );
           ignored += 1;
           continue;
         }
@@ -353,6 +389,52 @@ export class EvmWatcher {
     }
     return applied.kind === "written";
   }
+
+  private findOrderingConflicts(logs: readonly RawEvmLog[]): Map<string, OrderingConflict> {
+    const byPair = new Map<string, RawEvmLog>();
+    const conflicts = new Map<string, OrderingConflict>();
+
+    for (const log of logs) {
+      const decoded = decodeRouterLog(log);
+      if (decoded?.name !== "ClaimParked" && decoded?.name !== "BridgeIn") continue;
+      const route = decoded.args.route;
+      const sourceChain = decoded.args.sourceChain;
+      const sourceNonce = decoded.args.sourceNonce;
+      if (
+        (typeof route !== "number" && typeof route !== "bigint") ||
+        typeof sourceChain !== "string" ||
+        (typeof sourceNonce !== "bigint" && typeof sourceNonce !== "number")
+      ) {
+        continue;
+      }
+      const pair = `${log.blockNumber.toString()}|${log.transactionHash}|${String(route)}|${sourceChain}|${String(sourceNonce)}`;
+      const previous = byPair.get(pair);
+      if (previous === undefined) {
+        byPair.set(pair, log);
+        continue;
+      }
+      if (decoded.name === "ClaimParked" && previous !== log) {
+        const previousDecoded = decodeRouterLog(previous);
+        if (previousDecoded?.name === "BridgeIn") {
+          const reason = "BridgeIn precedes ClaimParked for the same transaction and hop";
+          conflicts.set(logKey(previous), { eventName: "BridgeIn", reason });
+          conflicts.set(logKey(log), { eventName: "ClaimParked", reason });
+        }
+      }
+    }
+
+    if (conflicts.size <= MAX_QUARANTINED_LOGS_PER_PASS) return conflicts;
+    return new Map([...conflicts.entries()].slice(0, MAX_QUARANTINED_LOGS_PER_PASS));
+  }
+}
+
+interface OrderingConflict {
+  readonly eventName: string;
+  readonly reason: string;
+}
+
+function logKey(log: Pick<RawEvmLog, "blockNumber" | "transactionHash" | "logIndex">): string {
+  return `${log.blockNumber.toString()}|${log.transactionHash}|${String(log.logIndex)}`;
 }
 
 function min(a: bigint, b: bigint): bigint {

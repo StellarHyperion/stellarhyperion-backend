@@ -40,6 +40,38 @@ export type Applied =
   /** A settlement for a row this indexer never saw created. */
   | { readonly kind: "unmatched"; readonly what: string };
 
+export interface EvmLogQuarantine {
+  readonly chainKey: string;
+  readonly block: bigint;
+  readonly txHash: string;
+  readonly logIndex: number;
+  readonly eventName: string;
+  readonly reason: string;
+}
+
+/** Keep malformed ranges visible without allowing one bad provider response to fill the database. */
+export async function quarantineEvmLog(
+  db: Queryable,
+  entry: EvmLogQuarantine,
+  observedAt: Date,
+): Promise<void> {
+  await db.query(
+    `INSERT INTO evm_log_quarantine
+       (chain_key, block_number, transaction_hash, log_index, event_name, reason, observed_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (chain_key, block_number, transaction_hash, log_index, reason) DO NOTHING`,
+    [
+      entry.chainKey,
+      entry.block.toString(),
+      entry.txHash,
+      entry.logIndex,
+      entry.eventName,
+      entry.reason,
+      observedAt,
+    ],
+  );
+}
+
 /**
  * Claims parked earlier in the same transaction, keyed by the hop they belong to.
  *
@@ -49,8 +81,14 @@ export type Applied =
 export class ClaimPairing {
   private readonly parked = new Map<string, bigint>();
 
-  static key(txHash: string, route: number, sourceChain: string, sourceNonce: bigint): string {
-    return `${txHash}|${String(route)}|${sourceChain}|${sourceNonce.toString()}`;
+  static key(
+    block: bigint,
+    txHash: string,
+    route: number,
+    sourceChain: string,
+    sourceNonce: bigint,
+  ): string {
+    return `${block.toString()}|${txHash}|${String(route)}|${sourceChain}|${sourceNonce.toString()}`;
   }
 
   note(key: string, claimId: bigint): void {
@@ -105,7 +143,7 @@ export async function applyRouterLog(
         // stored rather than an approximation of it.
         createdAt: at.observedAt,
       });
-      pairing.note(ClaimPairing.key(at.txHash, route, sourceChain, sourceNonce), claimId);
+      pairing.note(ClaimPairing.key(at.block, at.txHash, route, sourceChain, sourceNonce), claimId);
       return { kind: "written" };
     }
 
@@ -116,7 +154,7 @@ export async function applyRouterLog(
       // A claim parked in this same transaction means the delivery did not land. Nothing in the
       // BridgeIn log itself says so.
       const claimId = pairing.claimFor(
-        ClaimPairing.key(at.txHash, route, sourceChain, sourceNonce),
+        ClaimPairing.key(at.block, at.txHash, route, sourceChain, sourceNonce),
       );
       await writeInbound(db, at, {
         route,
