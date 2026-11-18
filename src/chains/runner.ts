@@ -64,6 +64,7 @@ export interface IndexerHandle {
 interface Pass extends ReadinessSource {
   readonly name: string;
   tick(signal: AbortSignal): Promise<boolean>;
+  release?(): Promise<unknown>;
 }
 
 /**
@@ -97,8 +98,11 @@ export class PolledWorker implements Worker {
     this.poller.start();
   }
 
-  stop(): Promise<void> {
-    return this.poller.stop();
+  async stop(): Promise<void> {
+    await this.poller.stop();
+    if (this.pass.release !== undefined) {
+      await this.pass.release().catch(() => undefined);
+    }
   }
 
   async readiness(): Promise<ReadinessReport> {
@@ -302,6 +306,11 @@ function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Lo
     startLedger: config.startLedger,
     pageSize: config.pageSize,
     rpc: new StellarRpc(config.rpcUrl),
+    ...(config.historicalRpcUrl !== undefined &&
+    config.historicalRpcUrl !== null &&
+    config.historicalRpcUrl !== ""
+      ? { historicalRpc: new StellarRpc(config.historicalRpcUrl) }
+      : {}),
     db,
     logger: child,
   });
