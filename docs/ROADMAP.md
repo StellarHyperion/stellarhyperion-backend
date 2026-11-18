@@ -6,4 +6,4 @@ Removed: mocked gas top-ups, synthetic second-step attestations and receipt-only
 
 Network acceptance passed: the current testnet lane was deployed and activated, a real wallet transfer confirmed on Stellar, and matching ITS/token payment events established its Sepolia delivery in the indexer. The API server alone cannot establish background worker availability.
 
-Additional rails/networks and distributed keeper signing need their own implementation and validation. The complete PostgreSQL-backed suite passes, and the live acceptance proof is preserved in the contracts deployment evidence.
+Axelar GMP status is only a candidate signal: a transfer becomes delivered after the configured deployment, source event fields, destination receipt and payment event all match. Deployments that enable Axelar ITS without supported destination receiver metadata are rejected at configuration load. Additional rails/networks and distributed keeper signing need their own implementation and validation. The complete PostgreSQL-backed suite passes, and the live acceptance proof is preserved in the contracts deployment evidence.

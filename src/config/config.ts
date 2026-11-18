@@ -25,6 +25,8 @@ import {
   isStellarChain,
   isStellarDeployment,
   parseDeploymentSet,
+  RAIL_CONTRACTS,
+  RouteKind,
 } from "@hyperion/protocol";
 
 import type { EnumSpec, VarSpec } from "./env.js";
@@ -613,6 +615,23 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
       DEPLOYMENTS_FILE,
       `names ${wrongNetwork.join(", ")}, which is not a ${input.network} chain. Split the record or change HYPERION_NETWORK.`,
     );
+  }
+
+  const stellarDeployment = Object.values(input.deployments.networks).find(
+    (deployment) => isStellarDeployment(deployment) && RouteKind.AxelarIts in deployment.adapters,
+  );
+  if (stellarDeployment !== undefined) {
+    const hasReceiver = Object.entries(input.deployments.networks).some(([key, deployment]) => {
+      const chain = CHAINS[key as ChainKey];
+      if (!isEvmDeployment(deployment) || !isEvmChain(chain)) return false;
+      return RAIL_CONTRACTS[key as ChainKey]?.axelar?.interchainTokenService !== undefined;
+    });
+    if (!hasReceiver) {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        "enables axelar-its without a supported deployed destination receiver; admission is blocked until receiver metadata is present",
+      );
+    }
   }
 
   for (const [key, deployment] of Object.entries(input.deployments.networks)) {
