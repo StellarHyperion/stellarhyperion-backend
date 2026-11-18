@@ -19,7 +19,21 @@
  * had handled the case. `observed_at` is deliberately left out of every update: it records when
  * this indexer first saw the row, and a reorg does not change that.
  */
+import { createHash } from "node:crypto";
 import type { Queryable } from "../db/pool.js";
+import {
+  bigintOf,
+  boolean,
+  integer,
+  integerOrNull,
+  json,
+  maybeOne,
+  one,
+  text,
+  textOrNull,
+  timestamp,
+  timestampOrNull,
+} from "../db/rows.js";
 
 /** Where on a chain a row was observed. One shape for a ledger and for a block. */
 export interface Position {
@@ -371,4 +385,347 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
       row.lastError,
     ],
   );
+}
+
+export type DigestRecordKind = "outbound_transfer" | "inbound_delivery" | "pending_claim" | "all";
+
+export interface TokenMonetarySummary {
+  readonly outboundGross: string;
+  readonly outboundFee: string;
+  readonly outboundNet: string;
+  readonly inboundAmount: string;
+  readonly claimAmount: string;
+}
+
+export interface MonetarySummary {
+  readonly outboundCount: number;
+  readonly inboundCount: number;
+  readonly claimCount: number;
+  readonly tokens: Readonly<Record<string, TokenMonetarySummary>>;
+}
+
+export interface ComputeHistoryDigestOptions {
+  readonly chainKey: string;
+  readonly startBlock: bigint;
+  readonly endBlock: bigint;
+  readonly recordKind?: DigestRecordKind;
+}
+
+export interface HistoryDigestResult {
+  readonly chainKey: string;
+  readonly recordKind: DigestRecordKind;
+  readonly startBlock: bigint;
+  readonly endBlock: bigint;
+  readonly rowCount: number;
+  readonly digest: string;
+  readonly monetarySummary: MonetarySummary;
+}
+
+export interface StoredHistoryDigest extends HistoryDigestResult {
+  readonly id: bigint;
+  readonly computedAt: Date;
+}
+
+export interface DigestVerificationResult {
+  readonly matches: boolean;
+  readonly expectedDigest: string | null;
+  readonly actualDigest: string;
+  readonly computed: HistoryDigestResult;
+}
+
+interface MutableTokenTotals {
+  outboundGross: bigint;
+  outboundFee: bigint;
+  outboundNet: bigint;
+  inboundAmount: bigint;
+  claimAmount: bigint;
+}
+
+function getOrInitTokenTotals(
+  map: Map<string, MutableTokenTotals>,
+  token: string,
+): MutableTokenTotals {
+  let entry = map.get(token);
+  if (entry === undefined) {
+    entry = {
+      outboundGross: 0n,
+      outboundFee: 0n,
+      outboundNet: 0n,
+      inboundAmount: 0n,
+      claimAmount: 0n,
+    };
+    map.set(token, entry);
+  }
+  return entry;
+}
+
+/**
+ * Compute a deterministic SHA-256 range digest and integer-string monetary summary over indexed
+ * event and monetary records in `[startBlock, endBlock]`.
+ *
+ * Excludes surrogate `id` and `observed_at` timestamps so backfills, replays, and restores
+ * produce the exact same digest whenever the underlying chain facts match.
+ */
+export async function computeHistoryDigest(
+  db: Queryable,
+  options: ComputeHistoryDigestOptions,
+): Promise<HistoryDigestResult> {
+  const { chainKey, startBlock, endBlock } = options;
+  const recordKind: DigestRecordKind = options.recordKind ?? "all";
+  if (startBlock < 0n || endBlock < startBlock) {
+    throw new RangeError(
+      `invalid digest block range [${startBlock.toString()}, ${endBlock.toString()}]`,
+    );
+  }
+
+  const hash = createHash("sha256");
+  hash.update(
+    `${JSON.stringify({
+      version: 1,
+      chainKey,
+      recordKind,
+      startBlock: startBlock.toString(),
+      endBlock: endBlock.toString(),
+    })}\n`,
+  );
+
+  const tokenMap = new Map<string, MutableTokenTotals>();
+  let outboundCount = 0;
+  let inboundCount = 0;
+  let claimCount = 0;
+  let rowCount = 0;
+
+  if (recordKind === "outbound_transfer" || recordKind === "all") {
+    const { rows } = await db.query(
+      `SELECT origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
+              destination_chain, destination, rail_ref, origin_block, origin_tx, origin_log_index
+         FROM outbound_transfer
+        WHERE origin_chain = $1
+          AND origin_block BETWEEN $2 AND $3
+        ORDER BY origin_block ASC, nonce ASC`,
+      [chainKey, startBlock.toString(), endBlock.toString()],
+    );
+    for (const row of rows) {
+      const token = text(row, "token");
+      const grossAmount = bigintOf(row, "gross_amount");
+      const fee = bigintOf(row, "fee");
+      const netAmount = bigintOf(row, "net_amount");
+      const totals = getOrInitTokenTotals(tokenMap, token);
+      totals.outboundGross += grossAmount;
+      totals.outboundFee += fee;
+      totals.outboundNet += netAmount;
+      outboundCount += 1;
+      rowCount += 1;
+
+      hash.update(
+        `${JSON.stringify({
+          kind: "outbound_transfer",
+          originChain: text(row, "origin_chain"),
+          route: integer(row, "route"),
+          nonce: bigintOf(row, "nonce").toString(),
+          sender: text(row, "sender"),
+          token,
+          grossAmount: grossAmount.toString(),
+          fee: fee.toString(),
+          netAmount: netAmount.toString(),
+          destinationChain: text(row, "destination_chain"),
+          destination: text(row, "destination"),
+          railRef: textOrNull(row, "rail_ref"),
+          originBlock: bigintOf(row, "origin_block").toString(),
+          originTx: text(row, "origin_tx"),
+          originLogIndex: integerOrNull(row, "origin_log_index"),
+        })}\n`,
+      );
+    }
+  }
+
+  if (recordKind === "inbound_delivery" || recordKind === "all") {
+    const { rows } = await db.query(
+      `SELECT destination_chain, route, source_chain, source_nonce, rail_message_id,
+              recipient, token, amount, delivered, claim_id, destination_block, destination_tx,
+              destination_log_index
+         FROM inbound_delivery
+        WHERE destination_chain = $1
+          AND destination_block BETWEEN $2 AND $3
+        ORDER BY destination_block ASC, route ASC, source_chain ASC, source_nonce ASC`,
+      [chainKey, startBlock.toString(), endBlock.toString()],
+    );
+    for (const row of rows) {
+      const token = text(row, "token");
+      const amount = bigintOf(row, "amount");
+      const totals = getOrInitTokenTotals(tokenMap, token);
+      totals.inboundAmount += amount;
+      inboundCount += 1;
+      rowCount += 1;
+
+      const claimIdRaw = row.claim_id;
+      hash.update(
+        `${JSON.stringify({
+          kind: "inbound_delivery",
+          destinationChain: text(row, "destination_chain"),
+          route: integer(row, "route"),
+          sourceChain: text(row, "source_chain"),
+          sourceNonce: bigintOf(row, "source_nonce").toString(),
+          railMessageId: textOrNull(row, "rail_message_id"),
+          recipient: text(row, "recipient"),
+          token,
+          amount: amount.toString(),
+          delivered: boolean(row, "delivered"),
+          claimId:
+            claimIdRaw === null || claimIdRaw === undefined
+              ? null
+              : bigintOf(row, "claim_id").toString(),
+          destinationBlock: bigintOf(row, "destination_block").toString(),
+          destinationTx: text(row, "destination_tx"),
+          destinationLogIndex: integerOrNull(row, "destination_log_index"),
+        })}\n`,
+      );
+    }
+  }
+
+  if (recordKind === "pending_claim" || recordKind === "all") {
+    const { rows } = await db.query(
+      `SELECT c.chain, c.claim_id, c.recipient, c.token, c.amount, c.route,
+              c.source_chain, c.source_nonce, c.created_at, c.settled,
+              c.settled_at, c.settled_by, c.settled_tx
+         FROM pending_claim c
+         INNER JOIN inbound_delivery d
+           ON d.destination_chain = c.chain
+          AND d.claim_id = c.claim_id
+        WHERE c.chain = $1
+          AND d.destination_block BETWEEN $2 AND $3
+        ORDER BY d.destination_block ASC, c.claim_id ASC`,
+      [chainKey, startBlock.toString(), endBlock.toString()],
+    );
+    for (const row of rows) {
+      const token = text(row, "token");
+      const amount = bigintOf(row, "amount");
+      const totals = getOrInitTokenTotals(tokenMap, token);
+      totals.claimAmount += amount;
+      claimCount += 1;
+      rowCount += 1;
+
+      const settledAt = timestampOrNull(row, "settled_at");
+      hash.update(
+        `${JSON.stringify({
+          kind: "pending_claim",
+          chain: text(row, "chain"),
+          claimId: bigintOf(row, "claim_id").toString(),
+          recipient: text(row, "recipient"),
+          token,
+          amount: amount.toString(),
+          route: integer(row, "route"),
+          sourceChain: text(row, "source_chain"),
+          sourceNonce: bigintOf(row, "source_nonce").toString(),
+          createdAt: timestamp(row, "created_at").toISOString(),
+          settled: boolean(row, "settled"),
+          settledAt: settledAt ? settledAt.toISOString() : null,
+          settledBy: textOrNull(row, "settled_by"),
+          settledTx: textOrNull(row, "settled_tx"),
+        })}\n`,
+      );
+    }
+  }
+
+  const tokens: Record<string, TokenMonetarySummary> = {};
+  for (const token of Array.from(tokenMap.keys()).sort()) {
+    const totals = tokenMap.get(token);
+    if (totals === undefined) continue;
+    tokens[token] = {
+      outboundGross: totals.outboundGross.toString(),
+      outboundFee: totals.outboundFee.toString(),
+      outboundNet: totals.outboundNet.toString(),
+      inboundAmount: totals.inboundAmount.toString(),
+      claimAmount: totals.claimAmount.toString(),
+    };
+  }
+
+  return {
+    chainKey,
+    recordKind,
+    startBlock,
+    endBlock,
+    rowCount,
+    digest: hash.digest("hex"),
+    monetarySummary: {
+      outboundCount,
+      inboundCount,
+      claimCount,
+      tokens,
+    },
+  };
+}
+
+export async function recordHistoryDigest(
+  db: Queryable,
+  result: HistoryDigestResult,
+): Promise<StoredHistoryDigest> {
+  const { rows } = await db.query(
+    `INSERT INTO indexed_history_digest
+       (chain_key, record_kind, start_block, end_block, row_count, digest, monetary_summary)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (chain_key, record_kind, start_block, end_block) DO UPDATE
+       SET row_count = EXCLUDED.row_count,
+           digest = EXCLUDED.digest,
+           monetary_summary = EXCLUDED.monetary_summary,
+           computed_at = now()
+     RETURNING id, chain_key, record_kind, start_block, end_block, row_count, digest,
+               monetary_summary, computed_at`,
+    [
+      result.chainKey,
+      result.recordKind,
+      result.startBlock.toString(),
+      result.endBlock.toString(),
+      result.rowCount,
+      result.digest,
+      JSON.stringify(result.monetarySummary),
+    ],
+  );
+  const row = one(rows, "recordHistoryDigest");
+  return {
+    id: bigintOf(row, "id"),
+    chainKey: text(row, "chain_key"),
+    recordKind: text(row, "record_kind") as DigestRecordKind,
+    startBlock: bigintOf(row, "start_block"),
+    endBlock: bigintOf(row, "end_block"),
+    rowCount: integer(row, "row_count"),
+    digest: text(row, "digest"),
+    monetarySummary: json(row, "monetary_summary") as MonetarySummary,
+    computedAt: timestamp(row, "computed_at"),
+  };
+}
+
+export async function verifyHistoryDigest(
+  db: Queryable,
+  options: ComputeHistoryDigestOptions & { readonly expectedDigest?: string },
+): Promise<DigestVerificationResult> {
+  const computed = await computeHistoryDigest(db, options);
+  let expectedDigest: string | null = options.expectedDigest ?? null;
+
+  if (expectedDigest === null) {
+    const { rows } = await db.query(
+      `SELECT digest
+         FROM indexed_history_digest
+        WHERE chain_key = $1
+          AND record_kind = $2
+          AND start_block = $3
+          AND end_block = $4
+        LIMIT 1`,
+      [
+        computed.chainKey,
+        computed.recordKind,
+        computed.startBlock.toString(),
+        computed.endBlock.toString(),
+      ],
+    );
+    const stored = maybeOne(rows, "verifyHistoryDigest");
+    expectedDigest = stored ? text(stored, "digest") : null;
+  }
+
+  return {
+    matches: expectedDigest !== null && computed.digest === expectedDigest,
+    expectedDigest,
+    actualDigest: computed.digest,
+    computed,
+  };
 }

@@ -9,6 +9,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text } from "../../db/rows.js";
+import { negotiateSchemaVersion, withSchemaMetadata } from "../schema-version.js";
 import type { ServerDeps } from "../server.js";
 
 export interface FormattedClaim {
@@ -53,6 +54,9 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       request: FastifyRequest<{ Params: { chain: string; claimId: string } }>,
       reply: FastifyReply,
     ) => {
+      const version = negotiateSchemaVersion(request, reply);
+      if (version === null) return;
+
       const { chain, claimId } = request.params;
       const { rows } = await db.query(
         `SELECT chain || ':' || claim_id::text AS id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
@@ -71,7 +75,7 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
         });
       }
 
-      return reply.send(formatClaimRow(row));
+      return reply.send(withSchemaMetadata(formatClaimRow(row), version));
     },
   );
 
@@ -90,6 +94,9 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       }>,
       reply: FastifyReply,
     ) => {
+      const version = negotiateSchemaVersion(request, reply);
+      if (version === null) return;
+
       const { chain, recipient, settled, limit, offset } = request.query;
 
       const conditions: string[] = [];
@@ -128,12 +135,17 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
         params,
       );
 
-      return reply.send({
-        claims: rows.map(formatClaimRow),
-        limit: parsedLimit,
-        offset: parsedOffset,
-        count: rows.length,
-      });
+      return reply.send(
+        withSchemaMetadata(
+          {
+            claims: rows.map(formatClaimRow),
+            limit: parsedLimit,
+            offset: parsedOffset,
+            count: rows.length,
+          },
+          version,
+        ),
+      );
     },
   );
 }

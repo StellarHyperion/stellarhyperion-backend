@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Database } from "../../src/db/pool.js";
 import { buildServer } from "../../src/http/server.js";
 import { loadConfig } from "../../src/config/config.js";
+import { recordWorkerHeartbeat } from "../../src/runtime/readiness.js";
 import { completeEnv } from "../helpers.js";
 import { capturingLogger } from "../stellar-fakes.js";
 
@@ -44,6 +45,7 @@ beforeAll(async () => {
     "1791000000000_cursor-block-hash.sql",
     "1791100000000_cursor-autovacuum-tuning.sql",
     "1791400000000_stellar-cursor-cas-leases-gaps.sql",
+    "1791700000000_indexer-worker-heartbeat.sql",
   ]) {
     const sql = readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8").split(
       "-- Down Migration",
@@ -124,5 +126,204 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     expect(response.json().destination.decimals).toBe(6);
     expect(response.json().destination.symbol).toBe("USDC");
     expect(response.json().origin.netAmount).toBe("9970000");
+  });
+
+  it("negotiates API schema versions without altering monetary or token fields (#105)", async () => {
+    const v1 = await app.inject("/v1/transfers/by-tx/cctp-source");
+    expect(v1.statusCode).toBe(200);
+    expect(v1.headers["x-api-schema-version"]).toBe("1.0");
+    expect(v1.headers.vary).toContain("X-API-Schema-Version");
+    expect(v1.json().schemaVersion).toBeUndefined();
+
+    const v11Transfer = await app.inject({
+      method: "GET",
+      url: "/v1/transfers/by-tx/cctp-source",
+      headers: { "x-api-schema-version": "1.1" },
+    });
+    expect(v11Transfer.statusCode).toBe(200);
+    expect(v11Transfer.headers["x-api-schema-version"]).toBe("1.1");
+    expect(v11Transfer.json().schemaVersion).toBe("1.1");
+    expect(v11Transfer.json().metadata).toEqual({
+      source: "indexed_postgres",
+      schemaVersion: "1.1",
+    });
+    expect(v11Transfer.json().origin.grossAmount).toBe("10000000");
+    expect(v11Transfer.json().destination.amount).toBe("897000");
+    expect(v11Transfer.json().destination.symbol).toBe("USDC");
+
+    const v11Claim = await app.inject({
+      method: "GET",
+      url: "/v1/claims/stellar-testnet/7",
+      headers: { "x-api-schema-version": "1.1" },
+    });
+    expect(v11Claim.statusCode).toBe(200);
+    expect(v11Claim.json().schemaVersion).toBe("1.1");
+    expect(v11Claim.json().amount).toBe("9970000");
+
+    const v11Routes = await app.inject({
+      method: "GET",
+      url: "/v1/routes/health",
+      headers: { "x-api-schema-version": "1.1" },
+    });
+    expect(v11Routes.statusCode).toBe(200);
+    expect(v11Routes.json().schemaVersion).toBe("1.1");
+    expect(v11Routes.json().routes[0].flowAvailable).toBe("90000000");
+
+    const unsupported = await app.inject({
+      method: "GET",
+      url: "/v1/transfers/by-tx/cctp-source",
+      headers: { "x-api-schema-version": "9.9" },
+    });
+    expect(unsupported.statusCode).toBe(400);
+    expect(unsupported.json().error).toBe("unsupported_schema_version");
+    expect(unsupported.json().supportedVersions).toEqual(["1.0", "1.1"]);
+  });
+
+  it("reports persistent worker heartbeats and stale diagnostics across processes (#107)", async () => {
+    const now = new Date();
+    const staleAt = new Date(now.getTime() - 300_000);
+
+    await recordWorkerHeartbeat(db, {
+      workerName: "stellar-testnet",
+      workerKind: "chain",
+      chainKey: "stellar-testnet",
+      state: "ready",
+      detail: "caught up to ledger 123",
+      completed: true,
+      lastCursorBlock: 123n,
+      consecutiveFailures: 0,
+      lastError: null,
+      at: now,
+    });
+    await recordWorkerHeartbeat(db, {
+      workerName: "sepolia",
+      workerKind: "chain",
+      chainKey: "sepolia",
+      state: "ready",
+      detail: "rpc error from https://user:secret-pass@rpc.example.com",
+      completed: false,
+      consecutiveFailures: 2,
+      lastError: "fetch failed for https://user:secret-pass@rpc.example.com",
+      at: staleAt,
+    });
+
+    const metricsRes = await app.inject("/v1/metrics");
+    expect(metricsRes.statusCode).toBe(200);
+    const metricsBody = metricsRes.json();
+    expect(metricsBody.freshness).toEqual({
+      totalWorkers: 2,
+      staleWorkers: 1,
+      degradedWorkers: 1,
+      downWorkers: 0,
+    });
+    const sepolia = metricsBody.workers.find((w: { name: string }) => w.name === "sepolia");
+    expect(sepolia.stale).toBe(true);
+    expect(sepolia.state).toBe("degraded");
+    expect(sepolia.lastError).not.toContain("secret-pass");
+    expect(sepolia.detail).not.toContain("secret-pass");
+
+    const readyRes = await app.inject("/ready");
+    expect(readyRes.statusCode).toBe(200);
+    expect(readyRes.json().status).toBe("degraded");
+    const sepoliaCheck = readyRes.json().checks.find((c: { name: string }) => c.name === "sepolia");
+    expect(sepoliaCheck.state).toBe("degraded");
+    expect(sepoliaCheck.detail).toContain("stale heartbeat");
+  });
+
+  it("enforces bounded rate-limit budgets with explicit proxy handling (#106)", async () => {
+    const untrustedApp = buildServer({
+      config,
+      logger,
+      db: db as unknown as Database,
+      readiness: [],
+      redis: { ping: () => Promise.resolve("PONG") },
+      trustProxy: false,
+      rateLimit: {
+        enabled: true,
+        max: 2,
+        streamMax: 1,
+        timeWindowMs: 60_000,
+      },
+    });
+    await untrustedApp.ready();
+
+    try {
+      // Spoofed X-Forwarded-For must not bypass budget when trustProxy is false
+      const r1 = await untrustedApp.inject({
+        method: "GET",
+        url: "/v1/routes/health",
+        headers: { "x-forwarded-for": "1.1.1.1" },
+      });
+      expect(r1.statusCode).toBe(200);
+      expect(r1.headers["x-ratelimit-limit"]).toBe("2");
+
+      const r2 = await untrustedApp.inject({
+        method: "GET",
+        url: "/v1/routes/health",
+        headers: { "x-forwarded-for": "2.2.2.2" },
+      });
+      expect(r2.statusCode).toBe(200);
+
+      const r3 = await untrustedApp.inject({
+        method: "GET",
+        url: "/v1/routes/health",
+        headers: { "x-forwarded-for": "3.3.3.3" },
+      });
+      expect(r3.statusCode).toBe(429);
+      expect(r3.json().error).toBe("too_many_requests");
+
+      // /health remains exempt for load balancers
+      const health = await untrustedApp.inject("/health");
+      expect(health.statusCode).toBe(200);
+
+      // SSE /stream enforces its own bounded budget rather than bypassing
+      const s1 = await untrustedApp.inject("/v1/transfers/999999/stream");
+      expect(s1.statusCode).toBe(404);
+      const s2 = await untrustedApp.inject("/v1/transfers/999999/stream");
+      expect(s2.statusCode).toBe(429);
+    } finally {
+      await untrustedApp.close();
+    }
+
+    // With trustProxy: true, distinct forwarded client IPs get separate budgets
+    const trustedApp = buildServer({
+      config,
+      logger,
+      db: db as unknown as Database,
+      readiness: [],
+      redis: { ping: () => Promise.resolve("PONG") },
+      trustProxy: true,
+      rateLimit: {
+        enabled: true,
+        max: 1,
+        timeWindowMs: 60_000,
+      },
+    });
+    await trustedApp.ready();
+
+    try {
+      const a1 = await trustedApp.inject({
+        method: "GET",
+        url: "/v1/routes/health",
+        headers: { "x-forwarded-for": "10.0.0.1" },
+      });
+      expect(a1.statusCode).toBe(200);
+
+      const b1 = await trustedApp.inject({
+        method: "GET",
+        url: "/v1/routes/health",
+        headers: { "x-forwarded-for": "10.0.0.2" },
+      });
+      expect(b1.statusCode).toBe(200);
+
+      const a2 = await trustedApp.inject({
+        method: "GET",
+        url: "/v1/routes/health",
+        headers: { "x-forwarded-for": "10.0.0.1" },
+      });
+      expect(a2.statusCode).toBe(429);
+    } finally {
+      await trustedApp.close();
+    }
   });
 });

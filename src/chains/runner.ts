@@ -22,8 +22,8 @@ import type {
 } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
 import { Poller } from "../runtime/poller.js";
-import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
-import { fixedReadiness } from "../runtime/readiness.js";
+import type { ReadinessReport, ReadinessSource, WorkerKind } from "../runtime/readiness.js";
+import { fixedReadiness, recordWorkerHeartbeat } from "../runtime/readiness.js";
 import { RouteKind } from "@hyperion/protocol";
 
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
@@ -67,6 +67,12 @@ interface Pass extends ReadinessSource {
   release?(): Promise<unknown>;
 }
 
+export interface PolledWorkerOptions {
+  readonly db?: Transactional;
+  readonly workerKind?: WorkerKind;
+  readonly chainKey?: string | null;
+}
+
 /**
  * A pass plus the clock it runs on.
  *
@@ -76,17 +82,58 @@ interface Pass extends ReadinessSource {
  */
 export class PolledWorker implements Worker {
   private readonly poller: Poller;
+  private readonly db: Transactional | undefined;
+  private readonly workerKind: WorkerKind;
+  private readonly chainKey: string | null;
 
   constructor(
     private readonly pass: Pass,
     intervalMs: number,
     logger: Logger,
+    options: PolledWorkerOptions = {},
   ) {
+    this.db = options.db;
+    this.workerKind = options.workerKind ?? "other";
+    this.chainKey = options.chainKey ?? null;
     this.poller = new Poller({
       name: pass.name,
       intervalMs,
       logger,
-      tick: (signal) => pass.tick(signal),
+      tick: async (signal) => {
+        let threw = false;
+        try {
+          return await pass.tick(signal);
+        } catch (error) {
+          threw = true;
+          throw error;
+        } finally {
+          if (this.db !== undefined) {
+            await this.persistHeartbeat(!threw).catch((err: unknown) => {
+              logger.warn({ err, worker: pass.name }, "failed to persist worker heartbeat");
+            });
+          }
+        }
+      },
+    });
+  }
+
+  private async persistHeartbeat(completed: boolean): Promise<void> {
+    if (this.db === undefined) return;
+    const stats = this.poller.stats;
+    const report = await this.readiness();
+    await recordWorkerHeartbeat(this.db, {
+      workerName: this.name,
+      workerKind: this.workerKind,
+      chainKey: this.chainKey,
+      state: report.state,
+      detail: report.detail,
+      completed,
+      consecutiveFailures: stats.consecutiveFailures,
+      lastError: stats.lastError,
+      metadata: {
+        ticks: stats.ticks,
+        running: stats.running,
+      },
     });
   }
 
@@ -277,7 +324,11 @@ function railWorkers(
       recheckAfterMs: config.recheckAfterMs,
       maxCheckFailures: config.maxCheckFailures,
     });
-    return new PolledWorker(pass, config.pollIntervalMs, child);
+    return new PolledWorker(pass, config.pollIntervalMs, child, {
+      db,
+      workerKind: "rail",
+      chainKey: null,
+    });
   });
 }
 
@@ -295,7 +346,11 @@ function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): W
     db,
     logger: child,
   });
-  return new PolledWorker(watcher, config.pollIntervalMs, child);
+  return new PolledWorker(watcher, config.pollIntervalMs, child, {
+    db,
+    workerKind: "chain",
+    chainKey: config.chain,
+  });
 }
 
 function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Logger): Worker {
@@ -314,5 +369,9 @@ function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Lo
     db,
     logger: child,
   });
-  return new PolledWorker(watcher, config.pollIntervalMs, child);
+  return new PolledWorker(watcher, config.pollIntervalMs, child, {
+    db,
+    workerKind: "chain",
+    chainKey: config.chain,
+  });
 }

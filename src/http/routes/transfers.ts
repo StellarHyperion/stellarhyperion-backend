@@ -12,7 +12,12 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
-import type { ServerDeps } from "../server.js";
+import { negotiateSchemaVersion, withSchemaMetadata } from "../schema-version.js";
+import {
+  DEFAULT_RATE_LIMIT_WINDOW_MS,
+  DEFAULT_STREAM_RATE_LIMIT_MAX,
+  type ServerDeps,
+} from "../server.js";
 
 export type TransferLifecycleStage =
   | "initiated"
@@ -249,6 +254,9 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       request: FastifyRequest<{ Params: { originChain: string; nonce: string } }>,
       reply: FastifyReply,
     ) => {
+      const version = negotiateSchemaVersion(request, reply);
+      if (version === null) return;
+
       const { originChain, nonce } = request.params;
       const { rows } = await db.query(
         `${TRANSFER_QUERY} WHERE t.origin_chain = $1 AND t.nonce = $2 LIMIT 1`,
@@ -263,7 +271,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         });
       }
 
-      return reply.send(formatRow(row, deps.config));
+      return reply.send(withSchemaMetadata(formatRow(row, deps.config), version));
     },
   );
 
@@ -271,6 +279,9 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
   app.get(
     "/v1/transfers/by-tx/:txHash",
     async (request: FastifyRequest<{ Params: { txHash: string } }>, reply: FastifyReply) => {
+      const version = negotiateSchemaVersion(request, reply);
+      if (version === null) return;
+
       const { txHash } = request.params;
       const { rows } = await db.query(
         `${TRANSFER_QUERY} WHERE t.origin_tx = $1 OR d.destination_tx = $1 LIMIT 1`,
@@ -285,7 +296,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         });
       }
 
-      return reply.send(formatRow(row, deps.config));
+      return reply.send(withSchemaMetadata(formatRow(row, deps.config), version));
     },
   );
 
@@ -297,6 +308,9 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     }>,
     reply: FastifyReply,
   ) => {
+    const version = negotiateSchemaVersion(request, reply);
+    if (version === null) return;
+
     const { id } = request.params;
     const initial = await queryTransferById(id);
     if (initial === null) {
@@ -312,6 +326,8 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
       "X-Accel-Buffering": "no",
+      "X-API-Schema-Version": version,
+      Vary: "X-API-Schema-Version",
     });
 
     const safeWrite = (chunk: string): boolean => {
@@ -327,15 +343,16 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       }
     };
 
-    safeWrite(`event: transfer_update\ndata: ${JSON.stringify(initial)}\n\n`);
+    const initialPayload = withSchemaMetadata(initial, version);
+    safeWrite(`event: transfer_update\ndata: ${JSON.stringify(initialPayload)}\n\n`);
 
     if (isDeliveryFinalized(initial)) {
-      safeWrite(`event: complete\ndata: ${JSON.stringify(initial)}\n\n`);
+      safeWrite(`event: complete\ndata: ${JSON.stringify(initialPayload)}\n\n`);
       safeEnd();
       return;
     }
 
-    let lastSerialized = JSON.stringify(initial);
+    let lastSerialized = JSON.stringify(initialPayload);
     let closed = false;
 
     const pollInterval = Math.max(Number(request.query.pollIntervalMs) || 1000, 1000);
@@ -370,13 +387,14 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
           const current = await queryTransferById(id);
           if (current === null) return;
 
-          const currentSerialized = JSON.stringify(current);
+          const currentPayload = withSchemaMetadata(current, version);
+          const currentSerialized = JSON.stringify(currentPayload);
           if (currentSerialized !== lastSerialized) {
             lastSerialized = currentSerialized;
-            safeWrite(`event: transfer_update\ndata: ${JSON.stringify(current)}\n\n`);
+            safeWrite(`event: transfer_update\ndata: ${currentSerialized}\n\n`);
 
             if (isDeliveryFinalized(current)) {
-              safeWrite(`event: complete\ndata: ${JSON.stringify(current)}\n\n`);
+              safeWrite(`event: complete\ndata: ${currentSerialized}\n\n`);
               safeEnd();
               cleanup();
             }
@@ -396,14 +414,26 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     }, heartbeatInterval);
   };
 
-  app.get("/v1/transfers/:id/stream", handleStream);
-  app.get("/api/v1/transfers/:id/stream", handleStream);
+  const streamRouteConfig = {
+    config: {
+      rateLimit: {
+        max: deps.rateLimit?.streamMax ?? DEFAULT_STREAM_RATE_LIMIT_MAX,
+        timeWindow: deps.rateLimit?.timeWindowMs ?? DEFAULT_RATE_LIMIT_WINDOW_MS,
+      },
+    },
+  };
+
+  app.get("/v1/transfers/:id/stream", streamRouteConfig, handleStream);
+  app.get("/api/v1/transfers/:id/stream", streamRouteConfig, handleStream);
 
   // 4. Look up by ID
   const getTransferById = async (
     request: FastifyRequest<{ Params: { id: string } }>,
     reply: FastifyReply,
   ) => {
+    const version = negotiateSchemaVersion(request, reply);
+    if (version === null) return;
+
     const { id } = request.params;
     const transfer = await queryTransferById(id);
     if (transfer === null) {
@@ -412,7 +442,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         message: `no transfer found with id ${id}`,
       });
     }
-    return reply.send(transfer);
+    return reply.send(withSchemaMetadata(transfer, version));
   };
 
   app.get("/v1/transfers/:id", getTransferById);
@@ -436,6 +466,9 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       }>,
       reply: FastifyReply,
     ) => {
+      const version = negotiateSchemaVersion(request, reply);
+      if (version === null) return;
+
       const { originChain, destinationChain, route, sender, recipient, search, limit, offset } =
         request.query;
 
@@ -485,12 +518,17 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         params,
       );
 
-      return reply.send({
-        transfers: rows.map((row) => formatRow(row, deps.config)),
-        limit: parsedLimit,
-        offset: parsedOffset,
-        count: rows.length,
-      });
+      return reply.send(
+        withSchemaMetadata(
+          {
+            transfers: rows.map((row) => formatRow(row, deps.config)),
+            limit: parsedLimit,
+            offset: parsedOffset,
+            count: rows.length,
+          },
+          version,
+        ),
+      );
     },
   );
 }

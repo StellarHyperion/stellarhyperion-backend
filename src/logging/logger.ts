@@ -31,16 +31,32 @@ const REDACTED_PATHS = [
   "connectionString",
   "password",
   "stellarSecret",
+  "apiKey",
+  "authorization",
+  "historicalRpcUrl",
+  "rpcUrl",
+  "rpcUrls",
   "*.stellarSecret",
   "config.keeper.stellarSecret",
   "*.databaseUrl",
   "*.redisUrl",
   "*.connectionString",
   "*.password",
+  "*.apiKey",
+  "*.authorization",
+  "*.headers.authorization",
+  "*.historicalRpcUrl",
+  "*.rpcUrl",
+  "*.rpcUrls",
   "err.connectionString",
   "config.databaseUrl",
   "config.redisUrl",
 ];
+
+/** Strip URL userinfo credentials from error messages before logging or persisting diagnostics. */
+export function sanitizeDiagnosticText(input: string): string {
+  return input.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^/@\s]+)@/g, "$1[redacted]@");
+}
 
 export function createLogger(config: AppConfig): Logger {
   return pino({

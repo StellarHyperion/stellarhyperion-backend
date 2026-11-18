@@ -17,7 +17,13 @@ import type { FastifyInstance } from "fastify";
 
 import type { ServerDeps } from "../server.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
-import { checkRedisHealth, worstOf } from "../../runtime/readiness.js";
+import {
+  checkRedisHealth,
+  evaluateHeartbeatFreshness,
+  readWorkerHeartbeats,
+  worstOf,
+} from "../../runtime/readiness.js";
+import { sanitizeDiagnosticText } from "../../logging/logger.js";
 
 const LIVENESS_MEANING =
   "This process is running and answering. It says nothing about Postgres or the chains. Use /ready for that.";
@@ -37,7 +43,8 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
   }));
 
   app.get("/ready", async (_request, reply) => {
-    const checks: ReadinessReport[] = [await checkDatabase(deps), await checkRedis(deps)];
+    const dbCheck = await checkDatabase(deps);
+    const checks: ReadinessReport[] = [dbCheck, await checkRedis(deps)];
 
     for (const source of deps.readiness) {
       try {
@@ -52,6 +59,28 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
           state: "down",
           detail: `readiness check threw: ${messageOf(error)}`,
         });
+      }
+    }
+
+    if (dbCheck.state !== "down") {
+      try {
+        const heartbeats = await readWorkerHeartbeats(deps.db);
+        const reportedNames = new Set(checks.map((c) => c.name));
+        const now = new Date();
+        for (const hb of heartbeats) {
+          if (reportedNames.has(hb.workerName)) continue;
+          const { report } = evaluateHeartbeatFreshness(hb, now);
+          checks.push(report);
+        }
+      } catch (error) {
+        // Minimal unit-test mocks or unmigrated DBs may not have indexer_worker_heartbeat.
+        if (!isMissingHeartbeatTable(error)) {
+          checks.push({
+            name: "indexer-heartbeat",
+            state: "degraded",
+            detail: `failed to read worker heartbeats: ${messageOf(error)}`,
+          });
+        }
       }
     }
 
@@ -90,5 +119,12 @@ async function checkRedis(deps: ServerDeps): Promise<ReadinessReport> {
 }
 
 function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return sanitizeDiagnosticText(error instanceof Error ? error.message : String(error));
+}
+
+function isMissingHeartbeatTable(error: unknown): boolean {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    return (error as { code?: unknown }).code === "42P01";
+  }
+  return false;
 }

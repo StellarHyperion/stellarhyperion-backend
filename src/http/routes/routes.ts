@@ -9,6 +9,7 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import { negotiateSchemaVersion, withSchemaMetadata } from "../schema-version.js";
 import type { ServerDeps } from "../server.js";
 
 export interface FormattedRouteHealth {
@@ -29,7 +30,10 @@ export interface FormattedRouteHealth {
 export function registerRouteHealthRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
 
-  app.get("/v1/routes/health", async (_request, reply: FastifyReply) => {
+  app.get("/v1/routes/health", async (request, reply: FastifyReply) => {
+    const version = negotiateSchemaVersion(request, reply);
+    if (version === null) return;
+
     // Return latest sample per (origin_chain, destination_chain, route, token)
     const { rows } = await db.query(
       `SELECT DISTINCT ON (origin_chain, destination_chain, route, token)
@@ -65,6 +69,6 @@ export function registerRouteHealthRoutes(app: FastifyInstance, deps: ServerDeps
       };
     });
 
-    return reply.send({ routes, count: routes.length });
+    return reply.send(withSchemaMetadata({ routes, count: routes.length }, version));
   });
 }

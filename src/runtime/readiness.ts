@@ -12,6 +12,10 @@
  * its own readiness and the HTTP layer only aggregates.
  */
 
+import type { Queryable } from "../db/pool.js";
+import { integer, json, text, textOrNull, timestamp, timestampOrNull } from "../db/rows.js";
+import { sanitizeDiagnosticText } from "../logging/logger.js";
+
 export type ReadinessState = "ready" | "degraded" | "down";
 
 export interface ReadinessReport {
@@ -196,4 +200,160 @@ export class ReadinessRegistry {
     }
     return { state: worstOf(checks), checks };
   }
+}
+
+export type WorkerKind = "chain" | "rail" | "keeper" | "other";
+
+export interface WorkerHeartbeatInput {
+  readonly workerName: string;
+  readonly workerKind: WorkerKind;
+  readonly chainKey: string | null;
+  readonly state: ReadinessState;
+  readonly detail: string;
+  readonly completed: boolean;
+  readonly lastCursorBlock?: bigint | null;
+  readonly consecutiveFailures: number;
+  readonly lastError: string | null;
+  readonly metadata?: Readonly<Record<string, unknown>>;
+  readonly at?: Date;
+}
+
+export interface WorkerHeartbeatRecord {
+  readonly workerName: string;
+  readonly workerKind: WorkerKind;
+  readonly chainKey: string | null;
+  readonly state: ReadinessState;
+  readonly detail: string;
+  readonly lastHeartbeatAt: Date;
+  readonly lastCompletedAt: Date | null;
+  readonly lastCursorBlock: string | null;
+  readonly consecutiveFailures: number;
+  readonly lastError: string | null;
+  readonly metadata: Readonly<Record<string, unknown>>;
+}
+
+export const DEFAULT_HEARTBEAT_STALE_MS = 120_000;
+
+export interface HeartbeatFreshness {
+  readonly stale: boolean;
+  readonly ageSeconds: number;
+  readonly report: ReadinessReport;
+}
+
+/**
+ * Evaluate whether a persisted worker heartbeat is still fresh enough to trust.
+ * Stale heartbeats degrade readiness rather than reporting an out-of-date "ready".
+ */
+export function evaluateHeartbeatFreshness(
+  record: WorkerHeartbeatRecord,
+  now = new Date(),
+  staleAfterMs = DEFAULT_HEARTBEAT_STALE_MS,
+): HeartbeatFreshness {
+  const ageMs = Math.max(0, now.getTime() - record.lastHeartbeatAt.getTime());
+  const ageSeconds = Math.floor(ageMs / 1000);
+  const stale = ageMs > staleAfterMs;
+
+  if (stale) {
+    return {
+      stale: true,
+      ageSeconds,
+      report: {
+        name: record.workerName,
+        state: record.state === "down" ? "down" : "degraded",
+        detail: `stale heartbeat (${String(ageSeconds)}s old): ${record.detail}`,
+      },
+    };
+  }
+
+  return {
+    stale: false,
+    ageSeconds,
+    report: {
+      name: record.workerName,
+      state: record.state,
+      detail: record.detail,
+    },
+  };
+}
+
+export async function recordWorkerHeartbeat(
+  db: Queryable,
+  input: WorkerHeartbeatInput,
+): Promise<void> {
+  const now = input.at ?? new Date();
+  const detail = sanitizeDiagnosticText(input.detail);
+  const lastError = input.lastError === null ? null : sanitizeDiagnosticText(input.lastError);
+  const cursorBlock =
+    input.lastCursorBlock === undefined || input.lastCursorBlock === null
+      ? null
+      : input.lastCursorBlock.toString();
+
+  await db.query(
+    `INSERT INTO indexer_worker_heartbeat
+       (worker_name, worker_kind, chain_key, state, detail, last_heartbeat_at,
+        last_completed_at, last_cursor_block, consecutive_failures, last_error, metadata,
+        updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $6)
+     ON CONFLICT (worker_name) DO UPDATE
+       SET worker_kind = EXCLUDED.worker_kind,
+           chain_key = EXCLUDED.chain_key,
+           state = EXCLUDED.state,
+           detail = EXCLUDED.detail,
+           last_heartbeat_at = EXCLUDED.last_heartbeat_at,
+           last_completed_at = COALESCE(
+             EXCLUDED.last_completed_at,
+             indexer_worker_heartbeat.last_completed_at
+           ),
+           last_cursor_block = COALESCE(
+             EXCLUDED.last_cursor_block,
+             indexer_worker_heartbeat.last_cursor_block
+           ),
+           consecutive_failures = EXCLUDED.consecutive_failures,
+           last_error = EXCLUDED.last_error,
+           metadata = EXCLUDED.metadata,
+           updated_at = EXCLUDED.updated_at`,
+    [
+      input.workerName,
+      input.workerKind,
+      input.chainKey,
+      input.state,
+      detail,
+      now,
+      input.completed ? now : null,
+      cursorBlock,
+      input.consecutiveFailures,
+      lastError,
+      JSON.stringify(input.metadata ?? {}),
+    ],
+  );
+}
+
+export async function readWorkerHeartbeats(db: Queryable): Promise<WorkerHeartbeatRecord[]> {
+  const { rows } = await db.query(
+    `SELECT worker_name, worker_kind, chain_key, state, detail, last_heartbeat_at,
+            last_completed_at, last_cursor_block, consecutive_failures, last_error, metadata
+       FROM indexer_worker_heartbeat
+      ORDER BY worker_name ASC`,
+  );
+
+  return rows.map((row) => {
+    const rawMeta = json(row, "metadata");
+    const metadata =
+      typeof rawMeta === "object" && rawMeta !== null && !Array.isArray(rawMeta)
+        ? (rawMeta as Record<string, unknown>)
+        : {};
+    return {
+      workerName: text(row, "worker_name"),
+      workerKind: text(row, "worker_kind") as WorkerKind,
+      chainKey: textOrNull(row, "chain_key"),
+      state: text(row, "state") as ReadinessState,
+      detail: text(row, "detail"),
+      lastHeartbeatAt: timestamp(row, "last_heartbeat_at"),
+      lastCompletedAt: timestampOrNull(row, "last_completed_at"),
+      lastCursorBlock: textOrNull(row, "last_cursor_block"),
+      consecutiveFailures: integer(row, "consecutive_failures"),
+      lastError: textOrNull(row, "last_error"),
+      metadata,
+    };
+  });
 }
