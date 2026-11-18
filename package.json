@@ -52,7 +52,15 @@
     "eslint": "^10.11.0",
     "prettier": "^3.9.9",
     "typescript": "^5.9.3",
-    "typescript-eslint": "^8.71.0",
+    "typescript-eslint": "^8.73.0",
     "vitest": "^5.0.3"
+  },
+  "overrides": {
+    "node-pg-migrate": {
+      "glob": "14.0.6"
+    },
+    "eslint": {
+      "minimatch": "11.0.9"
+    }
   }
 }

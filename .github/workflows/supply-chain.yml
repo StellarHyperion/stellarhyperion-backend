@@ -40,6 +40,9 @@ jobs:
       - name: Test pull request assignment policy
         run: python3 -B .github/scripts/test_enforce_pr_assignments.py
 
+      - name: Test dependency advisory verification
+        run: python3 -B .github/scripts/test_audit_npm_dependencies.py
+
       - name: Install checksum-verified security tools
         working-directory: ${{ runner.temp }}
         run: |
@@ -87,5 +90,6 @@ jobs:
           node-version: 22.22.1
 
       - name: Audit locked dependencies in .
-        working-directory: .
-        run: npm audit --audit-level=high --ignore-scripts
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B .github/scripts/audit_npm_dependencies.py . --audit-level high

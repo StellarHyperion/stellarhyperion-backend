@@ -124,3 +124,27 @@ Commits in this repository follow strict identity requirements:
 - Committer identity: `dotmantissa <negativemantissa@gmail.com>`.
 - Commit trailers (e.g. `Co-Authored-By`, `Signed-off-by`, or generator annotations) are forbidden.
 - Use imperative, concise commit summaries describing the technical change.
+
+## Locked dependency audits
+
+CI checks every committed npm lockfile version, including development and optional
+dependencies, with npm's official Bulk Advisory endpoint and blocks high or critical
+active advisories. No package scripts execute during the audit.
+The audit verifies each finding against GitHub's canonical advisory API. A finding
+is removed only when GitHub confirms that advisory was withdrawn; API errors,
+incomplete evidence, and active findings remain blocking. This handles stale npm
+reports without a repository allowlist or disabling security checks.
+
+Run the audit and its regression tests locally:
+
+```bash
+python3 -B .github/scripts/test_audit_npm_dependencies.py
+python3 -B .github/scripts/audit_npm_dependencies.py . --audit-level high
+```
+
+An optional `GITHUB_TOKEN` increases the API rate limit. It is sent only to the
+canonical GitHub API; npm's advisory endpoint receives no GitHub credential.
+
+Automatic Vercel Git deployments are disabled in `vercel.json` while the hosting
+project is paused. Build, test, and security checks continue to run in GitHub Actions.
+Restore `git.deploymentEnabled` when the hosting project is ready to deploy again.
