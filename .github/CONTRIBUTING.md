@@ -10,6 +10,7 @@ the PR title or description, preferably with `Closes #42`. You must be a current
 on every referenced issue in the StellarHyperion organization. Local issue numbers,
 `StellarHyperion/repository#42`, full GitHub issue URLs, and GitHub's linked closing issues
 are supported. References inside HTML comments and fenced examples do not count.
+Descriptions pasted entirely inside a code fence are read as PR descriptions.
 References to other pull requests or issues outside StellarHyperion do not grant eligibility.
 
 The `PR assignment enforcement` action closes unauthorized PRs and PRs without a referenced

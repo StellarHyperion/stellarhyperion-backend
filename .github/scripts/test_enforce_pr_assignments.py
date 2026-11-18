@@ -67,6 +67,22 @@ class AssignmentTests(unittest.TestCase):
         text = "<!-- Closes #1 -->\n```md\nFixes #2\n```\n~~~\n#3\n~~~\nReferences #7"
         self.assertEqual(policy.text_references(text, REPO), {("stellarhyperion/example", 7)})
 
+    def test_entire_fenced_description_keeps_issue_reference(self):
+        for ending in ["", "\n```"]:
+            text = "```\n## Summary\nFixes #7\n## Tests\nPassed" + ending
+            self.assertEqual(policy.text_references(text, REPO), {("stellarhyperion/example", 7)})
+
+    def test_assigned_author_with_fenced_description_is_kept(self):
+        github = FakeGitHub()
+        github.current = pr(title="Fix/7 simulation", body="```\n## Summary\nFixes #7\nTests pass")
+        self.assertEqual(policy.Enforcement(github).enforce(github.current)[0], "KEEP")
+        self.assertEqual(github.updates, [])
+
+    def test_fenced_description_still_requires_assignment(self):
+        github = FakeGitHub(assignees=("other",))
+        github.current = pr(body="```\nFixes #7")
+        self.assertEqual(policy.Enforcement(github).enforce(github.current)[0], "CLOSE")
+
     def test_external_url_fragment_is_not_local_issue(self):
         self.assertEqual(policy.text_references("https://elsewhere.test/page#7", REPO), set())
 

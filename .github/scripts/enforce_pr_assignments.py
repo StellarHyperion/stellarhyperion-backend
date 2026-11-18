@@ -44,6 +44,17 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
 def text_references(text, repository):
     """Read real issue mentions; ignore comments and fenced examples."""
     text = re.sub(r"<!--.*?(?:-->|\Z)", "", text or "", flags=re.DOTALL)
+    # Contributors sometimes paste their entire description inside a fence,
+    # including an accidentally unclosed fence. Preserve its real issue links.
+    lines = text.strip().splitlines()
+    opening = re.fullmatch(r"\s*(`{3,}|~{3,})[^`~]*", lines[0]) if lines else None
+    if opening:
+        closing = [index for index, line in enumerate(lines[1:], 1)
+                   if re.fullmatch(r"\s*" + re.escape(opening[1]) + r"\s*", line)]
+        if not closing:
+            text = "\n".join(lines[1:])
+        elif closing == [len(lines) - 1]:
+            text = "\n".join(lines[1:-1])
     text = re.sub(r"(?m)^\s*(`{3,}|~{3,})[^\n]*\n.*?(?:^\s*\1\s*$|\Z)", "", text, flags=re.DOTALL)
     text = re.sub(
         r"https?://[^\s<>()]+",
@@ -179,7 +190,8 @@ class Enforcement:
         if permission["permission"] in {"admin", "maintain", "write", "triage"}:
             return True, "repository role"
 
-        refs = text_references((pr.get("title") or "") + "\n" + (pr.get("body") or ""), self.github.repository)
+        refs = text_references(pr.get("title"), self.github.repository)
+        refs |= text_references(pr.get("body"), self.github.repository)
         refs |= self.github.linked_issues(pr["number"])
         organization = self.github.repository.split("/", 1)[0].lower()
         # Outside issues cannot authorize a contribution to this organization.
