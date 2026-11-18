@@ -42,6 +42,24 @@ export interface EventsPage {
   readonly oldestLedger: number;
 }
 
+/** Retained ledger window observed from a Soroban RPC `getEvents` response. */
+export interface RetainedHistoryWindow {
+  readonly oldestLedger: number;
+  readonly latestLedger: number;
+  readonly observedAt: Date;
+}
+
+export function retentionWindowOf(
+  page: Pick<EventsPage, "oldestLedger" | "latestLedger">,
+  observedAt: Date = new Date(),
+): RetainedHistoryWindow {
+  return {
+    oldestLedger: page.oldestLedger,
+    latestLedger: page.latestLedger,
+    observedAt,
+  };
+}
+
 export interface EventsQuery {
   readonly contractIds: readonly string[];
   /** Mutually exclusive with `cursor`, and the RPC rejects a request carrying both. */
@@ -183,5 +201,7 @@ export class StellarRpc {
 }
 
 function describe(cause: unknown): string {
-  return cause instanceof Error ? cause.message : String(cause);
+  const raw = cause instanceof Error ? cause.message : String(cause);
+  // Strip any embedded URL credentials before surfacing in errors or logs.
+  return raw.replace(/:\/\/[^/@\s]+@/g, "://***@");
 }
