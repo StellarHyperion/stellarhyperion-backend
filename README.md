@@ -49,6 +49,22 @@ For CCTP, Circle's forwarding hash is a candidate only. The backend binds the at
 
 Unknown or unreachable APIs produce errors; there are no fabricated deliveries or fallback attestations. Claims, route health and metrics query the actual migrated schema. Transfer amounts remain base-unit integer strings, with decimals/symbol supplied from deployment metadata when known.
 
+## Rail retry recovery
+
+Rail lookup failures persist a normalized `retry_class` and `next_attempt_at`. Transient failures use capped exponential backoff; rate limits use the provider's retry delay. Permanent failures and transfers that exhaust the configured retry count are held for operator recovery and are not retried automatically. After correcting the underlying issue and reviewing the source transfer, an operator may explicitly re-enable one transfer with:
+
+```sql
+UPDATE rail_attestation
+   SET check_failures = 0,
+       retry_class = NULL,
+       next_attempt_at = now(),
+       last_error = NULL
+ WHERE transfer_id = '<transfer-id>'
+   AND retry_class IN ('permanent', 'exhausted');
+```
+
+The worker stores only a generic failure category in `last_error`; provider error text and credentials are not exposed through the public transfer API or retry logs.
+
 ## Protocol fees and claims
 
 The active Stellar router charges 0.3% on outbound USDC and transfers that fee directly to its configured treasury during the source transaction. The backend indexes the recorded source fee; bridge and network fees are separate. Received amounts reflect actual destination payment after forwarding fees.

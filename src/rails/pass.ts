@@ -26,7 +26,13 @@ import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
 import { writeInbound, writeAttestation } from "../chains/writers.js";
 import { outstandingForRail, pendingForRail } from "./queue.js";
-import { RailError, isTerminal, type PendingTransfer, type RailClient } from "./types.js";
+import {
+  RailError,
+  isTerminal,
+  type PendingTransfer,
+  type RailClient,
+  type RailRetryClass,
+} from "./types.js";
 
 /**
  * How many outstanding transfers still counts as keeping up.
@@ -36,6 +42,7 @@ import { RailError, isTerminal, type PendingTransfer, type RailClient } from "./
  * the number itself goes in the readiness detail either way.
  */
 const BACKLOG_MULTIPLE_BEFORE_DEGRADED = 3;
+const MAX_RETRY_DELAY_MS = 60 * 60 * 1000;
 
 export interface RailPassOptions {
   readonly route: number;
@@ -118,6 +125,7 @@ export class RailPass {
     const queue = await pendingForRail(db, {
       route: this.options.route,
       limit: batchSize,
+      now: this.now(),
       notCheckedSince: new Date(this.now().getTime() - this.options.recheckAfterMs),
       maxCheckFailures: this.options.maxCheckFailures,
     });
@@ -136,6 +144,8 @@ export class RailPass {
           // The whole rail, not this transfer. Stop the pass and hold off.
           const waitMs = error.retryAfterMs ?? 60_000;
           this.cooldownUntil = new Date(this.now().getTime() + waitMs);
+          failures += 1;
+          await this.recordFailure(transfer, error);
           logger.warn(
             { rail: client.rail, until: this.cooldownUntil.toISOString() },
             "the rail rate limited us, holding off rather than retrying",
@@ -178,6 +188,8 @@ export class RailPass {
         checkedAt: at,
         failures: 0,
         error: null,
+        nextAttemptAt: null,
+        retryClass: null,
       });
       return true;
     }
@@ -193,6 +205,8 @@ export class RailPass {
         checkedAt: at,
         failures: 0,
         error: null,
+        nextAttemptAt: this.nextCheckAt(at),
+        retryClass: null,
       });
       return false;
     }
@@ -214,28 +228,41 @@ export class RailPass {
           checkedAt: at,
           failures: 0,
           error: null,
+          nextAttemptAt: null,
+          retryClass: null,
         });
         return true;
       }
     }
+    const status = report.status === "delivered" ? "pending" : report.status;
     await this.write(transfer, {
-      status: report.status,
+      status,
       railStatus: report.railStatus,
       reference: report.reference,
       attestedAt: report.attestedAt,
       checkedAt: at,
       failures: 0,
       error: null,
+      nextAttemptAt: isTerminal(status) ? null : this.nextCheckAt(at),
+      retryClass: null,
     });
-    return isTerminal(report.status);
+    return isTerminal(status);
   }
 
   private async recordFailure(transfer: PendingTransfer, error: unknown): Promise<void> {
     const failures = transfer.checkFailures + 1;
-    const reason = error instanceof Error ? error.message : String(error);
     const permanent = error instanceof RailError && error.kind === "permanent";
+    const exhausted = !permanent && failures >= this.options.maxCheckFailures;
+    const retryClass: RailRetryClass = permanent
+      ? "permanent"
+      : exhausted
+        ? "exhausted"
+        : error instanceof RailError && error.kind === "rateLimited"
+          ? "rate_limited"
+          : "transient";
+    const reason = safeFailureReason(error);
 
-    if (permanent || failures >= this.options.maxCheckFailures) {
+    if (permanent || exhausted) {
       // Said out loud, because the queue is about to stop offering this transfer and a transfer
       // that quietly stops being chased is the thing somebody notices a week later.
       this.options.logger.error(
@@ -243,11 +270,11 @@ export class RailPass {
           rail: this.options.client.rail,
           transferId: transfer.transferId.toString(),
           failures,
-          reason,
+          retryClass,
         },
         permanent
-          ? "this transfer cannot be looked up on this rail at all; it will not be retried"
-          : "giving up on this transfer after too many consecutive failures",
+          ? "this transfer lookup is permanent and requires operator recovery after the cause is corrected"
+          : "this transfer exhausted automatic retries and requires operator recovery",
       );
     }
 
@@ -262,6 +289,11 @@ export class RailPass {
       checkedAt: this.now(),
       failures,
       error: reason,
+      nextAttemptAt:
+        retryClass === "permanent" || retryClass === "exhausted"
+          ? null
+          : this.failureRetryAt(this.now(), failures, error),
+      retryClass,
     });
   }
 
@@ -275,6 +307,8 @@ export class RailPass {
       readonly checkedAt: Date;
       readonly failures: number;
       readonly error: string | null;
+      readonly nextAttemptAt: Date | null;
+      readonly retryClass: RailRetryClass | null;
     },
   ): Promise<void> {
     await this.options.db.transaction(async (tx: Queryable) => {
@@ -288,11 +322,33 @@ export class RailPass {
         checkedAt: fields.checkedAt,
         checkFailures: fields.failures,
         lastError: fields.error,
+        nextAttemptAt: fields.nextAttemptAt,
+        retryClass: fields.retryClass,
       });
     });
+  }
+
+  private nextCheckAt(at: Date): Date {
+    return new Date(at.getTime() + this.options.recheckAfterMs);
+  }
+
+  private failureRetryAt(at: Date, failures: number, error: unknown): Date {
+    const requestedDelay =
+      error instanceof RailError && error.kind === "rateLimited"
+        ? (error.retryAfterMs ?? 60_000)
+        : this.options.recheckAfterMs * 2 ** Math.min(failures - 1, 30);
+    const delay = Math.min(Math.max(1_000, requestedDelay), MAX_RETRY_DELAY_MS);
+    return new Date(at.getTime() + delay);
   }
 
   private now(): Date {
     return this.options.now?.() ?? new Date();
   }
+}
+
+function safeFailureReason(error: unknown): string {
+  if (error instanceof RailError) {
+    return `${error.rail} ${error.kind === "rateLimited" ? "rate_limited" : error.kind} lookup failure`;
+  }
+  return "lookup or delivery evidence verification failed";
 }

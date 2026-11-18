@@ -4,8 +4,8 @@
  * One query, and the shape of it is the whole design. A transfer needs looking at when it has left
  * one chain and has not arrived on the other, which is two conditions the schema expresses in two
  * different tables: no `rail_attestation` row yet, or one that is still `pending` or `attested`.
- * A `LEFT JOIN` covers both without a union, and the ordering matches the partial index B2 already
- * created for exactly this.
+ * A `LEFT JOIN` covers both without a union, and the ordering matches the partial index over
+ * persisted retry times.
  *
  * The `delivered` column is the part worth reading twice. It is computed from our own
  * `inbound_delivery` table rather than from a rail, because an inbound row means the money arrived
@@ -21,6 +21,7 @@ const STATUSES: readonly string[] = ["pending", "attested", "delivered", "failed
 export interface QueueQuery {
   readonly route: number;
   readonly limit: number;
+  readonly now: Date;
   /**
    * Skip transfers checked more recently than this.
    *
@@ -57,10 +58,17 @@ export async function pendingForRail(
       WHERE t.route = $1
         AND (a.transfer_id IS NULL OR a.status IN ('pending', 'attested'))
         AND COALESCE(a.check_failures, 0) < $2
-        AND (a.last_checked_at IS NULL OR a.last_checked_at < $3)
-      ORDER BY a.last_checked_at NULLS FIRST, t.id
-      LIMIT $4`,
-    [query.route, query.maxCheckFailures, query.notCheckedSince, query.limit],
+        AND a.retry_class IS DISTINCT FROM 'permanent'
+        AND a.retry_class IS DISTINCT FROM 'exhausted'
+        AND (
+          (a.next_attempt_at IS NOT NULL AND a.next_attempt_at <= $3)
+          OR
+          (a.next_attempt_at IS NULL AND
+            (a.last_checked_at IS NULL OR a.last_checked_at < $4))
+        )
+      ORDER BY a.next_attempt_at NULLS FIRST, a.last_checked_at NULLS FIRST, t.id
+      LIMIT $5`,
+    [query.route, query.maxCheckFailures, query.now, query.notCheckedSince, query.limit],
   );
 
   return rows.map((row) => ({

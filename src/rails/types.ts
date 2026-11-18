@@ -73,6 +73,9 @@ export type RailErrorKind =
    */
   | "rateLimited";
 
+/** Normalized database values describing how, or whether, a failed lookup may be retried. */
+export type RailRetryClass = "transient" | "rate_limited" | "permanent" | "exhausted";
+
 export class RailError extends Error {
   constructor(
     readonly rail: string,
