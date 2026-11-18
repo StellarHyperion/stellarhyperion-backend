@@ -110,6 +110,7 @@ export async function writeCursor(
 /** Context for one Soroban event, in the shape the shared writers take. */
 export interface EventContext {
   readonly chainKey: string;
+  readonly router: string;
   readonly ledger: number;
   readonly txHash: string;
   readonly closedAt: Date;
@@ -118,6 +119,7 @@ export interface EventContext {
 function positionOf(context: EventContext): Position {
   return {
     chainKey: context.chainKey,
+    router: context.router,
     block: BigInt(context.ledger),
     txHash: context.txHash,
     // Soroban orders events by operation and event index within a transaction rather than by a

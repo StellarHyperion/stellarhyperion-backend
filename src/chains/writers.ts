@@ -24,6 +24,9 @@ import type { Queryable } from "../db/pool.js";
 /** Where on a chain a row was observed. One shape for a ledger and for a block. */
 export interface Position {
   readonly chainKey: string;
+  /** The router deployment whose event produced this row. */
+  /** Present for rows emitted by a watched router; rail evidence has no local router context. */
+  readonly router?: string;
   /** Ledger sequence on Stellar, block number on an EVM chain. */
   readonly block: bigint;
   readonly txHash: string;
@@ -106,13 +109,14 @@ export interface HealthSample {
 }
 
 export async function writeOutbound(db: Queryable, at: Position, row: OutboundRow): Promise<void> {
+  if (at.router === undefined) throw new Error("outbound writes require a router deployment");
   await db.query(
     `INSERT INTO outbound_transfer
-       (origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
+       (origin_chain, origin_router, route, nonce, sender, token, gross_amount, fee, net_amount,
         destination_chain, destination, rail_ref, origin_block, origin_tx, origin_log_index,
         observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-     ON CONFLICT (origin_chain, nonce) DO UPDATE
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+     ON CONFLICT (origin_chain, origin_router, nonce) DO UPDATE
        SET route = EXCLUDED.route,
            sender = EXCLUDED.sender,
            token = EXCLUDED.token,
@@ -127,6 +131,7 @@ export async function writeOutbound(db: Queryable, at: Position, row: OutboundRo
            origin_log_index = EXCLUDED.origin_log_index`,
     [
       at.chainKey,
+      at.router,
       row.route,
       row.nonce.toString(),
       row.sender,

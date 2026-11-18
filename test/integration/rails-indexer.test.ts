@@ -48,6 +48,7 @@ suite("rail pollers against real Postgres", () => {
         tx,
         {
           chainKey: ORIGIN_CHAIN,
+          router: "router-rails-test",
           block: 1000n,
           txHash: "0xaaa101",
           logIndex: 0,
@@ -134,6 +135,7 @@ suite("rail pollers against real Postgres", () => {
         tx,
         {
           chainKey: ORIGIN_CHAIN,
+          router: "router-rails-test",
           block: 1005n,
           txHash: "0xaaa202",
           logIndex: 0,
