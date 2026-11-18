@@ -150,3 +150,5 @@ project is paused. Build, test, and security checks continue to run in GitHub Ac
 The Vercel GitHub app no longer has access to this repository because the paused
 account reported failed statuses before reading deployment settings. Regrant the
 app access and restore `git.deploymentEnabled` when hosting is ready to deploy again.
+
+Manage app repository access in the [organization integration settings](https://github.com/organizations/StellarHyperion/settings/installations).
