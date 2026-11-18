@@ -10,6 +10,8 @@
  * transaction. That is the whole restart safety claim: a page of events and the cursor advance past
  * it land together or not at all.
  */
+import { createHash } from "node:crypto";
+
 import { ROUTE_KINDS } from "@hyperion/protocol";
 
 import type { Queryable } from "../../db/pool.js";
@@ -374,12 +376,13 @@ export function canonicalEventPayload(
   raw: RawStellarEvent,
   decoded: StellarEvent,
 ): Record<string, unknown> {
-  return {
+  const canonical = JSON.stringify({
     kind: decoded.kind,
     data: "data" in decoded ? normalizeValue(decoded.data) : null,
     topicJson: normalizeValue(raw.topicJson),
     valueJson: normalizeValue(raw.valueJson),
-  };
+  });
+  return { kind: decoded.kind, sha256: createHash("sha256").update(canonical).digest("hex") };
 }
 
 function findDifferingFields(
@@ -449,6 +452,67 @@ export class EventConflictDetector {
   }
 }
 
+/** Persist identities in the same transaction as event application. Concurrent replays
+ * serialize on the unique key; a rollback cannot poison later conflict detection. */
+export async function inspectEventConflict(
+  db: Queryable,
+  chainKey: string,
+  raw: RawStellarEvent,
+  decoded: StellarEvent,
+): Promise<EventIdentityConflict | null> {
+  const incoming: EventEvidenceSnapshot = {
+    eventId: raw.id,
+    ledger: raw.ledger,
+    txHash: raw.txHash,
+    contractId: raw.contractId,
+    payload: canonicalEventPayload(raw, decoded),
+  };
+  for (const identity of canonicalEventIdentities(chainKey, raw, decoded)) {
+    await db.query(
+      `INSERT INTO stellar_event_identity (chain_key, contract, identity, evidence)
+      VALUES ($1, $2, $3, $4::jsonb) ON CONFLICT DO NOTHING`,
+      [chainKey, raw.contractId, identity, JSON.stringify(incoming)],
+    );
+    const { rows } = await db.query(
+      `SELECT evidence FROM stellar_event_identity
+      WHERE chain_key = $1 AND contract = $2 AND identity = $3 FOR UPDATE`,
+      [chainKey, raw.contractId, identity],
+    );
+    const existing = rows[0]?.evidence as EventEvidenceSnapshot | undefined;
+    if (existing === undefined) throw new Error("missing durable event identity");
+    const differingFields = findDifferingFields(existing, incoming);
+    if (differingFields.length === 0) continue;
+    const conflict: EventIdentityConflict = {
+      identity,
+      existing,
+      incoming,
+      differingFields,
+      detectedAt: new Date(),
+    };
+    await db.query(
+      `INSERT INTO stellar_event_conflict
+      (chain_key, contract, identity, incoming_digest, evidence)
+      VALUES ($1, $2, $3, $4, $5::jsonb) ON CONFLICT DO NOTHING`,
+      [chainKey, raw.contractId, identity, incoming.payload.sha256, JSON.stringify(conflict)],
+    );
+    return conflict;
+  }
+  return null;
+}
+
+export async function persistScanJournal(
+  db: Queryable,
+  contract: string,
+  journal: unknown,
+): Promise<void> {
+  const entry = journal as { chainKey: string };
+  await db.query(
+    `INSERT INTO stellar_scan_journal (chain_key, contract, journal)
+    VALUES ($1, $2, $3::jsonb)`,
+    [entry.chainKey, contract, JSON.stringify(journal)],
+  );
+}
+
 export type CursorRepairAction =
   | "noop"
   | "initialize_cursor"
@@ -459,6 +523,8 @@ export type CursorRepairAction =
 
 export interface VerifiedLedgerBoundary {
   readonly ledger: number;
+  /** First ledger proved complete by this range, inclusive. */
+  readonly from?: number;
   readonly cursor: string;
   readonly source: "journal" | "verified_boundary";
 }
@@ -509,10 +575,25 @@ export function planCursorRepair(input: CursorRepairPlanInput): CursorRepairProp
     conflicts,
   } = input;
 
-  const highestVerified =
-    verifiedBoundaries.length === 0
-      ? null
-      : verifiedBoundaries.reduce((max, b) => Math.max(max, b.ledger), 0);
+  // A later boundary alone cannot bridge an unverified earlier gap.
+  let covered =
+    currentCursor?.contract === expectedContract ? Number(currentCursor.position) : startLedger - 1;
+  let highestVerified: number | null = null;
+  for (const boundary of [...verifiedBoundaries].sort((a, b) => a.ledger - b.ledger)) {
+    if (
+      !Number.isSafeInteger(boundary.from) ||
+      !Number.isSafeInteger(boundary.ledger) ||
+      boundary.from === undefined ||
+      boundary.from < 1 ||
+      boundary.from > boundary.ledger ||
+      boundary.cursor !== endOfLedgerCursor(boundary.ledger)
+    )
+      continue;
+    if (boundary.from <= covered + 1 && boundary.ledger > covered) {
+      covered = boundary.ledger;
+      highestVerified = covered;
+    }
+  }
 
   const warnings: string[] = [];
   if (conflicts.length > 0) {
@@ -535,8 +616,8 @@ export function planCursorRepair(input: CursorRepairPlanInput): CursorRepairProp
       blockedByConflicts,
       conflictCount: conflicts.length,
       gap: null,
-      sql: "DELETE FROM indexer_cursor WHERE chain_key = $1 AND contract = $2",
-      params: [chainKey, currentCursor.contract],
+      sql: "DELETE FROM indexer_cursor WHERE chain_key = $1 AND contract = $2 AND last_processed = $3",
+      params: [chainKey, currentCursor.contract, currentCursor.position.toString()],
       rationale: `stored cursor belongs to contract ${currentCursor.contract}, not expected router ${expectedContract}`,
       warnings,
       evidence: baseEvidence,

@@ -302,22 +302,24 @@ describe("what the watcher says about itself", () => {
 });
 
 describe("gaps it cannot close", () => {
-  it("reports a gap when the window moved past the cursor mid request", async () => {
+  it("does not claim completion when retention moved past the requested range", async () => {
     // The window really does move between a response and the next request: testnet reported
     // oldestLedger 4872997 and then refused that exact ledger as outside "4873028 - 4993987" on
     // the following call. When the node serves the request anyway, the ledgers between the cursor
     // and the window edge were never read, and saying nothing would leave a hole nobody hears
     // about again.
-    const { watcher, db, lines } = harness({
+    const { watcher, db } = harness({
       startLedger: 4_900_000,
       latestLedger: 4_994_000,
       oldestLedger: 4_980_000,
     });
     db.cursorRow = cursorRow(4_970_000);
 
-    await watcher.tick(AbortSignal.timeout(5_000));
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+      "outside provider retention",
+    );
 
-    expect(lines.some((line) => line.message.includes("retention window"))).toBe(true);
+    expect(cursorWrites(db)).toEqual([]);
   });
 
   it("says a refused range cannot be closed from here rather than retrying it forever", async () => {
@@ -549,8 +551,8 @@ describe("read-only cursor repair planner (#40)", () => {
     expect(proposal.proposedPosition).toBe(String(FIRST_EVENT_LEDGER + 9_999));
     expect(proposal.proposedRpcCursor).toBe(endOfLedgerCursor(FIRST_EVENT_LEDGER + 9_999));
     expect(proposal.sql).toContain("UPDATE indexer_cursor");
-    // Only the readCursor SELECT should have run.
-    expect(db.queries.length).toBe(queriesBefore + 1);
+    // Read durable journals, conflicts and cursor; no repair writes.
+    expect(db.queries.length).toBe(queriesBefore + 3);
     expect(db.queries[db.queries.length - 1]?.text).toContain("SELECT last_processed");
   });
 

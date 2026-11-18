@@ -37,7 +37,8 @@ import type { EventSource, EventsQuery, RetainedHistoryWindow } from "./rpc.js";
 import { StellarRpcError, retentionWindowOf } from "./rpc.js";
 import {
   type CursorRepairProposal,
-  EventConflictDetector,
+  inspectEventConflict,
+  persistScanJournal,
   type EventContext,
   type EventIdentityConflict,
   type VerifiedLedgerBoundary,
@@ -121,7 +122,7 @@ export class StellarWatcher {
   /** Tags seen once and logged once. A contract ahead of this build should not be a log flood. */
   private readonly reportedUnknown = new Set<string>();
   private readonly progressJournals: ScanProgressJournal[] = [];
-  private readonly conflictDetector = new EventConflictDetector();
+  private readonly recordedConflicts: EventIdentityConflict[] = [];
   private readonly drainController = new AbortController();
   private draining = false;
   private inFlightTick: Promise<boolean> | null = null;
@@ -146,7 +147,7 @@ export class StellarWatcher {
   }
 
   get conflicts(): readonly EventIdentityConflict[] {
-    return this.conflictDetector.conflicts;
+    return this.recordedConflicts;
   }
 
   get isDraining(): boolean {
@@ -169,24 +170,33 @@ export class StellarWatcher {
    * Build a read-only, unsigned database repair proposal from verified completed ledger boundaries
    * recorded in scan journals and retained-history evidence.
    */
-  planRepair(retainedHistory?: RetainedHistoryWindow | null): Promise<CursorRepairProposal> {
+  async planRepair(retainedHistory?: RetainedHistoryWindow | null): Promise<CursorRepairProposal> {
     const verifiedBoundaries: VerifiedLedgerBoundary[] = [];
-    for (const journal of this.progressJournals) {
-      if (journal.committedRange !== null) {
+    const { rows: journals } = await this.options.db.query(
+      `SELECT journal FROM stellar_scan_journal WHERE chain_key = $1 AND contract = $2 ORDER BY id`,
+      [this.options.chainKey, this.options.router],
+    );
+    for (const row of journals) {
+      const journal = row.journal as ScanProgressJournal;
+      if (journal.committedRange !== null)
         verifiedBoundaries.push({
+          from: journal.committedRange.from,
           ledger: journal.committedRange.to,
           cursor: endOfLedgerCursor(journal.committedRange.to),
           source: "journal",
         });
-      }
     }
+    const { rows: evidence } = await this.options.db.query(
+      `SELECT evidence FROM stellar_event_conflict WHERE chain_key = $1 AND contract = $2`,
+      [this.options.chainKey, this.options.router],
+    );
     return planCursorRepairFromDb(this.options.db, {
       chainKey: this.options.chainKey,
       expectedContract: this.options.router,
       startLedger: this.options.startLedger,
       retainedHistory: retainedHistory ?? this.lastRetainedHistory,
       verifiedBoundaries,
-      conflicts: this.conflicts,
+      conflicts: evidence.map((row) => row.evidence as EventIdentityConflict),
     });
   }
 
@@ -237,6 +247,7 @@ export class StellarWatcher {
    * a watcher starting thousands of ledgers back catches up without sleeping between windows.
    */
   async tick(signal: AbortSignal): Promise<boolean> {
+    if (this.inFlightTick !== null) return this.inFlightTick;
     const effectiveSignal = AbortSignal.any([signal, this.drainController.signal]);
     if (this.draining || effectiveSignal.aborted) {
       const now = new Date();
@@ -277,6 +288,18 @@ export class StellarWatcher {
     let conflicts = 0;
     let pages = 0;
     let interruptionReason: string | null = null;
+    let journalPersisted = false;
+    const transactionConflicts: EventIdentityConflict[] = [];
+    const journal = (): ScanProgressJournal => ({
+      chainKey,
+      startedAt,
+      finishedAt: new Date(),
+      requestedRange: { from: requestedFrom, to: requestedTo },
+      committedRange,
+      eventCounts: { fetched, decoded, skipped, conflicts },
+      pages,
+      interruptionReason,
+    });
 
     try {
       const stored = await readCursor(db, chainKey);
@@ -310,13 +333,10 @@ export class StellarWatcher {
         return false;
       }
 
-      if (scan.oldestLedger > base + 1 && stored !== null) {
+      if (scan.oldestLedger > base + 1) {
         // The retention window moved past where we stopped. Anything between the two is gone from
         // this node, and carrying on from the window edge would leave a hole nothing ever reports.
-        logger.error(
-          { chain: chainKey, from: base + 1, oldestLedger: scan.oldestLedger },
-          "fell behind the rpc retention window; ledgers between the cursor and the oldest retained ledger were never read",
-        );
+        throw new Error("requested Stellar history is outside provider retention");
       }
 
       if (scan.through <= base && scan.events.length === 0) {
@@ -356,7 +376,7 @@ export class StellarWatcher {
             txHash: raw.txHash,
             closedAt: new Date(raw.ledgerClosedAt),
           };
-          const outcome = await this.apply(tx, context, raw);
+          const outcome = await this.apply(tx, context, raw, transactionConflicts);
           if (outcome === "decoded") decoded += 1;
           else if (outcome === "conflict") conflicts += 1;
           else skipped += 1;
@@ -371,11 +391,13 @@ export class StellarWatcher {
           // Nothing to record: a closed ledger cannot be replaced by a different one.
           hash: null,
         });
+        if (scan.through > base) committedRange = { from: base + 1, to: scan.through };
+        await persistScanJournal(tx, router, journal());
       });
-
-      if (scan.through > base) {
-        committedRange = { from: base + 1, to: scan.through };
-      }
+      journalPersisted = true;
+      this.recordedConflicts.push(...transactionConflicts);
+      if (this.recordedConflicts.length > 100)
+        this.recordedConflicts.splice(0, this.recordedConflicts.length - 100);
 
       const behind = Math.max(scan.latestLedger - scan.through, 0);
       this.lastProgress = { ledger: scan.through, decoded, skipped, behind, at: new Date() };
@@ -388,19 +410,16 @@ export class StellarWatcher {
       // poller come straight back rather than sleeping out the interval mid-backfill.
       return !this.draining && !signal.aborted && behind > 0;
     } catch (error) {
-      interruptionReason = error instanceof Error ? error.message : String(error);
+      committedRange = null;
+      interruptionReason =
+        error instanceof Error && error.message === "deadlock detected"
+          ? "deadlock detected"
+          : "scan_failed";
       throw error;
     } finally {
-      this.recordJournal({
-        chainKey,
-        startedAt,
-        finishedAt: new Date(),
-        requestedRange: { from: requestedFrom, to: requestedTo },
-        committedRange,
-        eventCounts: { fetched, decoded, skipped, conflicts },
-        pages,
-        interruptionReason,
-      });
+      const finalJournal = journal();
+      if (!journalPersisted) await persistScanJournal(db, router, finalJournal);
+      this.recordJournal(finalJournal);
     }
   }
 
@@ -510,10 +529,12 @@ export class StellarWatcher {
     tx: Queryable,
     context: EventContext,
     raw: RawStellarEvent,
+    transactionConflicts: EventIdentityConflict[],
   ): Promise<"decoded" | "skipped" | "conflict"> {
     const event = decodeStellarEvent(raw);
-    const conflict = this.conflictDetector.inspect(context.chainKey, raw, event);
+    const conflict = await inspectEventConflict(tx, context.chainKey, raw, event);
     if (conflict !== null) {
+      transactionConflicts.push(conflict);
       this.options.logger.warn(
         {
           chain: context.chainKey,
