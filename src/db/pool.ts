@@ -13,7 +13,7 @@
  * costume. Narrowing happens once per table, in `rows.ts`, where it is visible.
  */
 import { Pool } from "pg";
-import type { PoolClient, PoolConfig } from "pg";
+import type { PoolClient, PoolConfig, QueryConfig } from "pg";
 
 export interface QueryResultRows {
   readonly rows: readonly Record<string, unknown>[];
@@ -21,9 +21,18 @@ export interface QueryResultRows {
   readonly rowCount: number;
 }
 
+export interface QueryOptions {
+  /** Abort a query when its HTTP request is cancelled or its read budget expires. */
+  readonly signal?: AbortSignal;
+}
+
 /** What both the pool and a transaction offer, so a repository never knows which it has. */
 export interface Queryable {
-  query(text: string, params?: readonly unknown[]): Promise<QueryResultRows>;
+  query(
+    text: string,
+    params?: readonly unknown[],
+    options?: QueryOptions,
+  ): Promise<QueryResultRows>;
 }
 
 /**
@@ -66,8 +75,17 @@ export class Database implements Transactional {
     return new Database(new Pool(config));
   }
 
-  async query(text: string, params: readonly unknown[] = []): Promise<QueryResultRows> {
-    const result = await this.pool.query(text, params as unknown[]);
+  async query(
+    text: string,
+    params: readonly unknown[] = [],
+    options: QueryOptions = {},
+  ): Promise<QueryResultRows> {
+    const query = {
+      text,
+      values: params as unknown[],
+      signal: options.signal,
+    } as QueryConfig & { signal?: AbortSignal };
+    const result = await this.pool.query(query);
     return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount ?? 0 };
   }
 
@@ -156,8 +174,17 @@ export function startMaintenanceTask(
 
 function wrapClient(client: PoolClient): Queryable {
   return {
-    async query(text: string, params: readonly unknown[] = []): Promise<QueryResultRows> {
-      const result = await client.query(text, params as unknown[]);
+    async query(
+      text: string,
+      params: readonly unknown[] = [],
+      options: QueryOptions = {},
+    ): Promise<QueryResultRows> {
+      const query = {
+        text,
+        values: params as unknown[],
+        signal: options.signal,
+      } as QueryConfig & { signal?: AbortSignal };
+      const result = await client.query(query);
       return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount ?? 0 };
     },
   };

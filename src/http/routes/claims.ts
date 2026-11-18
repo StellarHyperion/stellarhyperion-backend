@@ -10,6 +10,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { Database } from "../../db/pool.js";
 import { integer, text } from "../../db/rows.js";
 import type { ServerDeps } from "../server.js";
+import { requestQuery } from "../request-budget.js";
 
 export interface FormattedClaim {
   readonly id: string;
@@ -54,7 +55,9 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       reply: FastifyReply,
     ) => {
       const { chain, claimId } = request.params;
-      const { rows } = await db.query(
+      const { rows } = await requestQuery(
+        request,
+        db,
         `SELECT chain || ':' || claim_id::text AS id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
                 created_at, settled, observed_at
            FROM pending_claim
@@ -117,7 +120,9 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       params.push(parsedOffset);
       const offsetClause = `OFFSET $${String(params.length)}`;
 
-      const { rows } = await db.query(
+      const { rows } = await requestQuery(
+        request,
+        db,
         `SELECT chain || ':' || claim_id::text AS id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
                 created_at, settled, observed_at
            FROM pending_claim

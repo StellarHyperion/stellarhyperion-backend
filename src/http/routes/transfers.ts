@@ -13,6 +13,53 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
 import type { ServerDeps } from "../server.js";
+import { requestQuery } from "../request-budget.js";
+
+const MAX_REPLAY_EVENTS = 100;
+const STREAM_HISTORY_TTL_MS = 15 * 60 * 1000;
+
+interface StreamEvent {
+  readonly id: number;
+  readonly serialized: string;
+}
+
+interface StreamHistory {
+  nextId: number;
+  touchedAt: number;
+  events: StreamEvent[];
+}
+
+const streamHistory = new Map<string, StreamHistory>();
+
+function historyFor(id: string): StreamHistory {
+  const now = Date.now();
+  for (const [key, history] of streamHistory) {
+    if (now - history.touchedAt > STREAM_HISTORY_TTL_MS) streamHistory.delete(key);
+  }
+  const existing = streamHistory.get(id);
+  if (existing !== undefined) {
+    existing.touchedAt = now;
+    return existing;
+  }
+  const created = { nextId: 1, touchedAt: now, events: [] };
+  streamHistory.set(id, created);
+  return created;
+}
+
+function rememberEvent(history: StreamHistory, serialized: string): StreamEvent {
+  const event = { id: history.nextId++, serialized };
+  history.events.push(event);
+  if (history.events.length > MAX_REPLAY_EVENTS) history.events.shift();
+  return event;
+}
+
+function lastEventId(request: FastifyRequest): number | null {
+  const raw = request.headers["last-event-id"];
+  if (raw === undefined) return null;
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (value === undefined || !/^\d+$/.test(value)) return -1;
+  return Number(value);
+}
 
 export type TransferLifecycleStage =
   | "initiated"
@@ -236,8 +283,13 @@ function isDeliveryFinalized(transfer: FormattedTransfer): boolean {
 export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
 
-  const queryTransferById = async (id: string): Promise<FormattedTransfer | null> => {
-    const { rows } = await db.query(`${TRANSFER_QUERY} WHERE t.id = $1 LIMIT 1`, [id]);
+  const queryTransferById = async (
+    request: FastifyRequest,
+    id: string,
+  ): Promise<FormattedTransfer | null> => {
+    const { rows } = await requestQuery(request, db, `${TRANSFER_QUERY} WHERE t.id = $1 LIMIT 1`, [
+      id,
+    ]);
     const row = rows[0];
     return row !== undefined ? formatRow(row, deps.config) : null;
   };
@@ -250,7 +302,9 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       reply: FastifyReply,
     ) => {
       const { originChain, nonce } = request.params;
-      const { rows } = await db.query(
+      const { rows } = await requestQuery(
+        request,
+        db,
         `${TRANSFER_QUERY} WHERE t.origin_chain = $1 AND t.nonce = $2 LIMIT 1`,
         [originChain, nonce],
       );
@@ -272,7 +326,9 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     "/v1/transfers/by-tx/:txHash",
     async (request: FastifyRequest<{ Params: { txHash: string } }>, reply: FastifyReply) => {
       const { txHash } = request.params;
-      const { rows } = await db.query(
+      const { rows } = await requestQuery(
+        request,
+        db,
         `${TRANSFER_QUERY} WHERE t.origin_tx = $1 OR d.destination_tx = $1 LIMIT 1`,
         [txHash],
       );
@@ -298,11 +354,29 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     reply: FastifyReply,
   ) => {
     const { id } = request.params;
-    const initial = await queryTransferById(id);
+    const initial = await queryTransferById(request, id);
     if (initial === null) {
       return reply.code(404).send({
         error: "not_found",
         message: `no transfer found with id ${id}`,
+      });
+    }
+
+    const history = historyFor(id);
+    const cursor = lastEventId(request);
+    const oldest = history.events[0]?.id;
+    const latest = history.events.at(-1)?.id ?? 0;
+    if (cursor === -1) {
+      return reply.code(400).send({
+        error: "invalid_cursor",
+        message: "Last-Event-ID must be a non-negative integer",
+      });
+    }
+    if (cursor !== null && ((oldest !== undefined && cursor < oldest - 1) || cursor > latest)) {
+      return reply.code(409).send({
+        error: "cursor_expired",
+        message: "the event cursor is no longer available; reconnect without it to resync",
+        resync: `/v1/transfers/${id}/stream`,
       });
     }
 
@@ -327,7 +401,15 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       }
     };
 
-    safeWrite(`event: transfer_update\ndata: ${JSON.stringify(initial)}\n\n`);
+    const writeEvent = (event: StreamEvent) =>
+      safeWrite(`id: ${event.id}\nevent: transfer_update\ndata: ${event.serialized}\n\n`);
+    if (cursor === null) {
+      writeEvent(rememberEvent(history, JSON.stringify(initial)));
+    } else {
+      for (const event of history.events) {
+        if (event.id > cursor) writeEvent(event);
+      }
+    }
 
     if (isDeliveryFinalized(initial)) {
       safeWrite(`event: complete\ndata: ${JSON.stringify(initial)}\n\n`);
@@ -367,13 +449,13 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         }
 
         try {
-          const current = await queryTransferById(id);
+          const current = await queryTransferById(request, id);
           if (current === null) return;
 
           const currentSerialized = JSON.stringify(current);
           if (currentSerialized !== lastSerialized) {
             lastSerialized = currentSerialized;
-            safeWrite(`event: transfer_update\ndata: ${JSON.stringify(current)}\n\n`);
+            writeEvent(rememberEvent(history, currentSerialized));
 
             if (isDeliveryFinalized(current)) {
               safeWrite(`event: complete\ndata: ${JSON.stringify(current)}\n\n`);
@@ -405,7 +487,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     reply: FastifyReply,
   ) => {
     const { id } = request.params;
-    const transfer = await queryTransferById(id);
+    const transfer = await queryTransferById(request, id);
     if (transfer === null) {
       return reply.code(404).send({
         error: "not_found",
@@ -480,7 +562,9 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       params.push(parsedOffset);
       const offsetClause = `OFFSET $${String(params.length)}`;
 
-      const { rows } = await db.query(
+      const { rows } = await requestQuery(
+        request,
+        db,
         `${TRANSFER_QUERY} ${whereClause} ORDER BY t.id DESC ${limitClause} ${offsetClause}`,
         params,
       );

@@ -87,7 +87,12 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     request.log.error({ err: error, status }, "request failed");
     void reply.code(status).send({
       error: status >= 500 ? "internal_error" : "bad_request",
-      message: status >= 500 ? "the server could not complete that request" : error.message,
+      message:
+        status === 504
+          ? "the request exceeded the public read budget"
+          : status >= 500
+            ? "the server could not complete that request"
+            : error.message,
       requestId: request.id,
     });
   });

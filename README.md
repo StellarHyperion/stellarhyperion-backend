@@ -69,6 +69,13 @@ One process serializes its Stellar submissions to avoid sequence conflicts. Run 
 - `GET /v1/claims`, `GET /v1/claims/:chain/:claimId`
 - `GET /v1/routes/health`, `GET /v1/metrics`
 
+Public reads have a ten-second request budget. A client disconnect cancels the in-flight
+PostgreSQL query through its `AbortSignal`; the pool's statement timeout remains the final
+server-side safeguard. The transfer stream sends a numeric `id` with each `transfer_update`.
+Clients may reconnect with `Last-Event-ID` to replay retained updates. Replay history is bounded
+to the most recent 100 events per transfer and expires after 15 minutes. A `409 cursor_expired`
+response includes a `resync` URL when the client must reconnect without a cursor.
+
 `npm run check` runs formatting, lint, type checking and tests. Schema/API regressions execute repository migrations in embedded PostgreSQL (PGlite). The full PostgreSQL integration suite requires `TEST_DATABASE_URL`; it is skipped when unset. Use `npm run build` for emitted production code.
 
 RPC event retention is finite. A fresh deployment record may predate the public RPC's retained history; initialize `STELLAR_START_LEDGER` within retained history only if you accept that older events are unavailable, or use a historical provider. Check readiness and logs rather than treating an empty database as complete history.
