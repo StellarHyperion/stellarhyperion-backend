@@ -147,4 +147,8 @@ canonical GitHub API; npm's advisory endpoint receives no GitHub credential.
 
 Automatic Vercel Git deployments are disabled in `vercel.json` while the hosting
 project is paused. Build, test, and security checks continue to run in GitHub Actions.
-Restore `git.deploymentEnabled` when the hosting project is ready to deploy again.
+The Vercel GitHub app no longer has access to this repository because the paused
+account reported failed statuses before reading deployment settings. Regrant the
+app access and restore `git.deploymentEnabled` when hosting is ready to deploy again.
+
+Manage app repository access in the [organization integration settings](https://github.com/organizations/StellarHyperion/settings/installations).
