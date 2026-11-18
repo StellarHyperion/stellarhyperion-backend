@@ -94,6 +94,50 @@ export class EvmWatcher {
   }
 
   /**
+   * Apply one historical range without reading or advancing the live cursor.
+   *
+   * A backfill deliberately shares the decoder and writers with live polling, but not its
+   * cursor. Each bounded page commits its rows before the returned next block is exposed, so a
+   * cancelled job can resume from that boundary without replaying a partial transaction.
+   */
+  async backfillRange(
+    from: bigint,
+    to: bigint,
+    signal: AbortSignal,
+  ): Promise<{ readonly written: number; readonly ignored: number }> {
+    if (from > to) throw new Error("backfill range must start at or before its end");
+    throwIfAborted(signal);
+    const { router, client, db, chainKey } = this.options;
+    await this.confirmChain(signal);
+    const logs = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
+    const wanted = new Set<bigint>(logs.map((log) => log.blockNumber));
+    wanted.add(to);
+    const blocks = await client.blocks([...wanted], signal);
+    if (!blocks.has(to)) throw new Error(`backfill end block ${to.toString()} is unavailable`);
+    throwIfAborted(signal);
+
+    let written = 0;
+    let ignored = 0;
+    const pairing = new ClaimPairing();
+    await db.transaction(async (tx) => {
+      for (const log of logs) {
+        if (signal.aborted) throw new DOMException("backfill cancelled", "AbortError");
+        if (log.removed) {
+          ignored += 1;
+          continue;
+        }
+        const timestamp = blocks.get(log.blockNumber)?.timestamp;
+        if (timestamp === undefined) {
+          throw new Error(`no timestamp for block ${log.blockNumber.toString()} on ${chainKey}`);
+        }
+        if (await this.apply(tx, log, timestamp, pairing)) written += 1;
+        else ignored += 1;
+      }
+    });
+    return { written, ignored };
+  }
+
+  /**
    * Readiness from cached state, never from a network call.
    *
    * Degraded at worst and never down, the same ceiling the Stellar watcher has and for the same
@@ -361,4 +405,8 @@ function min(a: bigint, b: bigint): bigint {
 
 function timestampOf(seconds: bigint | null): Date | null {
   return seconds === null ? null : new Date(Number(seconds) * 1000);
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw new DOMException("backfill cancelled", "AbortError");
 }

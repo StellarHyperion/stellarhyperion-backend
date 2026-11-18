@@ -8,6 +8,7 @@ import type { AppConfig } from "../config/config.js";
 import type { Database } from "../db/pool.js";
 import type { BullMQWorkerState, RedisPingable, ReadinessSource } from "../runtime/readiness.js";
 import { registerClaimRoutes } from "./routes/claims.js";
+import { registerBackfillRoutes } from "./routes/backfills.js";
 import { registerHealthRoutes } from "./routes/health.js";
 import { registerMetricsRoutes } from "./routes/metrics.js";
 import { registerRouteHealthRoutes } from "./routes/routes.js";
@@ -70,6 +71,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   registerHealthRoutes(app, deps);
   registerTransferRoutes(app, deps);
   registerClaimRoutes(app, deps);
+  registerBackfillRoutes(app, deps);
   registerRouteHealthRoutes(app, deps);
   registerMetricsRoutes(app, deps);
 
