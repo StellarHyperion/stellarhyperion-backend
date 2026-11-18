@@ -136,7 +136,9 @@ export class FakeRpc {
     }
 
     const width = query.cursor === undefined ? START_WINDOW : CURSOR_WINDOW;
-    const windowEnd = Math.min(from + width - 1, this.head);
+    const requestedEnd =
+      query.endLedger === undefined ? from + width - 1 : Math.max(from, query.endLedger - 1);
+    const windowEnd = Math.min(from + width - 1, requestedEnd, this.head);
 
     const inWindow = this.log.filter((event) => {
       if (event.ledger > windowEnd) return false;

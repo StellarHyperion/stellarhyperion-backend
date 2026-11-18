@@ -26,11 +26,19 @@ import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
-import { completeThrough, endOfLedgerCursor, parseEventCursor } from "./cursor.js";
-import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
+import {
+  type AdaptiveWindowConfig,
+  DEFAULT_ADAPTIVE_WINDOW_CONFIG,
+  SCAN_WINDOW_LEDGERS,
+  endOfLedgerCursor,
+  nextScanWindowLedgers,
+  validateScanPage,
+} from "./cursor.js";
+import { decodeStellarEvent, type RawStellarEvent, type StellarEvent } from "./events.js";
 import type { EventSource, EventsQuery } from "./rpc.js";
 import { StellarRpcError } from "./rpc.js";
 import {
+  type ChainCursor,
   readCursor,
   recordActionQueued,
   recordActionSettled,
@@ -38,7 +46,9 @@ import {
   recordBridgeOut,
   recordClaimParked,
   recordClaimSettled,
+  recordDeploymentRevision,
   recordPauseSet,
+  recordQuarantinedEvent,
   recordRouteConfigured,
   recordTokenRegistered,
   writeCursor,
@@ -77,6 +87,10 @@ export interface StellarWatcherOptions {
   readonly db: Transactional;
   readonly logger: Logger;
   readonly maxPagesPerTick?: number;
+  /** Optional explicit watched deployment revision; increments automatically on router change. */
+  readonly deploymentRevision?: number;
+  /** Optional adaptive scan-window sizing configuration. */
+  readonly adaptiveWindow?: AdaptiveWindowConfig;
 }
 
 export interface WatcherProgress {
@@ -84,6 +98,9 @@ export interface WatcherProgress {
   readonly ledger: number;
   readonly decoded: number;
   readonly skipped: number;
+  readonly quarantined: number;
+  readonly revision: number;
+  readonly windowLedgers: number;
   /** How far behind the chain's head this watcher is, in ledgers. */
   readonly behind: number;
   readonly at: Date;
@@ -91,10 +108,15 @@ export interface WatcherProgress {
 
 export class StellarWatcher {
   private lastProgress: WatcherProgress | null = null;
+  private scanWindowLedgers: number;
   /** Tags seen once and logged once. A contract ahead of this build should not be a log flood. */
   private readonly reportedUnknown = new Set<string>();
+  /** Router transitions logged once per `(old -> new)` pair. */
+  private readonly reportedReplacements = new Set<string>();
 
-  constructor(private readonly options: StellarWatcherOptions) {}
+  constructor(private readonly options: StellarWatcherOptions) {
+    this.scanWindowLedgers = options.adaptiveWindow?.maxLedgers ?? SCAN_WINDOW_LEDGERS;
+  }
 
   get name(): string {
     return this.options.chainKey;
@@ -102,6 +124,10 @@ export class StellarWatcher {
 
   get progress(): WatcherProgress | null {
     return this.lastProgress;
+  }
+
+  get windowLedgers(): number {
+    return this.scanWindowLedgers;
   }
 
   /**
@@ -143,20 +169,12 @@ export class StellarWatcher {
     const { chainKey, router, db, logger } = this.options;
 
     const stored = await readCursor(db, chainKey);
-    if (stored !== null && stored.contract !== router) {
-      // A different router at a different address shares no history with this cursor. Carrying it
-      // over would skip everything the new deployment has ever done, and it would do it silently,
-      // which is the worst available outcome. Stopping is the only honest move.
-      throw new Error(
-        `the cursor for ${chainKey} was written for router ${stored.contract} and this process is watching ${router}. ` +
-          "A redeployed router needs its cursor reset rather than reused.",
-      );
-    }
+    const deployment = this.resolveDeployment(stored);
+    const { base, fresh, revision, previous } = deployment;
 
-    const base = stored === null ? this.options.startLedger - 1 : Number(stored.position);
-    const scan = await this.scan(base, stored === null, signal);
+    const scan = await this.scan(base, fresh, signal);
 
-    if (scan.oldestLedger > base + 1 && stored !== null) {
+    if (scan.oldestLedger > base + 1 && !fresh) {
       // The retention window moved past where we stopped. Anything between the two is gone from
       // this node, and carrying on from the window edge would leave a hole nothing ever reports.
       logger.error(
@@ -172,6 +190,9 @@ export class StellarWatcher {
         ledger: base,
         decoded: 0,
         skipped: 0,
+        quarantined: 0,
+        revision,
+        windowLedgers: this.scanWindowLedgers,
         behind: Math.max(scan.latestLedger - base, 0),
         at: new Date(),
       };
@@ -180,14 +201,25 @@ export class StellarWatcher {
 
     let decoded = 0;
     let skipped = 0;
-    let closedAt = stored?.observedAt ?? null;
+    let quarantined = 0;
+    let closedAt = fresh ? null : (stored?.observedAt ?? null);
     for (const raw of scan.events) {
       if (raw.ledger <= scan.through) closedAt = new Date(raw.ledgerClosedAt);
     }
 
-    // One transaction for the page and the cursor. This is the restart guarantee, and splitting it
-    // would turn every crash into either a lost page or a duplicated one.
+    // One transaction for the page, quarantined events, revision record, and the cursor.
     await db.transaction(async (tx: Queryable) => {
+      if (fresh) {
+        await recordDeploymentRevision(tx, {
+          chainKey,
+          deploymentRevision: revision,
+          contract: router,
+          startLedger: BigInt(this.options.startLedger),
+          previousContract: previous?.contract ?? null,
+          previousCursor: previous?.cursor ?? null,
+        });
+      }
+
       for (const raw of scan.events) {
         if (raw.type !== "contract" || raw.inSuccessfulContractCall === false) {
           // getEvents no longer returns the deprecated success flag (RPC30).
@@ -202,8 +234,14 @@ export class StellarWatcher {
           txHash: raw.txHash,
           closedAt: new Date(raw.ledgerClosedAt),
         };
-        if (await this.apply(tx, context, raw)) decoded += 1;
-        else skipped += 1;
+        const outcome = await this.apply(tx, context, raw, revision);
+        if (outcome === "decoded") decoded += 1;
+        else if (outcome === "quarantined") {
+          quarantined += 1;
+          skipped += 1;
+        } else {
+          skipped += 1;
+        }
       }
 
       await writeCursor(tx, {
@@ -214,19 +252,103 @@ export class StellarWatcher {
         observedAt: closedAt,
         // Nothing to record: a closed ledger cannot be replaced by a different one.
         hash: null,
+        deploymentRevision: revision,
       });
     });
 
     const behind = Math.max(scan.latestLedger - scan.through, 0);
-    this.lastProgress = { ledger: scan.through, decoded, skipped, behind, at: new Date() };
+    this.lastProgress = {
+      ledger: scan.through,
+      decoded,
+      skipped,
+      quarantined,
+      revision,
+      windowLedgers: this.scanWindowLedgers,
+      behind,
+      at: new Date(),
+    };
     logger.info(
-      { chain: chainKey, ledger: scan.through, decoded, skipped, behind, pages: scan.pages },
+      {
+        chain: chainKey,
+        ledger: scan.through,
+        decoded,
+        skipped,
+        quarantined,
+        revision,
+        windowLedgers: this.scanWindowLedgers,
+        behind,
+        pages: scan.pages,
+      },
       "stellar window indexed",
     );
 
     // Behind the head means there is another window waiting, so say we progressed and let the
     // poller come straight back rather than sleeping out the interval mid-backfill.
     return behind > 0;
+  }
+
+  private resolveDeployment(stored: ChainCursor | null): {
+    readonly base: number;
+    readonly fresh: boolean;
+    readonly revision: number;
+    readonly previous: { readonly contract: string; readonly cursor: bigint } | null;
+  } {
+    const { chainKey, router, startLedger, deploymentRevision, logger } = this.options;
+    if (stored === null) {
+      return {
+        base: startLedger - 1,
+        fresh: true,
+        revision: deploymentRevision ?? 1,
+        previous: null,
+      };
+    }
+
+    if (stored.contract !== router) {
+      const nextRevision = Math.max(stored.deploymentRevision + 1, deploymentRevision ?? 1);
+      const transitionKey = `${stored.contract}->${router}:${String(nextRevision)}`;
+      if (!this.reportedReplacements.has(transitionKey)) {
+        this.reportedReplacements.add(transitionKey);
+        logger.warn(
+          {
+            chain: chainKey,
+            previousRouter: stored.contract,
+            router,
+            previousRevision: stored.deploymentRevision,
+            deploymentRevision: nextRevision,
+            startLedger,
+          },
+          "router contract changed; starting new watched deployment revision without reusing previous cursor",
+        );
+      }
+      return {
+        base: startLedger - 1,
+        fresh: true,
+        revision: nextRevision,
+        previous: { contract: stored.contract, cursor: stored.position },
+      };
+    }
+
+    if (deploymentRevision !== undefined && deploymentRevision < stored.deploymentRevision) {
+      throw new Error(
+        `configured deployment revision ${String(deploymentRevision)} for ${chainKey} is older than stored revision ${String(stored.deploymentRevision)}`,
+      );
+    }
+
+    if (deploymentRevision !== undefined && deploymentRevision > stored.deploymentRevision) {
+      return {
+        base: startLedger - 1,
+        fresh: true,
+        revision: deploymentRevision,
+        previous: { contract: stored.contract, cursor: stored.position },
+      };
+    }
+
+    return {
+      base: Number(stored.position),
+      fresh: false,
+      revision: stored.deploymentRevision,
+      previous: null,
+    };
   }
 
   /**
@@ -249,6 +371,7 @@ export class StellarWatcher {
   }> {
     const { router, pageSize, logger, chainKey } = this.options;
     const maxPages = this.options.maxPagesPerTick ?? MAX_PAGES_PER_TICK;
+    const windowConfig = this.options.adaptiveWindow ?? DEFAULT_ADAPTIVE_WINDOW_CONFIG;
 
     const events: RawStellarEvent[] = [];
     let through = base;
@@ -262,16 +385,52 @@ export class StellarWatcher {
       : { cursor: endOfLedgerCursor(base) };
 
     while (pages < maxPages) {
-      const page = await this.fetch(
-        { ...pagination, contractIds: [router], limit: pageSize },
-        signal,
+      const requestedWindow = this.scanWindowLedgers;
+      const endLedger =
+        requestedWindow < windowConfig.maxLedgers
+          ? pagination.startLedger !== undefined
+            ? pagination.startLedger + requestedWindow
+            : pages === 0
+              ? base + 1 + requestedWindow
+              : undefined
+          : undefined;
+      const query: EventsQuery = {
+        ...pagination,
+        ...(endLedger === undefined ? {} : { endLedger }),
+        contractIds: [router],
+        limit: pageSize,
+      };
+
+      const startedAt = performance.now();
+      const page = await this.fetch(query, signal);
+      const elapsedMs = performance.now() - startedAt;
+
+      const validated = validateScanPage({
+        events: page.events,
+        cursor: page.cursor,
+        latestLedger: page.latestLedger,
+        oldestLedger: page.oldestLedger,
+        requestCursor: pagination.cursor,
+        requestStartLedger: pagination.startLedger,
+        requestEndLedger: endLedger,
+      });
+
+      this.scanWindowLedgers = nextScanWindowLedgers(
+        {
+          currentLedgers: requestedWindow,
+          eventCount: page.events.length,
+          pageLimit: pageSize,
+          elapsedMs,
+        },
+        windowConfig,
       );
+
       pages += 1;
       events.push(...(page.events as readonly RawStellarEvent[]));
       latestLedger = page.latestLedger;
       oldestLedger = page.oldestLedger;
 
-      if (page.cursor === null) {
+      if (page.cursor === null || validated.through === null) {
         // Not something the live RPC does, and bailing is still better than inventing a position.
         logger.warn(
           { chain: chainKey, pages },
@@ -280,9 +439,8 @@ export class StellarWatcher {
         break;
       }
 
-      const candidate = completeThrough(parseEventCursor(page.cursor));
-      if (candidate > through) {
-        through = candidate;
+      if (validated.through > through) {
+        through = validated.through;
         break;
       }
       // Still inside one ledger. Keep pulling with the RPC's own cursor until it is drained.
@@ -319,19 +477,45 @@ export class StellarWatcher {
     tx: Queryable,
     context: EventContext,
     raw: RawStellarEvent,
-  ): Promise<boolean> {
-    const event = decodeStellarEvent(raw);
+    deploymentRevision: number,
+  ): Promise<"decoded" | "skipped" | "quarantined"> {
+    let event: StellarEvent;
+    try {
+      event = decodeStellarEvent(raw);
+    } catch (error) {
+      const decodeError = error instanceof Error ? error.message : String(error);
+      this.options.logger.warn(
+        {
+          chain: context.chainKey,
+          eventId: raw.id,
+          ledger: raw.ledger,
+          txHash: raw.txHash,
+          err: decodeError,
+        },
+        "quarantining stellar event that failed to decode",
+      );
+      await recordQuarantinedEvent(tx, {
+        chainKey: context.chainKey,
+        contract: this.options.router,
+        deploymentRevision,
+        raw,
+        reason: "decode_error",
+        tag: null,
+        decodeError,
+      });
+      return "quarantined";
+    }
 
     switch (event.kind) {
       case "bridgeOut":
         await recordBridgeOut(tx, context, event.data);
-        return true;
+        return "decoded";
       case "bridgeIn":
         await recordBridgeIn(tx, context, event.data);
-        return true;
+        return "decoded";
       case "claimParked":
         await recordClaimParked(tx, context, event.data);
-        return true;
+        return "decoded";
       case "claimSettled": {
         const matched = await recordClaimSettled(tx, context, event.data);
         if (!matched) {
@@ -342,34 +526,34 @@ export class StellarWatcher {
             "settlement for a claim this indexer never saw parked",
           );
         }
-        return matched;
+        return matched ? "decoded" : "skipped";
       }
       case "actionQueued":
         await recordActionQueued(tx, context, event.data, raw.valueJson);
-        return true;
+        return "decoded";
       case "actionExecuted":
         await recordActionSettled(tx, context, event.data, "executed");
-        return true;
+        return "decoded";
       case "actionCancelled":
         await recordActionSettled(tx, context, event.data, "cancelled");
-        return true;
+        return "decoded";
       case "tokenRegistered":
         await recordTokenRegistered(tx, context, event.data);
-        return true;
+        return "decoded";
       case "pauseSet":
         // A pause is router wide and there is no table for it, so it is recorded as every rail
         // becoming unavailable for the reason the router would give. That is not a cosmetic
         // mapping: a pause is the one operational state somebody needs to see in the same place
         // they look at route health, rather than in a log they have to go and find.
         await recordPauseSet(tx, context, event.data);
-        return true;
+        return "decoded";
       case "routeConfigured":
         // The sample needs a token and this event names none, so it is attributed to the chain
         // itself. A route being on or off is a property of the router, not of one asset.
         await recordRouteConfigured(tx, context, event.data, context.chainKey);
-        return true;
+        return "decoded";
       case "ignored":
-        return false;
+        return "skipped";
       case "unknown":
         if (!this.reportedUnknown.has(event.tag)) {
           this.reportedUnknown.add(event.tag);
@@ -378,7 +562,16 @@ export class StellarWatcher {
             "the router emitted an event tag this build does not know; it is running ahead of the indexer",
           );
         }
-        return false;
+        await recordQuarantinedEvent(tx, {
+          chainKey: context.chainKey,
+          contract: this.options.router,
+          deploymentRevision,
+          raw,
+          reason: "unknown_tag",
+          tag: event.tag,
+          decodeError: null,
+        });
+        return "quarantined";
       default:
         // Unreachable while the switch covers the union, and the point is that it stops compiling
         // the moment a new event kind is added without a case here. An indexer that silently drops

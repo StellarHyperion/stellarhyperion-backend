@@ -46,6 +46,8 @@ export interface EventsQuery {
   readonly contractIds: readonly string[];
   /** Mutually exclusive with `cursor`, and the RPC rejects a request carrying both. */
   readonly startLedger?: number;
+  /** Optional exclusive upper ledger bound for adaptive scan-window sizing. */
+  readonly endLedger?: number;
   readonly cursor?: string;
   readonly limit: number;
 }
@@ -104,6 +106,18 @@ export class StellarRpc {
     if (query.startLedger !== undefined && query.cursor !== undefined) {
       throw new StellarRpcError("getEvents", "takes a startLedger or a cursor, never both", false);
     }
+    if (query.endLedger !== undefined) {
+      if (!Number.isSafeInteger(query.endLedger) || query.endLedger <= 0) {
+        throw new StellarRpcError("getEvents", "endLedger must be a positive integer", false);
+      }
+      if (query.startLedger !== undefined && query.endLedger <= query.startLedger) {
+        throw new StellarRpcError(
+          "getEvents",
+          "endLedger must be greater than startLedger",
+          false,
+        );
+      }
+    }
 
     const params: Record<string, unknown> = {
       filters: [{ type: "contract", contractIds: [...query.contractIds] }],
@@ -115,6 +129,7 @@ export class StellarRpc {
       xdrFormat: "json",
     };
     if (query.startLedger !== undefined) params.startLedger = query.startLedger;
+    if (query.endLedger !== undefined) params.endLedger = query.endLedger;
 
     const result = await this.call("getEvents", params, signal);
     const body = result as {
@@ -126,11 +141,26 @@ export class StellarRpc {
     if (!Array.isArray(body.events)) {
       throw new StellarRpcError("getEvents", "no events array in the response", true);
     }
+    const latestLedger = Number(body.latestLedger ?? 0);
+    const oldestLedger = Number(body.oldestLedger ?? 0);
+    if (
+      !Number.isSafeInteger(latestLedger) ||
+      latestLedger <= 0 ||
+      !Number.isSafeInteger(oldestLedger) ||
+      oldestLedger < 0 ||
+      oldestLedger > latestLedger
+    ) {
+      throw new StellarRpcError(
+        "getEvents",
+        `invalid ledger range in response: ${String(body.oldestLedger)}..${String(body.latestLedger)}`,
+        true,
+      );
+    }
     return {
       events: body.events,
       cursor: typeof body.cursor === "string" && body.cursor.length > 0 ? body.cursor : null,
-      latestLedger: Number(body.latestLedger ?? 0),
-      oldestLedger: Number(body.oldestLedger ?? 0),
+      latestLedger,
+      oldestLedger,
     };
   }
 

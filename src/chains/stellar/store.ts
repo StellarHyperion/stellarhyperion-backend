@@ -32,9 +32,14 @@ import type {
   ClaimParkedEvent,
   ClaimSettledEvent,
   PauseSetEvent,
+  RawStellarEvent,
   RouteConfiguredEvent,
   TokenRegisteredEvent,
 } from "./events.js";
+
+const MAX_QUARANTINE_RAW_BYTES = 16_384;
+const MAX_QUARANTINE_PREVIEW_CHARS = 4_096;
+const MAX_QUARANTINE_ERROR_CHARS = 1_024;
 
 /** Where a watcher has read up to. */
 export interface ChainCursor {
@@ -43,21 +48,26 @@ export interface ChainCursor {
   readonly observedAt: Date | null;
   /** EVM only. Null on Stellar, where a closed ledger cannot change. */
   readonly hash: string | null;
+  readonly deploymentRevision: number;
 }
 
 export async function readCursor(db: Queryable, chainKey: string): Promise<ChainCursor | null> {
   const { rows } = await db.query(
-    `SELECT last_processed, contract, last_processed_at, last_processed_hash
+    `SELECT last_processed, contract, last_processed_at, last_processed_hash, deployment_revision
        FROM indexer_cursor WHERE chain_key = $1`,
     [chainKey],
   );
   const row = maybeOne(rows, `cursor for ${chainKey}`);
   if (row === null) return null;
+  const rawRevision = row.deployment_revision;
+  const deploymentRevision =
+    rawRevision === undefined || rawRevision === null ? 1 : Number(rawRevision);
   return {
     position: bigintOf(row, "last_processed"),
     contract: text(row, "contract"),
     observedAt: timestampOrNull(row, "last_processed_at"),
     hash: textOrNull(row, "last_processed_hash"),
+    deploymentRevision,
   };
 }
 
@@ -77,18 +87,44 @@ export async function writeCursor(
     readonly position: bigint;
     readonly observedAt: Date | null;
     readonly hash: string | null;
+    readonly deploymentRevision?: number;
   },
 ): Promise<void> {
+  if (entry.deploymentRevision === undefined) {
+    await db.query(
+      `INSERT INTO indexer_cursor
+         (chain_key, family, contract, last_processed, last_processed_at, last_processed_hash)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (chain_key) DO UPDATE
+         SET contract = EXCLUDED.contract,
+             family = EXCLUDED.family,
+             last_processed = EXCLUDED.last_processed,
+             last_processed_at = EXCLUDED.last_processed_at,
+             last_processed_hash = EXCLUDED.last_processed_hash,
+             updated_at = now()`,
+      [
+        entry.chainKey,
+        entry.family,
+        entry.contract,
+        entry.position.toString(),
+        entry.observedAt,
+        entry.hash,
+      ],
+    );
+    return;
+  }
+
   await db.query(
     `INSERT INTO indexer_cursor
-       (chain_key, family, contract, last_processed, last_processed_at, last_processed_hash)
-     VALUES ($1, $2, $3, $4, $5, $6)
+       (chain_key, family, contract, last_processed, last_processed_at, last_processed_hash, deployment_revision)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      ON CONFLICT (chain_key) DO UPDATE
        SET contract = EXCLUDED.contract,
            family = EXCLUDED.family,
            last_processed = EXCLUDED.last_processed,
            last_processed_at = EXCLUDED.last_processed_at,
            last_processed_hash = EXCLUDED.last_processed_hash,
+           deployment_revision = EXCLUDED.deployment_revision,
            updated_at = now()`,
     [
       entry.chainKey,
@@ -97,6 +133,110 @@ export async function writeCursor(
       entry.position.toString(),
       entry.observedAt,
       entry.hash,
+      entry.deploymentRevision,
+    ],
+  );
+}
+
+/** Record a watched Stellar deployment revision transition for auditability. */
+export async function recordDeploymentRevision(
+  db: Queryable,
+  entry: {
+    readonly chainKey: string;
+    readonly deploymentRevision: number;
+    readonly contract: string;
+    readonly startLedger: bigint;
+    readonly previousContract: string | null;
+    readonly previousCursor: bigint | null;
+  },
+): Promise<void> {
+  await db.query(
+    `INSERT INTO stellar_deployment_revision
+       (chain_key, deployment_revision, contract, start_ledger, previous_contract, previous_cursor)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (chain_key, deployment_revision) DO NOTHING`,
+    [
+      entry.chainKey,
+      entry.deploymentRevision,
+      entry.contract,
+      entry.startLedger.toString(),
+      entry.previousContract,
+      entry.previousCursor === null ? null : entry.previousCursor.toString(),
+    ],
+  );
+}
+
+function boundRawEventJson(raw: RawStellarEvent): string {
+  const serialized = JSON.stringify(raw, (_key, value: unknown) =>
+    typeof value === "bigint" ? value.toString() : value,
+  );
+  if (Buffer.byteLength(serialized, "utf8") <= MAX_QUARANTINE_RAW_BYTES) {
+    return serialized;
+  }
+  return JSON.stringify({
+    truncated: true,
+    byteLength: Buffer.byteLength(serialized, "utf8"),
+    id: raw.id,
+    type: raw.type,
+    ledger: raw.ledger,
+    ledgerClosedAt: raw.ledgerClosedAt,
+    contractId: raw.contractId,
+    txHash: raw.txHash,
+    transactionIndex: raw.transactionIndex,
+    operationIndex: raw.operationIndex,
+    preview: serialized.slice(0, MAX_QUARANTINE_PREVIEW_CHARS),
+  });
+}
+
+function boundDecodeError(error: string | null): string | null {
+  if (error === null) return null;
+  if (error.length <= MAX_QUARANTINE_ERROR_CHARS) return error;
+  return `${error.slice(0, MAX_QUARANTINE_ERROR_CHARS - 3)}...`;
+}
+
+/**
+ * Persist an unknown or undecodable raw Soroban event with its exact source position so offline
+ * decoder replay can reprocess it without losing ledger position.
+ */
+export async function recordQuarantinedEvent(
+  db: Queryable,
+  entry: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly deploymentRevision: number;
+    readonly raw: RawStellarEvent;
+    readonly reason: "unknown_tag" | "decode_error";
+    readonly tag: string | null;
+    readonly decodeError: string | null;
+  },
+): Promise<void> {
+  await db.query(
+    `INSERT INTO stellar_event_quarantine
+       (chain_key, contract, deployment_revision, event_id, ledger, tx_hash, tx_index, op_index,
+        ledger_closed_at, reason, tag, decode_error, raw_event)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb)
+     ON CONFLICT (chain_key, event_id) DO UPDATE
+       SET contract = EXCLUDED.contract,
+           deployment_revision = EXCLUDED.deployment_revision,
+           reason = EXCLUDED.reason,
+           tag = EXCLUDED.tag,
+           decode_error = EXCLUDED.decode_error,
+           raw_event = EXCLUDED.raw_event,
+           updated_at = now()`,
+    [
+      entry.chainKey,
+      entry.contract,
+      entry.deploymentRevision,
+      entry.raw.id,
+      String(entry.raw.ledger),
+      entry.raw.txHash,
+      entry.raw.transactionIndex,
+      entry.raw.operationIndex,
+      new Date(entry.raw.ledgerClosedAt),
+      entry.reason,
+      entry.tag,
+      boundDecodeError(entry.decodeError),
+      boundRawEventJson(entry.raw),
     ],
   );
 }
