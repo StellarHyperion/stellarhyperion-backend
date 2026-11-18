@@ -17,7 +17,7 @@ import type { FastifyInstance } from "fastify";
 
 import type { ServerDeps } from "../server.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
-import { checkRedisHealth, worstOf } from "../../runtime/readiness.js";
+import { checkRedisHealth, evaluateReadiness } from "../../runtime/readiness.js";
 
 const LIVENESS_MEANING =
   "This process is running and answering. It says nothing about Postgres or the chains. Use /ready for that.";
@@ -55,16 +55,18 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
       }
     }
 
-    const state = worstOf(checks);
-    // Degraded still serves. One stalled chain watcher is a reason to alert, not a reason to stop
-    // answering questions about the three chains that are fine.
-    const status = state === "down" ? 503 : 200;
+    const evaluated = evaluateReadiness(checks, deps.config.readinessPolicy);
+    // Degraded still serves. An optional dependency or a single stalled chain watcher is a reason
+    // to alert, not a reason to stop answering questions about the parts that are fine.
+    const status = evaluated.state === "down" ? 503 : 200;
     return reply.code(status).send({
-      status: state,
+      status: evaluated.state,
       meaning: READINESS_MEANING,
       network: deps.config.network,
+      deploymentMode: deps.config.deploymentMode,
+      policy: deps.config.readinessPolicy,
       indexer: deps.config.indexer.enabled ? "enabled" : "disabled",
-      checks,
+      checks: evaluated.checks,
     });
   });
 }
@@ -84,9 +86,10 @@ async function checkRedis(deps: ServerDeps): Promise<ReadinessReport> {
   if (deps.redis !== undefined) {
     return checkRedisHealth(deps.redis, { workers: deps.bullmqWorkers });
   }
-  return deps.config.keeper.enabled
-    ? { name: "redis", state: "down", detail: "redis client not configured or unreachable" }
-    : { name: "redis", state: "ready", detail: "not required: keeper is disabled" };
+  if (deps.config.readinessPolicy.keeper === "disabled" || !deps.config.keeper.enabled) {
+    return { name: "redis", state: "ready", detail: "not required: keeper is disabled" };
+  }
+  return { name: "redis", state: "down", detail: "redis client not configured or unreachable" };
 }
 
 function messageOf(error: unknown): string {

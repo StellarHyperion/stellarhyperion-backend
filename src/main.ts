@@ -34,7 +34,11 @@ async function main(): Promise<void> {
   const shutdown = new Shutdown(logger, config.shutdownTimeoutMs);
   installSignalHandlers(shutdown, logger);
 
-  const db = Database.open(config.databaseUrl, { applicationName: "hyperion-backend" });
+  const db = Database.open(config.databaseUrl, {
+    applicationName: "hyperion-backend",
+    logger,
+    slowQueryThresholdMs: 1_000,
+  });
   shutdown.add("postgres", () => db.close());
 
   const redis = config.keeper.enabled ? createKeeperRedis(config.redisUrl) : undefined;

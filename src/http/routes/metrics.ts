@@ -7,6 +7,7 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import { evaluateFreshnessSlo } from "../../runtime/freshness.js";
 import type { ServerDeps } from "../server.js";
 
 export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): void {
@@ -69,9 +70,16 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       }
     }
 
+    // 7. Configurable freshness SLO evaluation (#108)
+    const freshnessSlo = await evaluateFreshnessSlo(db, deps.config);
+
+    // 8. Bounded database pool & query latency telemetry (#110)
+    const database = typeof db.telemetrySnapshot === "function" ? db.telemetrySnapshot() : null;
+
     return reply.send({
       service: "hyperion-backend",
       network: deps.config.network,
+      deploymentMode: deps.config.deploymentMode,
       uptimeSeconds: Math.floor((Date.now() - startedAt.getTime()) / 1000),
       transfers: {
         totalOutbound,
@@ -81,6 +89,8 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       railAttestations: railStatusCounts,
       cursors,
       historyGaps,
+      freshnessSlo,
+      database,
     });
   });
 }

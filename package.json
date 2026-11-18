@@ -15,6 +15,7 @@
   },
   "scripts": {
     "dev": "node --watch --experimental-strip-types src/main.ts",
+    "diagnostics": "node dist/cli/diagnostics.js",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/main.js",
     "migrate": "node-pg-migrate --envPath .env --migrations-dir migrations --migrations-table pgmigrations",
