@@ -18,6 +18,7 @@ import {
   toEvmAddress,
 } from "@hyperion/protocol";
 import { createPublicClient, http, stringToHex } from "viem";
+import type { PublicClient } from "viem";
 import type { AppConfig } from "../../config/config.js";
 import type { Transactional } from "../../db/pool.js";
 import { bigintOf, text } from "../../db/rows.js";
@@ -25,9 +26,112 @@ import type { InboundRow, Position } from "../../chains/writers.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 
 import { ITS_ABI, matchingPayment } from "./events.js";
+import type { AxelarDeliveryEvidenceRow } from "../../chains/writers.js";
 export interface VerifiedDelivery {
   readonly at: Position;
   readonly row: InboundRow;
+}
+
+export interface VerifiedItsDelivery extends VerifiedDelivery {
+  readonly evidence: AxelarDeliveryEvidenceRow;
+}
+
+export interface AxelarCanonicalityClient {
+  getChainId(): Promise<number>;
+  getBlock(args: { readonly blockNumber: bigint }): Promise<{ readonly hash: `0x${string}` }>;
+  getTransactionReceipt(args: { readonly hash: `0x${string}` }): Promise<{
+    readonly status: "success" | "reverted";
+    readonly blockNumber: bigint;
+    readonly blockHash: `0x${string}`;
+    readonly transactionHash: `0x${string}`;
+  }>;
+}
+
+export interface RevalidationOptions {
+  readonly clientForChain?: (chainKey: string) => AxelarCanonicalityClient;
+}
+
+export async function revalidateItsDeliveryProofs(
+  config: AppConfig,
+  db: Transactional,
+  limit: number,
+  options: RevalidationOptions = {},
+): Promise<number> {
+  const { rows } = await db.query(
+    `SELECT id, transfer_id, destination_chain, execution_tx_hash, receipt_block,
+            receipt_block_hash
+       FROM axelar_delivery_evidence
+      WHERE status = 'canonical'
+      ORDER BY last_revalidated_at NULLS FIRST, receipt_block
+      LIMIT $1`,
+    [limit],
+  );
+  const clients = new Map<string, AxelarCanonicalityClient>();
+  let orphaned = 0;
+  for (const row of rows) {
+    const chain = text(row, "destination_chain");
+    const chainConfig = isChainKey(chain) && isEvmChain(CHAINS[chain]) ? CHAINS[chain] : null;
+    if (chainConfig === null) throw new Error(`Axelar proof names a non-EVM chain: ${chain}`);
+    let client = clients.get(chain);
+    if (!client) {
+      client = options.clientForChain?.(chain) ?? canonicalityClient(chainConfig.defaultRpcUrl);
+      if ((await client.getChainId()) !== chainConfig.chainId)
+        throw new Error(
+          `Destination RPC chain mismatch during Axelar proof revalidation: ${chain}`,
+        );
+      clients.set(chain, client);
+    }
+
+    const blockNumber = bigintOf(row, "receipt_block");
+    const blockHash = text(row, "receipt_block_hash");
+    const txHash = text(row, "execution_tx_hash") as `0x${string}`;
+    const block = await client.getBlock({ blockNumber });
+    const canonical = block.hash.toLowerCase() === blockHash.toLowerCase();
+    if (canonical) {
+      const receipt = await client.getTransactionReceipt({ hash: txHash });
+      if (
+        receipt.status !== "success" ||
+        receipt.blockNumber !== blockNumber ||
+        receipt.blockHash.toLowerCase() !== blockHash.toLowerCase() ||
+        receipt.transactionHash.toLowerCase() !== txHash.toLowerCase()
+      )
+        throw new Error("Canonical Axelar receipt no longer matches its stored delivery proof.");
+      await db.query(
+        "UPDATE axelar_delivery_evidence SET last_revalidated_at = now() WHERE id = $1",
+        [bigintOf(row, "id").toString()],
+      );
+      continue;
+    }
+
+    await db.transaction(async (tx) => {
+      const evidenceId = bigintOf(row, "id");
+      const transferId = bigintOf(row, "transfer_id");
+      await tx.query(
+        `UPDATE axelar_delivery_evidence
+            SET status = 'orphaned', last_revalidated_at = now()
+          WHERE id = $1 AND status = 'canonical'`,
+        [evidenceId.toString()],
+      );
+      await tx.query("DELETE FROM inbound_delivery WHERE axelar_evidence_id = $1", [
+        evidenceId.toString(),
+      ]);
+      await tx.query(
+        `UPDATE rail_attestation
+            SET status = 'attested', updated_at = now()
+          WHERE transfer_id = $1 AND status = 'delivered'`,
+        [transferId.toString()],
+      );
+    });
+    orphaned += 1;
+  }
+  return orphaned;
+}
+
+function canonicalityClient(url: string): AxelarCanonicalityClient {
+  const client: PublicClient = createPublicClient({
+    transport: http(url, { timeout: 15_000, retryCount: 0 }),
+  });
+  return client;
 }
 
 // The rail API supplies a candidate receipt. Only matching confirmed chain events establish delivery.
@@ -36,7 +140,7 @@ export async function verifyItsDelivery(
   db: Transactional,
   transfer: PendingTransfer,
   report: RailReport,
-): Promise<VerifiedDelivery | null> {
+): Promise<VerifiedItsDelivery | null> {
   const execution = report.execution;
   const source = config.indexer.stellar;
   if (
@@ -94,12 +198,23 @@ export async function verifyItsDelivery(
   if (receipt.status !== "success") return null;
   const head = await client.getBlockNumber();
   if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations)) return null;
+  const block = await client.getBlock({ blockNumber: receipt.blockNumber });
+  if (block.hash !== receipt.blockHash) return null;
   const destinationToken = await client.readContract({
     address: its as `0x${string}`,
     abi: ITS_ABI,
     functionName: "registeredTokenAddress",
     args: [tokenId],
+    blockNumber: receipt.blockNumber,
   });
+  const tokenManager = await client.readContract({
+    address: its as `0x${string}`,
+    abi: ITS_ABI,
+    functionName: "tokenManagerAddress",
+    args: [tokenId],
+    blockNumber: receipt.blockNumber,
+  });
+  if (/^0x0{40}$/i.test(tokenManager)) return null;
   const adapterConfig = (await view(adapter, "get_config")) as { its?: string };
   if (!adapterConfig.its) return null;
   const sourceName = await view(adapterConfig.its, "chain_name");
@@ -107,6 +222,7 @@ export async function verifyItsDelivery(
   const payment = matchingPayment(receipt.logs, {
     its,
     token: destinationToken,
+    tokenManager,
     commandId: execution.commandId,
     tokenId,
     sourceChain: sourceName,
@@ -115,8 +231,6 @@ export async function verifyItsDelivery(
     amount,
   });
   if (!payment) return null;
-  const block = await client.getBlock({ blockNumber: receipt.blockNumber });
-  if (block.hash !== receipt.blockHash) return null;
   return {
     at: {
       chainKey: transfer.destinationChain,
@@ -135,6 +249,23 @@ export async function verifyItsDelivery(
       amount,
       delivered: true,
       claimId: null,
+    },
+    evidence: {
+      transferId: transfer.transferId,
+      destinationChain: transfer.destinationChain,
+      commandId: execution.commandId,
+      executionTxHash: receipt.transactionHash,
+      receiptBlock: receipt.blockNumber,
+      receiptBlockHash: receipt.blockHash,
+      itsAddress: its,
+      tokenId,
+      registeredToken: destinationToken,
+      tokenManager,
+      tokenManagerBlock: receipt.blockNumber,
+      tokenManagerBlockHash: block.hash,
+      paymentLogIndex: payment.logIndex,
+      paymentRecipient: recipient,
+      paymentAmount: amount,
     },
   };
 }

@@ -18,13 +18,21 @@
  * second would spend those five minutes refreshing the block.
  */
 import type { AppConfig } from "../config/config.js";
-import { verifyItsDelivery } from "./axelar/delivery.js";
+import { RouteKind } from "@hyperion/protocol";
+import { revalidateItsDeliveryProofs, verifyItsDelivery } from "./axelar/delivery.js";
+import type { VerifiedItsDelivery } from "./axelar/delivery.js";
 import { verifyCctpDelivery } from "./cctp/delivery.js";
 import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
-import { writeInbound, writeAttestation } from "../chains/writers.js";
+import {
+  linkAxelarDeliveryEvidence,
+  writeAxelarDeliveryEvidence,
+  writeAxelarQuarantine,
+  writeInbound,
+  writeAttestation,
+} from "../chains/writers.js";
 import { outstandingForRail, pendingForRail } from "./queue.js";
 import { RailError, isTerminal, type PendingTransfer, type RailClient } from "./types.js";
 
@@ -115,6 +123,13 @@ export class RailPass {
     if (cooldown !== null && cooldown > this.now()) return false;
     this.cooldownUntil = null;
 
+    if (
+      this.options.config &&
+      this.options.route === RouteKind.AxelarIts &&
+      this.options.client.rail === "axelar"
+    )
+      await revalidateItsDeliveryProofs(this.options.config, db, batchSize);
+
     const queue = await pendingForRail(db, {
       route: this.options.route,
       limit: batchSize,
@@ -204,6 +219,16 @@ export class RailPass {
         (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report));
       if (verified) {
         await this.options.db.transaction(async (tx) => {
+          const axelarVerified =
+            transfer.route === RouteKind.AxelarIts && "evidence" in verified
+              ? (verified as VerifiedItsDelivery)
+              : null;
+          if (axelarVerified) {
+            const evidenceId = await writeAxelarDeliveryEvidence(tx, axelarVerified.evidence);
+            await writeInbound(tx, axelarVerified.at, axelarVerified.row);
+            await linkAxelarDeliveryEvidence(tx, axelarVerified.evidence, evidenceId);
+            return;
+          }
           await writeInbound(tx, verified.at, verified.row);
         });
         await this.write(transfer, {
@@ -214,6 +239,7 @@ export class RailPass {
           checkedAt: at,
           failures: 0,
           error: null,
+          ...(report.quarantine ? { quarantine: report.quarantine } : {}),
         });
         return true;
       }
@@ -275,6 +301,13 @@ export class RailPass {
       readonly checkedAt: Date;
       readonly failures: number;
       readonly error: string | null;
+      readonly quarantine?:
+        | {
+            readonly schema: string;
+            readonly providerReference: string | null;
+            readonly payload: unknown;
+          }
+        | undefined;
     },
   ): Promise<void> {
     await this.options.db.transaction(async (tx: Queryable) => {
@@ -289,6 +322,15 @@ export class RailPass {
         checkFailures: fields.failures,
         lastError: fields.error,
       });
+      if (fields.quarantine && this.options.client.rail === "axelar") {
+        await writeAxelarQuarantine(tx, {
+          transferId: transfer.transferId,
+          sourceTxHash: transfer.originTx,
+          providerReference: fields.quarantine.providerReference,
+          schema: fields.quarantine.schema,
+          payload: fields.quarantine.payload,
+        });
+      }
     });
   }
 
