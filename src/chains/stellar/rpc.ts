@@ -42,11 +42,29 @@ export interface EventsPage {
   readonly oldestLedger: number;
 }
 
+/** Retained ledger window observed from a Soroban RPC `getEvents` response. */
+export interface RetainedHistoryWindow {
+  readonly oldestLedger: number;
+  readonly latestLedger: number;
+  readonly observedAt: Date;
+}
+
+export function retentionWindowOf(
+  page: Pick<EventsPage, "oldestLedger" | "latestLedger">,
+  observedAt: Date = new Date(),
+): RetainedHistoryWindow {
+  return {
+    oldestLedger: page.oldestLedger,
+    latestLedger: page.latestLedger,
+    observedAt,
+  };
+}
+
 export interface EventsQuery {
   readonly contractIds: readonly string[];
   /** Mutually exclusive with `cursor`, and the RPC rejects a request carrying both. */
   readonly startLedger?: number;
-  /** Optional exclusive upper ledger bound for adaptive scan-window sizing. */
+  /** Optional inclusive upper bound supported by historical/bounded queries. */
   readonly endLedger?: number;
   readonly cursor?: string;
   readonly limit: number;
@@ -69,6 +87,8 @@ export interface EventSource {
 
 export interface StellarRpcOptions {
   readonly timeoutMs?: number;
+  /** Optional request headers (e.g. provider API key) for historical/archive RPCs. Never logged. */
+  readonly headers?: Readonly<Record<string, string>>;
 }
 
 export class StellarRpc {
@@ -106,18 +126,6 @@ export class StellarRpc {
     if (query.startLedger !== undefined && query.cursor !== undefined) {
       throw new StellarRpcError("getEvents", "takes a startLedger or a cursor, never both", false);
     }
-    if (query.endLedger !== undefined) {
-      if (!Number.isSafeInteger(query.endLedger) || query.endLedger <= 0) {
-        throw new StellarRpcError("getEvents", "endLedger must be a positive integer", false);
-      }
-      if (query.startLedger !== undefined && query.endLedger <= query.startLedger) {
-        throw new StellarRpcError(
-          "getEvents",
-          "endLedger must be greater than startLedger",
-          false,
-        );
-      }
-    }
 
     const params: Record<string, unknown> = {
       filters: [{ type: "contract", contractIds: [...query.contractIds] }],
@@ -141,26 +149,11 @@ export class StellarRpc {
     if (!Array.isArray(body.events)) {
       throw new StellarRpcError("getEvents", "no events array in the response", true);
     }
-    const latestLedger = Number(body.latestLedger ?? 0);
-    const oldestLedger = Number(body.oldestLedger ?? 0);
-    if (
-      !Number.isSafeInteger(latestLedger) ||
-      latestLedger <= 0 ||
-      !Number.isSafeInteger(oldestLedger) ||
-      oldestLedger < 0 ||
-      oldestLedger > latestLedger
-    ) {
-      throw new StellarRpcError(
-        "getEvents",
-        `invalid ledger range in response: ${String(body.oldestLedger)}..${String(body.latestLedger)}`,
-        true,
-      );
-    }
     return {
       events: body.events,
       cursor: typeof body.cursor === "string" && body.cursor.length > 0 ? body.cursor : null,
-      latestLedger,
-      oldestLedger,
+      latestLedger: Number(body.latestLedger ?? 0),
+      oldestLedger: Number(body.oldestLedger ?? 0),
     };
   }
 
@@ -175,7 +168,10 @@ export class StellarRpc {
     try {
       response = await fetch(this.url, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          ...this.options.headers,
+        },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
         signal: combined,
       });
@@ -213,5 +209,7 @@ export class StellarRpc {
 }
 
 function describe(cause: unknown): string {
-  return cause instanceof Error ? cause.message : String(cause);
+  const raw = cause instanceof Error ? cause.message : String(cause);
+  // Strip any embedded URL credentials before surfacing in errors or logs.
+  return raw.replace(/:\/\/[^/@\s]+@/g, "://***@");
 }

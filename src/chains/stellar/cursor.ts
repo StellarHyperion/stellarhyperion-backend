@@ -32,20 +32,11 @@ const END_OF_WINDOW_INDEX = 0xffff_ffff;
 
 /** Observed window width for a `startLedger` request. Used for reporting, never for resuming. */
 export const SCAN_WINDOW_LEDGERS = 10_000;
-/** Minimum adaptive scan window width in ledgers. */
-export const MIN_SCAN_WINDOW_LEDGERS = 100;
 
 export class EventCursorError extends Error {
   constructor(cursor: string, reason: string) {
     super(`event cursor ${JSON.stringify(cursor)} ${reason}`);
     this.name = "EventCursorError";
-  }
-}
-
-export class EventCompletenessError extends Error {
-  constructor(reason: string) {
-    super(`event source completeness check failed: ${reason}`);
-    this.name = "EventCompletenessError";
   }
 }
 
@@ -59,11 +50,6 @@ export interface CursorPosition {
    * the page did not reach.
    */
   readonly completesLedger: boolean;
-}
-
-interface CursorParts extends CursorPosition {
-  readonly toid: bigint;
-  readonly eventIndex: number;
 }
 
 /**
@@ -90,7 +76,9 @@ export function endOfLedgerCursor(ledger: number): string {
  * Parsed rather than trusted. A cursor shape that changed under us would otherwise show up as a
  * watcher silently rewinding to ledger zero and re-reading the chain from the beginning.
  */
-function parseEventCursorParts(cursor: string): CursorParts {
+function parseEventCursorParts(
+  cursor: string,
+): CursorPosition & { readonly toid: bigint; readonly eventIndex: number } {
   const parts = cursor.split("-");
   const [toidText, indexText] = parts;
   if (parts.length !== 2 || toidText === undefined || indexText === undefined) {
@@ -101,37 +89,28 @@ function parseEventCursorParts(cursor: string): CursorParts {
   }
 
   const toid = BigInt(toidText);
+  if (toid >= 1n << 64n) throw new EventCursorError(cursor, "exceeds wire limits");
   const ledger = Number(toid >> 32n);
   if (!Number.isSafeInteger(ledger)) {
     throw new EventCursorError(cursor, "names a ledger too large to be real");
   }
   const eventIndex = Number(indexText);
-  if (!Number.isSafeInteger(eventIndex) || eventIndex < 0 || eventIndex > END_OF_WINDOW_INDEX) {
-    throw new EventCursorError(cursor, "has an out-of-range event index");
-  }
-  return {
-    ledger,
-    completesLedger: eventIndex === END_OF_WINDOW_INDEX,
-    toid,
-    eventIndex,
-  };
+  if (!Number.isSafeInteger(eventIndex) || eventIndex < 0 || eventIndex > END_OF_WINDOW_INDEX)
+    throw new EventCursorError(cursor, "invalid event index");
+  return { ledger, completesLedger: eventIndex === END_OF_WINDOW_INDEX, toid, eventIndex };
 }
 
 export function parseEventCursor(cursor: string): CursorPosition {
   const { ledger, completesLedger } = parseEventCursorParts(cursor);
   return { ledger, completesLedger };
 }
-
-/** Compare two RPC event cursors numerically by `(toid, eventIndex)`. */
-export function compareEventCursors(a: string, b: string): number {
-  const left = parseEventCursorParts(a);
-  const right = parseEventCursorParts(b);
-  if (left.toid < right.toid) return -1;
-  if (left.toid > right.toid) return 1;
-  if (left.eventIndex < right.eventIndex) return -1;
-  if (left.eventIndex > right.eventIndex) return 1;
-  return 0;
+export class EventCompletenessError extends Error {
+  constructor(reason: string) {
+    super(`event source completeness check failed: ${reason}`);
+    this.name = "EventCompletenessError";
+  }
 }
+export const MIN_SCAN_WINDOW_LEDGERS = 100;
 
 /**
  * The last ledger a page leaves fully read.
@@ -146,8 +125,149 @@ export function compareEventCursors(a: string, b: string): number {
  * ledger, and the RPC's own documentation asks clients to deduplicate on event id for the same
  * reason.
  */
-export function completeThrough(position: Pick<CursorPosition, "ledger" | "completesLedger">): number {
+export function completeThrough(position: CursorPosition): number {
   return position.completesLedger ? position.ledger : position.ledger - 1;
+}
+
+export interface LedgerRange {
+  readonly oldestLedger: number;
+  readonly latestLedger: number;
+}
+
+/**
+ * Extract the retained `[oldestLedger, latestLedger]` bounds from a Soroban RPC range refusal.
+ *
+ * Returns null when the message does not carry two integers in that shape.
+ */
+export function parseLedgerRangeError(message: string): LedgerRange | null {
+  const match = /ledger range[^0-9]*(\d+)\s*-\s*(\d+)/i.exec(message);
+  if (match === null) return null;
+  const oldestLedger = Number(match[1]);
+  const latestLedger = Number(match[2]);
+  if (
+    !Number.isSafeInteger(oldestLedger) ||
+    !Number.isSafeInteger(latestLedger) ||
+    oldestLedger < 0 ||
+    latestLedger < oldestLedger
+  ) {
+    return null;
+  }
+  return { oldestLedger, latestLedger };
+}
+
+/**
+ * Compute the inclusive end ledger for one bounded backfill step.
+ */
+export function boundedWindowEnd(fromLedger: number, toLedger: number, maxLedgers: number): number {
+  if (!Number.isInteger(fromLedger) || fromLedger < 0) {
+    throw new RangeError(`fromLedger must be a non-negative integer, got ${String(fromLedger)}`);
+  }
+  if (!Number.isInteger(toLedger) || toLedger < fromLedger) {
+    throw new RangeError(
+      `toLedger must be an integer >= fromLedger (${String(fromLedger)}), got ${String(toLedger)}`,
+    );
+  }
+  if (!Number.isInteger(maxLedgers) || maxLedgers <= 0) {
+    throw new RangeError(`maxLedgers must be a positive integer, got ${String(maxLedgers)}`);
+  }
+  return Math.min(toLedger, fromLedger + maxLedgers - 1);
+}
+
+/**
+ * The inclusive upper ledger bound a single `getEvents` scan window can cover.
+ *
+ * Fresh `startLedger` requests scan `SCAN_WINDOW_LEDGERS` ledgers; cursor-resumed requests scan
+ * `SCAN_WINDOW_LEDGERS - 1` due to the RPC's off-by-one range arithmetic. Clamped to
+ * `latestLedger` when the head is closer.
+ */
+export function computeScanWindowEnd(
+  fromLedger: number,
+  fresh: boolean,
+  latestLedger: number,
+): number {
+  const width = fresh ? SCAN_WINDOW_LEDGERS : SCAN_WINDOW_LEDGERS - 1;
+  return Math.max(fromLedger, Math.min(fromLedger + width - 1, latestLedger));
+}
+
+/** Whether `ledger` falls inside the RPC's retained `[oldestLedger, latestLedger]` range. */
+export function isWithinRetentionWindow(
+  ledger: number,
+  oldestLedger: number,
+  latestLedger: number,
+): boolean {
+  return ledger >= oldestLedger && ledger <= latestLedger;
+}
+
+/** Verify range and event ordering before treating a provider cursor as completion. */
+export function validateRangePage(
+  page: {
+    readonly oldestLedger: number;
+    readonly latestLedger: number;
+    readonly cursor: string | null;
+    readonly events: readonly unknown[];
+  },
+  from: number,
+  end: number | undefined,
+  requestedCursor?: string,
+): void {
+  if (
+    !Number.isSafeInteger(page.oldestLedger) ||
+    !Number.isSafeInteger(page.latestLedger) ||
+    page.oldestLedger < 0 ||
+    page.latestLedger < from ||
+    page.oldestLedger > from
+  ) {
+    throw new Error("provider cannot verify the requested retained range");
+  }
+  const order = (id: string): bigint => {
+    const parts = id.split("-");
+    if (parts.length !== 2 || !parts.every((part) => /^\d+$/.test(part)))
+      throw new Error("invalid event cursor");
+    const toid = BigInt(parts[0] ?? "");
+    const index = BigInt(parts[1] ?? "");
+    if (toid >= 1n << 64n || index >= 1n << 32n)
+      throw new Error("event cursor exceeds wire limits");
+    return (toid << 32n) + index;
+  };
+  let previous = requestedCursor === undefined ? -1n : order(requestedCursor);
+  for (const input of page.events) {
+    const raw = input as { id: string; ledger: number };
+    const pos = parseEventCursor(raw.id);
+    const current = order(raw.id);
+    if (
+      current <= previous ||
+      pos.completesLedger ||
+      pos.ledger !== raw.ledger ||
+      raw.ledger < from ||
+      raw.ledger > page.latestLedger ||
+      (end !== undefined && raw.ledger > end)
+    ) {
+      throw new Error("provider returned unordered events or an unverifiable ledger");
+    }
+    previous = current;
+  }
+  if (page.cursor === null) return;
+  const terminal = parseEventCursor(page.cursor);
+  const cursorOrder = order(page.cursor);
+  if (
+    cursorOrder < previous ||
+    terminal.ledger > page.latestLedger ||
+    (end !== undefined && terminal.ledger > end) ||
+    (page.events.length === 0 && !terminal.completesLedger)
+  ) {
+    throw new Error("provider returned an unverifiable terminal cursor");
+  }
+}
+
+/** Compare two RPC event cursors numerically by `(toid, eventIndex)`. */
+export function compareEventCursors(a: string, b: string): number {
+  const left = parseEventCursorParts(a);
+  const right = parseEventCursorParts(b);
+  if (left.toid < right.toid) return -1;
+  if (left.toid > right.toid) return 1;
+  if (left.eventIndex < right.eventIndex) return -1;
+  if (left.eventIndex > right.eventIndex) return 1;
+  return 0;
 }
 
 export interface PageCompletenessInput {
@@ -255,9 +375,7 @@ export function validateScanPage(input: PageCompletenessInput): ValidatedPageBou
     );
   }
   if (previousId !== null && compareEventCursors(previousId, cursor) > 0) {
-    throw new EventCompletenessError(
-      `returned cursor ${cursor} precedes last event ${previousId}`,
-    );
+    throw new EventCompletenessError(`returned cursor ${cursor} precedes last event ${previousId}`);
   }
   if (events.length === 0 && !position.completesLedger) {
     throw new EventCompletenessError(
@@ -271,7 +389,11 @@ export function validateScanPage(input: PageCompletenessInput): ValidatedPageBou
       `cursor ${cursor} claims complete through ${String(through)} past latestLedger ${String(latestLedger)}`,
     );
   }
-  if (requestEndLedger !== undefined && position.completesLedger && position.ledger >= requestEndLedger) {
+  if (
+    requestEndLedger !== undefined &&
+    position.completesLedger &&
+    position.ledger >= requestEndLedger
+  ) {
     throw new EventCompletenessError(
       `end marker ${cursor} at ledger ${String(position.ledger)} exceeds exclusive endLedger ${String(requestEndLedger)}`,
     );

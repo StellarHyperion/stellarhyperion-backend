@@ -41,7 +41,7 @@ CREATE TABLE stellar_event_quarantine (
   replayed_at         timestamptz,
   created_at          timestamptz NOT NULL DEFAULT now(),
   updated_at          timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (chain_key, event_id)
+  UNIQUE (chain_key, contract, deployment_revision, event_id)
 );
 
 CREATE INDEX stellar_event_quarantine_unreplayed_idx
@@ -51,7 +51,12 @@ CREATE INDEX stellar_event_quarantine_unreplayed_idx
 COMMENT ON TABLE stellar_event_quarantine IS
   'Bounded raw Soroban events and decode errors saved with their exact source position for offline decoder replay.';
 
+-- Semantic keys also identify shared transfer/claim/action rows across router replacements.
+CREATE UNIQUE INDEX stellar_event_identity_shared_semantic_idx
+  ON stellar_event_identity (chain_key, identity) WHERE identity NOT LIKE 'event:%';
+
 -- Down Migration
+DROP INDEX IF EXISTS stellar_event_identity_shared_semantic_idx;
 
 DROP TABLE IF EXISTS stellar_event_quarantine;
 DROP TABLE IF EXISTS stellar_deployment_revision;
