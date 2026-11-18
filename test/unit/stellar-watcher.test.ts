@@ -1,3 +1,5 @@
+import type { EventSource, EventsPage, EventsQuery } from "../../src/chains/stellar/rpc.js";
+import { EventCompletenessError, SCAN_WINDOW_LEDGERS } from "../../src/chains/stellar/cursor.js";
 /**
  * The watcher's pass, driven by a fake RPC that reproduces the real one's window behaviour.
  *
@@ -10,7 +12,11 @@ import { describe, expect, it } from "vitest";
 
 import { endOfLedgerCursor } from "../../src/chains/stellar/cursor.js";
 import type { RawStellarEvent } from "../../src/chains/stellar/events.js";
-import { planCursorRepair } from "../../src/chains/stellar/store.js";
+import {
+  planCursorRepair,
+  LeaseLostError,
+  StaleCursorError,
+} from "../../src/chains/stellar/store.js";
 import { StellarWatcher } from "../../src/chains/stellar/watcher.js";
 import {
   FakeRpc,
@@ -38,8 +44,8 @@ function harness(
     readonly events?: readonly RawStellarEvent[];
     readonly startLedger?: number;
     readonly pageSize?: number;
-    readonly latestLedger?: number;
     readonly maxPagesPerTick?: number;
+    readonly latestLedger?: number;
     readonly oldestLedger?: number;
   } = {},
 ): Harness {
@@ -58,6 +64,7 @@ function harness(
     router: LIVE_ROUTER,
     startLedger,
     pageSize: options.pageSize ?? 200,
+    ...(options.maxPagesPerTick === undefined ? {} : { maxPagesPerTick: options.maxPagesPerTick }),
     rpc,
     db,
     logger,
@@ -67,21 +74,32 @@ function harness(
 }
 
 /** The cursor row `readCursor` expects, as pg would hand it back. */
-function cursorRow(ledger: number, contract = LIVE_ROUTER): Record<string, unknown> {
+function cursorRow(
+  ledger: number,
+  contract = LIVE_ROUTER,
+  revision = "1",
+): Record<string, unknown> {
   return {
     last_processed: String(ledger),
     contract,
     last_processed_at: new Date("2026-10-01T12:00:00.000Z"),
+    revision,
   };
 }
 
 /** Cursor writes, read back from the parameters rather than from the watcher's own cache. */
 function cursorWrites(db: RecordingDb): { ledger: number; contract: string }[] {
   // writeCursor takes (chain_key, family, contract, last_processed, last_processed_at, hash).
-  return db.matching("INSERT INTO indexer_cursor").map((entry) => ({
-    ledger: Number(entry.params[3]),
-    contract: String(entry.params[2]),
-  }));
+  return db.queries
+    .filter(
+      (entry) =>
+        entry.text.includes("INSERT INTO indexer_cursor") ||
+        entry.text.includes("UPDATE indexer_cursor"),
+    )
+    .map((entry) => ({
+      ledger: Number(entry.params[3]),
+      contract: String(entry.params[2]),
+    }));
 }
 
 describe("where a pass starts", () => {
@@ -105,15 +123,54 @@ describe("where a pass starts", () => {
     expect(rpc.requests[0]?.startLedger).toBeUndefined();
   });
 
-  it("refuses a cursor written for a different router instead of skipping its history", async () => {
-    const { watcher, db } = harness();
-    db.cursorRow = cursorRow(
-      4_970_000,
-      "CDIFFERENTROUTERADDRESSTHATSHARESNOHISTORYWITHOURSXXXXXXX",
-    );
+  it("starts a new watched deployment revision instead of reusing an old router's cursor", async () => {
+    const previousRouter = "CDIFFERENTROUTERADDRESSTHATSHARESNOHISTORYWITHOURSXXXXXXX";
+    const { watcher, db, rpc, lines } = harness({
+      startLedger: FIRST_EVENT_LEDGER,
+      latestLedger: FIRST_EVENT_LEDGER + 20_000,
+    });
+    db.cursorRow = { ...cursorRow(4_970_000, previousRouter), deployment_revision: 1 };
+
+    const progressed = await watcher.tick(AbortSignal.timeout(5_000));
+
+    expect(progressed).toBe(true);
+    expect(rpc.requests[0]?.startLedger).toBe(FIRST_EVENT_LEDGER);
+    expect(rpc.requests[0]?.cursor).toBeUndefined();
+    expect(cursorWrites(db)).toEqual([
+      { ledger: FIRST_EVENT_LEDGER + 9_999, contract: LIVE_ROUTER },
+    ]);
+    const revisions = db.matching("INSERT INTO stellar_deployment_revision");
+    expect(revisions).toHaveLength(1);
+    expect(revisions[0]?.params).toEqual([
+      CHAIN,
+      2,
+      LIVE_ROUTER,
+      String(FIRST_EVENT_LEDGER),
+      previousRouter,
+      "4970000",
+    ]);
+    expect(
+      lines.some((line) => line.message.includes("starting new watched deployment revision")),
+    ).toBe(true);
+  });
+
+  it("refuses a configured deployment revision older than the stored revision", async () => {
+    const db = new RecordingDb();
+    db.cursorRow = { ...cursorRow(4_970_000, LIVE_ROUTER), deployment_revision: 3 };
+    const { logger } = capturingLogger();
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 200,
+      deploymentRevision: 2,
+      rpc: new FakeRpc({ latestLedger: FIRST_EVENT_LEDGER + 20_000 }),
+      db,
+      logger,
+    });
 
     await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
-      /needs its cursor reset rather than reused/,
+      /older than stored revision 3/,
     );
     expect(cursorWrites(db)).toEqual([]);
   });
@@ -156,7 +213,9 @@ describe("the page and the cursor as one commit", () => {
     const { watcher, db } = harness({ events: ROUTER_HISTORY, startLedger: FIRST_EVENT_LEDGER });
     await watcher.tick(AbortSignal.timeout(5_000));
 
-    const inserts = db.queries.filter((entry) => entry.text.includes("INSERT INTO"));
+    const inserts = db.queries.filter(
+      (entry) => entry.text.includes("INSERT INTO") && !entry.text.includes("indexer_lease"),
+    );
     expect(inserts.length).toBeGreaterThan(1);
     const transactions = new Set(inserts.map((entry) => entry.transaction));
     expect(transactions.size).toBe(1);
@@ -302,24 +361,22 @@ describe("what the watcher says about itself", () => {
 });
 
 describe("gaps it cannot close", () => {
-  it("does not claim completion when retention moved past the requested range", async () => {
+  it("reports a gap when the window moved past the cursor mid request", async () => {
     // The window really does move between a response and the next request: testnet reported
     // oldestLedger 4872997 and then refused that exact ledger as outside "4873028 - 4993987" on
     // the following call. When the node serves the request anyway, the ledgers between the cursor
     // and the window edge were never read, and saying nothing would leave a hole nobody hears
     // about again.
-    const { watcher, db } = harness({
+    const { watcher, db, lines } = harness({
       startLedger: 4_900_000,
       latestLedger: 4_994_000,
       oldestLedger: 4_980_000,
     });
     db.cursorRow = cursorRow(4_970_000);
 
-    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
-      "outside provider retention",
-    );
+    await watcher.tick(AbortSignal.timeout(5_000));
 
-    expect(cursorWrites(db)).toEqual([]);
+    expect(lines.some((line) => line.message.includes("retention window"))).toBe(true);
   });
 
   it("says a refused range cannot be closed from here rather than retrying it forever", async () => {
@@ -345,6 +402,325 @@ describe("gaps it cannot close", () => {
 
     const warnings = lines.filter((line) => line.message.includes("running ahead of the indexer"));
     expect(warnings).toHaveLength(1);
+  });
+});
+
+describe("compare-and-swap cursor updates (#32)", () => {
+  it("rejects stale concurrent cursor writes inside the event transaction and rolls back", async () => {
+    const db = new RecordingDb();
+    db.cursorRow = cursorRow(FIRST_EVENT_LEDGER - 1, LIVE_ROUTER, "3");
+    const innerRpc = new FakeRpc({
+      events: ROUTER_HISTORY,
+      latestLedger: FIRST_EVENT_LEDGER + 20_000,
+    });
+    const concurrentRpc = {
+      events: async (query: Parameters<FakeRpc["events"]>[0]) => {
+        // Simulate another worker advancing the cursor revision while this scan is in flight.
+        db.cursorRow = cursorRow(FIRST_EVENT_LEDGER + 100, LIVE_ROUTER, "4");
+        return innerRpc.events(query);
+      },
+    };
+    const { logger } = capturingLogger();
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 200,
+      rpc: concurrentRpc,
+      db,
+      logger,
+    });
+
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(StaleCursorError);
+    expect(db.rollbacks).toEqual([1]);
+    expect(db.commits).toEqual([]);
+    expect(watcher.progress).toBeNull();
+  });
+
+  it("rejects concurrent initial cursor insert when another worker already created it", async () => {
+    const db = new RecordingDb();
+    const innerRpc = new FakeRpc({
+      events: ROUTER_HISTORY,
+      latestLedger: FIRST_EVENT_LEDGER + 20_000,
+    });
+    const concurrentRpc = {
+      events: async (query: Parameters<FakeRpc["events"]>[0]) => {
+        // Simulate another worker creating the initial cursor row mid-scan.
+        db.cursorRow = cursorRow(FIRST_EVENT_LEDGER, LIVE_ROUTER, "1");
+        return innerRpc.events(query);
+      },
+    };
+    const { logger } = capturingLogger();
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 200,
+      rpc: concurrentRpc,
+      db,
+      logger,
+    });
+
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(StaleCursorError);
+    expect(db.rollbacks).toEqual([1]);
+    expect(db.commits).toEqual([]);
+  });
+});
+
+describe("database leases for watcher ownership (#31)", () => {
+  it("prevents a scheduled worker from overlapping an active continuous worker", async () => {
+    const db = new RecordingDb();
+    const rpc = new FakeRpc({ latestLedger: FIRST_EVENT_LEDGER + 20_000 });
+    const { logger } = capturingLogger();
+
+    const continuous = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 200,
+      rpc,
+      db,
+      logger,
+      ownerId: "continuous-1",
+      leaseTtlMs: 30_000,
+    });
+    const scheduled = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 200,
+      rpc,
+      db,
+      logger,
+      ownerId: "scheduled-1",
+      leaseTtlMs: 30_000,
+      releaseLeaseOnTick: true,
+    });
+
+    await continuous.tick(AbortSignal.timeout(5_000));
+    expect(rpc.requests).toHaveLength(1);
+
+    // Scheduled worker sees active lease and skips without hitting RPC or writing cursor.
+    const ran = await scheduled.tick(AbortSignal.timeout(5_000));
+    expect(ran).toBe(false);
+    expect(rpc.requests).toHaveLength(1);
+    expect(cursorWrites(db)).toHaveLength(1);
+
+    // Once continuous worker releases (or lease expires), scheduled worker can take over.
+    await continuous.release();
+    await scheduled.tick(AbortSignal.timeout(5_000));
+    expect(rpc.requests).toHaveLength(2);
+    expect(cursorWrites(db)).toHaveLength(2);
+  });
+
+  it("aborts the transaction if the lease was lost before commit", async () => {
+    const db = new RecordingDb();
+    const innerRpc = new FakeRpc({
+      events: ROUTER_HISTORY,
+      latestLedger: FIRST_EVENT_LEDGER + 20_000,
+    });
+    const stolenRpc = {
+      events: async (query: Parameters<FakeRpc["events"]>[0]) => {
+        db.leaseRow = {
+          owner_id: "other-worker",
+          lease_until: new Date(Date.now() + 30_000),
+        };
+        return innerRpc.events(query);
+      },
+    };
+    const { logger } = capturingLogger();
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 200,
+      rpc: stolenRpc,
+      db,
+      logger,
+      ownerId: "worker-1",
+    });
+
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(LeaseLostError);
+    expect(db.rollbacks).toEqual([1]);
+    expect(db.commits).toEqual([]);
+  });
+});
+
+describe("durable history-gap tracking and historical backfill (#29, #30)", () => {
+  it("leaves unavailable archive ranges unresolved instead of trusting a later terminal marker", async () => {
+    const db = new RecordingDb();
+    const rpc = new FakeRpc({ latestLedger: FIRST_EVENT_LEDGER + 100 });
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 200,
+      rpc,
+      db,
+      logger: capturingLogger().logger,
+      historicalRpc: new FakeRpc({
+        latestLedger: FIRST_EVENT_LEDGER + 100,
+        oldestLedger: FIRST_EVENT_LEDGER + 10,
+      }),
+    });
+    await expect(
+      watcher.backfillTick(AbortSignal.timeout(5_000), {
+        startLedger: FIRST_EVENT_LEDGER,
+        endLedger: FIRST_EVENT_LEDGER + 100,
+      }),
+    ).rejects.toThrow("requested retained range");
+    expect(db.backfillRow).toBeNull();
+    expect(db.matching("INSERT INTO stellar_event_identity")).toHaveLength(0);
+  });
+
+  it("does not apply events after an interrupted backfill's completed boundary", async () => {
+    const events = [0, 1].map((index) =>
+      syntheticEvent({
+        ledger: FIRST_EVENT_LEDGER,
+        id: `${toid(FIRST_EVENT_LEDGER, 0, index).toString().padStart(19, "0")}-0000000000`,
+      }),
+    );
+    const db = new RecordingDb();
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 1,
+      rpc: new FakeRpc(),
+      db,
+      logger: capturingLogger().logger,
+      historicalRpc: new FakeRpc({ events, latestLedger: FIRST_EVENT_LEDGER + 1 }),
+      backfillMaxPagesPerTick: 1,
+    });
+    expect(
+      await watcher.backfillTick(AbortSignal.timeout(5_000), {
+        startLedger: FIRST_EVENT_LEDGER,
+        endLedger: FIRST_EVENT_LEDGER + 1,
+      }),
+    ).toBe(true);
+    expect(db.backfillRow?.next_ledger).toBe(String(FIRST_EVENT_LEDGER));
+    expect(db.matching("INSERT INTO stellar_event_identity")).toHaveLength(0);
+  });
+
+  it("persists unavailable ledger intervals and marks readiness degraded until reconciled", async () => {
+    const db = new RecordingDb();
+    db.cursorRow = cursorRow(4_970_000);
+    const liveRpc = new FakeRpc({
+      latestLedger: 4_980_002,
+      oldestLedger: 4_980_000,
+    });
+    const historicalRpc = new FakeRpc({
+      events: [syntheticEvent({ ledger: 4_972_000 }), syntheticEvent({ ledger: 4_978_000 })],
+      latestLedger: 4_980_002,
+      oldestLedger: 1,
+    });
+    const { logger } = capturingLogger();
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: 4_900_000,
+      pageSize: 200,
+      rpc: liveRpc,
+      historicalRpc,
+      backfillMaxLedgersPerTick: 5_000,
+      db,
+      logger,
+    });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    expect(db.gaps).toHaveLength(1);
+    expect(db.gaps[0]?.start_ledger).toBe("4970001");
+    expect(db.gaps[0]?.end_ledger).toBe("4979999");
+    expect(db.gaps[0]?.status).toBe("open");
+    // Must not claim ready while history is incomplete.
+    expect(watcher.readiness().state).toBe("degraded");
+    expect(watcher.readiness().detail).toMatch(/unreconciled Stellar history gap/);
+
+    // Bounded backfill pass 1: 4970001..4975000 (5000 ledgers) -> reconciling.
+    const more = await watcher.backfillTick(AbortSignal.timeout(5_000));
+    expect(more).toBe(true);
+    expect(db.gaps[0]?.status).toBe("reconciling");
+    expect(db.gaps[0]?.replayed_through).toBe("4975000");
+
+    // Bounded backfill pass 2: 4975001..4979999 -> reconciled.
+    const doneMore = await watcher.backfillTick(AbortSignal.timeout(5_000));
+    expect(doneMore).toBe(false);
+    expect(db.gaps[0]?.status).toBe("reconciled");
+    expect(db.gaps[0]?.replayed_through).toBe("4979999");
+    expect(watcher.readiness().state).toBe("ready");
+  });
+
+  it("persists a gap even when the live RPC refuses the range permanently", async () => {
+    const db = new RecordingDb();
+    db.cursorRow = cursorRow(4_000_000);
+    const rpc = new FakeRpc({ latestLedger: 4_994_000 });
+    const { logger } = capturingLogger();
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: 4_990_000,
+      pageSize: 200,
+      rpc,
+      db,
+      logger,
+    });
+
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(/ledger range/);
+    expect(db.gaps).toHaveLength(1);
+    expect(db.gaps[0]?.start_ledger).toBe("4000001");
+    expect(db.gaps[0]?.reason).toBe("rpc_range_refused");
+  });
+
+  it("tracks bounded explicit-range backfill separately from the live cursor", async () => {
+    const db = new RecordingDb();
+    db.cursorRow = cursorRow(4_990_000, LIVE_ROUTER, "7");
+    const historicalRpc = new FakeRpc({
+      events: ROUTER_HISTORY,
+      latestLedger: 4_994_000,
+      oldestLedger: 1,
+    });
+    const { logger } = capturingLogger();
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: 4_990_000,
+      pageSize: 200,
+      rpc: new FakeRpc({ latestLedger: 4_994_000 }),
+      historicalRpc,
+      backfillMaxLedgersPerTick: 500,
+      db,
+      logger,
+    });
+
+    const more = await watcher.backfillTick(AbortSignal.timeout(5_000), {
+      startLedger: FIRST_EVENT_LEDGER,
+      endLedger: FIRST_EVENT_LEDGER + 800,
+      jobKey: "manual-replay",
+    });
+
+    expect(more).toBe(true);
+    expect(db.backfillRow?.next_ledger).toBe(String(FIRST_EVENT_LEDGER + 500));
+    expect(db.backfillRow?.status).toBe("running");
+    // Live cursor was never touched by historical backfill.
+    expect(db.cursorRow.last_processed).toBe("4990000");
+    expect(db.cursorRow.revision).toBe("7");
+
+    const more2 = await watcher.backfillTick(AbortSignal.timeout(5_000), {
+      startLedger: FIRST_EVENT_LEDGER,
+      endLedger: FIRST_EVENT_LEDGER + 800,
+      jobKey: "manual-replay",
+    });
+    expect(more2).toBe(false);
+    expect(db.backfillRow?.status).toBe("completed");
+    expect(db.cursorRow.last_processed).toBe("4990000");
+  });
+
+  it("requires an explicitly configured historical provider for backfill", async () => {
+    const { watcher } = harness();
+    await expect(watcher.backfillTick(AbortSignal.timeout(5_000))).rejects.toThrow(
+      /historical event provider is not configured/,
+    );
   });
 });
 
@@ -563,6 +939,8 @@ describe("read-only cursor repair planner (#40)", () => {
       startLedger: 4_900_000,
       currentCursor: {
         position: 4_800_000n,
+        revision: 1n,
+        deploymentRevision: 1,
         contract: LIVE_ROUTER,
         observedAt: null,
         hash: null,
@@ -613,5 +991,226 @@ describe("read-only cursor repair planner (#40)", () => {
     expect(proposal.blockedByConflicts).toBe(true);
     expect(proposal.conflictCount).toBe(1);
     expect(proposal.sql).toContain("DELETE FROM indexer_cursor");
+  });
+});
+
+describe("quarantine for unknown and undecodable events", () => {
+  it("persists unknown events in the quarantine table with their exact source position", async () => {
+    const unknown = syntheticEvent({
+      ledger: FIRST_EVENT_LEDGER + 2,
+      id: `${toid(FIRST_EVENT_LEDGER + 2, 3, 1)
+        .toString()
+        .padStart(19, "0")}-0000000004`,
+      txHash: "tx-unknown-pos",
+      transactionIndex: 3,
+      operationIndex: 1,
+      topicJson: [{ symbol: "hyperion" }, { symbol: "future_event" }],
+      valueJson: { map: [{ key: { symbol: "foo" }, val: { u32: 42 } }] },
+    });
+    const { watcher, db } = harness({
+      events: [unknown],
+      startLedger: FIRST_EVENT_LEDGER,
+      latestLedger: FIRST_EVENT_LEDGER + 5,
+    });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    const quarantined = db.matching("INSERT INTO stellar_event_quarantine");
+    expect(quarantined).toHaveLength(1);
+    expect(quarantined[0]?.transaction).not.toBeNull();
+    expect(quarantined[0]?.params.slice(0, 11)).toEqual([
+      CHAIN,
+      LIVE_ROUTER,
+      1,
+      unknown.id,
+      String(unknown.ledger),
+      "tx-unknown-pos",
+      3,
+      1,
+      new Date(unknown.ledgerClosedAt),
+      "unknown_tag",
+      "future_event",
+    ]);
+    expect(quarantined[0]?.params[11]).toBeNull();
+    expect(watcher.progress?.quarantined).toBe(1);
+    expect(cursorWrites(db)).toEqual([{ ledger: FIRST_EVENT_LEDGER + 5, contract: LIVE_ROUTER }]);
+  });
+
+  it("quarantines decode errors and bounds oversized payloads without stalling the ledger", async () => {
+    const hugePadding = "x".repeat(20_000);
+    const malformed = syntheticEvent({
+      ledger: FIRST_EVENT_LEDGER + 1,
+      id: `${toid(FIRST_EVENT_LEDGER + 1, 1, 0)
+        .toString()
+        .padStart(19, "0")}-0000000000`,
+      txHash: "tx-malformed",
+      transactionIndex: 1,
+      operationIndex: 0,
+      topicJson: [{ symbol: "hyperion" }, { symbol: "out" }],
+      // Missing `transfer` map triggers ScValError, while padding exceeds 16 KiB raw limit.
+      valueJson: { map: [{ key: { symbol: "junk" }, val: { string: hugePadding } }] },
+    });
+    const { watcher, db, lines } = harness({
+      events: [malformed],
+      startLedger: FIRST_EVENT_LEDGER,
+      latestLedger: FIRST_EVENT_LEDGER + 2,
+    });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    const quarantined = db.matching("INSERT INTO stellar_event_quarantine");
+    expect(quarantined).toHaveLength(1);
+    expect(quarantined[0]?.params[9]).toBe("decode_error");
+    expect(typeof quarantined[0]?.params[11]).toBe("string");
+    expect(String(quarantined[0]?.params[11]).length).toBeLessThanOrEqual(1_024);
+
+    const storedRaw = JSON.parse(String(quarantined[0]?.params[12])) as {
+      truncated?: boolean;
+      id?: string;
+      ledger?: number;
+      txHash?: string;
+    };
+    expect(storedRaw.truncated).toBe(true);
+    expect(storedRaw.id).toBe(malformed.id);
+    expect(storedRaw.ledger).toBe(malformed.ledger);
+    expect(storedRaw.txHash).toBe("tx-malformed");
+    expect(lines.some((line) => line.message.includes("failed to decode"))).toBe(true);
+    expect(cursorWrites(db)).toEqual([{ ledger: FIRST_EVENT_LEDGER + 2, contract: LIVE_ROUTER }]);
+  });
+});
+
+describe("event-source completeness checks", () => {
+  function singlePageWatcher(page: EventsPage): {
+    watcher: StellarWatcher;
+    db: RecordingDb;
+  } {
+    const db = new RecordingDb();
+    const { logger } = capturingLogger();
+    const rpc: EventSource = {
+      events: (_query: EventsQuery) => Promise.resolve(page),
+    };
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 50,
+      rpc,
+      db,
+      logger,
+    });
+    return { watcher, db };
+  }
+
+  it("refuses an invalid provider ledger range before declaring a boundary complete", async () => {
+    const { watcher, db } = singlePageWatcher({
+      events: [],
+      cursor: endOfLedgerCursor(FIRST_EVENT_LEDGER + 10),
+      oldestLedger: FIRST_EVENT_LEDGER + 20,
+      latestLedger: FIRST_EVENT_LEDGER + 10,
+    });
+
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(EventCompletenessError);
+    expect(cursorWrites(db)).toEqual([]);
+  });
+
+  it("refuses out-of-order events within a page", async () => {
+    const first = syntheticEvent({ ledger: FIRST_EVENT_LEDGER + 1 });
+    const second = syntheticEvent({ ledger: FIRST_EVENT_LEDGER + 2 });
+    const { watcher, db } = singlePageWatcher({
+      events: [second, first],
+      cursor: endOfLedgerCursor(FIRST_EVENT_LEDGER + 10),
+      oldestLedger: FIRST_EVENT_LEDGER,
+      latestLedger: FIRST_EVENT_LEDGER + 10,
+    });
+
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(/out of order/);
+    expect(cursorWrites(db)).toEqual([]);
+  });
+
+  it("refuses an empty page that carries a mid-ledger cursor instead of an end marker", async () => {
+    const midLedger = `${toid(FIRST_EVENT_LEDGER + 5, 0, 0)
+      .toString()
+      .padStart(19, "0")}-0000000001`;
+    const { watcher, db } = singlePageWatcher({
+      events: [],
+      cursor: midLedger,
+      oldestLedger: FIRST_EVENT_LEDGER,
+      latestLedger: FIRST_EVENT_LEDGER + 10,
+    });
+
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(/end-of-window marker/);
+    expect(cursorWrites(db)).toEqual([]);
+  });
+
+  it("refuses an end marker that claims completion past latestLedger", async () => {
+    const { watcher, db } = singlePageWatcher({
+      events: [],
+      cursor: endOfLedgerCursor(FIRST_EVENT_LEDGER + 20),
+      oldestLedger: FIRST_EVENT_LEDGER,
+      latestLedger: FIRST_EVENT_LEDGER + 10,
+    });
+
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(/past latestLedger/);
+    expect(cursorWrites(db)).toEqual([]);
+  });
+});
+
+describe("adaptive scan-window sizing", () => {
+  it("shrinks and grows the requested ledger range while preserving complete-through semantics", async () => {
+    const denseLedger = FIRST_EVENT_LEDGER + 10;
+    const denseEvents = [0, 1, 2].map((idx) =>
+      syntheticEvent({
+        ledger: denseLedger + idx,
+        id: `${toid(denseLedger + idx, 0, 0)
+          .toString()
+          .padStart(19, "0")}-0000000000`,
+        txHash: `tx-dense-${String(idx)}`,
+      }),
+    );
+    const rpc = new FakeRpc({
+      events: denseEvents,
+      latestLedger: FIRST_EVENT_LEDGER + 30_000,
+    });
+    const db = new RecordingDb();
+    const { logger } = capturingLogger();
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 2,
+      rpc,
+      db,
+      logger,
+      adaptiveWindow: {
+        minLedgers: 1_000,
+        maxLedgers: SCAN_WINDOW_LEDGERS,
+        targetDurationMs: 2_000,
+        fastDurationMs: 500,
+      },
+    });
+
+    // Tick 1: saturated page (2 events === pageSize 2, more in window) stops mid-window at
+    // denseLedger + 1, so completeThrough is denseLedger, and shrinks window from 10_000 to 5_000.
+    await watcher.tick(AbortSignal.timeout(5_000));
+    expect(watcher.windowLedgers).toBe(5_000);
+    const firstWrite = cursorWrites(db)[0];
+    expect(firstWrite?.ledger).toBe(denseLedger);
+
+    // Tick 2: resumes from cursor with endLedger bounding the shrunk 5_000-ledger window,
+    // hits the remaining 2 events (saturated again), and shrinks to 2_500.
+    db.cursorRow = cursorRow(firstWrite!.ledger, LIVE_ROUTER);
+    await watcher.tick(AbortSignal.timeout(5_000));
+    expect(rpc.requests[1]?.cursor).toBe(endOfLedgerCursor(firstWrite!.ledger));
+    expect(rpc.requests[1]?.endLedger).toBe(firstWrite!.ledger + 1 + 5_000);
+    const secondWrite = cursorWrites(db)[1];
+    expect(secondWrite?.ledger).toBe(firstWrite!.ledger + 5_000);
+    expect(watcher.windowLedgers).toBe(2_500);
+
+    // Tick 3: empty fast page in the 2_500-ledger window grows back to 5_000.
+    db.cursorRow = cursorRow(secondWrite!.ledger, LIVE_ROUTER);
+    await watcher.tick(AbortSignal.timeout(5_000));
+    expect(rpc.requests[2]?.endLedger).toBe(secondWrite!.ledger + 1 + 2_500);
+    expect(cursorWrites(db)[2]?.ledger).toBe(secondWrite!.ledger + 2_500);
+    expect(watcher.windowLedgers).toBe(5_000);
   });
 });
