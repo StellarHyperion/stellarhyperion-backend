@@ -31,8 +31,8 @@ import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
 import type { Position } from "../writers.js";
-import { ClaimPairing, applyRouterLog } from "./store.js";
-import { decodeRouterLog, signatureOf } from "./logs.js";
+import { ClaimPairing, applyRouterLog, quarantineEvmLog } from "./store.js";
+import { decodeRouterLog, LogShapeError, signatureOf } from "./logs.js";
 import type { EvmClient, RawEvmLog } from "./client.js";
 
 /**
@@ -328,6 +328,19 @@ export class EvmWatcher {
           "the router emitted an event signature this build does not know; it is running ahead of the indexer",
         );
       }
+      await quarantineEvmLog(
+        tx,
+        {
+          chainKey,
+          block: log.blockNumber,
+          txHash: log.transactionHash,
+          logIndex: log.logIndex,
+          observedAt: new Date(Number(timestamp) * 1000),
+        },
+        log,
+        signature,
+        "unknown event signature",
+      );
       return false;
     }
 
@@ -340,7 +353,18 @@ export class EvmWatcher {
       observedAt: new Date(Number(timestamp) * 1000),
     };
 
-    const applied = await applyRouterLog(tx, at, decoded, pairing);
+    let applied;
+    try {
+      applied = await applyRouterLog(tx, at, decoded, pairing);
+    } catch (error) {
+      if (!(error instanceof LogShapeError)) throw error;
+      await quarantineEvmLog(tx, at, log, signatureOf(log), error.message);
+      logger.warn(
+        { chain: chainKey, signature: signatureOf(log), error: error.message },
+        "the router emitted a known event with an unsupported payload shape; quarantined for replay",
+      );
+      return false;
+    }
     if (applied.kind === "unmatched") {
       // A settlement for a row this indexer never saw created, which means the creating log is
       // before the start block. Inventing a row from a settlement would record a claim with no

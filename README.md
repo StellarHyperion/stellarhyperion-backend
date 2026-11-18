@@ -49,6 +49,12 @@ For CCTP, Circle's forwarding hash is a candidate only. The backend binds the at
 
 Unknown or unreachable APIs produce errors; there are no fabricated deliveries or fallback attestations. Claims, route health and metrics query the actual migrated schema. Transfer amounts remain base-unit integer strings, with decimals/symbol supplied from deployment metadata when known.
 
+EVM logs whose signature or payload is not understood are retained in `evm_log_quarantine` as raw,
+non-materialized evidence. The table keeps the newest 10,000 logs per chain; use
+`readQuarantinedEvmLogs` or `replayQuarantinedEvmLogs` after deploying a decoder upgrade. Unknown
+events never become fabricated transfers, and replay leaves the quarantine evidence intact until an
+operator has verified the materialized result.
+
 ## Protocol fees and claims
 
 The active Stellar router charges 0.3% on outbound USDC and transfers that fee directly to its configured treasury during the source transaction. The backend indexes the recorded source fee; bridge and network fees are separate. Received amounts reflect actual destination payment after forwarding fees.

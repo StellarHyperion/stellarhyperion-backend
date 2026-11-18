@@ -305,6 +305,34 @@ describe("what the watcher says about itself", () => {
   });
 });
 
+describe("unknown router logs", () => {
+  it("quarantines the raw payload instead of materializing a transfer", async () => {
+    const unknown = {
+      address: ANVIL_ROUTER,
+      blockNumber: 20n,
+      transactionHash: `0x${"12".repeat(32)}`,
+      logIndex: 0,
+      data: "0xdeadbeef" as `0x${string}`,
+      topics: [`0x${"34".repeat(32)}`],
+      removed: false,
+    };
+    const { watcher, db } = harness({
+      client: new FakeEvmClient({ logs: [unknown], head: 60n }),
+      confirmations: 3,
+    });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    expect(db.matching("INSERT INTO evm_log_quarantine")).toHaveLength(1);
+    expect(db.matching("INSERT INTO outbound_transfer")).toHaveLength(0);
+    expect(db.matching("INSERT INTO inbound_delivery")).toHaveLength(0);
+    expect(db.matching("DELETE FROM evm_log_quarantine")).toHaveLength(1);
+    expect(db.matching("INSERT INTO evm_log_quarantine")[0]?.params).toEqual(
+      expect.arrayContaining(["unknown event signature", unknown.data]),
+    );
+  });
+});
+
 describe("an arrival, which the capture has none of", () => {
   const RECIPIENT = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8";
   const TOKEN = "0x5fbdb2315678afecb367f032d93f642f64180aa3";

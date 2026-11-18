@@ -10,6 +10,7 @@
 import { ROUTE_KINDS } from "@hyperion/protocol";
 
 import type { Queryable } from "../../db/pool.js";
+import type { RawEvmLog } from "./client.js";
 import type { Position } from "../writers.js";
 import {
   settleAction,
@@ -31,6 +32,116 @@ import {
   secondsOrNull,
   wordOrNull,
 } from "./logs.js";
+
+export const EVM_LOG_QUARANTINE_LIMIT = 10_000;
+
+/** Save a log that cannot be decoded without pretending it was a transfer. */
+export async function quarantineEvmLog(
+  db: Queryable,
+  at: Position,
+  log: RawEvmLog,
+  signature: string,
+  reason: string,
+  limit = EVM_LOG_QUARANTINE_LIMIT,
+): Promise<void> {
+  await db.query(
+    `INSERT INTO evm_log_quarantine
+       (chain_key, contract, block_number, transaction_hash, log_index, signature, data, topics, reason)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
+     ON CONFLICT (chain_key, block_number, transaction_hash, log_index) DO UPDATE
+       SET signature = EXCLUDED.signature,
+           data = EXCLUDED.data,
+           topics = EXCLUDED.topics,
+           reason = EXCLUDED.reason,
+           last_seen_at = now()`,
+    [
+      at.chainKey,
+      log.address,
+      log.blockNumber.toString(),
+      log.transactionHash,
+      log.logIndex,
+      signature,
+      log.data,
+      JSON.stringify(log.topics),
+      reason,
+    ],
+  );
+  // Keep the newest evidence for this chain only. The limit is deliberately enforced in the same
+  // transaction as the cursor, so an outage cannot turn an unknown event flood into unbounded DB
+  // growth.
+  await db.query(
+    `DELETE FROM evm_log_quarantine
+      WHERE chain_key = $1
+        AND id NOT IN (
+          SELECT id FROM evm_log_quarantine
+           WHERE chain_key = $1
+           ORDER BY block_number DESC, log_index DESC, id DESC
+           LIMIT $2
+        )`,
+    [at.chainKey, limit],
+  );
+}
+
+export interface QuarantinedEvmLog {
+  readonly chainKey: string;
+  readonly contract: string;
+  readonly blockNumber: bigint;
+  readonly transactionHash: string;
+  readonly logIndex: number;
+  readonly signature: string;
+  readonly data: `0x${string}`;
+  readonly topics: [] | [`0x${string}`, ...`0x${string}`[]];
+  readonly reason: string;
+}
+
+/** Read a bounded batch of raw logs for replay after the router decoder is upgraded. */
+export async function readQuarantinedEvmLogs(
+  db: Queryable,
+  chainKey: string,
+  limit = 100,
+): Promise<readonly QuarantinedEvmLog[]> {
+  const { rows } = await db.query(
+    `SELECT chain_key, contract, block_number, transaction_hash, log_index, signature, data, topics, reason
+       FROM evm_log_quarantine
+      WHERE chain_key = $1
+      ORDER BY block_number, log_index
+      LIMIT $2`,
+    [chainKey, limit],
+  );
+  return rows.map((row) => ({
+    chainKey: String(row.chain_key),
+    contract: String(row.contract),
+    blockNumber: BigInt(String(row.block_number)),
+    transactionHash: String(row.transaction_hash),
+    logIndex: Number(row.log_index),
+    signature: String(row.signature),
+    data: String(row.data) as `0x${string}`,
+    topics: row.topics as [] | [`0x${string}`, ...`0x${string}`[]],
+    reason: String(row.reason),
+  }));
+}
+
+/** Replay raw quarantined logs through a newly deployed decoder without deleting the evidence. */
+export async function replayQuarantinedEvmLogs(
+  db: Queryable,
+  chainKey: string,
+  replay: (log: RawEvmLog) => Promise<void>,
+  limit = 100,
+): Promise<number> {
+  const logs = await readQuarantinedEvmLogs(db, chainKey, limit);
+  for (const log of logs) {
+    await replay({
+      address: log.contract as `0x${string}`,
+      blockNumber: log.blockNumber,
+      transactionHash: log.transactionHash as `0x${string}`,
+      logIndex: log.logIndex,
+      data: log.data,
+      topics: log.topics,
+      removed: false,
+    });
+  }
+  return logs.length;
+}
 
 /** How a log was applied, so the watcher can count and report rather than guess. */
 export type Applied =
