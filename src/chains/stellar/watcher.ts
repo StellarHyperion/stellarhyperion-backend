@@ -201,6 +201,7 @@ export class StellarWatcher {
     if (this.inFlightTick !== null) {
       await this.inFlightTick.catch(() => undefined);
     }
+    await this.release();
   }
 
   /**

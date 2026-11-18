@@ -47,6 +47,16 @@ suite("replaying the live router's history", () => {
       await db.query(`DELETE FROM ${table} WHERE ${column} = $1`, [CHAIN]);
     }
     await db.query("DELETE FROM indexer_cursor WHERE chain_key = $1", [CHAIN]);
+    for (const table of [
+      "indexer_lease",
+      "stellar_history_gap",
+      "stellar_backfill_cursor",
+      "stellar_event_identity",
+      "stellar_event_conflict",
+      "stellar_scan_journal",
+    ]) {
+      await db.query(`DELETE FROM ${table} WHERE chain_key = $1`, [CHAIN]);
+    }
   };
 
   /** Run the watcher to the head, the way the poller would, and say how many passes it took. */
@@ -66,6 +76,7 @@ suite("replaying the live router's history", () => {
       passes += 1;
       if (passes > 20) throw new Error("the watcher never reported catching up");
     }
+    await watcher.drain();
     return passes + 1;
   };
 
