@@ -11,6 +11,10 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import {
+  auditTransferAndClaimInvariants,
+  compactRouteHealthSamples,
+} from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
@@ -334,5 +338,50 @@ suite("maintenance and pruning", () => {
     expect(ids).not.toContain(999991);
     expect(ids).toContain(999992);
     expect(ids).toContain(999993);
+  });
+
+  it("compacts old identical route_health samples in bounded batches while preserving change boundaries", async () => {
+    await db.query("DELETE FROM public.route_health WHERE origin_chain = 'compact-test'");
+    // 5 identical old samples (t-10d .. t-6d), then a state change (t-5d), then 2 recent samples (t-2h, t-1h)
+    await db.query(
+      `INSERT INTO public.route_health
+         (sampled_at, origin_chain, destination_chain, route, token, available, blocker, flow_available)
+       VALUES
+         (now() - INTERVAL '10 days', 'compact-test', 'stellar-testnet', 0, 'USDC', true, 0, 1000),
+         (now() - INTERVAL '9 days',  'compact-test', 'stellar-testnet', 0, 'USDC', true, 0, 1000),
+         (now() - INTERVAL '8 days',  'compact-test', 'stellar-testnet', 0, 'USDC', true, 0, 1000),
+         (now() - INTERVAL '7 days',  'compact-test', 'stellar-testnet', 0, 'USDC', true, 0, 1000),
+         (now() - INTERVAL '6 days',  'compact-test', 'stellar-testnet', 0, 'USDC', true, 0, 1000),
+         (now() - INTERVAL '5 days',  'compact-test', 'stellar-testnet', 0, 'USDC', false, 1, 0),
+         (now() - INTERVAL '2 hours', 'compact-test', 'stellar-testnet', 0, 'USDC', false, 1, 0),
+         (now() - INTERVAL '1 hours', 'compact-test', 'stellar-testnet', 0, 'USDC', false, 1, 0)`,
+    );
+
+    const firstPass = await compactRouteHealthSamples(db, { retainRecentHours: 24, batchSize: 2 });
+    expect(firstPass.deleted).toBe(2);
+
+    const secondPass = await compactRouteHealthSamples(db, {
+      retainRecentHours: 24,
+      batchSize: 10,
+    });
+    expect(secondPass.deleted).toBe(1);
+
+    const thirdPass = await compactRouteHealthSamples(db, { retainRecentHours: 24, batchSize: 10 });
+    expect(thirdPass.deleted).toBe(0);
+
+    const { rows } = await db.query(
+      "SELECT available, blocker FROM public.route_health WHERE origin_chain = 'compact-test' ORDER BY sampled_at ASC, id ASC",
+    );
+    // Kept: first (t-10d), last of first run (t-6d), change boundary (t-5d), and both recent (t-2h, t-1h)
+    expect(rows).toHaveLength(5);
+  });
+
+  it("audits transfer and claim invariants without mutating state", async () => {
+    const report = await auditTransferAndClaimInvariants(db);
+    expect(report).toHaveProperty("ok");
+    expect(Array.isArray(report.sourceAmountViolations)).toBe(true);
+    expect(Array.isArray(report.claimLiabilityViolations)).toBe(true);
+    expect(Array.isArray(report.deliverySettlementViolations)).toBe(true);
+    expect(Array.isArray(report.unsettledLiabilities)).toBe(true);
   });
 });

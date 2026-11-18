@@ -207,7 +207,9 @@ describe("the range and the cursor as one commit", () => {
 
     await watcher.tick(AbortSignal.timeout(5_000));
 
-    const inserts = db.queries.filter((entry) => entry.text.includes("INSERT INTO"));
+    const inserts = db.queries.filter(
+      (entry) => entry.text.includes("INSERT INTO") && !entry.text.includes("indexer_lease"),
+    );
     expect(inserts.length).toBeGreaterThan(1);
     expect(new Set(inserts.map((entry) => entry.transaction)).size).toBe(1);
     expect(db.commits).toEqual([1]);
