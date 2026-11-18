@@ -16,6 +16,13 @@ import type { Queryable } from "../db/pool.js";
 import { bigintOf, integer, text, textOrNull } from "../db/rows.js";
 import type { AttestationStatus, PendingTransfer } from "./types.js";
 
+export {
+  BacklogValidationError,
+  formatBacklogReportText,
+  inspectRailBacklog,
+  type InspectRailBacklogOptions,
+} from "./backlog.js";
+
 export { requeueTerminalTransfer } from "./requeue.js";
 
 const STATUSES: readonly string[] = ["pending", "attested", "delivered", "failed", "expired"];

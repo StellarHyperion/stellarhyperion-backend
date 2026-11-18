@@ -124,3 +124,82 @@ export interface RailClient {
   /** Throws `RailError`; returns `missing` rather than throwing for a transfer not yet indexed. */
   look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup>;
 }
+
+export type MissingProofStage =
+  | "provider_discovery"
+  | "destination_receipt_verification"
+  | "attestation_reconciliation";
+
+export type BacklogRetryState =
+  | "never_checked"
+  | "cooling_down"
+  | "not_due"
+  | "overdue"
+  | "held";
+
+export interface BacklogDelayBreakdown {
+  readonly totalAgeMs: number;
+  readonly providerDiscoveryDelayMs: number | null;
+  readonly receiptVerificationDelayMs: number | null;
+  readonly overdueByMs: number;
+}
+
+export interface BacklogCandidate {
+  readonly transferId: string;
+  readonly route: number;
+  readonly originChain: string;
+  readonly destinationChain: string;
+  readonly nonce: string;
+  readonly grossAmount: string;
+  readonly fee: string;
+  readonly netAmount: string;
+  readonly originBlock: string;
+  readonly originTx: string;
+  readonly observedAt: string;
+  readonly attestationStatus: AttestationStatus | null;
+  readonly railStatus: string | null;
+  readonly railReference: string | null;
+  readonly attestedAt: string | null;
+  readonly lastCheckedAt: string | null;
+  readonly checkFailures: number;
+  readonly retryClass: RailRetryClass | null;
+  readonly retryState: BacklogRetryState;
+  readonly lastError: string | null;
+  readonly missingProofStage: MissingProofStage;
+  readonly overdue: boolean;
+  readonly delays: BacklogDelayBreakdown;
+}
+
+export interface BacklogInspectionReport {
+  readonly generatedAt: string;
+  readonly readOnly: true;
+  readonly parameters: {
+    readonly routes: readonly number[];
+    readonly destinationChain: string | null;
+    readonly stage: MissingProofStage | null;
+    readonly retryClass: RailRetryClass | null;
+    readonly overdueOnly: boolean;
+    readonly recheckAfterMs: number;
+    readonly maxCheckFailures: number;
+  };
+  readonly summary: {
+    readonly totalMatching: number;
+    readonly overdueCount: number;
+    readonly heldCount: number;
+    readonly oldestAgeMs: number | null;
+    readonly maxProviderDiscoveryDelayMs: number | null;
+    readonly maxReceiptVerificationDelayMs: number | null;
+    readonly byDestination: Readonly<Record<string, number>>;
+    readonly byRoute: Readonly<Record<string, number>>;
+    readonly byStage: Readonly<Record<MissingProofStage, number>>;
+    readonly byRetryClass: Readonly<Record<string, number>>;
+    readonly byRetryState: Readonly<Record<BacklogRetryState, number>>;
+  };
+  readonly pageInfo: {
+    readonly limit: number;
+    readonly sort: "asc" | "desc";
+    readonly hasMore: boolean;
+    readonly nextCursor: string | null;
+  };
+  readonly candidates: readonly BacklogCandidate[];
+}

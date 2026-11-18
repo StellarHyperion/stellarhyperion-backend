@@ -61,6 +61,14 @@ npm run rail:requeue -- --transfer-id 123 --reviewed-by operator-name --reason "
 
 Only transfers in the `failed` or `expired` terminal state can be reopened. Each requeue atomically records the prior state, operator and reason. A matching destination delivery or claim blocks requeue, and the original source transfer is never rewritten. Add `--evaluate-now` to make one immediate rail lookup after requeue; otherwise the regular worker picks it up. Provider error text and credentials are not exposed through the public transfer API or retry logs.
 
+Inspect active rail backlog without starting workers or changing lifecycle state:
+
+```bash
+npm run rails:backlog -- [--route 0|1] [--destination <chain>] [--stage <stage>] [--retry-class <class>] [--overdue-only] [--limit <n>] [--cursor <token>] [--sort asc|desc] [--format table|json]
+```
+
+The report separates provider discovery from destination receipt verification, includes retry class and due state, and uses stable keyset pagination. It runs its database transaction as read-only.
+
 ## Protocol fees and claims
 
 The active Stellar router charges 0.3% on outbound USDC and transfers that fee directly to its configured treasury during the source transaction. The backend indexes the recorded source fee; bridge and network fees are separate. Received amounts reflect actual destination payment after forwarding fees.

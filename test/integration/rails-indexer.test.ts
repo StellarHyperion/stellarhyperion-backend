@@ -9,7 +9,11 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { writeOutbound, writeInbound } from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
-import { outstandingForRail, pendingForRail } from "../../src/rails/queue.js";
+import {
+  inspectRailBacklog,
+  outstandingForRail,
+  pendingForRail,
+} from "../../src/rails/queue.js";
 import { RailPass } from "../../src/rails/pass.js";
 import { requeueTerminalTransfer } from "../../src/rails/requeue.js";
 import {
@@ -435,6 +439,155 @@ suite("rail pollers against real Postgres", () => {
     );
     expect(rows[0]?.status).toBe("pending");
     expect(rows[0]?.delivered).toBe(false);
+  });
+
+  it("reports missing proof stages and pages equal timestamps without changing lifecycle state", async () => {
+    const { logger } = capturingLogger();
+    const now = new Date();
+    const observedAt = new Date(now.getTime() - 60_000);
+    const fullWidthNonce = 18_446_744_073_709_551_615n;
+    const largeAmount = 100_000_000_000_000_000_000_000_000_000_000_000_000n;
+    const transfers = [
+      { nonce: fullWidthNonce, txHash: "0xbacklog-a", amount: largeAmount },
+      { nonce: 909n, txHash: "0xbacklog-b", amount: 5_000_000n },
+      { nonce: 910n, txHash: "0xbacklog-c", amount: 6_000_000n },
+    ];
+
+    await db.transaction(async (tx) => {
+      for (const [index, transfer] of transfers.entries()) {
+        await writeOutbound(
+          tx,
+          {
+            chainKey: ORIGIN_CHAIN,
+            block: 1_100n + BigInt(index),
+            txHash: transfer.txHash,
+            logIndex: 0,
+            observedAt,
+          },
+          {
+            route: 0,
+            nonce: transfer.nonce,
+            sender: "0x1111111111111111111111111111111111111111",
+            token: "0x3333333333333333333333333333333333333333",
+            grossAmount: transfer.amount + 1n,
+            fee: 1n,
+            netAmount: transfer.amount,
+            destinationChain: DESTINATION_CHAIN,
+            destination: "0x2222222222222222222222222222222222222222",
+            railRef: null,
+          },
+        );
+      }
+    });
+
+    const seeded = await db.query(
+      `SELECT id, nonce
+         FROM outbound_transfer
+        WHERE origin_chain = $1 AND route = 0 AND nonce IN ($2, $3)`,
+      [ORIGIN_CHAIN, "909", "910"],
+    );
+    const receiptId = seeded.rows.find((row) => row.nonce === "909")?.id;
+    const heldId = seeded.rows.find((row) => row.nonce === "910")?.id;
+    expect(receiptId).toBeDefined();
+    expect(heldId).toBeDefined();
+    if (receiptId === undefined || heldId === undefined) return;
+
+    await db.query(
+      `INSERT INTO rail_attestation
+         (transfer_id, route, status, rail_status, attested_at, last_checked_at,
+          retry_class, next_attempt_at, last_error, updated_at)
+       VALUES
+         ($1, 0, 'attested', 'complete', $2, $3, NULL, NULL, NULL, $3),
+         ($4, 0, 'pending', NULL, NULL, $3, 'permanent', NULL,
+          'Bearer test-token https://provider.example/key', $3)`,
+      [
+        String(receiptId),
+        new Date(observedAt.getTime() + 10_000),
+        new Date(observedAt.getTime() + 20_000),
+        String(heldId),
+      ],
+    );
+
+    const before = await db.query(
+      `SELECT transfer_id, status, attested_at, last_checked_at, retry_class, next_attempt_at,
+              last_error, updated_at
+         FROM rail_attestation
+        WHERE transfer_id IN ($1, $2)
+        ORDER BY transfer_id`,
+      [String(receiptId), String(heldId)],
+    );
+    let providerCalls = 0;
+    const pass = new RailPass({
+      route: 0,
+      client: {
+        rail: "cctp",
+        look: async () => {
+          providerCalls += 1;
+          throw new Error("backlog inspection must not call a provider");
+        },
+      },
+      db,
+      logger,
+      batchSize: 10,
+      recheckAfterMs: 1_000,
+      maxCheckFailures: 5,
+      now: () => now,
+    });
+    const firstPage = await pass.inspectBacklog({
+      limit: 1,
+      now: () => now,
+    });
+    expect(firstPage.readOnly).toBe(true);
+    expect(firstPage.summary.totalMatching).toBe(3);
+    expect(firstPage.pageInfo.hasMore).toBe(true);
+    expect(firstPage.candidates[0]?.nonce).toBe(fullWidthNonce.toString());
+    expect(firstPage.candidates[0]?.netAmount).toBe(largeAmount.toString());
+    expect(providerCalls).toBe(0);
+    expect(pass.progress).toBeNull();
+    const firstCursor = firstPage.pageInfo.nextCursor;
+    expect(firstCursor).not.toBeNull();
+    if (firstCursor === null) return;
+
+    const secondPage = await inspectRailBacklog(db, {
+      routes: [0],
+      limit: 1,
+      recheckAfterMs: 1_000,
+      maxCheckFailures: 5,
+      cursor: firstCursor,
+      now: () => now,
+    });
+    const receipt = secondPage.candidates[0];
+    expect(receipt?.nonce).toBe("909");
+    expect(receipt?.missingProofStage).toBe("destination_receipt_verification");
+    expect(receipt?.delays.providerDiscoveryDelayMs).toBe(10_000);
+    expect(receipt?.delays.receiptVerificationDelayMs).toBe(50_000);
+    const secondCursor = secondPage.pageInfo.nextCursor;
+    expect(secondCursor).not.toBeNull();
+    if (secondCursor === null) return;
+
+    const thirdPage = await inspectRailBacklog(db, {
+      routes: [0],
+      limit: 1,
+      recheckAfterMs: 1_000,
+      maxCheckFailures: 5,
+      cursor: secondCursor,
+      now: () => now,
+    });
+    expect(thirdPage.candidates[0]?.nonce).toBe("910");
+    expect(thirdPage.candidates[0]?.retryClass).toBe("permanent");
+    expect(thirdPage.candidates[0]?.retryState).toBe("held");
+    expect(thirdPage.candidates[0]?.lastError).not.toContain("test-token");
+    expect(thirdPage.candidates[0]?.lastError).not.toContain("provider.example");
+
+    const after = await db.query(
+      `SELECT transfer_id, status, attested_at, last_checked_at, retry_class, next_attempt_at,
+              last_error, updated_at
+         FROM rail_attestation
+        WHERE transfer_id IN ($1, $2)
+        ORDER BY transfer_id`,
+      [String(receiptId), String(heldId)],
+    );
+    expect(after.rows).toEqual(before.rows);
   });
 
   it("requeues an expired transfer with its original identity and records the review", async () => {
