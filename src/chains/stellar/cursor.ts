@@ -154,3 +154,89 @@ export function boundedWindowEnd(fromLedger: number, toLedger: number, maxLedger
   }
   return Math.min(toLedger, fromLedger + maxLedgers - 1);
 }
+
+/**
+ * The inclusive upper ledger bound a single `getEvents` scan window can cover.
+ *
+ * Fresh `startLedger` requests scan `SCAN_WINDOW_LEDGERS` ledgers; cursor-resumed requests scan
+ * `SCAN_WINDOW_LEDGERS - 1` due to the RPC's off-by-one range arithmetic. Clamped to
+ * `latestLedger` when the head is closer.
+ */
+export function computeScanWindowEnd(
+  fromLedger: number,
+  fresh: boolean,
+  latestLedger: number,
+): number {
+  const width = fresh ? SCAN_WINDOW_LEDGERS : SCAN_WINDOW_LEDGERS - 1;
+  return Math.max(fromLedger, Math.min(fromLedger + width - 1, latestLedger));
+}
+
+/** Whether `ledger` falls inside the RPC's retained `[oldestLedger, latestLedger]` range. */
+export function isWithinRetentionWindow(
+  ledger: number,
+  oldestLedger: number,
+  latestLedger: number,
+): boolean {
+  return ledger >= oldestLedger && ledger <= latestLedger;
+}
+
+/** Verify range and event ordering before treating a provider cursor as completion. */
+export function validateRangePage(
+  page: {
+    readonly oldestLedger: number;
+    readonly latestLedger: number;
+    readonly cursor: string | null;
+    readonly events: readonly unknown[];
+  },
+  from: number,
+  end: number | undefined,
+  requestedCursor?: string,
+): void {
+  if (
+    !Number.isSafeInteger(page.oldestLedger) ||
+    !Number.isSafeInteger(page.latestLedger) ||
+    page.oldestLedger < 0 ||
+    page.latestLedger < from ||
+    page.oldestLedger > from
+  ) {
+    throw new Error("provider cannot verify the requested retained range");
+  }
+  const order = (id: string): bigint => {
+    const parts = id.split("-");
+    if (parts.length !== 2 || !parts.every((part) => /^\d+$/.test(part)))
+      throw new Error("invalid event cursor");
+    const toid = BigInt(parts[0] ?? "");
+    const index = BigInt(parts[1] ?? "");
+    if (toid >= 1n << 64n || index >= 1n << 32n)
+      throw new Error("event cursor exceeds wire limits");
+    return (toid << 32n) + index;
+  };
+  let previous = requestedCursor === undefined ? -1n : order(requestedCursor);
+  for (const input of page.events) {
+    const raw = input as { id: string; ledger: number };
+    const pos = parseEventCursor(raw.id);
+    const current = order(raw.id);
+    if (
+      current <= previous ||
+      pos.completesLedger ||
+      pos.ledger !== raw.ledger ||
+      raw.ledger < from ||
+      raw.ledger > page.latestLedger ||
+      (end !== undefined && raw.ledger > end)
+    ) {
+      throw new Error("provider returned unordered events or an unverifiable ledger");
+    }
+    previous = current;
+  }
+  if (page.cursor === null) return;
+  const terminal = parseEventCursor(page.cursor);
+  const cursorOrder = order(page.cursor);
+  if (
+    cursorOrder < previous ||
+    terminal.ledger > page.latestLedger ||
+    (end !== undefined && terminal.ledger > end) ||
+    (page.events.length === 0 && !terminal.completesLedger)
+  ) {
+    throw new Error("provider returned an unverifiable terminal cursor");
+  }
+}

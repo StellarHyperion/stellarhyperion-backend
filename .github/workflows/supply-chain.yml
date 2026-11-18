@@ -32,10 +32,19 @@ jobs:
             nodejs.org:443
 
       - name: Check out the tested commit and history
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
+
+      - name: Test pull request assignment policy
+        run: python3 -B .github/scripts/test_enforce_pr_assignments.py
+
+      - name: Test automatic PR CI authorization
+        run: python3 -B .github/scripts/test_approve_pr_ci.py
+
+      - name: Test dependency advisory verification
+        run: python3 -B .github/scripts/test_audit_npm_dependencies.py
 
       - name: Install checksum-verified security tools
         working-directory: ${{ runner.temp }}
@@ -79,10 +88,11 @@ jobs:
             --gitleaks-ignore-path "$RUNNER_TEMP/security-tools" --log-opts="$range" .
 
       - name: Set up Node.js 22
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22.22.1
 
       - name: Audit locked dependencies in .
-        working-directory: .
-        run: npm audit --audit-level=high --ignore-scripts
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B .github/scripts/audit_npm_dependencies.py . --audit-level high

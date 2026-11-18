@@ -136,7 +136,11 @@ export class FakeRpc {
     }
 
     const width = query.cursor === undefined ? START_WINDOW : CURSOR_WINDOW;
-    const windowEnd = Math.min(from + width - 1, this.head);
+    const windowEnd = Math.min(
+      from + width - 1,
+      this.head,
+      query.endLedger === undefined ? this.head : query.endLedger - 1,
+    );
 
     const inWindow = this.log.filter((event) => {
       if (event.ledger > windowEnd) return false;
@@ -200,6 +204,10 @@ export class RecordingDb implements Transactional {
   /** Set to make every statement inside the next transaction throw. */
   failInTransaction: Error | null = null;
 
+  private identities = new Map<string, unknown>();
+  private conflicts = new Map<string, unknown>();
+  private journals: unknown[] = [];
+
   private open: number | null = null;
   private transactions = 0;
   private nextGapId = 1n;
@@ -215,7 +223,7 @@ export class RecordingDb implements Transactional {
         rowCount: this.cursorRow === null ? 0 : 1,
       });
     }
-    if (text.includes("INSERT INTO indexer_cursor")) {
+    if (text.includes("INSERT INTO indexer_cursor") || text.includes("UPDATE indexer_cursor")) {
       if (text.includes("ON CONFLICT (chain_key) DO NOTHING")) {
         if (this.cursorRow !== null) {
           return Promise.resolve({ rows: [], rowCount: 0 });
@@ -229,10 +237,12 @@ export class RecordingDb implements Transactional {
         };
         return Promise.resolve({ rows: [{ revision: "1" }], rowCount: 1 });
       }
-      if (text.includes("WHERE indexer_cursor.revision =")) {
+      if (
+        text.includes("WHERE indexer_cursor.revision =") ||
+        text.includes("WHERE chain_key = $1 AND revision =")
+      ) {
         const expected = asText(params[6]);
-        const current =
-          this.cursorRow === null ? null : asText(this.cursorRow.revision, "1");
+        const current = this.cursorRow === null ? null : asText(this.cursorRow.revision, "1");
         if (current === null || current !== expected) {
           return Promise.resolve({ rows: [], rowCount: 0 });
         }
@@ -275,10 +285,7 @@ export class RecordingDb implements Transactional {
       const ownerId = String(params[2]);
       const ttlMs = params[3] === null || params[3] === undefined ? null : Number(params[3]);
       const now = Date.now();
-      if (
-        this.leaseRow?.owner_id !== ownerId ||
-        this.leaseRow.lease_until.getTime() <= now
-      ) {
+      if (this.leaseRow?.owner_id !== ownerId || this.leaseRow.lease_until.getTime() <= now) {
         return Promise.resolve({ rows: [], rowCount: 0 });
       }
       if (ttlMs !== null) {
@@ -323,7 +330,10 @@ export class RecordingDb implements Transactional {
       }
       return Promise.resolve({ rows: [], rowCount: 1 });
     }
-    if (text.includes("SELECT count(*)::int AS count") && text.includes("FROM stellar_history_gap")) {
+    if (
+      text.includes("SELECT count(*)::int AS count") &&
+      text.includes("FROM stellar_history_gap")
+    ) {
       const chainKey = asText(params[0]);
       const contract = params[1] === undefined ? undefined : asText(params[1]);
       const count = this.gaps.filter(
@@ -376,8 +386,7 @@ export class RecordingDb implements Transactional {
     }
     if (text.includes("UPDATE stellar_backfill_cursor")) {
       const expected = asText(params[7]);
-      const current =
-        this.backfillRow === null ? null : asText(this.backfillRow.revision, "1");
+      const current = this.backfillRow === null ? null : asText(this.backfillRow.revision, "1");
       if (current === null || current !== expected) {
         return Promise.resolve({ rows: [], rowCount: 0 });
       }
@@ -394,6 +403,26 @@ export class RecordingDb implements Transactional {
       };
       return Promise.resolve({ rows: [{ revision: nextRev }], rowCount: 1 });
     }
+    const key = JSON.stringify(params.slice(0, 3));
+    if (text.includes("INSERT INTO stellar_event_identity")) {
+      if (!this.identities.has(key)) this.identities.set(key, JSON.parse(params[3] as string));
+    } else if (text.includes("FROM stellar_event_identity")) {
+      return Promise.resolve({ rows: [{ evidence: this.identities.get(key) }], rowCount: 1 });
+    } else if (text.includes("INSERT INTO stellar_event_conflict")) {
+      this.conflicts.set(key, JSON.parse(params[4] as string));
+    } else if (text.includes("FROM stellar_event_conflict")) {
+      return Promise.resolve({
+        rows: [...this.conflicts.values()].map((evidence) => ({ evidence })),
+        rowCount: this.conflicts.size,
+      });
+    } else if (text.includes("INSERT INTO stellar_scan_journal")) {
+      this.journals.push(JSON.parse(params[2] as string));
+    } else if (text.includes("FROM stellar_scan_journal")) {
+      return Promise.resolve({
+        rows: this.journals.map((journal) => ({ journal })),
+        rowCount: this.journals.length,
+      });
+    }
     // Zero rows affected, which is what makes `recordClaimSettled` report an unmatched settlement.
     return Promise.resolve({ rows: [], rowCount: 0 });
   }
@@ -401,11 +430,17 @@ export class RecordingDb implements Transactional {
   async transaction<T>(work: (tx: Queryable) => Promise<T>): Promise<T> {
     const id = ++this.transactions;
     this.open = id;
+    const identities = new Map(this.identities);
+    const conflicts = new Map(this.conflicts);
+    const journals = [...this.journals];
     try {
       const value = await work(this);
       this.commits.push(id);
       return value;
     } catch (error) {
+      this.identities = identities;
+      this.conflicts = conflicts;
+      this.journals = journals;
       this.rollbacks.push(id);
       throw error;
     } finally {

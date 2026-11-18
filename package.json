@@ -34,25 +34,33 @@
   "dependencies": {
     "@fastify/rate-limit": "^11.2.0",
     "@hyperion/protocol": "file:hyperion-protocol-0.1.0.tgz",
-    "@stellar/stellar-sdk": "^17.2.1",
-    "bullmq": "^6.3.11",
+    "@stellar/stellar-sdk": "^17.4.0",
+    "bullmq": "^6.7.6",
     "fastify": "^5.12.5",
     "ioredis": "^6.0.0",
     "node-pg-migrate": "^9.0.0",
     "pg": "^8.16.3",
-    "pino": "^10.3.1",
-    "pino-pretty": "^13.1.2",
+    "pino": "^10.4.0",
+    "pino-pretty": "^13.2.0",
     "viem": "^2.57.2"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.12",
-    "@types/ioredis": "^4.28.10",
-    "@types/node": "^24.19.0",
+    "@types/ioredis": "^5.0.0",
+    "@types/node": "^26.6.6",
     "@types/pg": "^8.15.6",
-    "eslint": "^10.11.0",
-    "prettier": "^3.9.9",
+    "eslint": "^10.15.0",
+    "prettier": "^3.10.1",
     "typescript": "^5.9.3",
-    "typescript-eslint": "^8.71.0",
-    "vitest": "^5.0.3"
+    "typescript-eslint": "^8.73.0",
+    "vitest": "^5.1.0"
+  },
+  "overrides": {
+    "node-pg-migrate": {
+      "glob": "14.0.6"
+    },
+    "eslint": {
+      "minimatch": "11.0.9"
+    }
   }
 }
