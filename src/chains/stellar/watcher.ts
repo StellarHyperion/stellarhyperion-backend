@@ -26,11 +26,23 @@ import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
-import { completeThrough, endOfLedgerCursor, parseEventCursor } from "./cursor.js";
-import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
-import type { EventSource, EventsQuery } from "./rpc.js";
-import { StellarRpcError } from "./rpc.js";
 import {
+  completeThrough,
+  computeScanWindowEnd,
+  endOfLedgerCursor,
+  parseEventCursor,
+} from "./cursor.js";
+import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
+import type { EventSource, EventsQuery, RetainedHistoryWindow } from "./rpc.js";
+import { StellarRpcError, retentionWindowOf } from "./rpc.js";
+import {
+  type CursorRepairProposal,
+  inspectEventConflict,
+  persistScanJournal,
+  type EventContext,
+  type EventIdentityConflict,
+  type VerifiedLedgerBoundary,
+  planCursorRepairFromDb,
   readCursor,
   recordActionQueued,
   recordActionSettled,
@@ -42,7 +54,6 @@ import {
   recordRouteConfigured,
   recordTokenRegistered,
   writeCursor,
-  type EventContext,
 } from "./store.js";
 
 /**
@@ -66,6 +77,23 @@ const CURRENT_WITHIN_LEDGERS = 5;
  * what it read.
  */
 const MAX_PAGES_PER_TICK = 20;
+const MAX_PROGRESS_JOURNALS = 100;
+
+export interface ScanProgressJournal {
+  readonly chainKey: string;
+  readonly startedAt: Date;
+  readonly finishedAt: Date;
+  readonly requestedRange: { readonly from: number; readonly to: number | null };
+  readonly committedRange: { readonly from: number; readonly to: number } | null;
+  readonly eventCounts: {
+    readonly fetched: number;
+    readonly decoded: number;
+    readonly skipped: number;
+    readonly conflicts: number;
+  };
+  readonly pages: number;
+  readonly interruptionReason: string | null;
+}
 
 export interface StellarWatcherOptions {
   readonly chainKey: string;
@@ -93,6 +121,12 @@ export class StellarWatcher {
   private lastProgress: WatcherProgress | null = null;
   /** Tags seen once and logged once. A contract ahead of this build should not be a log flood. */
   private readonly reportedUnknown = new Set<string>();
+  private readonly progressJournals: ScanProgressJournal[] = [];
+  private readonly recordedConflicts: EventIdentityConflict[] = [];
+  private readonly drainController = new AbortController();
+  private draining = false;
+  private inFlightTick: Promise<boolean> | null = null;
+  private lastRetainedHistory: RetainedHistoryWindow | null = null;
 
   constructor(private readonly options: StellarWatcherOptions) {}
 
@@ -102,6 +136,79 @@ export class StellarWatcher {
 
   get progress(): WatcherProgress | null {
     return this.lastProgress;
+  }
+
+  get journals(): readonly ScanProgressJournal[] {
+    return this.progressJournals;
+  }
+
+  get lastJournal(): ScanProgressJournal | null {
+    return this.progressJournals[this.progressJournals.length - 1] ?? null;
+  }
+
+  get conflicts(): readonly EventIdentityConflict[] {
+    return this.recordedConflicts;
+  }
+
+  get isDraining(): boolean {
+    return this.draining;
+  }
+
+  /**
+   * Gracefully drain the watcher: stop issuing new RPC requests and wait for any in-flight
+   * event transaction to finish committing or rolling back.
+   */
+  async drain(): Promise<void> {
+    this.draining = true;
+    this.drainController.abort();
+    if (this.inFlightTick !== null) {
+      await this.inFlightTick.catch(() => undefined);
+    }
+  }
+
+  /**
+   * Build a read-only, unsigned database repair proposal from verified completed ledger boundaries
+   * recorded in scan journals and retained-history evidence.
+   */
+  async planRepair(retainedHistory?: RetainedHistoryWindow | null): Promise<CursorRepairProposal> {
+    const verifiedBoundaries: VerifiedLedgerBoundary[] = [];
+    const { rows: journals } = await this.options.db.query(
+      `SELECT journal FROM stellar_scan_journal WHERE chain_key = $1 AND contract = $2 ORDER BY id`,
+      [this.options.chainKey, this.options.router],
+    );
+    for (const row of journals) {
+      const journal = row.journal as ScanProgressJournal;
+      if (journal.committedRange !== null)
+        verifiedBoundaries.push({
+          from: journal.committedRange.from,
+          ledger: journal.committedRange.to,
+          cursor: endOfLedgerCursor(journal.committedRange.to),
+          source: "journal",
+        });
+    }
+    const { rows: evidence } = await this.options.db.query(
+      `SELECT evidence FROM stellar_event_conflict WHERE chain_key = $1 AND contract = $2`,
+      [this.options.chainKey, this.options.router],
+    );
+    return planCursorRepairFromDb(this.options.db, {
+      chainKey: this.options.chainKey,
+      expectedContract: this.options.router,
+      startLedger: this.options.startLedger,
+      retainedHistory: retainedHistory ?? this.lastRetainedHistory,
+      verifiedBoundaries,
+      conflicts: evidence.map((row) => row.evidence as EventIdentityConflict),
+    });
+  }
+
+  private isCancelled(signal: AbortSignal): boolean {
+    return this.draining || signal.aborted;
+  }
+
+  private recordJournal(journal: ScanProgressJournal): void {
+    this.progressJournals.push(journal);
+    if (this.progressJournals.length > MAX_PROGRESS_JOURNALS) {
+      this.progressJournals.shift();
+    }
   }
 
   /**
@@ -140,93 +247,180 @@ export class StellarWatcher {
    * a watcher starting thousands of ledgers back catches up without sleeping between windows.
    */
   async tick(signal: AbortSignal): Promise<boolean> {
-    const { chainKey, router, db, logger } = this.options;
-
-    const stored = await readCursor(db, chainKey);
-    if (stored !== null && stored.contract !== router) {
-      // A different router at a different address shares no history with this cursor. Carrying it
-      // over would skip everything the new deployment has ever done, and it would do it silently,
-      // which is the worst available outcome. Stopping is the only honest move.
-      throw new Error(
-        `the cursor for ${chainKey} was written for router ${stored.contract} and this process is watching ${router}. ` +
-          "A redeployed router needs its cursor reset rather than reused.",
-      );
-    }
-
-    const base = stored === null ? this.options.startLedger - 1 : Number(stored.position);
-    const scan = await this.scan(base, stored === null, signal);
-
-    if (scan.oldestLedger > base + 1 && stored !== null) {
-      // The retention window moved past where we stopped. Anything between the two is gone from
-      // this node, and carrying on from the window edge would leave a hole nothing ever reports.
-      logger.error(
-        { chain: chainKey, from: base + 1, oldestLedger: scan.oldestLedger },
-        "fell behind the rpc retention window; ledgers between the cursor and the oldest retained ledger were never read",
-      );
-    }
-
-    if (scan.through <= base && scan.events.length === 0) {
-      // No window crossed and nothing read. Report where we still are so readiness keeps telling
-      // the truth about the lag rather than going quiet.
-      this.lastProgress = {
-        ledger: base,
-        decoded: 0,
-        skipped: 0,
-        behind: Math.max(scan.latestLedger - base, 0),
-        at: new Date(),
-      };
+    if (this.inFlightTick !== null) return this.inFlightTick;
+    const effectiveSignal = AbortSignal.any([signal, this.drainController.signal]);
+    if (this.draining || effectiveSignal.aborted) {
+      const now = new Date();
+      this.recordJournal({
+        chainKey: this.options.chainKey,
+        startedAt: now,
+        finishedAt: now,
+        requestedRange: {
+          from: (this.lastProgress?.ledger ?? this.options.startLedger - 1) + 1,
+          to: null,
+        },
+        committedRange: null,
+        eventCounts: { fetched: 0, decoded: 0, skipped: 0, conflicts: 0 },
+        pages: 0,
+        interruptionReason: "cancelled",
+      });
       return false;
     }
 
+    const run = this.runTick(effectiveSignal);
+    this.inFlightTick = run;
+    try {
+      return await run;
+    } finally {
+      this.inFlightTick = null;
+    }
+  }
+
+  private async runTick(signal: AbortSignal): Promise<boolean> {
+    const { chainKey, router, db, logger } = this.options;
+    const startedAt = new Date();
+    let requestedFrom = this.options.startLedger;
+    let requestedTo: number | null = null;
+    let committedRange: { readonly from: number; readonly to: number } | null = null;
+    let fetched = 0;
     let decoded = 0;
     let skipped = 0;
-    let closedAt = stored?.observedAt ?? null;
-    for (const raw of scan.events) {
-      if (raw.ledger <= scan.through) closedAt = new Date(raw.ledgerClosedAt);
-    }
-
-    // One transaction for the page and the cursor. This is the restart guarantee, and splitting it
-    // would turn every crash into either a lost page or a duplicated one.
-    await db.transaction(async (tx: Queryable) => {
-      for (const raw of scan.events) {
-        if (raw.type !== "contract" || raw.inSuccessfulContractCall === false) {
-          // getEvents no longer returns the deprecated success flag (RPC30).
-          // Diagnostic events are excluded by current RPC; retain legacy explicit-failure checks.
-          // https://github.com/stellar/stellar-rpc/releases/tag/v30.0.0
-          skipped += 1;
-          continue;
-        }
-        const context: EventContext = {
-          chainKey,
-          ledger: raw.ledger,
-          txHash: raw.txHash,
-          closedAt: new Date(raw.ledgerClosedAt),
-        };
-        if (await this.apply(tx, context, raw)) decoded += 1;
-        else skipped += 1;
-      }
-
-      await writeCursor(tx, {
-        chainKey,
-        family: "stellar",
-        contract: router,
-        position: BigInt(scan.through),
-        observedAt: closedAt,
-        // Nothing to record: a closed ledger cannot be replaced by a different one.
-        hash: null,
-      });
+    let conflicts = 0;
+    let pages = 0;
+    let interruptionReason: string | null = null;
+    let journalPersisted = false;
+    const transactionConflicts: EventIdentityConflict[] = [];
+    const journal = (): ScanProgressJournal => ({
+      chainKey,
+      startedAt,
+      finishedAt: new Date(),
+      requestedRange: { from: requestedFrom, to: requestedTo },
+      committedRange,
+      eventCounts: { fetched, decoded, skipped, conflicts },
+      pages,
+      interruptionReason,
     });
 
-    const behind = Math.max(scan.latestLedger - scan.through, 0);
-    this.lastProgress = { ledger: scan.through, decoded, skipped, behind, at: new Date() };
-    logger.info(
-      { chain: chainKey, ledger: scan.through, decoded, skipped, behind, pages: scan.pages },
-      "stellar window indexed",
-    );
+    try {
+      const stored = await readCursor(db, chainKey);
+      if (stored !== null && stored.contract !== router) {
+        // A different router at a different address shares no history with this cursor. Carrying it
+        // over would skip everything the new deployment has ever done, and it would do it silently,
+        // which is the worst available outcome. Stopping is the only honest move.
+        throw new Error(
+          `the cursor for ${chainKey} was written for router ${stored.contract} and this process is watching ${router}. ` +
+            "A redeployed router needs its cursor reset rather than reused.",
+        );
+      }
 
-    // Behind the head means there is another window waiting, so say we progressed and let the
-    // poller come straight back rather than sleeping out the interval mid-backfill.
-    return behind > 0;
+      const base = stored === null ? this.options.startLedger - 1 : Number(stored.position);
+      const fresh = stored === null;
+      requestedFrom = base + 1;
+
+      const scan = await this.scan(base, fresh, signal);
+      pages = scan.pages;
+      fetched = scan.events.length;
+      if (scan.latestLedger > 0) {
+        requestedTo = computeScanWindowEnd(requestedFrom, fresh, scan.latestLedger);
+        this.lastRetainedHistory = retentionWindowOf({
+          oldestLedger: scan.oldestLedger,
+          latestLedger: scan.latestLedger,
+        });
+      }
+      interruptionReason = scan.interruptionReason;
+
+      if (scan.interruptionReason === "cancelled" && scan.through <= base) {
+        return false;
+      }
+
+      if (scan.oldestLedger > base + 1) {
+        // The retention window moved past where we stopped. Anything between the two is gone from
+        // this node, and carrying on from the window edge would leave a hole nothing ever reports.
+        throw new Error("requested Stellar history is outside provider retention");
+      }
+
+      if (scan.through <= base && scan.events.length === 0) {
+        // No window crossed and nothing read. Report where we still are so readiness keeps telling
+        // the truth about the lag rather than going quiet.
+        this.lastProgress = {
+          ledger: base,
+          decoded: 0,
+          skipped: 0,
+          behind: Math.max(scan.latestLedger - base, 0),
+          at: new Date(),
+        };
+        return false;
+      }
+
+      let closedAt = stored?.observedAt ?? null;
+      for (const raw of scan.events) {
+        if (raw.ledger <= scan.through) closedAt = new Date(raw.ledgerClosedAt);
+      }
+
+      // One transaction for the page and the cursor. This is the restart guarantee, and splitting it
+      // would turn every crash into either a lost page or a duplicated one.
+      // Once inside the transaction, let it finish committing or rolling back even if drain is
+      // requested concurrently.
+      await db.transaction(async (tx: Queryable) => {
+        for (const raw of scan.events) {
+          if (raw.type !== "contract" || raw.inSuccessfulContractCall === false) {
+            // getEvents no longer returns the deprecated success flag (RPC30).
+            // Diagnostic events are excluded by current RPC; retain legacy explicit-failure checks.
+            // https://github.com/stellar/stellar-rpc/releases/tag/v30.0.0
+            skipped += 1;
+            continue;
+          }
+          const context: EventContext = {
+            chainKey,
+            ledger: raw.ledger,
+            txHash: raw.txHash,
+            closedAt: new Date(raw.ledgerClosedAt),
+          };
+          const outcome = await this.apply(tx, context, raw, transactionConflicts);
+          if (outcome === "decoded") decoded += 1;
+          else if (outcome === "conflict") conflicts += 1;
+          else skipped += 1;
+        }
+
+        await writeCursor(tx, {
+          chainKey,
+          family: "stellar",
+          contract: router,
+          position: BigInt(scan.through),
+          observedAt: closedAt,
+          // Nothing to record: a closed ledger cannot be replaced by a different one.
+          hash: null,
+        });
+        if (scan.through > base) committedRange = { from: base + 1, to: scan.through };
+        await persistScanJournal(tx, router, journal());
+      });
+      journalPersisted = true;
+      this.recordedConflicts.push(...transactionConflicts);
+      if (this.recordedConflicts.length > 100)
+        this.recordedConflicts.splice(0, this.recordedConflicts.length - 100);
+
+      const behind = Math.max(scan.latestLedger - scan.through, 0);
+      this.lastProgress = { ledger: scan.through, decoded, skipped, behind, at: new Date() };
+      logger.info(
+        { chain: chainKey, ledger: scan.through, decoded, skipped, conflicts, behind, pages },
+        "stellar window indexed",
+      );
+
+      // Behind the head means there is another window waiting, so say we progressed and let the
+      // poller come straight back rather than sleeping out the interval mid-backfill.
+      return !this.draining && !signal.aborted && behind > 0;
+    } catch (error) {
+      committedRange = null;
+      interruptionReason =
+        error instanceof Error && error.message === "deadlock detected"
+          ? "deadlock detected"
+          : "scan_failed";
+      throw error;
+    } finally {
+      const finalJournal = journal();
+      if (!journalPersisted) await persistScanJournal(db, router, finalJournal);
+      this.recordJournal(finalJournal);
+    }
   }
 
   /**
@@ -246,6 +440,7 @@ export class StellarWatcher {
     readonly latestLedger: number;
     readonly oldestLedger: number;
     readonly pages: number;
+    readonly interruptionReason: string | null;
   }> {
     const { router, pageSize, logger, chainKey } = this.options;
     const maxPages = this.options.maxPagesPerTick ?? MAX_PAGES_PER_TICK;
@@ -255,6 +450,7 @@ export class StellarWatcher {
     let latestLedger = 0;
     let oldestLedger = 0;
     let pages = 0;
+    let interruptionReason: string | null = null;
     // A fresh cursor starts by ledger. Everything after resumes from a cursor, which is the only
     // account of where the previous scan actually stopped.
     let pagination: Pick<EventsQuery, "startLedger" | "cursor"> = fresh
@@ -262,10 +458,22 @@ export class StellarWatcher {
       : { cursor: endOfLedgerCursor(base) };
 
     while (pages < maxPages) {
-      const page = await this.fetch(
-        { ...pagination, contractIds: [router], limit: pageSize },
-        signal,
-      );
+      if (this.isCancelled(signal)) {
+        interruptionReason = "cancelled";
+        break;
+      }
+
+      let page;
+      try {
+        page = await this.fetch({ ...pagination, contractIds: [router], limit: pageSize }, signal);
+      } catch (error) {
+        if (this.isCancelled(signal)) {
+          interruptionReason = "cancelled";
+          break;
+        }
+        throw error;
+      }
+
       pages += 1;
       events.push(...(page.events as readonly RawStellarEvent[]));
       latestLedger = page.latestLedger;
@@ -277,6 +485,7 @@ export class StellarWatcher {
           { chain: chainKey, pages },
           "the rpc returned a page with no cursor, so this pass cannot say what it finished reading",
         );
+        interruptionReason = "missing_cursor";
         break;
       }
 
@@ -289,14 +498,15 @@ export class StellarWatcher {
       pagination = { cursor: page.cursor };
     }
 
-    if (pages >= maxPages && through <= base) {
+    if (pages >= maxPages && through <= base && interruptionReason === null) {
       logger.error(
         { chain: chainKey, ledger: base + 1, pages, pageSize },
         "a single ledger holds more router events than this many pages could drain; raise STELLAR_EVENT_PAGE_SIZE",
       );
+      interruptionReason = "max_pages_reached";
     }
 
-    return { events, through, latestLedger, oldestLedger, pages };
+    return { events, through, latestLedger, oldestLedger, pages, interruptionReason };
   }
 
   private async fetch(query: EventsQuery, signal: AbortSignal) {
@@ -319,19 +529,35 @@ export class StellarWatcher {
     tx: Queryable,
     context: EventContext,
     raw: RawStellarEvent,
-  ): Promise<boolean> {
+    transactionConflicts: EventIdentityConflict[],
+  ): Promise<"decoded" | "skipped" | "conflict"> {
     const event = decodeStellarEvent(raw);
+    const conflict = await inspectEventConflict(tx, context.chainKey, raw, event);
+    if (conflict !== null) {
+      transactionConflicts.push(conflict);
+      this.options.logger.warn(
+        {
+          chain: context.chainKey,
+          identity: conflict.identity,
+          ledger: raw.ledger,
+          txHash: raw.txHash,
+          differingFields: conflict.differingFields,
+        },
+        "conflicting payload detected for canonical event identity; retaining reconciliation evidence",
+      );
+      return "conflict";
+    }
 
     switch (event.kind) {
       case "bridgeOut":
         await recordBridgeOut(tx, context, event.data);
-        return true;
+        return "decoded";
       case "bridgeIn":
         await recordBridgeIn(tx, context, event.data);
-        return true;
+        return "decoded";
       case "claimParked":
         await recordClaimParked(tx, context, event.data);
-        return true;
+        return "decoded";
       case "claimSettled": {
         const matched = await recordClaimSettled(tx, context, event.data);
         if (!matched) {
@@ -342,34 +568,34 @@ export class StellarWatcher {
             "settlement for a claim this indexer never saw parked",
           );
         }
-        return matched;
+        return matched ? "decoded" : "skipped";
       }
       case "actionQueued":
         await recordActionQueued(tx, context, event.data, raw.valueJson);
-        return true;
+        return "decoded";
       case "actionExecuted":
         await recordActionSettled(tx, context, event.data, "executed");
-        return true;
+        return "decoded";
       case "actionCancelled":
         await recordActionSettled(tx, context, event.data, "cancelled");
-        return true;
+        return "decoded";
       case "tokenRegistered":
         await recordTokenRegistered(tx, context, event.data);
-        return true;
+        return "decoded";
       case "pauseSet":
         // A pause is router wide and there is no table for it, so it is recorded as every rail
         // becoming unavailable for the reason the router would give. That is not a cosmetic
         // mapping: a pause is the one operational state somebody needs to see in the same place
         // they look at route health, rather than in a log they have to go and find.
         await recordPauseSet(tx, context, event.data);
-        return true;
+        return "decoded";
       case "routeConfigured":
         // The sample needs a token and this event names none, so it is attributed to the chain
         // itself. A route being on or off is a property of the router, not of one asset.
         await recordRouteConfigured(tx, context, event.data, context.chainKey);
-        return true;
+        return "decoded";
       case "ignored":
-        return false;
+        return "skipped";
       case "unknown":
         if (!this.reportedUnknown.has(event.tag)) {
           this.reportedUnknown.add(event.tag);
@@ -378,7 +604,7 @@ export class StellarWatcher {
             "the router emitted an event tag this build does not know; it is running ahead of the indexer",
           );
         }
-        return false;
+        return "skipped";
       default:
         // Unreachable while the switch covers the union, and the point is that it stops compiling
         // the moment a new event kind is added without a case here. An indexer that silently drops

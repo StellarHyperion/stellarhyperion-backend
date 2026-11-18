@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 
 import { endOfLedgerCursor } from "../../src/chains/stellar/cursor.js";
 import type { RawStellarEvent } from "../../src/chains/stellar/events.js";
+import { planCursorRepair } from "../../src/chains/stellar/store.js";
 import { StellarWatcher } from "../../src/chains/stellar/watcher.js";
 import {
   FakeRpc,
@@ -301,22 +302,24 @@ describe("what the watcher says about itself", () => {
 });
 
 describe("gaps it cannot close", () => {
-  it("reports a gap when the window moved past the cursor mid request", async () => {
+  it("does not claim completion when retention moved past the requested range", async () => {
     // The window really does move between a response and the next request: testnet reported
     // oldestLedger 4872997 and then refused that exact ledger as outside "4873028 - 4993987" on
     // the following call. When the node serves the request anyway, the ledgers between the cursor
     // and the window edge were never read, and saying nothing would leave a hole nobody hears
     // about again.
-    const { watcher, db, lines } = harness({
+    const { watcher, db } = harness({
       startLedger: 4_900_000,
       latestLedger: 4_994_000,
       oldestLedger: 4_980_000,
     });
     db.cursorRow = cursorRow(4_970_000);
 
-    await watcher.tick(AbortSignal.timeout(5_000));
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+      "outside provider retention",
+    );
 
-    expect(lines.some((line) => line.message.includes("retention window"))).toBe(true);
+    expect(cursorWrites(db)).toEqual([]);
   });
 
   it("says a refused range cannot be closed from here rather than retrying it forever", async () => {
@@ -342,5 +345,273 @@ describe("gaps it cannot close", () => {
 
     const warnings = lines.filter((line) => line.message.includes("running ahead of the indexer"));
     expect(warnings).toHaveLength(1);
+  });
+});
+
+describe("scan progress journals (#37)", () => {
+  it("records requested range, committed range, event counts, and null interruption on success", async () => {
+    const { watcher } = harness({
+      events: ROUTER_HISTORY,
+      startLedger: FIRST_EVENT_LEDGER,
+      latestLedger: FIRST_EVENT_LEDGER + 20_000,
+    });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    const journal = watcher.lastJournal;
+    expect(journal).not.toBeNull();
+    expect(journal?.chainKey).toBe(CHAIN);
+    expect(journal?.requestedRange).toEqual({
+      from: FIRST_EVENT_LEDGER,
+      to: FIRST_EVENT_LEDGER + 9_999,
+    });
+    expect(journal?.committedRange).toEqual({
+      from: FIRST_EVENT_LEDGER,
+      to: FIRST_EVENT_LEDGER + 9_999,
+    });
+    const expectedInWindow = ROUTER_HISTORY.filter(
+      (event) => event.ledger <= FIRST_EVENT_LEDGER + 9_999,
+    ).length;
+    expect(journal?.eventCounts.fetched).toBe(expectedInWindow);
+    expect(journal?.eventCounts.decoded).toBeGreaterThan(0);
+    expect(journal?.eventCounts.conflicts).toBe(0);
+    expect(journal?.pages).toBe(1);
+    expect(journal?.interruptionReason).toBeNull();
+  });
+
+  it("records interruptionReason and null committedRange when a transaction rolls back", async () => {
+    const { watcher, db } = harness({
+      events: ROUTER_HISTORY,
+      startLedger: FIRST_EVENT_LEDGER,
+    });
+    db.failInTransaction = new Error("deadlock detected");
+
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow("deadlock detected");
+
+    const journal = watcher.lastJournal;
+    expect(journal?.committedRange).toBeNull();
+    expect(journal?.interruptionReason).toBe("deadlock detected");
+  });
+
+  it("records max_pages_reached when a crowded ledger hits the page ceiling", async () => {
+    const crowded = Array.from({ length: 4 }, (_, index) =>
+      syntheticEvent({
+        ledger: FIRST_EVENT_LEDGER,
+        id: `${toid(FIRST_EVENT_LEDGER, 0, index).toString().padStart(19, "0")}-0000000000`,
+        txHash: `tx-cap-${String(index)}`,
+      }),
+    );
+    const { watcher } = harness({
+      events: crowded,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 1,
+      maxPagesPerTick: 2,
+      latestLedger: FIRST_EVENT_LEDGER,
+    });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    expect(watcher.lastJournal?.interruptionReason).toBe("max_pages_reached");
+    expect(watcher.lastJournal?.pages).toBe(2);
+  });
+});
+
+describe("graceful watcher draining (#38)", () => {
+  it("stops new RPC requests when cancelled before or during scan", async () => {
+    const { watcher, rpc } = harness({ startLedger: FIRST_EVENT_LEDGER });
+    const controller = new AbortController();
+    controller.abort();
+
+    const progressed = await watcher.tick(controller.signal);
+
+    expect(progressed).toBe(false);
+    expect(rpc.requests).toHaveLength(0);
+    expect(watcher.lastJournal?.interruptionReason).toBe("cancelled");
+    expect(watcher.lastJournal?.committedRange).toBeNull();
+  });
+
+  it("waits for an in-flight event transaction to finish committing before drain() resolves", async () => {
+    const { watcher, db, rpc } = harness({
+      events: ROUTER_HISTORY,
+      startLedger: FIRST_EVENT_LEDGER,
+    });
+
+    let releaseTx!: () => void;
+    const txEntered = new Promise<void>((resolve) => {
+      const originalTransaction = db.transaction.bind(db);
+      db.transaction = async (work) => {
+        return originalTransaction(async (tx) => {
+          resolve();
+          await new Promise<void>((done) => {
+            releaseTx = done;
+          });
+          return work(tx);
+        });
+      };
+    });
+
+    const tickPromise = watcher.tick(AbortSignal.timeout(5_000));
+    await txEntered;
+
+    let drainResolved = false;
+    const drainPromise = watcher.drain().then(() => {
+      drainResolved = true;
+    });
+
+    await Promise.resolve();
+    expect(drainResolved).toBe(false);
+    expect(watcher.isDraining).toBe(true);
+
+    releaseTx();
+    await drainPromise;
+    await tickPromise;
+
+    expect(drainResolved).toBe(true);
+    expect(db.commits).toEqual([1]);
+    expect(cursorWrites(db)).toHaveLength(1);
+
+    // Subsequent ticks must not issue new RPC requests once drained.
+    const requestsBefore = rpc.requests.length;
+    expect(await watcher.tick(AbortSignal.timeout(5_000))).toBe(false);
+    expect(rpc.requests.length).toBe(requestsBefore);
+  });
+});
+
+describe("event identity conflict detection (#39)", () => {
+  it("treats identical replays as idempotent and detects distinct payloads for the same canonical identity", async () => {
+    const queued = ROUTER_HISTORY.find((event) => event.topicJson[1]?.symbol === "queued");
+    if (!queued) throw new Error("Missing captured queued event");
+
+    const conflicting: RawStellarEvent = {
+      ...queued,
+      id: `${toid(queued.ledger + 1, 0, 0)
+        .toString()
+        .padStart(19, "0")}-0000000000`,
+      ledger: queued.ledger + 1,
+      txHash: "0xconflictingtxhash",
+    };
+
+    const { watcher, db, lines } = harness({
+      events: [queued, conflicting],
+      startLedger: queued.ledger,
+      latestLedger: queued.ledger + 5,
+    });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    // Only the first payload should have been written; the conflicting one is quarantined.
+    expect(db.matching("INSERT INTO admin_action")).toHaveLength(1);
+    expect(watcher.conflicts).toHaveLength(1);
+    expect(watcher.conflicts[0]?.identity).toMatch(/^actionQueued:/);
+    expect(watcher.conflicts[0]?.differingFields).toContain("txHash");
+    expect(watcher.lastJournal?.eventCounts.conflicts).toBe(1);
+    expect(lines.some((line) => line.message.includes("conflicting payload detected"))).toBe(true);
+  });
+
+  it("allows identical replay of the same event without recording a conflict", async () => {
+    const queued = ROUTER_HISTORY.find((event) => event.topicJson[1]?.symbol === "queued");
+    if (!queued) throw new Error("Missing captured queued event");
+
+    const { watcher, db } = harness({
+      events: [queued],
+      startLedger: queued.ledger,
+      latestLedger: queued.ledger + 5,
+    });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+    // Rewind cursor to re-read the exact same ledger and event.
+    db.cursorRow = cursorRow(queued.ledger - 1);
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    expect(watcher.conflicts).toHaveLength(0);
+  });
+});
+
+describe("read-only cursor repair planner (#40)", () => {
+  it("generates an unsigned advance_cursor proposal from verified journal boundaries without writing to DB", async () => {
+    const { watcher, db } = harness({
+      events: ROUTER_HISTORY,
+      startLedger: FIRST_EVENT_LEDGER,
+      latestLedger: FIRST_EVENT_LEDGER + 20_000,
+    });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+    const queriesBefore = db.queries.length;
+
+    // Simulate a stale cursor row behind the verified journal boundary.
+    const staleLedger = FIRST_EVENT_LEDGER + 100;
+    db.cursorRow = cursorRow(staleLedger);
+
+    const proposal = await watcher.planRepair();
+
+    expect(proposal.unsigned).toBe(true);
+    expect(proposal.readOnly).toBe(true);
+    expect(proposal.action).toBe("advance_cursor");
+    expect(proposal.currentPosition).toBe(String(staleLedger));
+    expect(proposal.proposedPosition).toBe(String(FIRST_EVENT_LEDGER + 9_999));
+    expect(proposal.proposedRpcCursor).toBe(endOfLedgerCursor(FIRST_EVENT_LEDGER + 9_999));
+    expect(proposal.sql).toContain("UPDATE indexer_cursor");
+    // Read durable journals, conflicts and cursor; no repair writes.
+    expect(db.queries.length).toBe(queriesBefore + 3);
+    expect(db.queries[db.queries.length - 1]?.text).toContain("SELECT last_processed");
+  });
+
+  it("proposes backfill_required with gap bounds when cursor fell behind retention with no verified boundary", () => {
+    const proposal = planCursorRepair({
+      chainKey: CHAIN,
+      expectedContract: LIVE_ROUTER,
+      startLedger: 4_900_000,
+      currentCursor: {
+        position: 4_800_000n,
+        contract: LIVE_ROUTER,
+        observedAt: null,
+        hash: null,
+      },
+      retainedHistory: {
+        oldestLedger: 4_950_000,
+        latestLedger: 4_994_000,
+        observedAt: new Date(),
+      },
+      verifiedBoundaries: [],
+      conflicts: [],
+    });
+
+    expect(proposal.unsigned).toBe(true);
+    expect(proposal.readOnly).toBe(true);
+    expect(proposal.action).toBe("backfill_required");
+    expect(proposal.gap).toEqual({ from: 4_800_001, to: 4_949_999 });
+    expect(proposal.sql).toBeNull();
+  });
+
+  it("proposes reset_cursor on contract mismatch and flags conflicts when present", async () => {
+    const queued = ROUTER_HISTORY.find((event) => event.topicJson[1]?.symbol === "queued");
+    if (!queued) throw new Error("Missing captured queued event");
+
+    const conflicting: RawStellarEvent = {
+      ...queued,
+      id: `${toid(queued.ledger + 1, 0, 0)
+        .toString()
+        .padStart(19, "0")}-0000000000`,
+      ledger: queued.ledger + 1,
+      txHash: "0xconflictingtxhash",
+    };
+
+    const { watcher, db } = harness({
+      events: [queued, conflicting],
+      startLedger: queued.ledger,
+      latestLedger: queued.ledger + 5,
+    });
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    db.cursorRow = cursorRow(
+      queued.ledger,
+      "CDIFFERENTROUTERADDRESSTHATSHARESNOHISTORYWITHOURSXXXXXXX",
+    );
+    const proposal = await watcher.planRepair();
+
+    expect(proposal.action).toBe("reset_cursor");
+    expect(proposal.blockedByConflicts).toBe(true);
+    expect(proposal.conflictCount).toBe(1);
+    expect(proposal.sql).toContain("DELETE FROM indexer_cursor");
   });
 });

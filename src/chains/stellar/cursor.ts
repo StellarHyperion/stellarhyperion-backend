@@ -110,3 +110,28 @@ export function parseEventCursor(cursor: string): CursorPosition {
 export function completeThrough(position: CursorPosition): number {
   return position.completesLedger ? position.ledger : position.ledger - 1;
 }
+
+/**
+ * The inclusive upper ledger bound a single `getEvents` scan window can cover.
+ *
+ * Fresh `startLedger` requests scan `SCAN_WINDOW_LEDGERS` ledgers; cursor-resumed requests scan
+ * `SCAN_WINDOW_LEDGERS - 1` due to the RPC's off-by-one range arithmetic. Clamped to
+ * `latestLedger` when the head is closer.
+ */
+export function computeScanWindowEnd(
+  fromLedger: number,
+  fresh: boolean,
+  latestLedger: number,
+): number {
+  const width = fresh ? SCAN_WINDOW_LEDGERS : SCAN_WINDOW_LEDGERS - 1;
+  return Math.max(fromLedger, Math.min(fromLedger + width - 1, latestLedger));
+}
+
+/** Whether `ledger` falls inside the RPC's retained `[oldestLedger, latestLedger]` range. */
+export function isWithinRetentionWindow(
+  ledger: number,
+  oldestLedger: number,
+  latestLedger: number,
+): boolean {
+  return ledger >= oldestLedger && ledger <= latestLedger;
+}
