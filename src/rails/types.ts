@@ -100,6 +100,7 @@ export interface PendingTransfer {
   /** Null until the first check. */
   readonly status: AttestationStatus | null;
   readonly checkFailures: number;
+  readonly retryAttempts: number;
   /** True when an inbound delivery already exists, which settles it without asking the rail. */
   readonly delivered: boolean;
 }
