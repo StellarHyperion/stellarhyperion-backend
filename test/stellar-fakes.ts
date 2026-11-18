@@ -234,6 +234,7 @@ export class RecordingDb implements Transactional {
           last_processed_at: params[4] ?? null,
           last_processed_hash: params[5] ?? null,
           revision: "1",
+          deployment_revision: Number(params[6] ?? 1),
         };
         return Promise.resolve({ rows: [{ revision: "1" }], rowCount: 1 });
       }
@@ -253,6 +254,7 @@ export class RecordingDb implements Transactional {
           last_processed_at: params[4] ?? null,
           last_processed_hash: params[5] ?? null,
           revision: nextRev,
+          deployment_revision: Number(params[7] ?? this.cursorRow?.deployment_revision ?? 1),
         };
         return Promise.resolve({ rows: [{ revision: nextRev }], rowCount: 1 });
       }
@@ -403,7 +405,11 @@ export class RecordingDb implements Transactional {
       };
       return Promise.resolve({ rows: [{ revision: nextRev }], rowCount: 1 });
     }
-    const key = JSON.stringify(params.slice(0, 3));
+    const key = JSON.stringify(
+      typeof params[2] === "string" && !params[2].startsWith("event:")
+        ? [params[0], params[2]]
+        : params.slice(0, 3),
+    );
     if (text.includes("INSERT INTO stellar_event_identity")) {
       if (!this.identities.has(key)) this.identities.set(key, JSON.parse(params[3] as string));
     } else if (text.includes("FROM stellar_event_identity")) {

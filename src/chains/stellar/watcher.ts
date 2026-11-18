@@ -37,11 +37,19 @@ import {
   parseLedgerRangeError,
   validateRangePage,
   SCAN_WINDOW_LEDGERS,
+  type AdaptiveWindowConfig,
+  DEFAULT_ADAPTIVE_WINDOW_CONFIG,
+  nextScanWindowLedgers,
+  validateScanPage,
 } from "./cursor.js";
-import { decodeStellarEvent, type RawStellarEvent } from "./events.js";
+import { decodeStellarEvent, type RawStellarEvent, type StellarEvent } from "./events.js";
 import type { EventSource, EventsQuery, RetainedHistoryWindow } from "./rpc.js";
 import { StellarRpcError, retentionWindowOf } from "./rpc.js";
 import {
+  type ChainCursor,
+  recordDeploymentRevision,
+  recordQuarantinedEvent,
+  boundDecodeError,
   type CursorRepairProposal,
   type EventIdentityConflict,
   type VerifiedLedgerBoundary,
@@ -123,6 +131,8 @@ export interface StellarWatcherOptions {
   readonly db: Transactional;
   readonly logger: Logger;
   readonly maxPagesPerTick?: number;
+  readonly deploymentRevision?: number;
+  readonly adaptiveWindow?: AdaptiveWindowConfig;
   /** Unique worker identity for expiring database lease ownership (#31). */
   readonly ownerId?: string;
   /** Lease TTL in milliseconds (#31). Defaults to 30_000. */
@@ -142,6 +152,9 @@ export interface WatcherProgress {
   readonly ledger: number;
   readonly decoded: number;
   readonly skipped: number;
+  readonly quarantined: number;
+  readonly revision: number;
+  readonly windowLedgers: number;
   /** How far behind the chain's head this watcher is, in ledgers. */
   readonly behind: number;
   readonly at: Date;
@@ -149,6 +162,8 @@ export interface WatcherProgress {
 
 export class StellarWatcher {
   private lastProgress: WatcherProgress | null = null;
+  private scanWindowLedgers: number;
+  private readonly reportedReplacements = new Set<string>();
   private readonly progressJournals: ScanProgressJournal[] = [];
   private readonly recordedConflicts: EventIdentityConflict[] = [];
   private readonly drainController = new AbortController();
@@ -163,8 +178,32 @@ export class StellarWatcher {
   private readonly reportedUnknown = new Set<string>();
 
   constructor(private readonly options: StellarWatcherOptions) {
+    const config = options.adaptiveWindow ?? DEFAULT_ADAPTIVE_WINDOW_CONFIG;
+    if (
+      !Number.isSafeInteger(config.minLedgers) ||
+      !Number.isSafeInteger(config.maxLedgers) ||
+      config.minLedgers < 1 ||
+      config.maxLedgers < config.minLedgers ||
+      config.maxLedgers > SCAN_WINDOW_LEDGERS ||
+      !Number.isFinite(config.targetDurationMs) ||
+      config.targetDurationMs <= 0 ||
+      !Number.isFinite(config.fastDurationMs) ||
+      config.fastDurationMs < 0 ||
+      config.fastDurationMs > config.targetDurationMs
+    )
+      throw new Error("invalid adaptive scan-window configuration");
+    if (
+      options.deploymentRevision !== undefined &&
+      (!Number.isSafeInteger(options.deploymentRevision) || options.deploymentRevision < 1)
+    )
+      throw new Error("invalid deployment revision");
+    this.scanWindowLedgers = config.maxLedgers;
     this.ownerId = options.ownerId ?? randomUUID();
     this.leaseTtlMs = options.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS;
+  }
+
+  get windowLedgers(): number {
+    return this.scanWindowLedgers;
   }
 
   get name(): string {
@@ -375,24 +414,15 @@ export class StellarWatcher {
     });
     try {
       const stored = await readCursor(db, chainKey);
-      if (stored !== null && stored.contract !== router) {
-        // A different router at a different address shares no history with this cursor. Carrying it
-        // over would skip everything the new deployment has ever done, and it would do it silently,
-        // which is the worst available outcome. Stopping is the only honest move.
-        throw new Error(
-          `the cursor for ${chainKey} was written for router ${stored.contract} and this process is watching ${router}. ` +
-            "A redeployed router needs its cursor reset rather than reused.",
-        );
-      }
-
-      const base = stored === null ? this.options.startLedger - 1 : Number(stored.position);
+      const deployment = this.resolveDeployment(stored);
+      const { base, fresh, revision, previous } = deployment;
       const expectedRevision = stored === null ? null : stored.revision;
       requestedFrom = base + 1;
-      const scan = await this.scan(base, stored === null, signal);
+      const scan = await this.scan(base, fresh, signal);
       interruptionReason = scan.interruptionReason;
       pages = scan.pages;
       fetched = scan.events.length;
-      requestedTo = computeScanWindowEnd(requestedFrom, stored === null, scan.latestLedger);
+      requestedTo = computeScanWindowEnd(requestedFrom, fresh, scan.latestLedger);
       this.lastRetainedHistory = retentionWindowOf(scan);
 
       const hasRetentionGap = scan.oldestLedger > base + 1;
@@ -422,13 +452,17 @@ export class StellarWatcher {
           ledger: base,
           decoded: 0,
           skipped: 0,
+          quarantined: 0,
+          revision,
+          windowLedgers: this.scanWindowLedgers,
           behind: Math.max(scan.latestLedger - base, 0),
           at: new Date(),
         };
         return false;
       }
 
-      let closedAt = stored?.observedAt ?? null;
+      let closedAt = fresh ? null : (stored?.observedAt ?? null);
+      let quarantined = 0;
 
       // One transaction for the page and the cursor. This is the restart guarantee, and splitting it
       // would turn every crash into either a lost page or a duplicated one.
@@ -440,7 +474,17 @@ export class StellarWatcher {
           ttlMs: this.leaseTtlMs,
         });
 
-        const applied = await this.applyEvents(tx, chainKey, scan.events, scan.through);
+        if (fresh)
+          await recordDeploymentRevision(tx, {
+            chainKey,
+            contract: router,
+            deploymentRevision: revision,
+            startLedger: BigInt(this.options.startLedger),
+            previousContract: previous?.contract ?? null,
+            previousCursor: previous?.cursor ?? null,
+          });
+        const applied = await this.applyEvents(tx, chainKey, scan.events, scan.through, revision);
+        quarantined = applied.quarantined;
         decoded = applied.decoded;
         skipped = applied.skipped;
         conflicts = applied.conflicts;
@@ -471,6 +515,9 @@ export class StellarWatcher {
           // Nothing to record: a closed ledger cannot be replaced by a different one.
           hash: null,
           expectedRevision,
+          deploymentRevision: revision,
+          expectedContract: stored?.contract ?? router,
+          expectedDeploymentRevision: stored?.deploymentRevision ?? revision,
         });
         committedRange =
           scan.through >= Math.max(base + 1, scan.oldestLedger)
@@ -496,7 +543,16 @@ export class StellarWatcher {
       );
       this.openGapCount = await countUnreconciledGaps(db, chainKey, router);
       const behind = Math.max(scan.latestLedger - scan.through, 0);
-      this.lastProgress = { ledger: scan.through, decoded, skipped, behind, at: new Date() };
+      this.lastProgress = {
+        ledger: scan.through,
+        decoded,
+        skipped,
+        quarantined,
+        revision,
+        windowLedgers: this.scanWindowLedgers,
+        behind,
+        at: new Date(),
+      };
       logger.info(
         { chain: chainKey, ledger: scan.through, decoded, skipped, behind, pages: scan.pages },
         "stellar window indexed",
@@ -520,6 +576,70 @@ export class StellarWatcher {
         await this.release().catch(() => undefined);
       }
     }
+  }
+
+  private resolveDeployment(stored: ChainCursor | null): {
+    readonly base: number;
+    readonly fresh: boolean;
+    readonly revision: number;
+    readonly previous: { readonly contract: string; readonly cursor: bigint } | null;
+  } {
+    const { chainKey, router, startLedger, deploymentRevision, logger } = this.options;
+    if (stored === null) {
+      return {
+        base: startLedger - 1,
+        fresh: true,
+        revision: deploymentRevision ?? 1,
+        previous: null,
+      };
+    }
+
+    if (stored.contract !== router) {
+      const nextRevision = Math.max(stored.deploymentRevision + 1, deploymentRevision ?? 1);
+      const transitionKey = `${stored.contract}->${router}:${String(nextRevision)}`;
+      if (!this.reportedReplacements.has(transitionKey)) {
+        this.reportedReplacements.add(transitionKey);
+        logger.warn(
+          {
+            chain: chainKey,
+            previousRouter: stored.contract,
+            router,
+            previousRevision: stored.deploymentRevision,
+            deploymentRevision: nextRevision,
+            startLedger,
+          },
+          "router contract changed; starting new watched deployment revision without reusing previous cursor",
+        );
+      }
+      return {
+        base: startLedger - 1,
+        fresh: true,
+        revision: nextRevision,
+        previous: { contract: stored.contract, cursor: stored.position },
+      };
+    }
+
+    if (deploymentRevision !== undefined && deploymentRevision < stored.deploymentRevision) {
+      throw new Error(
+        `configured deployment revision ${String(deploymentRevision)} for ${chainKey} is older than stored revision ${String(stored.deploymentRevision)}`,
+      );
+    }
+
+    if (deploymentRevision !== undefined && deploymentRevision > stored.deploymentRevision) {
+      return {
+        base: startLedger - 1,
+        fresh: true,
+        revision: deploymentRevision,
+        previous: { contract: stored.contract, cursor: stored.position },
+      };
+    }
+
+    return {
+      base: Number(stored.position),
+      fresh: false,
+      revision: stored.deploymentRevision,
+      previous: null,
+    };
   }
 
   /**
@@ -737,6 +857,10 @@ export class StellarWatcher {
     const { router, pageSize, logger, chainKey } = this.options;
     const maxPages = this.options.maxPagesPerTick ?? MAX_PAGES_PER_TICK;
 
+    const windowConfig = this.options.adaptiveWindow ?? DEFAULT_ADAPTIVE_WINDOW_CONFIG;
+    const requestedWindow = this.scanWindowLedgers;
+    const endLedger =
+      requestedWindow < SCAN_WINDOW_LEDGERS ? base + 1 + requestedWindow : undefined;
     const events: RawStellarEvent[] = [];
     let through = base;
     let latestLedger = 0;
@@ -749,10 +873,31 @@ export class StellarWatcher {
       : { cursor: endOfLedgerCursor(base) };
 
     while (pages < maxPages && !signal.aborted && !this.draining) {
-      const page = await this.fetch(
-        { ...pagination, contractIds: [router], limit: pageSize },
-        base,
-        signal,
+      const query: EventsQuery = {
+        ...pagination,
+        ...(endLedger === undefined ? {} : { endLedger }),
+        contractIds: [router],
+        limit: pageSize,
+      };
+      const startedAt = performance.now();
+      const page = await this.fetch(query, base, signal);
+      const validated = validateScanPage({
+        events: page.events,
+        cursor: page.cursor,
+        latestLedger: page.latestLedger,
+        oldestLedger: page.oldestLedger,
+        requestCursor: pagination.cursor,
+        requestStartLedger: pagination.startLedger,
+        requestEndLedger: endLedger,
+      });
+      this.scanWindowLedgers = nextScanWindowLedgers(
+        {
+          currentLedgers: requestedWindow,
+          eventCount: page.events.length,
+          pageLimit: pageSize,
+          elapsedMs: performance.now() - startedAt,
+        },
+        windowConfig,
       );
       pages += 1;
       events.push(...(page.events as readonly RawStellarEvent[]));
@@ -768,7 +913,7 @@ export class StellarWatcher {
         break;
       }
 
-      const candidate = completeThrough(parseEventCursor(page.cursor));
+      const candidate = validated.through ?? through;
       if (candidate > through) {
         through = candidate;
         break;
@@ -864,17 +1009,27 @@ export class StellarWatcher {
     chainKey: string,
     events: readonly RawStellarEvent[],
     maxLedger: number,
+    deploymentRevision?: number,
   ): Promise<{
     readonly decoded: number;
     readonly skipped: number;
     readonly conflicts: number;
+    readonly quarantined: number;
     readonly closedAt: Date | null;
   }> {
     let decoded = 0;
     let skipped = 0;
     let conflicts = 0;
+    let quarantined = 0;
+    const revision =
+      deploymentRevision ??
+      (await readCursor(tx, chainKey))?.deploymentRevision ??
+      this.options.deploymentRevision ??
+      1;
     let closedAt: Date | null = null;
     for (const raw of events) {
+      if (raw.contractId !== this.options.router)
+        throw new Error("provider returned an event from an unrequested router");
       if (raw.ledger <= maxLedger) {
         closedAt = new Date(raw.ledgerClosedAt);
       }
@@ -891,16 +1046,60 @@ export class StellarWatcher {
         txHash: raw.txHash,
         closedAt: new Date(raw.ledgerClosedAt),
       };
-      const event = decodeStellarEvent(raw);
+      let event: StellarEvent;
+      try {
+        event = decodeStellarEvent(raw);
+      } catch (error) {
+        const decodeError = boundDecodeError(error instanceof Error ? error.name : "decode failed");
+        this.options.logger.warn(
+          { chain: chainKey, eventId: raw.id, ledger: raw.ledger, err: decodeError },
+          "quarantining stellar event that failed to decode",
+        );
+        await recordQuarantinedEvent(tx, {
+          chainKey,
+          contract: this.options.router,
+          deploymentRevision: revision,
+          raw,
+          reason: "decode_error",
+          tag: null,
+          decodeError,
+        });
+        quarantined += 1;
+        skipped += 1;
+        continue;
+      }
+      if (event.kind === "unknown") {
+        await recordQuarantinedEvent(tx, {
+          chainKey,
+          contract: this.options.router,
+          deploymentRevision: revision,
+          raw,
+          reason: "unknown_tag",
+          tag: event.tag.slice(0, 128),
+          decodeError: null,
+        });
+        // Do not freeze a decoded identity before a decoder exists. A later replay may classify
+        // the same source event, while successful row writes still require durable conflict checks.
+        quarantined += 1;
+        await this.apply(tx, context, raw, event);
+        skipped += 1;
+        continue;
+      }
       const conflict = await inspectEventConflict(tx, chainKey, raw, event);
       if (conflict !== null) {
         conflicts += 1;
         continue;
       }
-      if (await this.apply(tx, context, raw)) decoded += 1;
-      else skipped += 1;
+      if (await this.apply(tx, context, raw, event)) {
+        decoded += 1;
+        await tx.query(
+          `UPDATE stellar_event_quarantine SET replayed_at = clock_timestamp()
+          WHERE chain_key = $1 AND contract = $2 AND event_id = $3 AND replayed_at IS NULL`,
+          [chainKey, this.options.router, raw.id],
+        );
+      } else skipped += 1;
     }
-    return { decoded, skipped, conflicts, closedAt };
+    return { decoded, skipped, conflicts, quarantined, closedAt };
   }
 
   private async fetch(query: EventsQuery, base: number, signal: AbortSignal) {
@@ -938,9 +1137,8 @@ export class StellarWatcher {
     tx: Queryable,
     context: EventContext,
     raw: RawStellarEvent,
+    event: StellarEvent,
   ): Promise<boolean> {
-    const event = decodeStellarEvent(raw);
-
     switch (event.kind) {
       case "bridgeOut":
         await recordBridgeOut(tx, context, event.data);
@@ -990,10 +1188,13 @@ export class StellarWatcher {
       case "ignored":
         return false;
       case "unknown":
-        if (!this.reportedUnknown.has(event.tag)) {
+        if (!this.reportedUnknown.has(event.tag) && this.reportedUnknown.size < 100) {
           this.reportedUnknown.add(event.tag);
           this.options.logger.warn(
-            { chain: context.chainKey, tag: event.tag },
+            {
+              chain: context.chainKey,
+              tag: event.tag.replace(/[^a-zA-Z0-9_.-]/g, "?").slice(0, 128),
+            },
             "the router emitted an event tag this build does not know; it is running ahead of the indexer",
           );
         }

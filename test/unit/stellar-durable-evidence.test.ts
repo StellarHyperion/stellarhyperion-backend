@@ -4,7 +4,14 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Queryable, Transactional } from "../../src/db/pool.js";
 import { decodeStellarEvent } from "../../src/chains/stellar/events.js";
 import { endOfLedgerCursor } from "../../src/chains/stellar/cursor.js";
-import { inspectEventConflict, planCursorRepair } from "../../src/chains/stellar/store.js";
+import {
+  inspectEventConflict,
+  planCursorRepair,
+  readCursor,
+  writeCursor,
+  StaleCursorError,
+  recordQuarantinedEvent,
+} from "../../src/chains/stellar/store.js";
 import { StellarWatcher } from "../../src/chains/stellar/watcher.js";
 import { FakeRpc, LIVE_ROUTER, ROUTER_HISTORY, capturingLogger } from "../stellar-fakes.js";
 
@@ -39,8 +46,9 @@ beforeAll(async () => {
   for (const file of [
     "1790900000000_initial-schema.sql",
     "1791000000000_cursor-block-hash.sql",
-    "1791400000000_stellar-cursor-cas-leases-gaps.sql",
     "1791300000000_stellar-durable-scan-evidence.sql",
+    "1791400000000_stellar-cursor-cas-leases-gaps.sql",
+    "1791500000000_stellar-revisions-and-quarantine.sql",
   ]) {
     await pg.exec(
       readFileSync(new URL(`../../migrations/${file}`, import.meta.url), "utf8").split(
@@ -144,5 +152,117 @@ describe("durable Stellar evidence", () => {
     });
     expect(proposal.action).toBe("backfill_required");
     expect(proposal.sql).toBeNull();
+  });
+});
+
+describe("deployment and quarantine SQL safety", () => {
+  it("guards replacement cursors against an earlier replica and keeps old deployment evidence", async () => {
+    const base = {
+      chainKey: "replacement-cas",
+      family: "stellar" as const,
+      contract: LIVE_ROUTER,
+      position: 500n,
+      observedAt: null,
+      hash: null,
+      deploymentRevision: 1,
+    };
+    await writeCursor(db, { ...base, expectedRevision: null });
+    const original = (await readCursor(db, base.chainKey))!;
+    await writeCursor(db, {
+      ...base,
+      contract: "replacement-router",
+      position: 100n,
+      deploymentRevision: 2,
+      expectedDeploymentRevision: 1,
+      expectedContract: LIVE_ROUTER,
+      expectedRevision: original.revision,
+    });
+    await expect(
+      writeCursor(db, { ...base, position: 600n, expectedRevision: original.revision }),
+    ).rejects.toThrow(StaleCursorError);
+    const current = (await readCursor(db, base.chainKey))!;
+    expect(current.contract).toBe("replacement-router");
+    expect(current.position).toBe(100n);
+    expect(current.deploymentRevision).toBe(2);
+  });
+  it("retains conflicting natural keys across router replacements without overwriting original evidence", async () => {
+    const raw = ROUTER_HISTORY.find((event) => event.topicJson[1]?.symbol === "queued")!;
+    const decoded = decodeStellarEvent(raw);
+    expect(
+      await db.transaction((tx) => inspectEventConflict(tx, "shared-deployment", raw, decoded)),
+    ).toBeNull();
+    const incoming = { ...raw, contractId: "replacement-router", txHash: "new-source" };
+    const conflict = await db.transaction((tx) =>
+      inspectEventConflict(tx, "shared-deployment", incoming, decoded),
+    );
+    expect(conflict?.differingFields).toContain("contractId");
+    expect(conflict?.existing.contractId).toBe(LIVE_ROUTER);
+    const stored = await db.query(
+      "SELECT evidence FROM stellar_event_identity WHERE chain_key = $1 AND identity LIKE 'actionQueued:%'",
+      ["shared-deployment"],
+    );
+    expect(stored.rows).toHaveLength(1);
+  });
+  it("bounds and redacts quarantine metadata, preserves distinct revisions", async () => {
+    const raw = { ...ROUTER_HISTORY[0]!, authorization: "do-not-store-this-secret" };
+    for (const deploymentRevision of [1, 2])
+      await recordQuarantinedEvent(db, {
+        chainKey: "quarantine-history",
+        contract: LIVE_ROUTER,
+        deploymentRevision,
+        raw,
+        reason: "decode_error",
+        tag: null,
+        decodeError: "ScValError: do-not-store-this-secret",
+      });
+    const stored = await db.query(
+      "SELECT raw_event, decode_error FROM stellar_event_quarantine WHERE chain_key = $1",
+      ["quarantine-history"],
+    );
+    expect(stored.rows).toHaveLength(2);
+    expect(JSON.stringify(stored.rows)).not.toContain("do-not-store-this-secret");
+  });
+});
+
+describe("offline decoder replay", () => {
+  it("applies a newly decodable quarantined event idempotently and records successful replay", async () => {
+    const raw = ROUTER_HISTORY.find((event) => event.topicJson[1]?.symbol === "queued")!;
+    const chainKey = "new-decoder-replay";
+    await recordQuarantinedEvent(db, {
+      chainKey,
+      contract: LIVE_ROUTER,
+      deploymentRevision: 1,
+      raw,
+      reason: "unknown_tag",
+      tag: "queued",
+      decodeError: null,
+    });
+    const options = {
+      chainKey,
+      router: LIVE_ROUTER,
+      startLedger: raw.ledger,
+      pageSize: 200,
+      rpc: new FakeRpc({ events: [raw], latestLedger: raw.ledger + 1 }),
+      db,
+      logger: capturingLogger().logger,
+      releaseLeaseOnTick: true,
+    };
+    await new StellarWatcher(options).tick(AbortSignal.timeout(5_000));
+    const first = await db.query("SELECT action_id, payload FROM admin_action WHERE chain = $1", [
+      chainKey,
+    ]);
+    expect(first.rows).toHaveLength(1);
+    await db.query("DELETE FROM indexer_cursor WHERE chain_key = $1", [chainKey]);
+    await new StellarWatcher(options).tick(AbortSignal.timeout(5_000));
+    const replayed = await db.query(
+      "SELECT action_id, payload FROM admin_action WHERE chain = $1",
+      [chainKey],
+    );
+    expect(replayed.rows).toEqual(first.rows);
+    const stored = await db.query(
+      "SELECT replayed_at FROM stellar_event_quarantine WHERE chain_key = $1",
+      [chainKey],
+    );
+    expect(stored.rows[0]?.replayed_at).not.toBeNull();
   });
 });

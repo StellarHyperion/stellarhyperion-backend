@@ -60,6 +60,7 @@ export interface ChainCursor {
   readonly hash: string | null;
   /** Monotonic revision for compare-and-swap cursor updates. */
   readonly revision: bigint;
+  readonly deploymentRevision: number;
 }
 
 export class StaleCursorError extends Error {
@@ -76,7 +77,7 @@ export class StaleCursorError extends Error {
 
 export async function readCursor(db: Queryable, chainKey: string): Promise<ChainCursor | null> {
   const { rows } = await db.query(
-    `SELECT last_processed, contract, last_processed_at, last_processed_hash, revision
+    `SELECT last_processed, contract, last_processed_at, last_processed_hash, revision, deployment_revision
        FROM indexer_cursor WHERE chain_key = $1`,
     [chainKey],
   );
@@ -89,6 +90,7 @@ export async function readCursor(db: Queryable, chainKey: string): Promise<Chain
     observedAt: timestampOrNull(row, "last_processed_at"),
     hash: textOrNull(row, "last_processed_hash"),
     revision,
+    deploymentRevision: Number(row.deployment_revision ?? 1),
   };
 }
 
@@ -113,6 +115,9 @@ export async function writeCursor(
     readonly observedAt: Date | null;
     readonly hash: string | null;
     readonly expectedRevision?: bigint | null;
+    readonly deploymentRevision?: number;
+    readonly expectedContract?: string;
+    readonly expectedDeploymentRevision?: number;
   },
 ): Promise<void> {
   const baseParams = [
@@ -127,8 +132,8 @@ export async function writeCursor(
   if (entry.expectedRevision === undefined) {
     await db.query(
       `INSERT INTO indexer_cursor
-         (chain_key, family, contract, last_processed, last_processed_at, last_processed_hash, revision)
-       VALUES ($1, $2, $3, $4, $5, $6, 1)
+         (chain_key, family, contract, last_processed, last_processed_at, last_processed_hash, revision, deployment_revision)
+       VALUES ($1, $2, $3, $4, $5, $6, 1, $7)
        ON CONFLICT (chain_key) DO UPDATE
          SET contract = EXCLUDED.contract,
              family = EXCLUDED.family,
@@ -136,8 +141,9 @@ export async function writeCursor(
              last_processed_at = EXCLUDED.last_processed_at,
              last_processed_hash = EXCLUDED.last_processed_hash,
              revision = indexer_cursor.revision + 1,
+             deployment_revision = EXCLUDED.deployment_revision,
              updated_at = now()`,
-      baseParams,
+      [...baseParams, entry.deploymentRevision ?? 1],
     );
     return;
   }
@@ -145,11 +151,11 @@ export async function writeCursor(
   if (entry.expectedRevision === null) {
     const result = await db.query(
       `INSERT INTO indexer_cursor
-         (chain_key, family, contract, last_processed, last_processed_at, last_processed_hash, revision)
-       VALUES ($1, $2, $3, $4, $5, $6, 1)
+         (chain_key, family, contract, last_processed, last_processed_at, last_processed_hash, revision, deployment_revision)
+       VALUES ($1, $2, $3, $4, $5, $6, 1, $7)
        ON CONFLICT (chain_key) DO NOTHING
        RETURNING revision`,
-      baseParams,
+      [...baseParams, entry.deploymentRevision ?? 1],
     );
     if (result.rowCount === 0) {
       throw new StaleCursorError(entry.chainKey, null);
@@ -161,15 +167,133 @@ export async function writeCursor(
     `UPDATE indexer_cursor
        SET family = $2, contract = $3, last_processed = $4,
            last_processed_at = $5, last_processed_hash = $6,
-           revision = revision + 1, updated_at = now()
-     WHERE chain_key = $1 AND revision = $7 AND contract = $3
-       AND last_processed <= $4
+           revision = revision + 1, deployment_revision = $8, updated_at = now()
+     WHERE chain_key = $1 AND revision = $7 AND contract = $9
+       AND deployment_revision = $10
+       AND (($8 = deployment_revision AND contract = $3 AND last_processed <= $4)
+            OR $8 > deployment_revision)
      RETURNING revision`,
-    [...baseParams, entry.expectedRevision.toString()],
+    [
+      ...baseParams,
+      entry.expectedRevision.toString(),
+      entry.deploymentRevision ?? 1,
+      entry.expectedContract ?? entry.contract,
+      entry.expectedDeploymentRevision ?? entry.deploymentRevision ?? 1,
+    ],
   );
   if (result.rowCount === 0) {
     throw new StaleCursorError(entry.chainKey, entry.expectedRevision);
   }
+}
+
+const MAX_QUARANTINE_RAW_BYTES = 16_384;
+
+/** Record a watched Stellar deployment revision transition for auditability. */
+export async function recordDeploymentRevision(
+  db: Queryable,
+  entry: {
+    readonly chainKey: string;
+    readonly deploymentRevision: number;
+    readonly contract: string;
+    readonly startLedger: bigint;
+    readonly previousContract: string | null;
+    readonly previousCursor: bigint | null;
+  },
+): Promise<void> {
+  await db.query(
+    `INSERT INTO stellar_deployment_revision
+       (chain_key, deployment_revision, contract, start_ledger, previous_contract, previous_cursor)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (chain_key, deployment_revision) DO NOTHING`,
+    [
+      entry.chainKey,
+      entry.deploymentRevision,
+      entry.contract,
+      entry.startLedger.toString(),
+      entry.previousContract,
+      entry.previousCursor === null ? null : entry.previousCursor.toString(),
+    ],
+  );
+}
+
+function boundRawEventJson(raw: RawStellarEvent): string {
+  const serialized = JSON.stringify(raw, (_key, value: unknown) => {
+    if (/secret|password|authorization|credential|private.?key|access.?token/i.test(_key))
+      return "[redacted]";
+    return typeof value === "bigint" ? value.toString() : value;
+  });
+  if (Buffer.byteLength(serialized, "utf8") <= MAX_QUARANTINE_RAW_BYTES) return serialized;
+  // Oversized payloads must be fetched again from their source position; a partial preview
+  // cannot be replayed and can expose arbitrary attacker-controlled data.
+  return JSON.stringify({
+    truncated: true,
+    byteLength: Buffer.byteLength(serialized, "utf8"),
+    id: raw.id,
+    type: raw.type,
+    ledger: raw.ledger,
+    ledgerClosedAt: raw.ledgerClosedAt,
+    contractId: raw.contractId,
+    txHash: raw.txHash,
+    transactionIndex: raw.transactionIndex,
+    operationIndex: raw.operationIndex,
+  });
+}
+export function boundDecodeError(error: string | null): string | null {
+  if (error === null) return null;
+  // Decoder errors may embed raw ScVal content. Keep a diagnostic category only.
+  return (
+    error
+      .split(":", 1)[0]
+      ?.replace(/[^a-zA-Z0-9 _.-]/g, "?")
+      .slice(0, 128) ?? "decode failed"
+  );
+}
+
+/**
+ * Persist an unknown or undecodable raw Soroban event with its exact source position so offline
+ * decoder replay can reprocess it without losing ledger position.
+ */
+export async function recordQuarantinedEvent(
+  db: Queryable,
+  entry: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly deploymentRevision: number;
+    readonly raw: RawStellarEvent;
+    readonly reason: "unknown_tag" | "decode_error";
+    readonly tag: string | null;
+    readonly decodeError: string | null;
+  },
+): Promise<void> {
+  await db.query(
+    `INSERT INTO stellar_event_quarantine
+       (chain_key, contract, deployment_revision, event_id, ledger, tx_hash, tx_index, op_index,
+        ledger_closed_at, reason, tag, decode_error, raw_event)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb)
+     ON CONFLICT (chain_key, contract, deployment_revision, event_id) DO UPDATE
+       SET contract = EXCLUDED.contract,
+           deployment_revision = EXCLUDED.deployment_revision,
+           reason = EXCLUDED.reason,
+           tag = EXCLUDED.tag,
+           decode_error = EXCLUDED.decode_error,
+           raw_event = EXCLUDED.raw_event,
+           updated_at = now()`,
+    [
+      entry.chainKey,
+      entry.contract,
+      entry.deploymentRevision,
+      entry.raw.id,
+      String(entry.raw.ledger),
+      entry.raw.txHash,
+      entry.raw.transactionIndex,
+      entry.raw.operationIndex,
+      new Date(entry.raw.ledgerClosedAt),
+      entry.reason,
+      entry.tag,
+      boundDecodeError(entry.decodeError),
+      boundRawEventJson(entry.raw),
+    ],
+  );
 }
 
 // --------------------------------------------------------------------------------------------
@@ -859,7 +983,7 @@ export async function inspectEventConflict(
     );
     const { rows } = await db.query(
       `SELECT evidence FROM stellar_event_identity
-      WHERE chain_key = $1 AND contract = $2 AND identity = $3 FOR UPDATE`,
+      WHERE chain_key = $1 AND identity = $3 AND (contract = $2 OR identity NOT LIKE 'event:%') FOR UPDATE`,
       [chainKey, raw.contractId, identity],
     );
     const existing = rows[0]?.evidence as EventEvidenceSnapshot | undefined;
@@ -1000,8 +1124,14 @@ export function planCursorRepair(input: CursorRepairPlanInput): CursorRepairProp
       blockedByConflicts,
       conflictCount: conflicts.length,
       gap: null,
-      sql: "DELETE FROM indexer_cursor WHERE chain_key = $1 AND contract = $2 AND last_processed = $3",
-      params: [chainKey, currentCursor.contract, currentCursor.position.toString()],
+      sql: "DELETE FROM indexer_cursor WHERE chain_key = $1 AND contract = $2 AND last_processed = $3 AND revision = $4 AND deployment_revision = $5",
+      params: [
+        chainKey,
+        currentCursor.contract,
+        currentCursor.position.toString(),
+        currentCursor.revision.toString(),
+        currentCursor.deploymentRevision,
+      ],
       rationale: `stored cursor belongs to contract ${currentCursor.contract}, not expected router ${expectedContract}`,
       warnings,
       evidence: baseEvidence,
@@ -1084,13 +1214,15 @@ ON CONFLICT (chain_key) DO NOTHING`,
         conflictCount: conflicts.length,
         gap: null,
         sql: `UPDATE indexer_cursor
-   SET last_processed = $1, updated_at = now()
- WHERE chain_key = $2 AND contract = $3 AND last_processed = $4`,
+   SET last_processed = $1, revision = revision + 1, updated_at = now()
+ WHERE chain_key = $2 AND contract = $3 AND last_processed = $4 AND revision = $5 AND deployment_revision = $6`,
         params: [
           String(highestVerified),
           chainKey,
           expectedContract,
           currentCursor.position.toString(),
+          currentCursor.revision.toString(),
+          currentCursor.deploymentRevision,
         ],
         rationale: `cursor ${currentCursor.position.toString()} exceeds latest retained ledger ${String(retainedHistory.latestLedger)}; rewind to verified boundary ${String(highestVerified)}`,
         warnings,
@@ -1134,13 +1266,15 @@ ON CONFLICT (chain_key) DO NOTHING`,
         conflictCount: conflicts.length,
         gap: null,
         sql: `UPDATE indexer_cursor
-   SET last_processed = $1, updated_at = now()
- WHERE chain_key = $2 AND contract = $3 AND last_processed = $4`,
+   SET last_processed = $1, revision = revision + 1, updated_at = now()
+ WHERE chain_key = $2 AND contract = $3 AND last_processed = $4 AND revision = $5 AND deployment_revision = $6`,
         params: [
           String(highestVerified),
           chainKey,
           expectedContract,
           currentCursor.position.toString(),
+          currentCursor.revision.toString(),
+          currentCursor.deploymentRevision,
         ],
         rationale: `cursor ${currentCursor.position.toString()} fell behind retention (${String(retainedHistory.oldestLedger)}), but verified boundary ${String(highestVerified)} bridges the gap`,
         warnings,
@@ -1182,13 +1316,15 @@ ON CONFLICT (chain_key) DO NOTHING`,
       conflictCount: conflicts.length,
       gap: null,
       sql: `UPDATE indexer_cursor
-   SET last_processed = $1, updated_at = now()
- WHERE chain_key = $2 AND contract = $3 AND last_processed = $4`,
+   SET last_processed = $1, revision = revision + 1, updated_at = now()
+ WHERE chain_key = $2 AND contract = $3 AND last_processed = $4 AND revision = $5 AND deployment_revision = $6`,
       params: [
         String(highestVerified),
         chainKey,
         expectedContract,
         currentCursor.position.toString(),
+        currentCursor.revision.toString(),
+        currentCursor.deploymentRevision,
       ],
       rationale: `verified completed ledger boundary ${String(highestVerified)} is ahead of stored cursor ${currentCursor.position.toString()}`,
       warnings,
