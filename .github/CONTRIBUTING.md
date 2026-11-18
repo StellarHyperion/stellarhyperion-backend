@@ -3,6 +3,43 @@
 Hyperion backend indexes cross-chain transfers between Stellar and EVM chains, polls rail
 attestation APIs, runs on-chain keeper upkeep jobs, and exposes transfer queries via REST.
 
+## Issue assignment requirement
+
+Request assignment from a maintainer before opening a pull request. Reference the issue in
+the PR title or description, preferably with `Closes #42`. You must be a current assignee
+on every referenced issue in the StellarHyperion organization. Local issue numbers,
+`StellarHyperion/repository#42`, full GitHub issue URLs, and GitHub's linked closing issues
+are supported. References inside HTML comments and fenced examples do not count.
+References to other pull requests or issues outside StellarHyperion do not grant eligibility.
+
+The `PR assignment enforcement` action closes unauthorized PRs and PRs without a referenced
+issue. It sweeps all open PRs every five minutes and runs when an issue is assigned or
+unassigned. GitHub may delay scheduled runs. Reopened and edited PRs are included in the
+next sweep. Closing a PR leaves its issue open and never merges its changes. Ask for
+assignment before reopening a rejected PR.
+
+Organization owners and members, repository collaborators, users with admin, maintain,
+write, or triage permission, and users named in the default branch's CODEOWNERS are exempt.
+Team code owners qualify through organization membership. Public read access and previous
+contributions alone do not grant an exemption.
+
+Trusted helper bots are Dependabot, Renovate, GitHub Actions, GitHub Copilot, and CodeRabbit.
+Maintainers can add other exact bot or service account logins to the comma-separated
+repository Actions variable `PR_ASSIGNMENT_HELPER_BOTS`. An unknown bot still needs issue
+assignment unless it qualifies through a repository role or code ownership.
+
+The action uses GitHub's built-in token and only executes the policy on the default branch.
+It never checks out a PR branch. API verification errors preserve affected PRs and fail the
+workflow for maintainer review. No personal access token is needed in Actions. The action
+records its decisions in the run log and summary. Use its manual `dry_run` input to inspect
+decisions without closing PRs.
+
+Policy regression tests also run in the required contribution security job. Run them locally:
+
+```bash
+python3 -B .github/scripts/test_enforce_pr_assignments.py
+```
+
 ## Prerequisites
 
 - Node.js >= 20.11
