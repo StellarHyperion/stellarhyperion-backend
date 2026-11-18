@@ -64,7 +64,9 @@ One process serializes its Stellar submissions to avoid sequence conflicts. Run 
 ## API and checks
 
 - `GET /health`, `GET /ready`
-- `GET /v1/transfers`, with sender/recipient/chain/route/search/limit/offset filters
+- `GET /v1/transfers`, with sender/recipient/chain/route/search/limit/offset filters. Responses
+  also include an opaque `nextCursor`; pass it back with the same filters for stable keyset
+  pagination. Cursors are scoped to the descending transfer-id order and reject mismatched filters.
 - `GET /v1/transfers/by-tx/:txHash`, `GET /v1/transfers/:originChain/:nonce`
 - `GET /v1/claims`, `GET /v1/claims/:chain/:claimId`
 - `GET /v1/routes/health`, `GET /v1/metrics`

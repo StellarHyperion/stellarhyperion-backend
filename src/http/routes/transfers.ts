@@ -13,6 +13,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
 import type { ServerDeps } from "../server.js";
+import { CursorError, decodeCursor, encodeCursor, type CursorScope } from "../cursor.js";
 
 export type TransferLifecycleStage =
   | "initiated"
@@ -432,12 +433,37 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
           search?: string;
           limit?: string;
           offset?: string;
+          cursor?: string;
         };
       }>,
       reply: FastifyReply,
     ) => {
-      const { originChain, destinationChain, route, sender, recipient, search, limit, offset } =
-        request.query;
+      const {
+        originChain,
+        destinationChain,
+        route,
+        sender,
+        recipient,
+        search,
+        limit,
+        offset,
+        cursor,
+      } = request.query;
+
+      const scope: CursorScope = {
+        ...(originChain === undefined ? {} : { originChain }),
+        ...(destinationChain === undefined ? {} : { destinationChain }),
+        ...(route === undefined ? {} : { route }),
+        ...(sender === undefined ? {} : { sender }),
+        ...(recipient === undefined ? {} : { recipient }),
+        ...(search?.trim() ? { search: search.trim() } : {}),
+      };
+      if (cursor !== undefined && offset !== undefined && Number(offset) !== 0) {
+        return reply.code(400).send({
+          error: "invalid_cursor",
+          message: "cursor cannot be combined with offset",
+        });
+      }
 
       const conditions: string[] = [];
       const params: unknown[] = [];
@@ -471,25 +497,50 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         );
       }
 
-      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
       const parsedLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
       const parsedOffset = Math.max(Number(offset) || 0, 0);
 
+      if (cursor !== undefined) {
+        try {
+          const afterId = decodeCursor(cursor, scope);
+          params.push(afterId);
+          conditions.push(`t.id < $${String(params.length)}`);
+        } catch (error) {
+          if (error instanceof CursorError) {
+            return reply.code(400).send({ error: "invalid_cursor", message: error.message });
+          }
+          throw error;
+        }
+      }
+
+      const finalWhereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
       params.push(parsedLimit);
       const limitClause = `LIMIT $${String(params.length)}`;
-      params.push(parsedOffset);
-      const offsetClause = `OFFSET $${String(params.length)}`;
+      let offsetClause = "";
+      if (cursor === undefined) {
+        params.push(parsedOffset);
+        offsetClause = `OFFSET $${String(params.length)}`;
+      }
 
       const { rows } = await db.query(
-        `${TRANSFER_QUERY} ${whereClause} ORDER BY t.id DESC ${limitClause} ${offsetClause}`,
+        `${TRANSFER_QUERY} ${finalWhereClause} ORDER BY t.id DESC ${limitClause} ${offsetClause}`,
         params,
       );
 
+      const transfers = rows.map((row) => formatRow(row, deps.config));
+      const lastRow = rows.at(-1);
+      const nextCursor =
+        rows.length === parsedLimit && lastRow !== undefined
+          ? encodeCursor(String(lastRow.id), scope)
+          : null;
+
       return reply.send({
-        transfers: rows.map((row) => formatRow(row, deps.config)),
+        transfers,
         limit: parsedLimit,
-        offset: parsedOffset,
+        ...(cursor === undefined ? { offset: parsedOffset } : {}),
         count: rows.length,
+        nextCursor,
       });
     },
   );

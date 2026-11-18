@@ -43,6 +43,7 @@ beforeAll(async () => {
     "1790900000000_initial-schema.sql",
     "1791000000000_cursor-block-hash.sql",
     "1791100000000_cursor-autovacuum-tuning.sql",
+    "1791400000000_rail-transition-history.sql",
   ]) {
     const sql = readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8").split(
       "-- Down Migration",
@@ -105,6 +106,20 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     const quoted = await app.inject("/v1/transfers?search=%27%20OR%201%3D1%20--");
     expect(quoted.statusCode).toBe(200);
     expect(quoted.json().transfers).toHaveLength(0);
+  });
+  it("returns an opaque cursor and rejects a cursor used with different filters", async () => {
+    const first = await app.inject("/v1/transfers?limit=1&originChain=stellar-testnet");
+    expect(first.statusCode).toBe(200);
+    expect(first.json().nextCursor).toEqual(expect.any(String));
+    const next = await app.inject(
+      `/v1/transfers?limit=1&originChain=stellar-testnet&cursor=${encodeURIComponent(first.json().nextCursor)}`,
+    );
+    expect(next.statusCode).toBe(200);
+    const mismatched = await app.inject(
+      `/v1/transfers?originChain=sepolia&cursor=${encodeURIComponent(first.json().nextCursor)}`,
+    );
+    expect(mismatched.statusCode).toBe(400);
+    expect(mismatched.json().error).toBe("invalid_cursor");
   });
   it("reports the actual native-USDC payout after Circle fees in destination precision", async () => {
     const source = config.deployments.networks["stellar-testnet"];

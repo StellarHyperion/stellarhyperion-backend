@@ -342,6 +342,45 @@ export interface AttestationRow {
 }
 
 export async function writeAttestation(db: Queryable, row: AttestationRow): Promise<void> {
+  const current = await db.query(
+    `SELECT status, rail_status, rail_reference, last_error
+       FROM rail_attestation
+      WHERE transfer_id = $1
+      FOR UPDATE`,
+    [row.transferId.toString()],
+  );
+  const previous = current.rows[0] ?? null;
+  const effectiveRailStatus = row.railStatus ?? (previous?.rail_status as string | null) ?? null;
+  const effectiveReference =
+    row.railReference ?? (previous?.rail_reference as string | null) ?? null;
+  const effectiveReason = row.lastError ?? (previous?.last_error as string | null) ?? null;
+  const previousRailStatus = (previous?.rail_status as string | null) ?? null;
+  const previousReference = (previous?.rail_reference as string | null) ?? null;
+  const previousReason = (previous?.last_error as string | null) ?? null;
+  const changed =
+    previous?.status !== row.status ||
+    previousRailStatus !== effectiveRailStatus ||
+    previousReference !== effectiveReference ||
+    previousReason !== effectiveReason;
+  if (changed) {
+    await db.query(
+      `INSERT INTO rail_attestation_history
+         (transfer_id, route, old_status, new_status, reason, rail_status, evidence_reference, observed_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (transfer_id, old_status, new_status, reason, rail_status, evidence_reference)
+       DO NOTHING`,
+      [
+        row.transferId.toString(),
+        row.route,
+        previous === null ? "unobserved" : String(previous.status),
+        row.status,
+        effectiveReason ?? "",
+        effectiveRailStatus ?? "",
+        effectiveReference ?? "",
+        row.checkedAt,
+      ],
+    );
+  }
   await db.query(
     `INSERT INTO rail_attestation
        (transfer_id, route, status, rail_status, rail_reference, attested_at, last_checked_at,
