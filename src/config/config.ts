@@ -48,6 +48,8 @@ export type LogLevel = "trace" | "debug" | "info" | "warn" | "error" | "fatal";
 export interface StellarWatchConfig {
   readonly chain: ChainKey;
   readonly rpcUrl: string;
+  /** Explicitly configured historical event provider URL for bounded backfill (#30). */
+  readonly historicalRpcUrl?: string | null;
   readonly networkPassphrase: string;
   /** The router contract id, from the deployment record. */
   readonly routerContractId: string;
@@ -343,6 +345,16 @@ const STELLAR_RPC_URL: VarSpec = {
     "Soroban RPC. Defaults to the chain registry endpoint, which is public and will rate limit you under real load.",
 };
 
+const STELLAR_HISTORICAL_RPC_URL: VarSpec = {
+  name: "STELLAR_HISTORICAL_RPC_URL",
+  kind: "url",
+  protocols: ["http", "https"],
+  required: false,
+  printable: false,
+  purpose:
+    "Explicitly configured historical Soroban event provider URL for bounded backfill of retention gaps.",
+};
+
 const STELLAR_START_LEDGER: VarSpec = {
   name: "STELLAR_START_LEDGER",
   kind: "integer",
@@ -472,6 +484,9 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     ? reader.string(KEEPER_STELLAR_SECRET)
     : null;
   const stellarRpcOverride = reader.url(STELLAR_RPC_URL);
+  const stellarHistoricalRpcUrl = reader.has(STELLAR_HISTORICAL_RPC_URL.name)
+    ? reader.url(STELLAR_HISTORICAL_RPC_URL)
+    : null;
   const startLedgerOverride = reader.has(STELLAR_START_LEDGER.name)
     ? reader.integer(STELLAR_START_LEDGER)
     : null;
@@ -490,6 +505,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     deployments,
     enabled: indexerEnabled,
     stellarRpcOverride,
+    stellarHistoricalRpcUrl,
     startLedgerOverride,
     pageSize,
     stellarPollIntervalMs,
@@ -578,6 +594,7 @@ interface PlanInput {
   readonly deployments: DeploymentSet;
   readonly enabled: boolean;
   readonly stellarRpcOverride: string;
+  readonly stellarHistoricalRpcUrl: string | null;
   readonly startLedgerOverride: number | null;
   readonly pageSize: number;
   readonly stellarPollIntervalMs: number;
@@ -642,6 +659,7 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
       stellar = {
         chain: chainKey,
         rpcUrl: input.stellarRpcOverride === "" ? chain.defaultRpcUrl : input.stellarRpcOverride,
+        historicalRpcUrl: input.stellarHistoricalRpcUrl,
         networkPassphrase: chain.networkPassphrase,
         routerContractId: deployment.router,
         startLedger: input.startLedgerOverride ?? deployment.deployedAt.ledger,
