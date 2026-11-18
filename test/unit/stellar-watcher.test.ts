@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 
 import { endOfLedgerCursor } from "../../src/chains/stellar/cursor.js";
 import type { RawStellarEvent } from "../../src/chains/stellar/events.js";
+import { LeaseLostError, StaleCursorError } from "../../src/chains/stellar/store.js";
 import { StellarWatcher } from "../../src/chains/stellar/watcher.js";
 import {
   FakeRpc,
@@ -66,11 +67,16 @@ function harness(
 }
 
 /** The cursor row `readCursor` expects, as pg would hand it back. */
-function cursorRow(ledger: number, contract = LIVE_ROUTER): Record<string, unknown> {
+function cursorRow(
+  ledger: number,
+  contract = LIVE_ROUTER,
+  revision = "1",
+): Record<string, unknown> {
   return {
     last_processed: String(ledger),
     contract,
     last_processed_at: new Date("2026-10-01T12:00:00.000Z"),
+    revision,
   };
 }
 
@@ -155,7 +161,9 @@ describe("the page and the cursor as one commit", () => {
     const { watcher, db } = harness({ events: ROUTER_HISTORY, startLedger: FIRST_EVENT_LEDGER });
     await watcher.tick(AbortSignal.timeout(5_000));
 
-    const inserts = db.queries.filter((entry) => entry.text.includes("INSERT INTO"));
+    const inserts = db.queries.filter(
+      (entry) => entry.text.includes("INSERT INTO") && !entry.text.includes("indexer_lease"),
+    );
     expect(inserts.length).toBeGreaterThan(1);
     const transactions = new Set(inserts.map((entry) => entry.transaction));
     expect(transactions.size).toBe(1);
@@ -342,5 +350,272 @@ describe("gaps it cannot close", () => {
 
     const warnings = lines.filter((line) => line.message.includes("running ahead of the indexer"));
     expect(warnings).toHaveLength(1);
+  });
+});
+
+describe("compare-and-swap cursor updates (#32)", () => {
+  it("rejects stale concurrent cursor writes inside the event transaction and rolls back", async () => {
+    const db = new RecordingDb();
+    db.cursorRow = cursorRow(FIRST_EVENT_LEDGER - 1, LIVE_ROUTER, "3");
+    const innerRpc = new FakeRpc({
+      events: ROUTER_HISTORY,
+      latestLedger: FIRST_EVENT_LEDGER + 20_000,
+    });
+    const concurrentRpc = {
+      events: async (query: Parameters<FakeRpc["events"]>[0]) => {
+        // Simulate another worker advancing the cursor revision while this scan is in flight.
+        db.cursorRow = cursorRow(FIRST_EVENT_LEDGER + 100, LIVE_ROUTER, "4");
+        return innerRpc.events(query);
+      },
+    };
+    const { logger } = capturingLogger();
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 200,
+      rpc: concurrentRpc,
+      db,
+      logger,
+    });
+
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(StaleCursorError);
+    expect(db.rollbacks).toEqual([1]);
+    expect(db.commits).toEqual([]);
+    expect(watcher.progress).toBeNull();
+  });
+
+  it("rejects concurrent initial cursor insert when another worker already created it", async () => {
+    const db = new RecordingDb();
+    const innerRpc = new FakeRpc({
+      events: ROUTER_HISTORY,
+      latestLedger: FIRST_EVENT_LEDGER + 20_000,
+    });
+    const concurrentRpc = {
+      events: async (query: Parameters<FakeRpc["events"]>[0]) => {
+        // Simulate another worker creating the initial cursor row mid-scan.
+        db.cursorRow = cursorRow(FIRST_EVENT_LEDGER, LIVE_ROUTER, "1");
+        return innerRpc.events(query);
+      },
+    };
+    const { logger } = capturingLogger();
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 200,
+      rpc: concurrentRpc,
+      db,
+      logger,
+    });
+
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(StaleCursorError);
+    expect(db.rollbacks).toEqual([1]);
+    expect(db.commits).toEqual([]);
+  });
+});
+
+describe("database leases for watcher ownership (#31)", () => {
+  it("prevents a scheduled worker from overlapping an active continuous worker", async () => {
+    const db = new RecordingDb();
+    const rpc = new FakeRpc({ latestLedger: FIRST_EVENT_LEDGER + 20_000 });
+    const { logger } = capturingLogger();
+
+    const continuous = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 200,
+      rpc,
+      db,
+      logger,
+      ownerId: "continuous-1",
+      leaseTtlMs: 30_000,
+    });
+    const scheduled = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 200,
+      rpc,
+      db,
+      logger,
+      ownerId: "scheduled-1",
+      leaseTtlMs: 30_000,
+      releaseLeaseOnTick: true,
+    });
+
+    await continuous.tick(AbortSignal.timeout(5_000));
+    expect(rpc.requests).toHaveLength(1);
+
+    // Scheduled worker sees active lease and skips without hitting RPC or writing cursor.
+    const ran = await scheduled.tick(AbortSignal.timeout(5_000));
+    expect(ran).toBe(false);
+    expect(rpc.requests).toHaveLength(1);
+    expect(cursorWrites(db)).toHaveLength(1);
+
+    // Once continuous worker releases (or lease expires), scheduled worker can take over.
+    await continuous.release();
+    await scheduled.tick(AbortSignal.timeout(5_000));
+    expect(rpc.requests).toHaveLength(2);
+    expect(cursorWrites(db)).toHaveLength(2);
+  });
+
+  it("aborts the transaction if the lease was lost before commit", async () => {
+    const db = new RecordingDb();
+    const innerRpc = new FakeRpc({
+      events: ROUTER_HISTORY,
+      latestLedger: FIRST_EVENT_LEDGER + 20_000,
+    });
+    const stolenRpc = {
+      events: async (query: Parameters<FakeRpc["events"]>[0]) => {
+        db.leaseRow = {
+          owner_id: "other-worker",
+          lease_until: new Date(Date.now() + 30_000),
+        };
+        return innerRpc.events(query);
+      },
+    };
+    const { logger } = capturingLogger();
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: FIRST_EVENT_LEDGER,
+      pageSize: 200,
+      rpc: stolenRpc,
+      db,
+      logger,
+      ownerId: "worker-1",
+    });
+
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(LeaseLostError);
+    expect(db.rollbacks).toEqual([1]);
+    expect(db.commits).toEqual([]);
+  });
+});
+
+describe("durable history-gap tracking and historical backfill (#29, #30)", () => {
+  it("persists unavailable ledger intervals and marks readiness degraded until reconciled", async () => {
+    const db = new RecordingDb();
+    db.cursorRow = cursorRow(4_970_000);
+    const liveRpc = new FakeRpc({
+      latestLedger: 4_980_002,
+      oldestLedger: 4_980_000,
+    });
+    const historicalRpc = new FakeRpc({
+      events: [
+        syntheticEvent({ ledger: 4_972_000 }),
+        syntheticEvent({ ledger: 4_978_000 }),
+      ],
+      latestLedger: 4_980_002,
+      oldestLedger: 1,
+    });
+    const { logger } = capturingLogger();
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: 4_900_000,
+      pageSize: 200,
+      rpc: liveRpc,
+      historicalRpc,
+      backfillMaxLedgersPerTick: 5_000,
+      db,
+      logger,
+    });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    expect(db.gaps).toHaveLength(1);
+    expect(db.gaps[0]?.start_ledger).toBe("4970001");
+    expect(db.gaps[0]?.end_ledger).toBe("4979999");
+    expect(db.gaps[0]?.status).toBe("open");
+    // Must not claim ready while history is incomplete.
+    expect(watcher.readiness().state).toBe("degraded");
+    expect(watcher.readiness().detail).toMatch(/unreconciled Stellar history gap/);
+
+    // Bounded backfill pass 1: 4970001..4975000 (5000 ledgers) -> reconciling.
+    const more = await watcher.backfillTick(AbortSignal.timeout(5_000));
+    expect(more).toBe(true);
+    expect(db.gaps[0]?.status).toBe("reconciling");
+    expect(db.gaps[0]?.replayed_through).toBe("4975000");
+
+    // Bounded backfill pass 2: 4975001..4979999 -> reconciled.
+    const doneMore = await watcher.backfillTick(AbortSignal.timeout(5_000));
+    expect(doneMore).toBe(false);
+    expect(db.gaps[0]?.status).toBe("reconciled");
+    expect(db.gaps[0]?.replayed_through).toBe("4979999");
+    expect(watcher.readiness().state).toBe("ready");
+  });
+
+  it("persists a gap even when the live RPC refuses the range permanently", async () => {
+    const db = new RecordingDb();
+    db.cursorRow = cursorRow(4_000_000);
+    const rpc = new FakeRpc({ latestLedger: 4_994_000 });
+    const { logger } = capturingLogger();
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: 4_990_000,
+      pageSize: 200,
+      rpc,
+      db,
+      logger,
+    });
+
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(/ledger range/);
+    expect(db.gaps).toHaveLength(1);
+    expect(db.gaps[0]?.start_ledger).toBe("4000001");
+    expect(db.gaps[0]?.reason).toBe("rpc_range_refused");
+  });
+
+  it("tracks bounded explicit-range backfill separately from the live cursor", async () => {
+    const db = new RecordingDb();
+    db.cursorRow = cursorRow(4_990_000, LIVE_ROUTER, "7");
+    const historicalRpc = new FakeRpc({
+      events: ROUTER_HISTORY,
+      latestLedger: 4_994_000,
+      oldestLedger: 1,
+    });
+    const { logger } = capturingLogger();
+    const watcher = new StellarWatcher({
+      chainKey: CHAIN,
+      router: LIVE_ROUTER,
+      startLedger: 4_990_000,
+      pageSize: 200,
+      rpc: new FakeRpc({ latestLedger: 4_994_000 }),
+      historicalRpc,
+      backfillMaxLedgersPerTick: 500,
+      db,
+      logger,
+    });
+
+    const more = await watcher.backfillTick(AbortSignal.timeout(5_000), {
+      startLedger: FIRST_EVENT_LEDGER,
+      endLedger: FIRST_EVENT_LEDGER + 800,
+      jobKey: "manual-replay",
+    });
+
+    expect(more).toBe(true);
+    expect(db.backfillRow?.next_ledger).toBe(String(FIRST_EVENT_LEDGER + 500));
+    expect(db.backfillRow?.status).toBe("running");
+    // Live cursor was never touched by historical backfill.
+    expect(db.cursorRow.last_processed).toBe("4990000");
+    expect(db.cursorRow.revision).toBe("7");
+
+    const more2 = await watcher.backfillTick(AbortSignal.timeout(5_000), {
+      startLedger: FIRST_EVENT_LEDGER,
+      endLedger: FIRST_EVENT_LEDGER + 800,
+      jobKey: "manual-replay",
+    });
+    expect(more2).toBe(false);
+    expect(db.backfillRow?.status).toBe("completed");
+    expect(db.cursorRow.last_processed).toBe("4990000");
+  });
+
+  it("requires an explicitly configured historical provider for backfill", async () => {
+    const { watcher } = harness();
+    await expect(watcher.backfillTick(AbortSignal.timeout(5_000))).rejects.toThrow(
+      /historical event provider is not configured/,
+    );
   });
 });

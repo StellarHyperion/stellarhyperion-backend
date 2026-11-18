@@ -46,6 +46,8 @@ export interface EventsQuery {
   readonly contractIds: readonly string[];
   /** Mutually exclusive with `cursor`, and the RPC rejects a request carrying both. */
   readonly startLedger?: number;
+  /** Optional inclusive upper bound supported by historical/bounded queries. */
+  readonly endLedger?: number;
   readonly cursor?: string;
   readonly limit: number;
 }
@@ -67,6 +69,8 @@ export interface EventSource {
 
 export interface StellarRpcOptions {
   readonly timeoutMs?: number;
+  /** Optional request headers (e.g. provider API key) for historical/archive RPCs. Never logged. */
+  readonly headers?: Readonly<Record<string, string>>;
 }
 
 export class StellarRpc {
@@ -115,6 +119,7 @@ export class StellarRpc {
       xdrFormat: "json",
     };
     if (query.startLedger !== undefined) params.startLedger = query.startLedger;
+    if (query.endLedger !== undefined) params.endLedger = query.endLedger;
 
     const result = await this.call("getEvents", params, signal);
     const body = result as {
@@ -145,7 +150,10 @@ export class StellarRpc {
     try {
       response = await fetch(this.url, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          ...this.options.headers,
+        },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
         signal: combined,
       });
@@ -183,5 +191,7 @@ export class StellarRpc {
 }
 
 function describe(cause: unknown): string {
-  return cause instanceof Error ? cause.message : String(cause);
+  const raw = cause instanceof Error ? cause.message : String(cause);
+  // Strip any userinfo credentials if an underlying fetch error includes the URL.
+  return raw.replace(/\/\/[^/@\s]+@/g, "//[redacted]@");
 }

@@ -110,3 +110,47 @@ export function parseEventCursor(cursor: string): CursorPosition {
 export function completeThrough(position: CursorPosition): number {
   return position.completesLedger ? position.ledger : position.ledger - 1;
 }
+
+export interface LedgerRange {
+  readonly oldestLedger: number;
+  readonly latestLedger: number;
+}
+
+/**
+ * Extract the retained `[oldestLedger, latestLedger]` bounds from a Soroban RPC range refusal.
+ *
+ * Returns null when the message does not carry two integers in that shape.
+ */
+export function parseLedgerRangeError(message: string): LedgerRange | null {
+  const match = /ledger range[^0-9]*(\d+)\s*-\s*(\d+)/i.exec(message);
+  if (match === null) return null;
+  const oldestLedger = Number(match[1]);
+  const latestLedger = Number(match[2]);
+  if (
+    !Number.isSafeInteger(oldestLedger) ||
+    !Number.isSafeInteger(latestLedger) ||
+    oldestLedger < 0 ||
+    latestLedger < oldestLedger
+  ) {
+    return null;
+  }
+  return { oldestLedger, latestLedger };
+}
+
+/**
+ * Compute the inclusive end ledger for one bounded backfill step.
+ */
+export function boundedWindowEnd(fromLedger: number, toLedger: number, maxLedgers: number): number {
+  if (!Number.isInteger(fromLedger) || fromLedger < 0) {
+    throw new RangeError(`fromLedger must be a non-negative integer, got ${String(fromLedger)}`);
+  }
+  if (!Number.isInteger(toLedger) || toLedger < fromLedger) {
+    throw new RangeError(
+      `toLedger must be an integer >= fromLedger (${String(fromLedger)}), got ${String(toLedger)}`,
+    );
+  }
+  if (!Number.isInteger(maxLedgers) || maxLedgers <= 0) {
+    throw new RangeError(`maxLedgers must be a positive integer, got ${String(maxLedgers)}`);
+  }
+  return Math.min(toLedger, fromLedger + maxLedgers - 1);
+}
