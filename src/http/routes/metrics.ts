@@ -56,6 +56,19 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       updatedAt: new Date(row.updated_at as string | number | Date).toISOString(),
     }));
 
+    // 6. Durable Stellar history-gap reconciliation status (#29)
+    const gapResult = await db.query(
+      "SELECT status, count(*)::int AS count FROM stellar_history_gap GROUP BY status",
+    );
+    const historyGaps = { open: 0, reconciling: 0, reconciled: 0 };
+    for (const row of gapResult.rows) {
+      const status = text(row, "status");
+      const count = integer(row, "count");
+      if (status === "open" || status === "reconciling" || status === "reconciled") {
+        historyGaps[status] = count;
+      }
+    }
+
     return reply.send({
       service: "hyperion-backend",
       network: deps.config.network,
@@ -67,6 +80,7 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       claims,
       railAttestations: railStatusCounts,
       cursors,
+      historyGaps,
     });
   });
 }
