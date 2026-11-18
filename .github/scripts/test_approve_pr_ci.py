@@ -1,0 +1,168 @@
+"""Regression tests for privileged CI authorization, without running PR code."""
+
+import copy
+import unittest
+
+from approve_pr_ci import Approval, matches
+
+REPO = "StellarHyperion/example"
+HEAD = "a" * 40
+
+
+def pr():
+    return {"number": 42, "state": "open", "draft": False,
+            "head": {"sha": HEAD, "ref": "fix", "repo": {"id": 2, "full_name": "contributor/example"}},
+            "base": {"ref": "main", "repo": {"full_name": REPO}}}
+
+
+def run():
+    return {"id": 7, "event": "pull_request", "path": ".github/workflows/ci.yml",
+            "repository": {"full_name": REPO}, "head_sha": HEAD, "head_branch": "fix",
+            "head_repository": {"id": 2, "full_name": "contributor/example"},
+            "status": "completed", "conclusion": "action_required"}
+
+
+class Policy:
+    def __init__(self):
+        self.allowed = True
+        self.calls = 0
+        self.before_recheck = None
+
+    def decision(self, _pr):
+        self.calls += 1
+        if self.calls == 2 and self.before_recheck:
+            self.before_recheck(self)
+        return self.allowed, "assigned" if self.allowed else "unassigned"
+
+
+class GitHub:
+    repository = REPO
+    policy_ref = "main"
+
+    def __init__(self):
+        self.pr = pr()
+        self.run = run()
+        self.approvals = []
+        self.fetches = 0
+        self.before_recheck = None
+        self.failure = False
+
+    def request(self, path, method="GET", data=None):
+        if self.failure:
+            raise OSError("API unavailable")
+        if method == "POST":
+            self.approvals.append(path)
+            return None
+        if "/pulls/" in path:
+            self.fetches += 1
+            if self.fetches == 2 and self.before_recheck:
+                self.before_recheck(self)
+            return copy.deepcopy(self.pr)
+        if "?" in path:
+            return {"workflow_runs": [copy.deepcopy(self.run)]}
+        return copy.deepcopy(self.run)
+
+
+class ApprovalTests(unittest.TestCase):
+    def setUp(self):
+        self.github = GitHub()
+        self.policy = Policy()
+        self.approval = Approval(self.github, self.policy)
+
+    def test_assigned_author_starts_only_waiting_current_ci(self):
+        self.assertIn("APPROVE", self.approval.approve(42)[0])
+        self.assertEqual(self.github.approvals, [f"repos/{REPO}/actions/runs/7/approve"])
+        self.assertEqual(self.policy.calls, 2)
+
+    def test_unassigned_author_is_not_approved(self):
+        self.policy.allowed = False
+        self.assertIn("WAIT", self.approval.approve(42)[0])
+        self.assertEqual(self.github.approvals, [])
+
+    def test_assignment_revocation_before_mutation_is_respected(self):
+        self.policy.before_recheck = lambda policy: setattr(policy, "allowed", False)
+        self.assertIn("WAIT", self.approval.approve(42)[0])
+        self.assertEqual(self.github.approvals, [])
+
+    def test_closed_pr_is_not_approved(self):
+        self.github.pr["state"] = "closed"
+        self.assertIn("SKIP", self.approval.approve(42)[0])
+        self.assertEqual(self.github.approvals, [])
+
+    def test_head_change_before_mutation_is_respected(self):
+        self.github.before_recheck = lambda github: github.pr["head"].update(sha="b" * 40)
+        self.assertIn("SKIP", self.approval.approve(42)[0])
+        self.assertEqual(self.github.approvals, [])
+
+    def test_pr_closed_before_mutation_is_respected(self):
+        self.github.before_recheck = lambda github: github.pr.update(state="closed")
+        self.assertIn("SKIP", self.approval.approve(42)[0])
+        self.assertEqual(self.github.approvals, [])
+
+    def test_finished_checks_are_never_rewritten_or_reapproved(self):
+        for conclusion in ["success", "failure", "cancelled"]:
+            self.github.run["conclusion"] = conclusion
+            self.assertIn("SKIP", self.approval.approve(42)[0])
+            self.assertEqual(self.github.approvals, [])
+
+    def test_draft_contributors_can_get_ci_feedback(self):
+        self.github.pr["draft"] = True
+        self.assertIn("APPROVE", self.approval.approve(42)[0])
+
+    def test_wrong_event_workflow_repo_sha_or_branch_never_authorized(self):
+        for change in [{"event": "workflow_dispatch"}, {"event": "pull_request_target"},
+                       {"path": ".github/workflows/deploy.yml"}, {"head_sha": "b" * 40},
+                       {"repository": {"full_name": "other/repo"}}, {"head_branch": "other"},
+                       {"head_repository": {"id": 3, "full_name": "contributor/example"}},
+                       {"head_repository": {"id": 2, "full_name": "attacker/example"}}]:
+            with self.subTest(change=change):
+                candidate = run()
+                candidate.update(change)
+                self.assertFalse(matches(pr(), candidate, REPO, "main"))
+
+    def test_non_default_base_and_same_repo_runs_are_excluded(self):
+        for changes in [{"ref": "other"}, {"repo": {"full_name": "other/repo"}}]:
+            current = pr()
+            current["base"].update(changes)
+            self.assertFalse(matches(current, run(), REPO, "main"))
+        current = pr()
+        current["head"]["repo"] = {"id": 1, "full_name": REPO}
+        candidate = run()
+        candidate["head_repository"] = current["head"]["repo"]
+        self.assertFalse(matches(current, candidate, REPO, "main"))
+
+    def test_invalid_identifiers_cannot_be_api_paths(self):
+        for number in [True, -1, 0, "42/merge"]:
+            with self.subTest(number=number), self.assertRaises(ValueError):
+                self.approval.approve(number)
+        self.github.pr["head"]["sha"] = "bad&head_sha=attacker"
+        with self.assertRaises(ValueError):
+            self.approval.approve(42)
+        self.assertEqual(self.github.approvals, [])
+
+    def test_missing_or_boolean_fork_identity_and_empty_branch_are_rejected(self):
+        for identity in [{"id": True, "full_name": "contributor/example"},
+                         {"id": 2}, {"id": 0, "full_name": "contributor/example"}]:
+            current = pr()
+            candidate = run()
+            current["head"]["repo"] = identity
+            candidate["head_repository"] = identity
+            self.assertFalse(matches(current, candidate, REPO, "main"))
+        current = pr()
+        candidate = run()
+        current["head"]["ref"] = ""
+        candidate["head_branch"] = ""
+        self.assertFalse(matches(current, candidate, REPO, "main"))
+        candidate = run()
+        candidate["head_repository"]["id"] = True
+        self.assertFalse(matches(pr(), candidate, REPO, "main"))
+
+    def test_verification_error_never_approves_ci(self):
+        self.github.failure = True
+        with self.assertRaises(OSError):
+            self.approval.approve(42)
+        self.assertEqual(self.github.approvals, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

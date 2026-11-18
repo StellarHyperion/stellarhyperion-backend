@@ -150,178 +150,27 @@ export function completeThrough(position: Pick<CursorPosition, "ledger" | "compl
   return position.completesLedger ? position.ledger : position.ledger - 1;
 }
 
-export interface PageCompletenessInput {
-  readonly events: readonly unknown[];
-  readonly cursor: string | null;
-  readonly latestLedger: number;
-  readonly oldestLedger: number;
-  readonly requestCursor?: string | undefined;
-  readonly requestStartLedger?: number | undefined;
-  readonly requestEndLedger?: number | undefined;
-}
-
-export interface ValidatedPageBoundary {
-  readonly position: CursorPosition | null;
-  readonly through: number | null;
-}
-
 /**
- * Validate provider ledger ranges, event/cursor ordering, and end markers before declaring a
- * scan boundary complete.
+ * The inclusive upper ledger bound a single `getEvents` scan window can cover.
+ *
+ * Fresh `startLedger` requests scan `SCAN_WINDOW_LEDGERS` ledgers; cursor-resumed requests scan
+ * `SCAN_WINDOW_LEDGERS - 1` due to the RPC's off-by-one range arithmetic. Clamped to
+ * `latestLedger` when the head is closer.
  */
-export function validateScanPage(input: PageCompletenessInput): ValidatedPageBoundary {
-  const {
-    events,
-    cursor,
-    latestLedger,
-    oldestLedger,
-    requestCursor,
-    requestStartLedger,
-    requestEndLedger,
-  } = input;
-
-  if (!Number.isSafeInteger(latestLedger) || latestLedger <= 0) {
-    throw new EventCompletenessError(`invalid latestLedger ${String(latestLedger)}`);
-  }
-  if (!Number.isSafeInteger(oldestLedger) || oldestLedger < 0 || oldestLedger > latestLedger) {
-    throw new EventCompletenessError(
-      `invalid provider ledger range ${String(oldestLedger)}..${String(latestLedger)}`,
-    );
-  }
-  if (requestStartLedger !== undefined && latestLedger < requestStartLedger) {
-    throw new EventCompletenessError(
-      `provider latestLedger ${String(latestLedger)} is behind requested startLedger ${String(requestStartLedger)}`,
-    );
-  }
-
-  let previousId: string | null = null;
-  for (const raw of events) {
-    if (typeof raw !== "object" || raw === null) {
-      throw new EventCompletenessError("event entry is not an object");
-    }
-    const candidate = raw as { readonly id?: unknown; readonly ledger?: unknown };
-    if (typeof candidate.id !== "string" || candidate.id.length === 0) {
-      throw new EventCompletenessError("event is missing a string id");
-    }
-    if (typeof candidate.ledger !== "number" || !Number.isSafeInteger(candidate.ledger)) {
-      throw new EventCompletenessError(`event ${candidate.id} has invalid ledger`);
-    }
-
-    const eventPos = parseEventCursor(candidate.id);
-    if (eventPos.completesLedger) {
-      throw new EventCompletenessError(`event ${candidate.id} carries end-of-window index`);
-    }
-    if (eventPos.ledger !== candidate.ledger) {
-      throw new EventCompletenessError(
-        `event ${candidate.id} ledger ${String(eventPos.ledger)} disagrees with event.ledger ${String(candidate.ledger)}`,
-      );
-    }
-    if (candidate.ledger > latestLedger || (oldestLedger > 0 && candidate.ledger < oldestLedger)) {
-      throw new EventCompletenessError(
-        `event ${candidate.id} at ledger ${String(candidate.ledger)} falls outside provider range ${String(oldestLedger)}..${String(latestLedger)}`,
-      );
-    }
-    if (requestStartLedger !== undefined && candidate.ledger < requestStartLedger) {
-      throw new EventCompletenessError(
-        `event ${candidate.id} at ledger ${String(candidate.ledger)} precedes startLedger ${String(requestStartLedger)}`,
-      );
-    }
-    if (requestEndLedger !== undefined && candidate.ledger >= requestEndLedger) {
-      throw new EventCompletenessError(
-        `event ${candidate.id} at ledger ${String(candidate.ledger)} meets or exceeds endLedger ${String(requestEndLedger)}`,
-      );
-    }
-    if (requestCursor !== undefined && compareEventCursors(requestCursor, candidate.id) >= 0) {
-      throw new EventCompletenessError(
-        `event ${candidate.id} is not strictly after requested cursor ${requestCursor}`,
-      );
-    }
-    if (previousId !== null && compareEventCursors(previousId, candidate.id) >= 0) {
-      throw new EventCompletenessError(
-        `events are out of order: ${previousId} followed by ${candidate.id}`,
-      );
-    }
-    previousId = candidate.id;
-  }
-
-  if (cursor === null) {
-    return { position: null, through: null };
-  }
-
-  const position = parseEventCursor(cursor);
-  if (requestCursor !== undefined && compareEventCursors(requestCursor, cursor) >= 0) {
-    throw new EventCompletenessError(
-      `returned cursor ${cursor} did not advance past requested cursor ${requestCursor}`,
-    );
-  }
-  if (previousId !== null && compareEventCursors(previousId, cursor) > 0) {
-    throw new EventCompletenessError(
-      `returned cursor ${cursor} precedes last event ${previousId}`,
-    );
-  }
-  if (events.length === 0 && !position.completesLedger) {
-    throw new EventCompletenessError(
-      `empty page returned mid-ledger cursor ${cursor} instead of an end-of-window marker`,
-    );
-  }
-
-  const through = completeThrough(position);
-  if (through > latestLedger) {
-    throw new EventCompletenessError(
-      `cursor ${cursor} claims complete through ${String(through)} past latestLedger ${String(latestLedger)}`,
-    );
-  }
-  if (requestEndLedger !== undefined && position.completesLedger && position.ledger >= requestEndLedger) {
-    throw new EventCompletenessError(
-      `end marker ${cursor} at ledger ${String(position.ledger)} exceeds exclusive endLedger ${String(requestEndLedger)}`,
-    );
-  }
-
-  return { position, through };
-}
-
-export interface AdaptiveWindowConfig {
-  readonly minLedgers: number;
-  readonly maxLedgers: number;
-  readonly targetDurationMs: number;
-  readonly fastDurationMs: number;
-}
-
-export const DEFAULT_ADAPTIVE_WINDOW_CONFIG: AdaptiveWindowConfig = {
-  minLedgers: MIN_SCAN_WINDOW_LEDGERS,
-  maxLedgers: SCAN_WINDOW_LEDGERS,
-  targetDurationMs: 2_000,
-  fastDurationMs: 500,
-};
-
-export interface WindowSample {
-  readonly currentLedgers: number;
-  readonly eventCount: number;
-  readonly pageLimit: number;
-  readonly elapsedMs: number;
-}
-
-/**
- * Adjust the next requested ledger window based on provider response size and elapsed time.
- * Always clamped to `[config.minLedgers, config.maxLedgers]`.
- */
-export function nextScanWindowLedgers(
-  sample: WindowSample,
-  config: AdaptiveWindowConfig = DEFAULT_ADAPTIVE_WINDOW_CONFIG,
+export function computeScanWindowEnd(
+  fromLedger: number,
+  fresh: boolean,
+  latestLedger: number,
 ): number {
-  const current = Math.min(config.maxLedgers, Math.max(config.minLedgers, sample.currentLedgers));
-  const saturated = sample.pageLimit > 0 && sample.eventCount >= sample.pageLimit;
-  const slow = sample.elapsedMs > config.targetDurationMs;
+  const width = fresh ? SCAN_WINDOW_LEDGERS : SCAN_WINDOW_LEDGERS - 1;
+  return Math.max(fromLedger, Math.min(fromLedger + width - 1, latestLedger));
+}
 
-  if (saturated || slow) {
-    return Math.max(config.minLedgers, Math.floor(current / 2));
-  }
-
-  const sparse = sample.pageLimit > 0 && sample.eventCount <= Math.floor(sample.pageLimit / 4);
-  const fast = sample.elapsedMs <= config.fastDurationMs;
-  if (sparse && fast) {
-    return Math.min(config.maxLedgers, current * 2);
-  }
-
-  return current;
+/** Whether `ledger` falls inside the RPC's retained `[oldestLedger, latestLedger]` range. */
+export function isWithinRetentionWindow(
+  ledger: number,
+  oldestLedger: number,
+  latestLedger: number,
+): boolean {
+  return ledger >= oldestLedger && ledger <= latestLedger;
 }

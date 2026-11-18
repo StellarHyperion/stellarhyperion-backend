@@ -10,6 +10,8 @@
  * transaction. That is the whole restart safety claim: a page of events and the cursor advance past
  * it land together or not at all.
  */
+import { createHash } from "node:crypto";
+
 import { ROUTE_KINDS } from "@hyperion/protocol";
 
 import type { Queryable } from "../../db/pool.js";
@@ -24,6 +26,7 @@ import {
   writeInbound,
   writeOutbound,
 } from "../writers.js";
+import { endOfLedgerCursor } from "./cursor.js";
 import type {
   ActionLifecycleEvent,
   ActionQueuedEvent,
@@ -34,8 +37,10 @@ import type {
   PauseSetEvent,
   RawStellarEvent,
   RouteConfiguredEvent,
+  StellarEvent,
   TokenRegisteredEvent,
 } from "./events.js";
+import type { RetainedHistoryWindow } from "./rpc.js";
 
 const MAX_QUARANTINE_RAW_BYTES = 16_384;
 const MAX_QUARANTINE_PREVIEW_CHARS = 4_096;
@@ -427,4 +432,552 @@ export async function recordRouteConfigured(
     blocker: event.enabled ? 0 : 2,
     flowAvailable: null,
   });
+}
+
+export interface EventEvidenceSnapshot {
+  readonly eventId: string;
+  readonly ledger: number;
+  readonly txHash: string;
+  readonly contractId: string;
+  readonly payload: Record<string, unknown>;
+}
+
+export interface EventIdentityConflict {
+  readonly identity: string;
+  readonly detectedAt: Date;
+  readonly existing: EventEvidenceSnapshot;
+  readonly incoming: EventEvidenceSnapshot;
+  readonly differingFields: readonly string[];
+}
+
+/**
+ * Canonical identity keys for a Soroban event.
+ *
+ * Every event has its RPC event id (`event:<chain>:<id>`). Events that map onto a unique natural
+ * key in the shared tables also carry that semantic identity so two distinct events claiming the
+ * same transfer, claim, or action are detected even if their RPC event ids differ.
+ */
+export function canonicalEventIdentities(
+  chainKey: string,
+  raw: RawStellarEvent,
+  decoded: StellarEvent,
+): readonly string[] {
+  const keys = [`event:${chainKey}:${raw.id}`];
+  switch (decoded.kind) {
+    case "bridgeOut":
+      keys.push(`bridgeOut:${chainKey}:${decoded.data.nonce.toString()}`);
+      break;
+    case "bridgeIn":
+      keys.push(
+        `bridgeIn:${chainKey}:${String(decoded.data.route)}:${decoded.data.sourceChain}:${decoded.data.sourceNonce.toString()}`,
+      );
+      break;
+    case "claimParked":
+      keys.push(`claimParked:${chainKey}:${decoded.data.claimId.toString()}`);
+      break;
+    case "claimSettled":
+      keys.push(`claimSettled:${chainKey}:${decoded.data.claimId.toString()}`);
+      break;
+    case "actionQueued":
+      keys.push(`actionQueued:${chainKey}:${decoded.data.id.toString()}`);
+      break;
+    case "actionExecuted":
+      keys.push(`actionExecuted:${chainKey}:${decoded.data.id.toString()}`);
+      break;
+    case "actionCancelled":
+      keys.push(`actionCancelled:${chainKey}:${decoded.data.id.toString()}`);
+      break;
+    case "tokenRegistered":
+    case "routeConfigured":
+    case "pauseSet":
+    case "ignored":
+    case "unknown":
+      break;
+  }
+  return keys;
+}
+
+/** Normalize any `bigint` values to integer strings so canonical comparisons never lose precision. */
+function normalizeValue(value: unknown): unknown {
+  if (typeof value === "bigint") return value.toString();
+  if (Array.isArray(value)) return value.map(normalizeValue);
+  if (value !== null && typeof value === "object") {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(value).sort()) {
+      sorted[key] = normalizeValue((value as Record<string, unknown>)[key]);
+    }
+    return sorted;
+  }
+  return value;
+}
+
+export function canonicalEventPayload(
+  raw: RawStellarEvent,
+  decoded: StellarEvent,
+): Record<string, unknown> {
+  const canonical = JSON.stringify({
+    kind: decoded.kind,
+    data: "data" in decoded ? normalizeValue(decoded.data) : null,
+    topicJson: normalizeValue(raw.topicJson),
+    valueJson: normalizeValue(raw.valueJson),
+  });
+  return { kind: decoded.kind, sha256: createHash("sha256").update(canonical).digest("hex") };
+}
+
+function findDifferingFields(
+  existing: EventEvidenceSnapshot,
+  incoming: EventEvidenceSnapshot,
+): string[] {
+  const diffs: string[] = [];
+  if (existing.ledger !== incoming.ledger) diffs.push("ledger");
+  if (existing.txHash !== incoming.txHash) diffs.push("txHash");
+  if (existing.contractId !== incoming.contractId) diffs.push("contractId");
+  if (JSON.stringify(existing.payload) !== JSON.stringify(incoming.payload)) {
+    diffs.push("payload");
+  }
+  return diffs;
+}
+
+/**
+ * Detects two distinct payloads claiming the same canonical event identity and retains
+ * reconciliation evidence. Identical replays (e.g. from mid-ledger restarts) are not conflicts.
+ */
+export class EventConflictDetector {
+  private readonly seen = new Map<string, EventEvidenceSnapshot>();
+  private readonly recorded: EventIdentityConflict[] = [];
+
+  get conflicts(): readonly EventIdentityConflict[] {
+    return this.recorded;
+  }
+
+  inspect(
+    chainKey: string,
+    raw: RawStellarEvent,
+    decoded: StellarEvent,
+    now: Date = new Date(),
+  ): EventIdentityConflict | null {
+    const identities = canonicalEventIdentities(chainKey, raw, decoded);
+    const incoming: EventEvidenceSnapshot = {
+      eventId: raw.id,
+      ledger: raw.ledger,
+      txHash: raw.txHash,
+      contractId: raw.contractId,
+      payload: canonicalEventPayload(raw, decoded),
+    };
+
+    for (const identity of identities) {
+      const existing = this.seen.get(identity);
+      if (existing === undefined) continue;
+      const differingFields = findDifferingFields(existing, incoming);
+      if (differingFields.length > 0) {
+        const conflict: EventIdentityConflict = {
+          identity,
+          detectedAt: now,
+          existing,
+          incoming,
+          differingFields,
+        };
+        this.recorded.push(conflict);
+        return conflict;
+      }
+    }
+
+    for (const identity of identities) {
+      if (!this.seen.has(identity)) {
+        this.seen.set(identity, incoming);
+      }
+    }
+    return null;
+  }
+}
+
+/** Persist identities in the same transaction as event application. Concurrent replays
+ * serialize on the unique key; a rollback cannot poison later conflict detection. */
+export async function inspectEventConflict(
+  db: Queryable,
+  chainKey: string,
+  raw: RawStellarEvent,
+  decoded: StellarEvent,
+): Promise<EventIdentityConflict | null> {
+  const incoming: EventEvidenceSnapshot = {
+    eventId: raw.id,
+    ledger: raw.ledger,
+    txHash: raw.txHash,
+    contractId: raw.contractId,
+    payload: canonicalEventPayload(raw, decoded),
+  };
+  for (const identity of canonicalEventIdentities(chainKey, raw, decoded)) {
+    await db.query(
+      `INSERT INTO stellar_event_identity (chain_key, contract, identity, evidence)
+      VALUES ($1, $2, $3, $4::jsonb) ON CONFLICT DO NOTHING`,
+      [chainKey, raw.contractId, identity, JSON.stringify(incoming)],
+    );
+    const { rows } = await db.query(
+      `SELECT evidence FROM stellar_event_identity
+      WHERE chain_key = $1 AND contract = $2 AND identity = $3 FOR UPDATE`,
+      [chainKey, raw.contractId, identity],
+    );
+    const existing = rows[0]?.evidence as EventEvidenceSnapshot | undefined;
+    if (existing === undefined) throw new Error("missing durable event identity");
+    const differingFields = findDifferingFields(existing, incoming);
+    if (differingFields.length === 0) continue;
+    const conflict: EventIdentityConflict = {
+      identity,
+      existing,
+      incoming,
+      differingFields,
+      detectedAt: new Date(),
+    };
+    await db.query(
+      `INSERT INTO stellar_event_conflict
+      (chain_key, contract, identity, incoming_digest, evidence)
+      VALUES ($1, $2, $3, $4, $5::jsonb) ON CONFLICT DO NOTHING`,
+      [chainKey, raw.contractId, identity, incoming.payload.sha256, JSON.stringify(conflict)],
+    );
+    return conflict;
+  }
+  return null;
+}
+
+export async function persistScanJournal(
+  db: Queryable,
+  contract: string,
+  journal: unknown,
+): Promise<void> {
+  const entry = journal as { chainKey: string };
+  await db.query(
+    `INSERT INTO stellar_scan_journal (chain_key, contract, journal)
+    VALUES ($1, $2, $3::jsonb)`,
+    [entry.chainKey, contract, JSON.stringify(journal)],
+  );
+}
+
+export type CursorRepairAction =
+  | "noop"
+  | "initialize_cursor"
+  | "advance_cursor"
+  | "rewind_cursor"
+  | "reset_cursor"
+  | "backfill_required";
+
+export interface VerifiedLedgerBoundary {
+  readonly ledger: number;
+  /** First ledger proved complete by this range, inclusive. */
+  readonly from?: number;
+  readonly cursor: string;
+  readonly source: "journal" | "verified_boundary";
+}
+
+export interface CursorRepairPlanInput {
+  readonly chainKey: string;
+  readonly expectedContract: string;
+  readonly startLedger: number;
+  readonly currentCursor: ChainCursor | null;
+  readonly retainedHistory: RetainedHistoryWindow | null;
+  readonly verifiedBoundaries: readonly VerifiedLedgerBoundary[];
+  readonly conflicts: readonly EventIdentityConflict[];
+}
+
+export interface CursorRepairProposal {
+  readonly unsigned: true;
+  readonly readOnly: true;
+  readonly chainKey: string;
+  readonly action: CursorRepairAction;
+  readonly currentPosition: string | null;
+  readonly proposedPosition: string | null;
+  readonly proposedRpcCursor: string | null;
+  readonly blockedByConflicts: boolean;
+  readonly conflictCount: number;
+  readonly gap: { readonly from: number; readonly to: number } | null;
+  readonly sql: string | null;
+  readonly params: readonly unknown[];
+  readonly rationale: string;
+  readonly warnings: readonly string[];
+  readonly evidence: {
+    readonly retainedHistory: RetainedHistoryWindow | null;
+    readonly highestVerifiedLedger: number | null;
+  };
+}
+
+/**
+ * Generate an unsigned, read-only database repair proposal from verified completed ledger
+ * boundaries and retained-history evidence. Never executes or signs database writes.
+ */
+export function planCursorRepair(input: CursorRepairPlanInput): CursorRepairProposal {
+  const {
+    chainKey,
+    expectedContract,
+    startLedger,
+    currentCursor,
+    retainedHistory,
+    verifiedBoundaries,
+    conflicts,
+  } = input;
+
+  // A later boundary alone cannot bridge an unverified earlier gap.
+  let covered =
+    currentCursor?.contract === expectedContract ? Number(currentCursor.position) : startLedger - 1;
+  let highestVerified: number | null = null;
+  for (const boundary of [...verifiedBoundaries].sort((a, b) => a.ledger - b.ledger)) {
+    if (
+      !Number.isSafeInteger(boundary.from) ||
+      !Number.isSafeInteger(boundary.ledger) ||
+      boundary.from === undefined ||
+      boundary.from < 1 ||
+      boundary.from > boundary.ledger ||
+      boundary.cursor !== endOfLedgerCursor(boundary.ledger)
+    )
+      continue;
+    if (boundary.from <= covered + 1 && boundary.ledger > covered) {
+      covered = boundary.ledger;
+      highestVerified = covered;
+    }
+  }
+
+  const warnings: string[] = [];
+  if (conflicts.length > 0) {
+    warnings.push(
+      `${String(conflicts.length)} event identity conflict(s) detected; reconcile before applying cursor changes`,
+    );
+  }
+  const blockedByConflicts = conflicts.length > 0;
+  const baseEvidence = { retainedHistory, highestVerifiedLedger: highestVerified };
+
+  if (currentCursor !== null && currentCursor.contract !== expectedContract) {
+    return {
+      unsigned: true,
+      readOnly: true,
+      chainKey,
+      action: "reset_cursor",
+      currentPosition: currentCursor.position.toString(),
+      proposedPosition: null,
+      proposedRpcCursor: null,
+      blockedByConflicts,
+      conflictCount: conflicts.length,
+      gap: null,
+      sql: "DELETE FROM indexer_cursor WHERE chain_key = $1 AND contract = $2 AND last_processed = $3",
+      params: [chainKey, currentCursor.contract, currentCursor.position.toString()],
+      rationale: `stored cursor belongs to contract ${currentCursor.contract}, not expected router ${expectedContract}`,
+      warnings,
+      evidence: baseEvidence,
+    };
+  }
+
+  if (currentCursor === null) {
+    if (highestVerified !== null) {
+      return {
+        unsigned: true,
+        readOnly: true,
+        chainKey,
+        action: "initialize_cursor",
+        currentPosition: null,
+        proposedPosition: String(highestVerified),
+        proposedRpcCursor: endOfLedgerCursor(highestVerified),
+        blockedByConflicts,
+        conflictCount: conflicts.length,
+        gap: null,
+        sql: `INSERT INTO indexer_cursor (chain_key, family, contract, last_processed, last_processed_at, last_processed_hash)
+VALUES ($1, 'stellar', $2, $3, NULL, NULL)
+ON CONFLICT (chain_key) DO NOTHING`,
+        params: [chainKey, expectedContract, String(highestVerified)],
+        rationale: `no cursor row exists; initialize from verified completed ledger boundary ${String(highestVerified)}`,
+        warnings,
+        evidence: baseEvidence,
+      };
+    }
+    if (retainedHistory !== null && startLedger < retainedHistory.oldestLedger) {
+      return {
+        unsigned: true,
+        readOnly: true,
+        chainKey,
+        action: "backfill_required",
+        currentPosition: null,
+        proposedPosition: null,
+        proposedRpcCursor: null,
+        blockedByConflicts,
+        conflictCount: conflicts.length,
+        gap: { from: startLedger, to: retainedHistory.oldestLedger - 1 },
+        sql: null,
+        params: [],
+        rationale: `configured startLedger ${String(startLedger)} is older than retained history (${String(retainedHistory.oldestLedger)}) with no verified boundary`,
+        warnings: [...warnings, "archive backfill is required to cover ledgers below oldestLedger"],
+        evidence: baseEvidence,
+      };
+    }
+    return {
+      unsigned: true,
+      readOnly: true,
+      chainKey,
+      action: "noop",
+      currentPosition: null,
+      proposedPosition: null,
+      proposedRpcCursor: null,
+      blockedByConflicts,
+      conflictCount: conflicts.length,
+      gap: null,
+      sql: null,
+      params: [],
+      rationale: "no cursor row exists yet and startLedger is within retained history",
+      warnings,
+      evidence: baseEvidence,
+    };
+  }
+
+  const currentPos = Number(currentCursor.position);
+
+  if (retainedHistory !== null && currentPos > retainedHistory.latestLedger) {
+    if (highestVerified !== null && highestVerified <= retainedHistory.latestLedger) {
+      return {
+        unsigned: true,
+        readOnly: true,
+        chainKey,
+        action: "rewind_cursor",
+        currentPosition: currentCursor.position.toString(),
+        proposedPosition: String(highestVerified),
+        proposedRpcCursor: endOfLedgerCursor(highestVerified),
+        blockedByConflicts,
+        conflictCount: conflicts.length,
+        gap: null,
+        sql: `UPDATE indexer_cursor
+   SET last_processed = $1, updated_at = now()
+ WHERE chain_key = $2 AND contract = $3 AND last_processed = $4`,
+        params: [
+          String(highestVerified),
+          chainKey,
+          expectedContract,
+          currentCursor.position.toString(),
+        ],
+        rationale: `cursor ${currentCursor.position.toString()} exceeds latest retained ledger ${String(retainedHistory.latestLedger)}; rewind to verified boundary ${String(highestVerified)}`,
+        warnings,
+        evidence: baseEvidence,
+      };
+    }
+    return {
+      unsigned: true,
+      readOnly: true,
+      chainKey,
+      action: "backfill_required",
+      currentPosition: currentCursor.position.toString(),
+      proposedPosition: null,
+      proposedRpcCursor: null,
+      blockedByConflicts,
+      conflictCount: conflicts.length,
+      gap: null,
+      sql: null,
+      params: [],
+      rationale: `cursor ${currentCursor.position.toString()} exceeds latest retained ledger ${String(retainedHistory.latestLedger)} and no verified fallback boundary exists`,
+      warnings: [...warnings, "manual verification required before rewinding cursor"],
+      evidence: baseEvidence,
+    };
+  }
+
+  if (retainedHistory !== null && currentPos + 1 < retainedHistory.oldestLedger) {
+    if (
+      highestVerified !== null &&
+      highestVerified >= retainedHistory.oldestLedger - 1 &&
+      highestVerified > currentPos
+    ) {
+      return {
+        unsigned: true,
+        readOnly: true,
+        chainKey,
+        action: "advance_cursor",
+        currentPosition: currentCursor.position.toString(),
+        proposedPosition: String(highestVerified),
+        proposedRpcCursor: endOfLedgerCursor(highestVerified),
+        blockedByConflicts,
+        conflictCount: conflicts.length,
+        gap: null,
+        sql: `UPDATE indexer_cursor
+   SET last_processed = $1, updated_at = now()
+ WHERE chain_key = $2 AND contract = $3 AND last_processed = $4`,
+        params: [
+          String(highestVerified),
+          chainKey,
+          expectedContract,
+          currentCursor.position.toString(),
+        ],
+        rationale: `cursor ${currentCursor.position.toString()} fell behind retention (${String(retainedHistory.oldestLedger)}), but verified boundary ${String(highestVerified)} bridges the gap`,
+        warnings,
+        evidence: baseEvidence,
+      };
+    }
+    return {
+      unsigned: true,
+      readOnly: true,
+      chainKey,
+      action: "backfill_required",
+      currentPosition: currentCursor.position.toString(),
+      proposedPosition: null,
+      proposedRpcCursor: null,
+      blockedByConflicts,
+      conflictCount: conflicts.length,
+      gap: { from: currentPos + 1, to: retainedHistory.oldestLedger - 1 },
+      sql: null,
+      params: [],
+      rationale: `ledgers ${String(currentPos + 1)}..${String(retainedHistory.oldestLedger - 1)} fell outside provider retention with no verified completion evidence`,
+      warnings: [
+        ...warnings,
+        "archive backfill is required; advancing past an unverified gap would drop history",
+      ],
+      evidence: baseEvidence,
+    };
+  }
+
+  if (highestVerified !== null && highestVerified > currentPos) {
+    return {
+      unsigned: true,
+      readOnly: true,
+      chainKey,
+      action: "advance_cursor",
+      currentPosition: currentCursor.position.toString(),
+      proposedPosition: String(highestVerified),
+      proposedRpcCursor: endOfLedgerCursor(highestVerified),
+      blockedByConflicts,
+      conflictCount: conflicts.length,
+      gap: null,
+      sql: `UPDATE indexer_cursor
+   SET last_processed = $1, updated_at = now()
+ WHERE chain_key = $2 AND contract = $3 AND last_processed = $4`,
+      params: [
+        String(highestVerified),
+        chainKey,
+        expectedContract,
+        currentCursor.position.toString(),
+      ],
+      rationale: `verified completed ledger boundary ${String(highestVerified)} is ahead of stored cursor ${currentCursor.position.toString()}`,
+      warnings,
+      evidence: baseEvidence,
+    };
+  }
+
+  return {
+    unsigned: true,
+    readOnly: true,
+    chainKey,
+    action: "noop",
+    currentPosition: currentCursor.position.toString(),
+    proposedPosition: null,
+    proposedRpcCursor: null,
+    blockedByConflicts,
+    conflictCount: conflicts.length,
+    gap: null,
+    sql: null,
+    params: [],
+    rationale: "cursor is consistent with retained history and verified boundaries",
+    warnings,
+    evidence: baseEvidence,
+  };
+}
+
+/**
+ * Read-only wrapper that inspects `indexer_cursor` in `db` and generates an unsigned repair
+ * proposal without performing any writes.
+ */
+export async function planCursorRepairFromDb(
+  db: Queryable,
+  input: Omit<CursorRepairPlanInput, "currentCursor">,
+): Promise<CursorRepairProposal> {
+  const currentCursor = await readCursor(db, input.chainKey);
+  return planCursorRepair({ ...input, currentCursor });
 }
