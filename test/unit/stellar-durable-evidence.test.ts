@@ -39,6 +39,7 @@ beforeAll(async () => {
   for (const file of [
     "1790900000000_initial-schema.sql",
     "1791000000000_cursor-block-hash.sql",
+    "1791400000000_stellar-cursor-cas-leases-gaps.sql",
     "1791300000000_stellar-durable-scan-evidence.sql",
   ]) {
     await pg.exec(

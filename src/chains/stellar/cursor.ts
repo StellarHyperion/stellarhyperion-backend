@@ -111,6 +111,50 @@ export function completeThrough(position: CursorPosition): number {
   return position.completesLedger ? position.ledger : position.ledger - 1;
 }
 
+export interface LedgerRange {
+  readonly oldestLedger: number;
+  readonly latestLedger: number;
+}
+
+/**
+ * Extract the retained `[oldestLedger, latestLedger]` bounds from a Soroban RPC range refusal.
+ *
+ * Returns null when the message does not carry two integers in that shape.
+ */
+export function parseLedgerRangeError(message: string): LedgerRange | null {
+  const match = /ledger range[^0-9]*(\d+)\s*-\s*(\d+)/i.exec(message);
+  if (match === null) return null;
+  const oldestLedger = Number(match[1]);
+  const latestLedger = Number(match[2]);
+  if (
+    !Number.isSafeInteger(oldestLedger) ||
+    !Number.isSafeInteger(latestLedger) ||
+    oldestLedger < 0 ||
+    latestLedger < oldestLedger
+  ) {
+    return null;
+  }
+  return { oldestLedger, latestLedger };
+}
+
+/**
+ * Compute the inclusive end ledger for one bounded backfill step.
+ */
+export function boundedWindowEnd(fromLedger: number, toLedger: number, maxLedgers: number): number {
+  if (!Number.isInteger(fromLedger) || fromLedger < 0) {
+    throw new RangeError(`fromLedger must be a non-negative integer, got ${String(fromLedger)}`);
+  }
+  if (!Number.isInteger(toLedger) || toLedger < fromLedger) {
+    throw new RangeError(
+      `toLedger must be an integer >= fromLedger (${String(fromLedger)}), got ${String(toLedger)}`,
+    );
+  }
+  if (!Number.isInteger(maxLedgers) || maxLedgers <= 0) {
+    throw new RangeError(`maxLedgers must be a positive integer, got ${String(maxLedgers)}`);
+  }
+  return Math.min(toLedger, fromLedger + maxLedgers - 1);
+}
+
 /**
  * The inclusive upper ledger bound a single `getEvents` scan window can cover.
  *
@@ -134,4 +178,65 @@ export function isWithinRetentionWindow(
   latestLedger: number,
 ): boolean {
   return ledger >= oldestLedger && ledger <= latestLedger;
+}
+
+/** Verify range and event ordering before treating a provider cursor as completion. */
+export function validateRangePage(
+  page: {
+    readonly oldestLedger: number;
+    readonly latestLedger: number;
+    readonly cursor: string | null;
+    readonly events: readonly unknown[];
+  },
+  from: number,
+  end: number | undefined,
+  requestedCursor?: string,
+): void {
+  if (
+    !Number.isSafeInteger(page.oldestLedger) ||
+    !Number.isSafeInteger(page.latestLedger) ||
+    page.oldestLedger < 0 ||
+    page.latestLedger < from ||
+    page.oldestLedger > from
+  ) {
+    throw new Error("provider cannot verify the requested retained range");
+  }
+  const order = (id: string): bigint => {
+    const parts = id.split("-");
+    if (parts.length !== 2 || !parts.every((part) => /^\d+$/.test(part)))
+      throw new Error("invalid event cursor");
+    const toid = BigInt(parts[0] ?? "");
+    const index = BigInt(parts[1] ?? "");
+    if (toid >= 1n << 64n || index >= 1n << 32n)
+      throw new Error("event cursor exceeds wire limits");
+    return (toid << 32n) + index;
+  };
+  let previous = requestedCursor === undefined ? -1n : order(requestedCursor);
+  for (const input of page.events) {
+    const raw = input as { id: string; ledger: number };
+    const pos = parseEventCursor(raw.id);
+    const current = order(raw.id);
+    if (
+      current <= previous ||
+      pos.completesLedger ||
+      pos.ledger !== raw.ledger ||
+      raw.ledger < from ||
+      raw.ledger > page.latestLedger ||
+      (end !== undefined && raw.ledger > end)
+    ) {
+      throw new Error("provider returned unordered events or an unverifiable ledger");
+    }
+    previous = current;
+  }
+  if (page.cursor === null) return;
+  const terminal = parseEventCursor(page.cursor);
+  const cursorOrder = order(page.cursor);
+  if (
+    cursorOrder < previous ||
+    terminal.ledger > page.latestLedger ||
+    (end !== undefined && terminal.ledger > end) ||
+    (page.events.length === 0 && !terminal.completesLedger)
+  ) {
+    throw new Error("provider returned an unverifiable terminal cursor");
+  }
 }
