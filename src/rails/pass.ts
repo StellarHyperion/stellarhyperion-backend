@@ -25,10 +25,17 @@ import type { Logger } from "pino";
 import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
 import { writeInbound, writeAttestation } from "../chains/writers.js";
-import { outstandingForRail, pendingForRail, pendingTransferById } from "./queue.js";
+import {
+  inspectRailBacklog,
+  outstandingForRail,
+  pendingForRail,
+  pendingTransferById,
+  type InspectRailBacklogOptions,
+} from "./queue.js";
 import {
   RailError,
   isTerminal,
+  type BacklogInspectionReport,
   type PendingTransfer,
   type RailClient,
   type RailRetryClass,
@@ -85,6 +92,19 @@ export class RailPass {
 
   get progress(): RailProgress | null {
     return this.lastProgress;
+  }
+
+  /** Inspect this rail's backlog without polling providers or mutating pass state. */
+  inspectBacklog(
+    options: Omit<InspectRailBacklogOptions, "routes" | "recheckAfterMs" | "maxCheckFailures"> = {},
+  ): Promise<BacklogInspectionReport> {
+    return inspectRailBacklog(this.options.db, {
+      ...options,
+      routes: [this.options.route],
+      recheckAfterMs: this.options.recheckAfterMs,
+      maxCheckFailures: this.options.maxCheckFailures,
+      now: options.now ?? (() => this.now()),
+    });
   }
 
   readiness(): ReadinessReport {

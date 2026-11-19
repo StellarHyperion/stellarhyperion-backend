@@ -27,10 +27,16 @@ import { fixedReadiness } from "../runtime/readiness.js";
 import { RouteKind } from "@hyperion/protocol";
 
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
+import { inspectRailBacklog, type InspectRailBacklogOptions } from "../rails/backlog.js";
 import { IrisClient } from "../rails/cctp/iris.js";
 import { RailPass } from "../rails/pass.js";
 import { requeueTerminalTransfer } from "../rails/requeue.js";
-import type { RailClient, RailRequeueRequest, RailRequeueResult } from "../rails/types.js";
+import type {
+  BacklogInspectionReport,
+  RailClient,
+  RailRequeueRequest,
+  RailRequeueResult,
+} from "../rails/types.js";
 import { KeeperWorker } from "../keeper/worker.js";
 import { viemClient } from "./evm/client.js";
 import { EvmWatcher } from "./evm/watcher.js";
@@ -56,6 +62,8 @@ export interface Worker extends ReadinessSource {
 export interface IndexerHandle {
   readonly workers: readonly Worker[];
   readonly readiness: readonly ReadinessSource[];
+  /** Read-only operator inspection; it does not start workers or change transfer state. */
+  inspectBacklog(options?: InspectRailBacklogOptions): Promise<BacklogInspectionReport>;
   /** Begin polling. Separate from building, the way `listen` is separate from `buildServer`. */
   start(): void;
   stop(): Promise<void>;
@@ -140,6 +148,14 @@ export interface BuildIndexerDeps {
 export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   const { config, logger, db } = deps;
   const passes = buildRailPasses(config.rails, config.network, db, logger, config);
+  const inspectBacklog = (
+    options: InspectRailBacklogOptions = {},
+  ): Promise<BacklogInspectionReport> =>
+    inspectRailBacklog(db, {
+      ...options,
+      recheckAfterMs: config.rails.recheckAfterMs,
+      maxCheckFailures: config.rails.maxCheckFailures,
+    });
   const requeueTransfer: IndexerHandle["requeueTransfer"] = async (request, options) => {
     if (options?.evaluateNow === true && !config.rails.enabled) {
       throw new Error("immediate rail evaluation is disabled by configuration");
@@ -165,6 +181,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
           "disabled by configuration, so this replica answers questions and watches nothing",
         ),
       ],
+      inspectBacklog,
       start: () => undefined,
       stop: () => Promise.resolve(),
       requeueTransfer,
@@ -238,6 +255,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   return {
     workers,
     readiness: [...workers, ...extra],
+    inspectBacklog,
     start: () => {
       for (const worker of workers) worker.start();
       if (workers.length > 0) {
