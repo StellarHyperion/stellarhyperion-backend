@@ -10,6 +10,33 @@ describe("transfer stream timer bounds", () => {
     ).toEqual({ poll: 5000, heartbeat: 30_000 });
   });
 
+  it("accepts both boundaries and clamps values just outside them", () => {
+    expect(
+      transferStreamIntervals({ pollIntervalMs: "1000", heartbeatIntervalMs: "5000" }),
+    ).toEqual({
+      poll: 1000,
+      heartbeat: 5000,
+    });
+    expect(
+      transferStreamIntervals({ pollIntervalMs: "30000", heartbeatIntervalMs: "60000" }),
+    ).toEqual({
+      poll: 30_000,
+      heartbeat: 60_000,
+    });
+    expect(transferStreamIntervals({ pollIntervalMs: "999", heartbeatIntervalMs: "4999" })).toEqual(
+      {
+        poll: 1000,
+        heartbeat: 5000,
+      },
+    );
+    expect(
+      transferStreamIntervals({ pollIntervalMs: "30001", heartbeatIntervalMs: "60001" }),
+    ).toEqual({
+      poll: 30_000,
+      heartbeat: 60_000,
+    });
+  });
+
   it.each(["2147483648", "9007199254740993", "1e309", "Infinity"])(
     "caps %s instead of allowing Node to overflow it into a one-millisecond timer",
     (value) => {
