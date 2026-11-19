@@ -39,6 +39,7 @@ import {
   type PendingTransfer,
   type RailClient,
   type RailRetryClass,
+  type CctpVerificationFailure,
 } from "./types.js";
 
 /**
@@ -261,6 +262,7 @@ export class RailPass {
         error: null,
         nextAttemptAt: null,
         retryClass: null,
+        verificationFailure: null,
       });
       return true;
     }
@@ -280,15 +282,23 @@ export class RailPass {
         error: null,
         nextAttemptAt: this.nextCheckAt(at),
         retryClass: null,
+        verificationFailure: null,
       });
       return false;
     }
 
     const { report } = lookup;
-    if (this.options.config && (report.execution || report.forwardTxHash)) {
-      const verified =
-        (await verifyItsDelivery(this.options.config, db, transfer, report)) ??
-        (await verifyCctpDelivery(this.options.config, db, transfer, report));
+    let verificationFailure: CctpVerificationFailure | null = null;
+    if (this.options.config) {
+      let verified =
+        report.execution || report.forwardTxHash
+          ? await verifyItsDelivery(this.options.config, db, transfer, report)
+          : null;
+      if (!verified) {
+        const cctp = await verifyCctpDelivery(this.options.config, db, transfer, report);
+        verified = cctp.delivery;
+        verificationFailure = cctp.failure;
+      }
       if (verified) {
         signal.throwIfAborted();
         await writeInbound(db, verified.at, verified.row);
@@ -303,11 +313,13 @@ export class RailPass {
           error: null,
           nextAttemptAt: null,
           retryClass: null,
+          verificationFailure: null,
         });
         return true;
       }
     }
-    const status = report.status === "delivered" ? "pending" : report.status;
+    const status =
+      verificationFailure !== null || report.status === "delivered" ? "pending" : report.status;
     await this.write(db, transfer, {
       status,
       railStatus: report.railStatus,
@@ -319,6 +331,7 @@ export class RailPass {
       error: null,
       nextAttemptAt: isTerminal(status) ? null : this.nextCheckAt(at),
       retryClass: null,
+      verificationFailure,
     });
     return isTerminal(status);
   }
@@ -375,6 +388,7 @@ export class RailPass {
           ? null
           : this.failureRetryAt(this.now(), attempts, error),
       retryClass,
+      verificationFailure: null,
     });
   }
 
@@ -392,6 +406,7 @@ export class RailPass {
       readonly error: string | null;
       readonly nextAttemptAt: Date | null;
       readonly retryClass: RailRetryClass | null;
+      readonly verificationFailure: CctpVerificationFailure | null;
     },
   ): Promise<void> {
     await writeAttestation(db, {
@@ -407,6 +422,7 @@ export class RailPass {
       lastError: fields.error,
       nextAttemptAt: fields.nextAttemptAt,
       retryClass: fields.retryClass,
+      verificationFailure: fields.verificationFailure,
     });
   }
 

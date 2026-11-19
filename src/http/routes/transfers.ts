@@ -19,6 +19,8 @@ import {
 } from "../etag.js";
 import type { ServerDeps } from "../server.js";
 import { transferStreamIntervals } from "../stream-intervals.js";
+import { sanitizeRailDiagnostic } from "../../rails/diagnostics.js";
+import { CCTP_VERIFICATION_FAILURES, type CctpVerificationFailure } from "../../rails/types.js";
 
 export type TransferLifecycleStage =
   | "initiated"
@@ -64,6 +66,7 @@ export interface FormattedTransfer {
   readonly rail: {
     readonly status: string | null;
     readonly railStatus: string | null;
+    readonly verificationFailure: CctpVerificationFailure | null;
     readonly reference: string | null;
     readonly attestedAt: string | null;
     readonly lastError: string | null;
@@ -177,12 +180,13 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
         ? null
         : {
             status: railStatus,
-            railStatus: textOrNull(row, "rail_status"),
-            reference: textOrNull(row, "rail_reference"),
+            railStatus: sanitizeRailDiagnostic(textOrNull(row, "rail_status")),
+            verificationFailure: cctpFailureValue(textOrNull(row, "verification_failure")),
+            reference: sanitizeRailDiagnostic(textOrNull(row, "rail_reference")),
             attestedAt: row.attested_at
               ? new Date(row.attested_at as string | number | Date).toISOString()
               : null,
-            lastError: textOrNull(row, "last_error"),
+            lastError: sanitizeRailDiagnostic(textOrNull(row, "last_error")),
           },
     claim: hasClaim
       ? {
@@ -213,6 +217,7 @@ const TRANSFER_QUERY = `
          t.observed_at,
          a.status AS attestation_status,
          a.rail_status,
+         a.verification_failure,
          a.rail_reference,
          a.attested_at,
          a.last_error,
@@ -252,6 +257,10 @@ const TRANSFER_QUERY = `
            AND other.id <> t.id
       )))
 `;
+
+function cctpFailureValue(value: string | null): CctpVerificationFailure | null {
+  return CCTP_VERIFICATION_FAILURES.find((failure) => failure === value) ?? null;
+}
 
 function isDeliveryFinalized(transfer: FormattedTransfer): boolean {
   return (
