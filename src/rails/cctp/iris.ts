@@ -53,6 +53,21 @@ const EXPIRED_STATUSES = new Set(["expired"]);
 /** What Circle asks for after a 429, which it does not put in a header. */
 const RATE_LIMIT_COOLDOWN_MS = 5 * 60_000;
 
+/** Keep an untrusted provider response from consuming unbounded worker memory. */
+export const MAX_IRIS_RESPONSE_BYTES = 2 * 1024 * 1024;
+/** CCTP messages are fixed-format and small; this leaves room for future v2 fields. */
+export const MAX_IRIS_MESSAGE_BYTES = 64 * 1024;
+/** Attestations are signatures, not arbitrary provider documents. */
+export const MAX_IRIS_ATTESTATION_BYTES = 128 * 1024;
+const MAX_IRIS_ERROR_BYTES = 16 * 1024;
+
+export class IrisResourceLimitError extends RailError {
+  readonly category = "provider_resource_limit";
+  constructor(detail: string) {
+    super("cctp", "permanent", `resource limit exceeded: ${detail}`);
+  }
+}
+
 export interface FastAttestationMetadata {
   readonly signature?: unknown;
   readonly attestation?: unknown;
@@ -261,8 +276,9 @@ export class IrisClient implements RailClient {
 
     let body: unknown;
     try {
-      body = await response.json();
+      body = await readJson(response, MAX_IRIS_RESPONSE_BYTES);
     } catch (cause) {
+      if (cause instanceof RailError) throw cause;
       throw new RailError(this.rail, "transient", `response was not json: ${describe(cause)}`);
     }
 
@@ -295,6 +311,11 @@ export class IrisClient implements RailClient {
     // A 200 with no messages is the same situation as a 404 and both happen. Reporting it as a
     // failure would be reporting the normal case.
     if (message === undefined) return { kind: "missing" };
+
+    const limit = messageLimitViolation(message);
+    if (limit !== null) {
+      throw new IrisResourceLimitError(limit);
+    }
 
     return { kind: "found", report: reportFor(message) };
   }
@@ -555,15 +576,84 @@ export function domainFor(chainKey: string): number {
 
 async function describeError(response: Response): Promise<string> {
   try {
-    const body = (await response.json()) as { error?: unknown; message?: unknown };
+    const body = (await readJson(response, MAX_IRIS_ERROR_BYTES)) as {
+      error?: unknown;
+      message?: unknown;
+    };
     // Two shapes, both real: the reference documents `{code, message}` and the sandbox returns
     // `{error}`.
     if (typeof body.error === "string") return body.error;
     if (typeof body.message === "string") return body.message;
     return "no reason given";
-  } catch {
+  } catch (error) {
+    if (error instanceof IrisResourceLimitError) throw error;
     return "no reason given";
   }
+}
+
+async function readJson(response: Response, maxBytes: number): Promise<unknown> {
+  if (response.body === null) {
+    throw new SyntaxError("empty provider body");
+  }
+
+  const contentLength = response.headers.get("content-length");
+  if (contentLength !== null && /^\d+$/.test(contentLength) && Number(contentLength) > maxBytes) {
+    await response.body.cancel().catch(() => undefined);
+    throw new IrisResourceLimitError(`response exceeds ${maxBytes} bytes`);
+  }
+
+  const reader: ReadableStreamDefaultReader<unknown> = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!(value instanceof Uint8Array))
+        throw new RailError("cctp", "transient", "invalid provider byte stream");
+      size += value.byteLength;
+      if (size > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new IrisResourceLimitError(`response exceeds ${maxBytes} bytes`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+
+function messageLimitViolation(message: IrisMessage): string | null {
+  const messageFields = [message.message, message.messageBytes, message.rawMessage];
+  if (
+    messageFields.some(
+      (value) => typeof value === "string" && value.length > MAX_IRIS_MESSAGE_BYTES,
+    )
+  ) {
+    return `message exceeds ${MAX_IRIS_MESSAGE_BYTES} characters`;
+  }
+  const attestationFields = [
+    message.attestation,
+    message.signature,
+    message.attestationSignature,
+    message.fastAttestation?.attestation,
+    message.fastAttestation?.signature,
+  ];
+  if (
+    attestationFields.some(
+      (value) => typeof value === "string" && value.length > MAX_IRIS_ATTESTATION_BYTES,
+    )
+  ) {
+    return `attestation exceeds ${MAX_IRIS_ATTESTATION_BYTES} characters`;
+  }
+  return null;
 }
 
 function describe(cause: unknown): string {
