@@ -1,13 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { encodeAbiParameters, encodeEventTopics, stringToHex, type Hex } from "viem";
 import {
+  AXELAR_GAS_ABI,
   ITS_ABI,
+  inspectAxelarGasEvidence,
   inspectDeliveryEvidence,
   matchingPayment,
   inspectPayment,
   normalizeVerificationDiagnostics,
   type DeliveryLog,
   type ExpectedDelivery,
+  type GasLinkTarget,
 } from "../../src/rails/axelar/events.js";
 const recipient = "0x1111111111111111111111111111111111111111";
 const its = "0x2222222222222222222222222222222222222222";
@@ -188,5 +191,126 @@ describe("Destination delivery evidence", () => {
         }),
       ]),
     );
+  });
+});
+
+describe("Axelar gas-service evidence", () => {
+  const gasService = "0x6666666666666666666666666666666666666666";
+  const payer = "0x7777777777777777777777777777777777777777";
+  const refund = "0x8888888888888888888888888888888888888888";
+  const receiver = "0x9999999999999999999999999999999999999999";
+  const zeroAddress = "0x0000000000000000000000000000000000000000";
+  const sourceTx = `0x${"aa".repeat(32)}`;
+  const payloadHash = `0x${"bb".repeat(32)}`;
+  const targets: readonly GasLinkTarget[] = [
+    {
+      transferId: 42n,
+      originTx: sourceTx,
+      originLogIndex: 7,
+      sender: payer,
+      destinationChain: "ethereum-sepolia",
+      destination: recipient,
+    },
+  ];
+
+  it("preserves native payment amounts and refund identity while linking by source identity", () => {
+    const log: DeliveryLog = {
+      address: gasService,
+      topics: encodeEventTopics({
+        abi: AXELAR_GAS_ABI,
+        eventName: "NativeGasPaidForContractCall",
+        args: { sourceAddress: payer, payloadHash },
+      }) as [Hex, ...Hex[]],
+      data: encodeAbiParameters(
+        [{ type: "string" }, { type: "string" }, { type: "uint256" }, { type: "address" }],
+        ["ethereum-sepolia", recipient, 123456789012345678901n, refund],
+      ),
+      logIndex: 3,
+    };
+    const [record] = inspectAxelarGasEvidence([log], gasService, sourceTx, targets);
+    expect(record).toMatchObject({
+      kind: "payment",
+      native: true,
+      gasToken: null,
+      amount: 123456789012345678901n,
+      refundAddress: refund,
+      transferId: 42n,
+      linkBasis: "source_identity",
+    });
+  });
+
+  it("links native top-ups and refunds by the original call log without changing delivery", () => {
+    const topup: DeliveryLog = {
+      address: gasService,
+      topics: encodeEventTopics({
+        abi: AXELAR_GAS_ABI,
+        eventName: "NativeGasAdded",
+        args: { txHash: sourceTx, logIndex: 7n },
+      }) as [Hex, ...Hex[]],
+      data: encodeAbiParameters([{ type: "uint256" }, { type: "address" }], [987654321n, refund]),
+      logIndex: 4,
+    };
+    const refunded: DeliveryLog = {
+      address: gasService,
+      topics: encodeEventTopics({
+        abi: AXELAR_GAS_ABI,
+        eventName: "Refunded",
+        args: { txHash: sourceTx, logIndex: 7n },
+      }) as [Hex, ...Hex[]],
+      data: encodeAbiParameters(
+        [{ type: "address" }, { type: "address" }, { type: "uint256" }],
+        [receiver, zeroAddress, 55n],
+      ),
+      logIndex: 5,
+    };
+    expect(inspectAxelarGasEvidence([topup, refunded], gasService, sourceTx, targets)).toEqual([
+      expect.objectContaining({
+        kind: "topup",
+        native: true,
+        amount: 987654321n,
+        refundAddress: refund,
+        transferId: 42n,
+        linkBasis: "origin_log",
+      }),
+      expect.objectContaining({
+        kind: "refund",
+        native: true,
+        amount: 55n,
+        refundAddress: receiver,
+        transferId: 42n,
+        linkBasis: "origin_log",
+      }),
+    ]);
+  });
+
+  it("retains unsupported links as unresolved evidence", () => {
+    const mismatched: DeliveryLog = {
+      address: gasService,
+      topics: encodeEventTopics({
+        abi: AXELAR_GAS_ABI,
+        eventName: "GasAdded",
+        args: { txHash: sourceTx, logIndex: 99n },
+      }) as [Hex, ...Hex[]],
+      data: encodeAbiParameters(
+        [{ type: "address" }, { type: "uint256" }, { type: "address" }],
+        [token, 1n, refund],
+      ),
+      logIndex: 6,
+    };
+    const unsupported: DeliveryLog = {
+      address: gasService,
+      topics: [`0x${"de".repeat(32)}`],
+      data: "0x",
+      logIndex: 7,
+    };
+    const records = inspectAxelarGasEvidence(
+      [mismatched, unsupported],
+      gasService,
+      sourceTx,
+      targets,
+    );
+    expect(records.map((record) => record.linkBasis)).toEqual(["unresolved", "unresolved"]);
+    expect(records[0]).toMatchObject({ kind: "topup", native: false, candidateCount: 0 });
+    expect(records[1]).toMatchObject({ kind: "unsupported", amount: 0n });
   });
 });

@@ -6,6 +6,21 @@ export const ITS_ABI = parseAbi([
   "event InterchainTransferReceived(bytes32 indexed commandId, bytes32 indexed tokenId, string sourceChain, bytes sourceAddress, address indexed destinationAddress, uint256 amount, bytes32 dataHash)",
   "event Transfer(address indexed from, address indexed to, uint256 value)",
 ]);
+export const AXELAR_GAS_ABI = parseAbi([
+  "event GasPaidForContractCall(address indexed sourceAddress, string destinationChain, string destinationAddress, bytes32 indexed payloadHash, address gasToken, uint256 gasFeeAmount, address refundAddress)",
+  "event GasPaidForContractCallWithToken(address indexed sourceAddress, string destinationChain, string destinationAddress, bytes32 indexed payloadHash, string symbol, uint256 amount, address gasToken, uint256 gasFeeAmount, address refundAddress)",
+  "event NativeGasPaidForContractCall(address indexed sourceAddress, string destinationChain, string destinationAddress, bytes32 indexed payloadHash, uint256 gasFeeAmount, address refundAddress)",
+  "event NativeGasPaidForContractCallWithToken(address indexed sourceAddress, string destinationChain, string destinationAddress, bytes32 indexed payloadHash, string symbol, uint256 amount, uint256 gasFeeAmount, address refundAddress)",
+  "event GasPaidForExpressCall(address indexed sourceAddress, string destinationChain, string destinationAddress, bytes32 indexed payloadHash, address gasToken, uint256 gasFeeAmount, address refundAddress)",
+  "event GasPaidForExpressCallWithToken(address indexed sourceAddress, string destinationChain, string destinationAddress, bytes32 indexed payloadHash, string symbol, uint256 amount, address gasToken, uint256 gasFeeAmount, address refundAddress)",
+  "event NativeGasPaidForExpressCall(address indexed sourceAddress, string destinationChain, string destinationAddress, bytes32 indexed payloadHash, uint256 gasFeeAmount, address refundAddress)",
+  "event NativeGasPaidForExpressCallWithToken(address indexed sourceAddress, string destinationChain, string destinationAddress, bytes32 indexed payloadHash, string symbol, uint256 amount, uint256 gasFeeAmount, address refundAddress)",
+  "event GasAdded(bytes32 indexed txHash, uint256 indexed logIndex, address gasToken, uint256 gasFeeAmount, address refundAddress)",
+  "event NativeGasAdded(bytes32 indexed txHash, uint256 indexed logIndex, uint256 gasFeeAmount, address refundAddress)",
+  "event ExpressGasAdded(bytes32 indexed txHash, uint256 indexed logIndex, address gasToken, uint256 gasFeeAmount, address refundAddress)",
+  "event NativeExpressGasAdded(bytes32 indexed txHash, uint256 indexed logIndex, uint256 gasFeeAmount, address refundAddress)",
+  "event Refunded(bytes32 indexed txHash, uint256 indexed logIndex, address payable receiver, address token, uint256 amount)",
+]);
 export interface DeliveryLog {
   address: Hex;
   topics: [] | [Hex, ...Hex[]];
@@ -22,6 +37,193 @@ export interface ExpectedDelivery {
   sourceAddress: string;
   recipient: string;
   amount: bigint;
+}
+
+export type AxelarGasEvidenceKind = "payment" | "topup" | "refund" | "unsupported";
+export type AxelarGasLinkBasis = "origin_log" | "source_identity" | "unresolved";
+
+export interface GasLinkTarget {
+  readonly transferId: bigint;
+  readonly originTx: string;
+  readonly originLogIndex: number | null;
+  readonly sender: string;
+  readonly destinationChain: string;
+  readonly destination: string;
+}
+
+export interface AxelarGasEvidence<T extends DeliveryLog = DeliveryLog> {
+  readonly log: T;
+  readonly eventName: string;
+  readonly eventSignature: string;
+  readonly kind: AxelarGasEvidenceKind;
+  readonly native: boolean;
+  readonly gasToken: string | null;
+  readonly amount: bigint;
+  readonly refundAddress: string | null;
+  readonly sourceAddress: string | null;
+  readonly destinationChain: string | null;
+  readonly destinationAddress: string | null;
+  readonly sourceLogIndex: number;
+  readonly referenceTxHash: string;
+  readonly referenceLogIndex: number | null;
+  readonly transferId: bigint | null;
+  readonly linkBasis: AxelarGasLinkBasis;
+  readonly candidateCount: number;
+  readonly payload: unknown;
+}
+
+const GAS_PAYMENT_EVENTS: readonly string[] = [
+  "GasPaidForContractCall",
+  "GasPaidForContractCallWithToken",
+  "NativeGasPaidForContractCall",
+  "NativeGasPaidForContractCallWithToken",
+  "GasPaidForExpressCall",
+  "GasPaidForExpressCallWithToken",
+  "NativeGasPaidForExpressCall",
+  "NativeGasPaidForExpressCallWithToken",
+];
+const GAS_TOPUP_EVENTS: readonly string[] = [
+  "GasAdded",
+  "NativeGasAdded",
+  "ExpressGasAdded",
+  "NativeExpressGasAdded",
+];
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+
+function gasString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function gasAmount(value: unknown): bigint | null {
+  if (typeof value === "bigint") return value;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return BigInt(value);
+  return null;
+}
+
+function safeLogIndex(value: unknown): number | null {
+  const index = gasAmount(value);
+  return index !== null && index <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(index) : null;
+}
+
+function sameAddress(left: string | null, right: string): boolean {
+  return left !== null && left.toLowerCase() === right.toLowerCase();
+}
+
+export function inspectAxelarGasEvidence<T extends DeliveryLog>(
+  logs: readonly T[],
+  gasService: string,
+  sourceTxHash: string,
+  targets: readonly GasLinkTarget[],
+): readonly AxelarGasEvidence<T>[] {
+  const records: AxelarGasEvidence<T>[] = [];
+  for (const log of logs) {
+    if (!sameAddress(log.address, gasService)) continue;
+    const signature = log.topics[0] ?? "0x";
+    let event: { readonly eventName: string; readonly args: unknown };
+    try {
+      event = decodeEventLog({
+        abi: AXELAR_GAS_ABI,
+        topics: log.topics,
+        data: log.data,
+      });
+    } catch {
+      records.push({
+        log,
+        eventName: "unsupported",
+        eventSignature: signature,
+        kind: "unsupported",
+        native: false,
+        gasToken: null,
+        amount: 0n,
+        refundAddress: null,
+        sourceAddress: null,
+        destinationChain: null,
+        destinationAddress: null,
+        sourceLogIndex: log.logIndex ?? -1,
+        referenceTxHash: sourceTxHash,
+        referenceLogIndex: null,
+        transferId: null,
+        linkBasis: "unresolved",
+        candidateCount: 0,
+        payload: {
+          address: log.address,
+          topics: log.topics,
+          data: log.data,
+          logIndex: log.logIndex,
+        },
+      });
+      continue;
+    }
+    const name = event.eventName;
+    const args = event.args as Record<string, unknown>;
+    const kind: AxelarGasEvidenceKind = GAS_PAYMENT_EVENTS.includes(name)
+      ? "payment"
+      : GAS_TOPUP_EVENTS.includes(name)
+        ? "topup"
+        : name === "Refunded"
+          ? "refund"
+          : "unsupported";
+    const referenceTx =
+      kind === "payment" ? sourceTxHash : (gasString(args.txHash) ?? sourceTxHash);
+    const referenceLogIndex =
+      kind === "payment" ? log.logIndex : (safeLogIndex(args.logIndex) ?? log.logIndex);
+    const sourceAddress = gasString(args.sourceAddress);
+    const destinationChain = gasString(args.destinationChain);
+    const destinationAddress = gasString(args.destinationAddress);
+    const token = gasString(args.gasToken) ?? gasString(args.token);
+    const native =
+      name.startsWith("Native") || (kind === "refund" && sameAddress(token, ZERO_ADDRESS));
+    const candidates =
+      kind === "payment"
+        ? targets.filter(
+            (target) =>
+              sameAddress(target.originTx, referenceTx) &&
+              sameAddress(target.sender, sourceAddress ?? "") &&
+              target.destinationChain === destinationChain &&
+              sameAddress(target.destination, destinationAddress ?? ""),
+          )
+        : kind === "unsupported"
+          ? []
+          : targets.filter(
+              (target) =>
+                sameAddress(target.originTx, referenceTx) &&
+                target.originLogIndex === referenceLogIndex,
+            );
+    const only = candidates.length === 1 ? candidates[0] : undefined;
+    records.push({
+      log,
+      eventName: name,
+      eventSignature: signature,
+      kind,
+      native,
+      gasToken: native ? null : token,
+      amount: gasAmount(kind === "refund" ? args.amount : args.gasFeeAmount) ?? 0n,
+      refundAddress: gasString(kind === "refund" ? args.receiver : args.refundAddress),
+      sourceAddress,
+      destinationChain,
+      destinationAddress,
+      sourceLogIndex: log.logIndex ?? -1,
+      referenceTxHash: referenceTx,
+      referenceLogIndex,
+      transferId: only?.transferId ?? null,
+      linkBasis:
+        only === undefined ? "unresolved" : kind === "payment" ? "source_identity" : "origin_log",
+      candidateCount: candidates.length,
+      payload: {
+        eventName: name,
+        address: log.address,
+        topics: log.topics,
+        data: log.data,
+        logIndex: log.logIndex,
+        sourceAddress,
+        destinationChain,
+        destinationAddress,
+        gasToken: native ? null : token,
+        refundAddress: gasString(kind === "refund" ? args.receiver : args.refundAddress),
+      },
+    });
+  }
+  return records;
 }
 
 export type VerificationMismatchCategory =

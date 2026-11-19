@@ -22,6 +22,7 @@ import type { AxelarDeliveryEvidenceRow } from "../chains/writers.js";
  */
 import type { AppConfig } from "../config/config.js";
 import { revalidateItsDeliveryProofs, verifyItsDelivery } from "./axelar/delivery.js";
+import { ingestAxelarGasEvidence } from "./axelar/gas.js";
 import type { VerificationDiagnostic } from "./axelar/events.js";
 import { inspectCctpDelivery } from "./cctp/delivery.js";
 import type { Logger } from "pino";
@@ -161,12 +162,12 @@ export class RailPass {
     if (cooldown !== null && cooldown > this.now()) return false;
     this.cooldownUntil = null;
 
-    if (
-      this.options.config &&
-      this.options.route === RouteKind.AxelarIts &&
-      client.rail === "axelar"
-    )
-      await revalidateItsDeliveryProofs(this.options.config, db, batchSize, { signal });
+    if (this.options.config && client.rail === "axelar") {
+      if (this.options.route === RouteKind.AxelarIts || this.options.route === RouteKind.AxelarGmp)
+        await ingestAxelarGasEvidence(this.options.config, db, batchSize, { signal });
+      if (this.options.route === RouteKind.AxelarIts)
+        await revalidateItsDeliveryProofs(this.options.config, db, batchSize, { signal });
+    }
 
     let checked = 0;
     let settled = 0;

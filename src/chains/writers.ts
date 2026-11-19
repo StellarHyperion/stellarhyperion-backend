@@ -577,6 +577,92 @@ export async function linkAxelarDeliveryEvidence(
   if (rowCount !== 1) throw new Error("Axelar evidence did not match its inbound delivery.");
 }
 
+export interface AxelarGasEvidenceRow {
+  readonly transferId: bigint | null;
+  readonly originChain: string;
+  readonly sourceTxHash: string;
+  readonly sourceLogIndex: number;
+  readonly sourceEvent: string;
+  readonly eventSignature: string;
+  readonly eventKind: "payment" | "topup" | "refund" | "unsupported";
+  readonly linkBasis: "origin_log" | "source_identity" | "unresolved";
+  readonly native: boolean;
+  readonly gasToken: string | null;
+  readonly amount: bigint;
+  readonly refundAddress: string | null;
+  readonly referenceTxHash: string;
+  readonly referenceLogIndex: number | null;
+  readonly candidateCount: number;
+  readonly payload: unknown;
+}
+
+export async function writeAxelarGasEvidence(
+  db: Queryable,
+  row: AxelarGasEvidenceRow,
+): Promise<void> {
+  await db.query(
+    `INSERT INTO axelar_gas_evidence
+       (transfer_id, origin_chain, source_tx_hash, source_log_index, source_event,
+        event_signature, event_kind, status, link_basis, gas_token, native, amount,
+        refund_address, reference_tx_hash, reference_log_index, candidate_count, payload)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+     ON CONFLICT (origin_chain, source_tx_hash, source_log_index, source_event) DO UPDATE
+       SET transfer_id = EXCLUDED.transfer_id,
+           status = EXCLUDED.status,
+           link_basis = EXCLUDED.link_basis,
+           gas_token = EXCLUDED.gas_token,
+           native = EXCLUDED.native,
+           amount = EXCLUDED.amount,
+           refund_address = EXCLUDED.refund_address,
+           reference_tx_hash = EXCLUDED.reference_tx_hash,
+           reference_log_index = EXCLUDED.reference_log_index,
+           candidate_count = EXCLUDED.candidate_count,
+           payload = EXCLUDED.payload,
+           last_seen_at = now(),
+           replay_count = axelar_gas_evidence.replay_count + 1`,
+    [
+      row.transferId?.toString() ?? null,
+      safeString(row.originChain),
+      safeString(row.sourceTxHash),
+      row.sourceLogIndex,
+      safeString(row.sourceEvent),
+      safeString(row.eventSignature),
+      row.eventKind,
+      row.transferId === null ? "unresolved" : "linked",
+      row.linkBasis,
+      row.gasToken === null ? null : safeString(row.gasToken),
+      row.native,
+      row.amount.toString(),
+      row.refundAddress === null ? null : safeString(row.refundAddress),
+      safeString(row.referenceTxHash),
+      row.referenceLogIndex,
+      row.candidateCount,
+      JSON.stringify(bounded(row.payload)),
+    ],
+  );
+}
+
+export async function recordAxelarGasScan(
+  db: Queryable,
+  row: {
+    readonly originChain: string;
+    readonly originTx: string;
+    readonly eventCount: number;
+    readonly unresolvedCount: number;
+  },
+): Promise<void> {
+  await db.query(
+    `INSERT INTO axelar_gas_scan
+       (origin_chain, origin_tx, event_count, unresolved_count, first_scanned_at, last_scanned_at)
+     VALUES ($1, $2, $3, $4, now(), now())
+     ON CONFLICT (origin_chain, origin_tx) DO UPDATE
+       SET event_count = EXCLUDED.event_count,
+           unresolved_count = EXCLUDED.unresolved_count,
+           last_scanned_at = now()`,
+    [safeString(row.originChain), safeString(row.originTx), row.eventCount, row.unresolvedCount],
+  );
+}
+
 export async function writeAttestation(db: Queryable, row: AttestationRow): Promise<void> {
   await db.query(
     `INSERT INTO rail_attestation
