@@ -33,6 +33,42 @@ describe("loadConfig", () => {
     expect(config.indexer.enabled).toBe(true);
   });
 
+  it("requires a preview database identity and read-only API role", () => {
+    const config = loadConfig({
+      env: completeEnv({
+        VERCEL_ENV: "preview",
+        HYPERION_DATABASE_ENV: "preview",
+        INDEXER_ENABLED: "false",
+        RAILS_ENABLED: "false",
+        KEEPER_ENABLED: "false",
+      }),
+    });
+
+    expect(config.deploymentEnvironment).toBe("preview");
+    expect(config.databaseEnvironment).toBe("preview");
+    expect(config.databaseRole).toBe("read-only");
+  });
+
+  it("rejects a preview that points at a production database", () => {
+    expect(() =>
+      loadConfig({
+        env: completeEnv({ VERCEL_ENV: "preview", HYPERION_DATABASE_ENV: "production" }),
+      }),
+    ).toThrow(/HYPERION_DATABASE_ENV/);
+  });
+
+  it("rejects write-capable components with a read-only database role", () => {
+    expect(() =>
+      loadConfig({
+        env: completeEnv({
+          VERCEL_ENV: "production",
+          HYPERION_DATABASE_ENV: "production",
+          HYPERION_DATABASE_ROLE: "read-only",
+        }),
+      }),
+    ).toThrow(/HYPERION_DATABASE_ROLE/);
+  });
+
   it("names every missing variable at once rather than the first one", () => {
     const env = completeEnv();
     delete env.DATABASE_URL;
