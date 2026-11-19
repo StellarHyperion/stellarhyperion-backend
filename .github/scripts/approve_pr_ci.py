@@ -32,6 +32,13 @@ def waiting(run):
     return run.get("conclusion") == "action_required" or run.get("status") == "action_required"
 
 
+def newest_run(runs):
+    for run in runs:
+        if type(run.get("id")) is not int or run["id"] <= 0:
+            raise ValueError("Invalid workflow run id")
+    return max(runs, key=lambda run: run["id"]) if runs else None
+
+
 def authorization_state(pr):
     head, base, user = pr.get("head", {}), pr.get("base", {}), pr.get("user", {})
     fork, target = head.get("repo") or {}, base.get("repo") or {}
@@ -105,7 +112,11 @@ class Approval:
             runs = [run for run in self.runs(pr["head"]["sha"])
                     if matches(pr, run, self.github.repository, self.github.policy_ref)
                     and (not_before is None or timestamp(run.get("created_at")) >= not_before)]
-            candidates = [run for run in runs if waiting(run)]
+            # Approving an older description snapshot after the newest run can cancel the
+            # correct run through the CI concurrency group. Only the newest matching run
+            # can be authorized, including during scheduled recovery sweeps.
+            newest = newest_run(runs)
+            candidates = [newest] if newest is not None and waiting(newest) else []
             if runs or attempt == registration_attempts - 1:
                 break
             allowed, reason = self.policy.decision(pr)
@@ -141,6 +152,12 @@ class Approval:
             if (authorization_state(latest) != authorization_state(current)
                     or not matches(latest, run, self.github.repository, self.github.policy_ref)):
                 rows.append(f"SKIP run {run_id}: PR changed during assignment verification")
+                continue
+            current_runs = [item for item in self.runs(latest["head"]["sha"])
+                            if matches(latest, item, self.github.repository, self.github.policy_ref)]
+            newest = newest_run(current_runs)
+            if newest is None or newest["id"] != run_id:
+                rows.append(f"SKIP run {run_id}: a newer matching CI run registered")
                 continue
             self.github.request(f"repos/{self.github.repository}/actions/runs/{run_id}/approve", "POST")
             rows.append(f"APPROVE run {run_id}: " + reason)
