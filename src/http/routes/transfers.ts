@@ -24,6 +24,7 @@ import {
 } from "../server.js";
 import { transferStreamIntervals } from "../stream-intervals.js";
 import { negotiateSchemaVersion, withSchemaMetadata } from "../schema-version.js";
+import { coverageMetadata } from "./coverage.js";
 
 export type TransferLifecycleStage =
   | "initiated"
@@ -598,6 +599,12 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         params,
       );
 
+      const coverageChain = originChain ?? (deps.config.indexer.stellar?.chain ?? "");
+      const coverage = await coverageMetadata(deps.db, {
+        indexer: deps.config.indexer,
+        deploymentMode: deps.config.deploymentMode,
+      }, coverageChain, rows.length);
+
       reply.header("Cache-Control", LIST_CACHE_CONTROL);
       return reply.send(
         withSchemaMetadata(
@@ -606,6 +613,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
             limit: parsedLimit,
             offset: parsedOffset,
             count: rows.length,
+            coverage,
           },
           version,
         ),

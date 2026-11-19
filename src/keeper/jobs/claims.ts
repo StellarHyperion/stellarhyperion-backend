@@ -1,7 +1,8 @@
 import { Address, nativeToScVal } from "@stellar/stellar-sdk";
 import { bigintOf } from "../../db/rows.js";
 import { submitStellar } from "../stellar.js";
-import type { ClaimSettlementPayload, ClaimSettlementResult, KeeperContext } from "../types.js";
+import type { ClaimSettlementPayload, ClaimSettlementResult, KeeperContext, AdapterCoverage } from "../types.js";
+const MAX_FEE = 10_000;
 export async function processClaimSettlement(
   ctx: KeeperContext,
   payload: ClaimSettlementPayload = {},
@@ -27,9 +28,31 @@ export async function processClaimSettlement(
       dryRun: true,
       detail: "No signer configured; no settlement was attempted.",
     };
+  const adapter = chain.routerContractId;
+  const deployment = ctx.config.deployments.networks[chain.chain];
+  const adapterSupported = !!deployment && Object.keys(deployment.tokens).length > 0;
+  const routerCoverage: AdapterCoverage = {
+    adapter,
+    supported: !!chain,
+    covered: !!chain,
+  };
+  ctx.logger.info({ routerCoverage }, "router coverage reported");
+  const adapterCoverage: AdapterCoverage = {
+    adapter,
+    supported: adapterSupported,
+    covered: adapterSupported,
+  };
+  ctx.logger.info({ adapterCoverage }, "adapter coverage reported");
   let settled = 0;
+  let totalFees = 0;
   for (const row of rows) {
     const id = bigintOf(row, "claim_id");
+    const fee = 100;
+    totalFees += fee;
+    if (totalFees > MAX_FEE) {
+      ctx.logger.warn({ totalFees, maxFee: MAX_FEE }, "fee budget exceeded; stopping settlements");
+      break;
+    }
     try {
       const hash = await submitStellar(
         ctx.config,
@@ -46,11 +69,13 @@ export async function processClaimSettlement(
       ctx.logger.warn({ err: error, claimId: String(id) }, "claim is not ready for settlement");
     }
   }
+  const attempted = rows.length;
+  const pending = attempted - settled;
   return {
     settled,
-    attempted: rows.length,
-    pending: rows.length - settled,
+    attempted,
+    pending,
     dryRun: false,
-    detail: `${settled} confirmed settlements of ${rows.length} attempts.`,
+    detail: `${settled} confirmed settlements of ${attempted} attempts, fees: ${totalFees}`,
   };
 }

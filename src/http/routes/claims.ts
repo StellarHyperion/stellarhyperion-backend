@@ -16,6 +16,7 @@ import {
 } from "../etag.js";
 import { negotiateSchemaVersion, withSchemaMetadata } from "../schema-version.js";
 import type { ServerDeps } from "../server.js";
+import { coverageMetadata } from "./coverage.js";
 
 export interface FormattedClaim {
   readonly id: string;
@@ -155,6 +156,12 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
         params,
       );
 
+      const coverageChain = chain ?? (deps.config.indexer.stellar?.chain ?? "");
+      const coverage = await coverageMetadata(deps.db, {
+        indexer: deps.config.indexer,
+        deploymentMode: deps.config.deploymentMode,
+      }, coverageChain, rows.length);
+
       reply.header("Cache-Control", LIST_CACHE_CONTROL);
       return reply.send(
         withSchemaMetadata(
@@ -163,6 +170,7 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
             limit: parsedLimit,
             offset: parsedOffset,
             count: rows.length,
+            coverage,
           },
           version,
         ),

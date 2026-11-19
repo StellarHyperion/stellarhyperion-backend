@@ -1,7 +1,8 @@
-import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
+import { Address, BASE_FEE, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 import { bigintOf } from "../../db/rows.js";
 import { submitStellar } from "../stellar.js";
-import type { KeeperContext, TtlBumpPayload, TtlBumpResult } from "../types.js";
+import type { AdapterCoverage, KeeperContext, TtlBumpPayload, TtlBumpResult } from "../types.js";
+const MAX_FEE = 10_000;
 export async function processTtlBump(
   ctx: KeeperContext,
   payload: TtlBumpPayload = {},
@@ -40,6 +41,30 @@ export async function processTtlBump(
       dryRun: true,
       detail: `No signer: ${tokens.length} tokens, ${claims.length} claims, ${transfers.length} transfers need maintenance.`,
     };
+  const totalFees = tokens.length * BASE_FEE + claims.length * 100 + transfers.length * 50;
+  if (totalFees > MAX_FEE) {
+    return {
+      bumpedTokens: 0,
+      bumpedClaims: 0,
+      bumpedTransfers: 0,
+      dryRun: false,
+      detail: `Excessive fee budget: ${totalFees} exceeds maximum ${MAX_FEE}`,
+    };
+  }
+  const adapter = chain.routerContractId;
+  const adapterSupported = !!deployment && Object.keys(deployment.tokens).length > 0;
+  const routerCoverage: AdapterCoverage = {
+    adapter,
+    supported: !!chain,
+    covered: !!chain,
+  };
+  ctx.logger.info({ routerCoverage }, "router coverage reported");
+  const adapterCoverage: AdapterCoverage = {
+    adapter,
+    supported: adapterSupported,
+    covered: adapterSupported,
+  };
+  ctx.logger.info({ adapterCoverage }, "adapter coverage reported");
   const vector = (values: xdr.ScVal[]) => xdr.ScVal.scvVec(values);
   const hash = await submitStellar(ctx.config, chain.routerContractId, "keep_alive", () => [
     vector(tokens.map((token) => new Address(token).toScVal())),

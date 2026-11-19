@@ -31,3 +31,8 @@ export interface KeeperContext {
   readonly config: AppConfig;
   readonly logger: Logger;
 }
+export interface AdapterCoverage {
+  readonly adapter: string;
+  readonly supported: boolean;
+  readonly covered: boolean;
+}
