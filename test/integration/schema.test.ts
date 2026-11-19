@@ -10,6 +10,10 @@
  * runs the unit suite rather than failing in a way somebody learns to ignore.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { runner } from "node-pg-migrate";
 
 import {
   auditTransferAndClaimInvariants,
@@ -71,6 +75,89 @@ suite("the schema", () => {
       "route_health",
     ]) {
       expect(names, `${table} is missing; has the migration run`).toContain(table);
+    }
+  });
+
+  it("serializes real SQL migration runners and applies each step once", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "hyperion-migration-lock-"));
+    const file = join(directory, "1790900000000_lock-test.sql");
+    await writeFile(
+      file,
+      "-- Up Migration\nSELECT pg_sleep(1); CREATE TABLE lock_once (id integer PRIMARY KEY); INSERT INTO lock_once VALUES (1);\n-- Down Migration\nDROP TABLE lock_once;",
+    );
+    const run = (applicationName: string) =>
+      runner({
+        databaseUrl: { connectionString: CONNECTION ?? "", application_name: applicationName },
+        dir: directory,
+        migrationsTable: "pgmigrations",
+        schema: MIGRATION_TEST_SCHEMA,
+        createSchema: true,
+        direction: "up",
+        advisoryLockMode: "wait",
+        log: () => undefined,
+      });
+    const first = run("hyperion-migration-lock-first");
+    let second: Promise<unknown> | undefined;
+    let secondRunnerWaiting = false;
+    try {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const { rows } = await db.query(
+          "SELECT 1 FROM pg_stat_activity WHERE application_name='hyperion-migration-lock-first' AND wait_event='PgSleep'",
+        );
+        if (rows.length) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      second = run("hyperion-migration-lock-second");
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const { rows } = await db.query(
+          "SELECT 1 FROM pg_stat_activity WHERE application_name='hyperion-migration-lock-second' AND wait_event_type='Lock' AND wait_event='advisory'",
+        );
+        if (rows.length) {
+          secondRunnerWaiting = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const outcomes = await Promise.allSettled([first, second]);
+      expect(outcomes.map((value) => value.status)).toEqual(["fulfilled", "fulfilled"]);
+      expect(secondRunnerWaiting).toBe(true);
+      const { rows } = await db.query(
+        `SELECT count(*)::integer AS count FROM "${MIGRATION_TEST_SCHEMA}".lock_once`,
+      );
+      expect(rows[0]?.count).toBe(1);
+    } finally {
+      await Promise.allSettled([first, ...(second ? [second] : [])]);
+      await db.query(`DROP SCHEMA IF EXISTS "${MIGRATION_TEST_SCHEMA}" CASCADE`);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("releases advisory ownership after a failed SQL migration and permits a clean retry", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "hyperion-migration-failure-"));
+    const file = join(directory, "1790900000000_failure-test.sql");
+    const schema = MIGRATION_TEST_SCHEMA + "_failed";
+    const run = () =>
+      runner({
+        databaseUrl: CONNECTION ?? "",
+        dir: directory,
+        migrationsTable: "pgmigrations",
+        schema,
+        createSchema: true,
+        direction: "up",
+        advisoryLockMode: "wait",
+        log: () => undefined,
+      });
+    try {
+      await writeFile(file, "-- Up Migration\nSELECT 1/0;\n-- Down Migration\nSELECT 1;");
+      await expect(run()).rejects.toThrow();
+      await writeFile(
+        file,
+        "-- Up Migration\nCREATE TABLE retry_once(id integer PRIMARY KEY); INSERT INTO retry_once VALUES (1);\n-- Down Migration\nDROP TABLE retry_once;",
+      );
+      await expect(run()).resolves.toHaveLength(1);
+    } finally {
+      await db.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+      await rm(directory, { recursive: true, force: true });
     }
   });
 
