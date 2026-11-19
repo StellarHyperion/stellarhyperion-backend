@@ -1,3 +1,5 @@
+import { RouteKind } from "@hyperion/protocol";
+import type { AxelarDeliveryEvidenceRow } from "../chains/writers.js";
 /**
  * One pass over the transfers waiting on one rail.
  *
@@ -18,13 +20,19 @@
  * second would spend those five minutes refreshing the block.
  */
 import type { AppConfig } from "../config/config.js";
-import { verifyItsDelivery } from "./axelar/delivery.js";
+import { revalidateItsDeliveryProofs, verifyItsDelivery } from "./axelar/delivery.js";
 import { verifyCctpDelivery } from "./cctp/delivery.js";
 import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
-import { writeInbound, writeAttestation } from "../chains/writers.js";
+import {
+  writeInbound,
+  writeAttestation,
+  writeAxelarDeliveryEvidence,
+  linkAxelarDeliveryEvidence,
+  writeAxelarQuarantine,
+} from "../chains/writers.js";
 import {
   inspectRailBacklog,
   outstandingForRail,
@@ -149,6 +157,13 @@ export class RailPass {
     const cooldown = this.cooldownUntil;
     if (cooldown !== null && cooldown > this.now()) return false;
     this.cooldownUntil = null;
+
+    if (
+      this.options.config &&
+      this.options.route === RouteKind.AxelarIts &&
+      client.rail === "axelar"
+    )
+      await revalidateItsDeliveryProofs(this.options.config, db, batchSize, { signal });
 
     let checked = 0;
     let settled = 0;
@@ -285,13 +300,26 @@ export class RailPass {
     }
 
     const { report } = lookup;
+    if (report.quarantine && this.options.client.rail === "axelar")
+      await writeAxelarQuarantine(db, {
+        transferId: transfer.transferId,
+        sourceTxHash: transfer.originTx,
+        providerReference: report.quarantine.providerReference,
+        schema: report.quarantine.schema,
+        payload: report.quarantine.payload,
+      });
     if (this.options.config && (report.execution || report.forwardTxHash)) {
       const verified =
         (await verifyItsDelivery(this.options.config, db, transfer, report)) ??
         (await verifyCctpDelivery(this.options.config, db, transfer, report));
       if (verified) {
         signal.throwIfAborted();
-        await writeInbound(db, verified.at, verified.row);
+        if (transfer.route === RouteKind.AxelarIts && "evidence" in verified) {
+          const evidence = verified.evidence as AxelarDeliveryEvidenceRow;
+          const evidenceId = await writeAxelarDeliveryEvidence(db, evidence);
+          await writeInbound(db, verified.at, verified.row);
+          await linkAxelarDeliveryEvidence(db, evidence, evidenceId);
+        } else await writeInbound(db, verified.at, verified.row);
         await this.write(db, transfer, {
           status: "delivered",
           railStatus: report.railStatus,
