@@ -1095,7 +1095,9 @@ suite("database load and bounded-latency benchmarks", () => {
     let db: Database;
 
     beforeAll(async () => {
-      db = Database.open(CONNECTION ?? "", { applicationName: "hyperion-benchmark" });
+      db = await Database.open(CONNECTION ?? "", {
+        applicationName: "hyperion-benchmark",
+      });
     });
 
     afterAll(async () => {
@@ -1115,13 +1117,13 @@ suite("database load and bounded-latency benchmarks", () => {
       expect(elapsed).toBeLessThan(5_000);
     });
 
-    it("generates deterministic event history at fixed scale", async () => {
+    it("generates deterministic event history at fixed scale", () => {
       const scale = 50;
-      const transfers: Array<{
+      const transfers: {
         nonce: bigint;
         amount: bigint;
         txHash: string;
-      }> = [];
+      }[] = [];
       for (let i = 0; i < scale; i += 1) {
         const nonce = 10_000n + BigInt(i);
         const amount = 1_000_000n + BigInt(i) * 1_000n;

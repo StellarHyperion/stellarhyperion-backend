@@ -96,7 +96,7 @@ export function destinationProofMutations(delivery: {
 }): readonly Mutation[] {
   const flip = (value: string): string => {
     if (value.length === 0) return "x";
-    const chars = [...value];
+    const chars = Array.from(value);
     chars[0] = chars[0] === "a" ? "b" : "a";
     return chars.join("");
   };
