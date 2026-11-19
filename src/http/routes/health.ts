@@ -65,16 +65,35 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
     if (dbCheck.state !== "down") {
       try {
         const heartbeats = await readWorkerHeartbeats(deps.db);
-        const reportedNames = new Set(checks.map((c) => c.name));
         const now = new Date();
+        if (deps.config.indexer.enabled) {
+          const expectedChains = [
+            ...(deps.config.indexer.stellar ? [deps.config.indexer.stellar.chain] : []),
+            ...deps.config.indexer.evm.map((chain) => chain.chain),
+          ];
+          const missing = expectedChains.filter(
+            (chain) => !heartbeats.some((hb) => hb.workerKind === "chain" && hb.chainKey === chain),
+          );
+          if (missing.length > 0 || heartbeats.every((hb) => hb.workerKind !== "chain")) {
+            checks.push({
+              name: "indexer-heartbeat",
+              state: "degraded",
+              detail: `enabled indexer has no persisted chain-worker heartbeat${missing.length ? ` for ${missing.join(", ")}` : ""}`,
+            });
+          }
+        }
         for (const hb of heartbeats) {
-          if (reportedNames.has(hb.workerName)) continue;
           const { report } = evaluateHeartbeatFreshness(hb, now);
-          checks.push(report);
+          const existing = checks.findIndex((check) => check.name === hb.workerName);
+          const current = checks[existing];
+          if (existing < 0) checks.push(report);
+          else if (current !== undefined && worstOf([current, report]) === report.state) {
+            checks[existing] = report;
+          }
         }
       } catch (error) {
         // Minimal unit-test mocks or unmigrated DBs may not have indexer_worker_heartbeat.
-        if (!isMissingHeartbeatTable(error)) {
+        if (deps.config.indexer.enabled || !isMissingHeartbeatTable(error)) {
           checks.push({
             name: "indexer-heartbeat",
             state: "degraded",

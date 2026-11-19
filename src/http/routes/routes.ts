@@ -10,6 +10,7 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
 import { negotiateSchemaVersion, withSchemaMetadata } from "../schema-version.js";
+import { LIST_CACHE_CONTROL } from "../etag.js";
 import type { ServerDeps } from "../server.js";
 
 export interface FormattedRouteHealth {
@@ -69,6 +70,7 @@ export function registerRouteHealthRoutes(app: FastifyInstance, deps: ServerDeps
       };
     });
 
+    reply.header("Cache-Control", LIST_CACHE_CONTROL);
     return reply.send(withSchemaMetadata({ routes, count: routes.length }, version));
   });
 }

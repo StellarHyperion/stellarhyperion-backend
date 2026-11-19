@@ -19,7 +19,7 @@ import {
 } from "@hyperion/protocol";
 import { createPublicClient, http, stringToHex } from "viem";
 import type { AppConfig } from "../../config/config.js";
-import type { Transactional } from "../../db/pool.js";
+import type { Queryable } from "../../db/pool.js";
 import { bigintOf, text } from "../../db/rows.js";
 import type { InboundRow, Position } from "../../chains/writers.js";
 import type { PendingTransfer, RailReport } from "../types.js";
@@ -33,7 +33,7 @@ export interface VerifiedDelivery {
 // The rail API supplies a candidate receipt. Only matching confirmed chain events establish delivery.
 export async function verifyItsDelivery(
   config: AppConfig,
-  db: Transactional,
+  db: Queryable,
   transfer: PendingTransfer,
   report: RailReport,
 ): Promise<VerifiedDelivery | null> {
@@ -126,6 +126,7 @@ export async function verifyItsDelivery(
       observedAt: new Date(Number(block.timestamp) * 1000),
     },
     row: {
+      sourceTransferId: transfer.transferId,
       route: transfer.route,
       sourceChain: transfer.originChain,
       sourceNonce: transfer.nonce,

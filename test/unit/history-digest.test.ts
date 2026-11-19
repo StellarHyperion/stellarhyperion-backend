@@ -11,6 +11,7 @@ import {
   writeOutbound,
 } from "../../src/chains/writers.js";
 import type { Queryable } from "../../src/db/pool.js";
+import { RecordingDb } from "../stellar-fakes.js";
 
 const pg = new PGlite();
 
@@ -41,7 +42,19 @@ describe("indexed-history integrity digests (#63)", () => {
     for (const name of [
       "1790900000000_initial-schema.sql",
       "1791000000000_cursor-block-hash.sql",
-      "1791600000000_indexed-history-digests.sql",
+      "1791100000000_cursor-autovacuum-tuning.sql",
+      "1791300000000_stellar-durable-scan-evidence.sql",
+      "1791400000000_stellar-cursor-cas-leases-gaps.sql",
+      "1791500000000_stellar-revisions-and-quarantine.sql",
+      "1791600000000_durable-rail-retry-schedules.sql",
+      "1791700000000_rail-requeue-audit.sql",
+      "1791800000000_outbound-router-identity.sql",
+      "1791900000000_evm-log-quarantine.sql",
+      "1792000000000_evm-backfill-jobs.sql",
+      "1792100000000_route-health-compaction-and-audits.sql",
+      "1792200000000_evm-scan-provenance.sql",
+      "1792300000000_indexed-history-digests.sql",
+      "1792400000000_indexer-worker-heartbeat.sql",
     ]) {
       const sql = readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8").split(
         "-- Down Migration",
@@ -258,6 +271,35 @@ describe("indexed-history integrity digests (#63)", () => {
     });
     expect(restored.digest).toBe(first.digest);
     expect(restored.monetarySummary).toEqual(first.monetarySummary);
+  });
+
+  it("includes router deployment identity and pages every row of large ranges", async () => {
+    await pg.exec(`INSERT INTO outbound_transfer (origin_chain,origin_router,route,nonce,sender,token,gross_amount,fee,net_amount,destination_chain,destination,origin_block,origin_tx)
+      SELECT 'sepolia','0xrouter-a',1,n,'sender','USDC',100,1,99,'stellar-testnet','Gdestination',n,'tx-'||n FROM generate_series(1,1001) n`);
+    const options = { chainKey: "sepolia", startBlock: 1n, endBlock: 1001n };
+    const original = await computeHistoryDigest(db, options);
+    expect(original.rowCount).toBe(1001);
+    expect(original.monetarySummary.tokens.USDC?.outboundGross).toBe("100100");
+    await pg.exec("UPDATE outbound_transfer SET origin_router='0xrouter-b'");
+    expect((await computeHistoryDigest(db, options)).digest).not.toBe(original.digest);
+    await pg.exec(
+      "UPDATE outbound_transfer SET origin_router='0xrouter-a'; DELETE FROM outbound_transfer WHERE nonce=1001",
+    );
+    expect((await computeHistoryDigest(db, options)).digest).not.toBe(original.digest);
+  });
+
+  it("uses one repeatable read snapshot for transactional callers", async () => {
+    const recording = new RecordingDb();
+    await computeHistoryDigest(recording, { chainKey: "sepolia", startBlock: 1n, endBlock: 2n });
+    expect(recording.queries[0]?.text).toBe(
+      "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
+    );
+    expect(
+      recording.queries.every(
+        (query) =>
+          query.transaction === recording.queries[0]?.transaction && query.transaction !== null,
+      ),
+    ).toBe(true);
   });
 
   it("persists digests and detects monetary or event drift on verification", async () => {

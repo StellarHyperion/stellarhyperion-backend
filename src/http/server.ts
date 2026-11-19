@@ -9,6 +9,7 @@ import type { AppConfig } from "../config/config.js";
 import type { Database } from "../db/pool.js";
 import type { BullMQWorkerState, RedisPingable, ReadinessSource } from "../runtime/readiness.js";
 import { registerClaimRoutes } from "./routes/claims.js";
+import { registerBackfillRoutes } from "./routes/backfills.js";
 import { registerHealthRoutes } from "./routes/health.js";
 import { registerMetricsRoutes } from "./routes/metrics.js";
 import { registerRouteHealthRoutes } from "./routes/routes.js";
@@ -79,22 +80,45 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   app.addHook("onRequest", async (_request, reply) => {
     reply.header("Access-Control-Allow-Origin", "*");
     reply.header("Access-Control-Allow-Methods", "GET, OPTIONS");
-    reply.header("Access-Control-Allow-Headers", "Accept, Content-Type, X-API-Schema-Version");
-    reply.header("Access-Control-Expose-Headers", "X-API-Schema-Version");
+    reply.header(
+      "Access-Control-Allow-Headers",
+      "Accept, Content-Type, If-None-Match, X-API-Schema-Version",
+    );
+    reply.header(
+      "Access-Control-Expose-Headers",
+      "ETag, Cache-Control, X-API-Schema-Version, Retry-After",
+    );
   });
   app.options("/*", async (_request, reply) => reply.code(204).send());
 
   const rateLimitEnabled = deps.rateLimit?.enabled ?? deps.config.nodeEnv !== "test";
   const max = deps.rateLimit?.max ?? DEFAULT_RATE_LIMIT_MAX;
+  const streamMax = deps.rateLimit?.streamMax ?? DEFAULT_STREAM_RATE_LIMIT_MAX;
   const timeWindow = deps.rateLimit?.timeWindowMs ?? DEFAULT_RATE_LIMIT_WINDOW_MS;
   const cacheSize = deps.rateLimit?.cacheSize ?? DEFAULT_RATE_LIMIT_CACHE_SIZE;
+  if (
+    !Number.isSafeInteger(max) ||
+    max < 1 ||
+    max > 1_000_000 ||
+    !Number.isSafeInteger(streamMax) ||
+    streamMax < 1 ||
+    streamMax > 1_000_000 ||
+    !Number.isSafeInteger(timeWindow) ||
+    timeWindow < 1 ||
+    timeWindow > 86_400_000 ||
+    !Number.isSafeInteger(cacheSize) ||
+    cacheSize < 1 ||
+    cacheSize > DEFAULT_RATE_LIMIT_CACHE_SIZE
+  ) {
+    throw new RangeError("rate-limit policy exceeds supported request, time or storage bounds");
+  }
   const sharedRedis = isIoredisStore(deps.redis) ? deps.redis : undefined;
 
   void app.register(rateLimit, {
     max,
     timeWindow,
     cache: cacheSize,
-    skipOnError: true,
+    skipOnError: false,
     ...(sharedRedis !== undefined
       ? {
           redis: sharedRedis,
@@ -102,7 +126,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
         }
       : {}),
     keyGenerator: (req) => req.ip,
-    allowList: (req) => !rateLimitEnabled || req.url === "/health" || req.url === "/ready",
+    allowList: (req) =>
+      !rateLimitEnabled || ["/health", "/ready"].includes(req.url.split("?")[0] ?? ""),
     addHeadersOnExceeding: {
       "x-ratelimit-limit": true,
       "x-ratelimit-remaining": true,
@@ -127,6 +152,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     registerHealthRoutes(app, deps);
     registerTransferRoutes(app, deps);
     registerClaimRoutes(app, deps);
+    registerBackfillRoutes(app, deps);
     registerRouteHealthRoutes(app, deps);
     registerMetricsRoutes(app, deps);
   });
@@ -141,9 +167,11 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   app.setErrorHandler((error: FastifyError, request, reply) => {
     const status = error.statusCode ?? 500;
     if (status === 429) {
+      const seconds = Number(reply.getHeader("retry-after"));
       void reply.code(429).send({
         error: "too_many_requests",
-        message: error.message,
+        message: "rate limit exceeded; retry after the deployment request budget resets",
+        retryAfterMs: Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : timeWindow,
         requestId: request.id,
       });
       return;

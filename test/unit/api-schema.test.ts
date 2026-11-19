@@ -4,7 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Database } from "../../src/db/pool.js";
 import { buildServer } from "../../src/http/server.js";
 import { loadConfig } from "../../src/config/config.js";
-import { recordWorkerHeartbeat } from "../../src/runtime/readiness.js";
+import { recordWorkerHeartbeat, readWorkerHeartbeats } from "../../src/runtime/readiness.js";
 import { completeEnv } from "../helpers.js";
 import { capturingLogger } from "../stellar-fakes.js";
 
@@ -44,8 +44,18 @@ beforeAll(async () => {
     "1790900000000_initial-schema.sql",
     "1791000000000_cursor-block-hash.sql",
     "1791100000000_cursor-autovacuum-tuning.sql",
+    "1791300000000_stellar-durable-scan-evidence.sql",
     "1791400000000_stellar-cursor-cas-leases-gaps.sql",
-    "1791700000000_indexer-worker-heartbeat.sql",
+    "1791500000000_stellar-revisions-and-quarantine.sql",
+    "1791600000000_durable-rail-retry-schedules.sql",
+    "1791700000000_rail-requeue-audit.sql",
+    "1791800000000_outbound-router-identity.sql",
+    "1791900000000_evm-log-quarantine.sql",
+    "1792000000000_evm-backfill-jobs.sql",
+    "1792100000000_route-health-compaction-and-audits.sql",
+    "1792200000000_evm-scan-provenance.sql",
+    "1792300000000_indexed-history-digests.sql",
+    "1792400000000_indexer-worker-heartbeat.sql",
   ]) {
     const sql = readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8").split(
       "-- Down Migration",
@@ -77,6 +87,37 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     const list = await app.inject("/v1/claims?chain=stellar-testnet");
     expect(list.statusCode).toBe(200);
     expect(list.json().claims).toHaveLength(1);
+  });
+  it("supports revalidation for detail claims and updates their revision after settlement", async () => {
+    const detailUrl = "/v1/claims/stellar-testnet/7";
+    const pending = await app.inject(detailUrl);
+    expect(pending.statusCode).toBe(200);
+    expect(pending.headers["cache-control"]).toBe("private, no-cache, max-age=0, must-revalidate");
+    const etag = pending.headers.etag;
+    expect(etag).toBeDefined();
+
+    const unchanged = await app.inject({
+      method: "GET",
+      url: detailUrl,
+      headers: { "if-none-match": `W/${etag}` },
+    });
+    expect(unchanged.statusCode).toBe(304);
+    expect(unchanged.payload).toBe("");
+    expect(unchanged.headers.etag).toBe(etag);
+
+    await pg.query(
+      `UPDATE pending_claim
+          SET settled = true, settled_at = now(), settled_by = 'Gsettler', settled_tx = 'settlement-tx'
+        WHERE chain = 'stellar-testnet' AND claim_id = 7`,
+    );
+    const settled = await app.inject({
+      method: "GET",
+      url: detailUrl,
+      headers: { "if-none-match": etag },
+    });
+    expect(settled.statusCode).toBe(200);
+    expect(settled.headers.etag).not.toBe(etag);
+    expect(settled.json().settled).toBe(true);
   });
   it("reads sampled route health using the migration's timestamp", async () => {
     const response = await app.inject("/v1/routes/health");
@@ -150,6 +191,17 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     expect(v11Transfer.json().origin.grossAmount).toBe("10000000");
     expect(v11Transfer.json().destination.amount).toBe("897000");
     expect(v11Transfer.json().destination.symbol).toBe("USDC");
+    expect(v11Transfer.headers.etag).not.toBe(v1.headers.etag);
+    const versionTransition = await app.inject({
+      method: "GET",
+      url: "/v1/transfers/by-tx/cctp-source",
+      headers: { "x-api-schema-version": "1.1", "if-none-match": v1.headers.etag },
+    });
+    expect(versionTransition.statusCode).toBe(200);
+    const normalizeFixture = (payload: unknown): unknown =>
+      JSON.parse(JSON.stringify(payload).replace(/\d{4}-\d{2}-\d{2}T[^" ]+Z/g, "<timestamp>"));
+    expect(normalizeFixture(v1.json())).toMatchSnapshot("legacy transfer response");
+    expect(normalizeFixture(v11Transfer.json())).toMatchSnapshot("1.1 transfer response");
 
     const v11Claim = await app.inject({
       method: "GET",
@@ -177,6 +229,45 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     expect(unsupported.statusCode).toBe(400);
     expect(unsupported.json().error).toBe("unsupported_schema_version");
     expect(unsupported.json().supportedVersions).toEqual(["1.0", "1.1"]);
+  });
+
+  it("degrades missing heartbeats and rejects stale writes even with a healthy database", async () => {
+    await pg.exec("TRUNCATE indexer_worker_heartbeat");
+    const missing = await app.inject("/ready");
+    expect(missing.json().checks).toContainEqual(
+      expect.objectContaining({ name: "indexer-heartbeat", state: "degraded" }),
+    );
+    const at = new Date();
+    const input = {
+      workerName: "stellar-testnet",
+      workerKind: "chain" as const,
+      chainKey: "stellar-testnet",
+      state: "ready" as const,
+      detail: "current",
+      completed: true,
+      lastCursorBlock: 123n,
+      consecutiveFailures: 0,
+      lastError: null,
+      at,
+    };
+    await recordWorkerHeartbeat(db, input);
+    await recordWorkerHeartbeat(db, {
+      ...input,
+      lastCursorBlock: 1n,
+      detail: "old",
+      at: new Date(at.getTime() - 300_000),
+    });
+    const [stored] = await readWorkerHeartbeats(db);
+    expect(stored?.lastCursorBlock).toBe("123");
+    expect(stored?.detail).toBe("current");
+    const partial = await app.inject("/ready");
+    expect(partial.json().checks).toContainEqual(
+      expect.objectContaining({
+        name: "indexer-heartbeat",
+        detail: expect.stringContaining("sepolia"),
+      }),
+    );
+    await pg.exec("TRUNCATE indexer_worker_heartbeat");
   });
 
   it("reports persistent worker heartbeats and stale diagnostics across processes (#107)", async () => {
@@ -228,6 +319,27 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     const sepoliaCheck = readyRes.json().checks.find((c: { name: string }) => c.name === "sepolia");
     expect(sepoliaCheck.state).toBe("degraded");
     expect(sepoliaCheck.detail).toContain("stale heartbeat");
+    const localReady = buildServer({
+      config,
+      logger,
+      db: db as unknown as Database,
+      redis: { ping: () => Promise.resolve("PONG") },
+      readiness: [
+        { readiness: () => ({ name: "sepolia", state: "ready", detail: "cached local ready" }) },
+      ],
+    });
+    try {
+      const combined = await localReady.inject("/ready");
+      expect(combined.json().checks).toContainEqual(
+        expect.objectContaining({
+          name: "sepolia",
+          state: "degraded",
+          detail: expect.stringContaining("stale heartbeat"),
+        }),
+      );
+    } finally {
+      await localReady.close();
+    }
   });
 
   it("enforces bounded rate-limit budgets with explicit proxy handling (#106)", async () => {
@@ -271,10 +383,14 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
       });
       expect(r3.statusCode).toBe(429);
       expect(r3.json().error).toBe("too_many_requests");
+      expect(r3.headers["retry-after"]).toBeDefined();
+      expect(r3.json().retryAfterMs).toBe(Number(r3.headers["retry-after"]) * 1000);
 
       // /health remains exempt for load balancers
       const health = await untrustedApp.inject("/health");
       expect(health.statusCode).toBe(200);
+      expect((await untrustedApp.inject("/health?probe=1")).statusCode).toBe(200);
+      expect((await untrustedApp.inject("/ready?probe=1")).statusCode).toBe(200);
 
       // SSE /stream enforces its own bounded budget rather than bypassing
       const s1 = await untrustedApp.inject("/v1/transfers/999999/stream");
@@ -325,5 +441,63 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     } finally {
       await trustedApp.close();
     }
+  });
+
+  it("revalidates equivalent transfer detail routes and invalidates on proof changes", async () => {
+    const initial = await app.inject("/v1/transfers/by-tx/source-hash");
+    expect(initial.statusCode).toBe(200);
+    expect(initial.json().destination.delivered).toBe(false);
+    expect(initial.headers["cache-control"]).toBe("private, no-cache, max-age=0, must-revalidate");
+    expect(initial.headers["access-control-allow-headers"]).toContain("If-None-Match");
+    expect(initial.headers["access-control-expose-headers"]).toContain("ETag");
+    const transferId = initial.json().id as string;
+    const etag = initial.headers.etag;
+    expect(etag).toBeDefined();
+
+    for (const url of [
+      "/v1/transfers/stellar-testnet/42",
+      "/v1/transfers/by-tx/source-hash",
+      `/v1/transfers/${transferId}`,
+      `/api/v1/transfers/${transferId}`,
+    ]) {
+      const unchanged = await app.inject({
+        method: "GET",
+        url,
+        headers: { "if-none-match": etag },
+      });
+      expect(unchanged.statusCode).toBe(304);
+      expect(unchanged.payload).toBe("");
+      expect(unchanged.headers.etag).toBe(etag);
+    }
+
+    await pg.query(
+      `INSERT INTO rail_attestation (transfer_id, route, status, rail_status, rail_reference, attested_at)
+       VALUES ($1, 1, 'attested', 'complete', 'provider-proof', now())`,
+      [transferId],
+    );
+    const providerStatusOnly = await app.inject({
+      method: "GET",
+      url: `/v1/transfers/${transferId}`,
+      headers: { "if-none-match": etag },
+    });
+    expect(providerStatusOnly.statusCode).toBe(200);
+    expect(providerStatusOnly.headers.etag).not.toBe(etag);
+    expect(providerStatusOnly.json().destination.delivered).toBe(false);
+    expect(providerStatusOnly.headers["cache-control"]).toBe(
+      "private, no-cache, max-age=0, must-revalidate",
+    );
+
+    await pg.query(
+      `UPDATE outbound_transfer SET origin_log_index = 3
+        WHERE origin_chain = 'stellar-testnet' AND nonce = 42`,
+    );
+    const updatedProof = await app.inject({
+      method: "GET",
+      url: `/v1/transfers/${transferId}`,
+      headers: { "if-none-match": providerStatusOnly.headers.etag },
+    });
+    expect(updatedProof.statusCode).toBe(200);
+    expect(updatedProof.headers.etag).not.toBe(providerStatusOnly.headers.etag);
+    expect(updatedProof.json().destination.delivered).toBe(false);
   });
 });

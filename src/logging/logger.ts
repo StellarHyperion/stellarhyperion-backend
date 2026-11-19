@@ -36,6 +36,8 @@ const REDACTED_PATHS = [
   "historicalRpcUrl",
   "rpcUrl",
   "rpcUrls",
+  "failedRpc",
+  "fallbackRpc",
   "*.stellarSecret",
   "config.keeper.stellarSecret",
   "*.databaseUrl",
@@ -55,7 +57,14 @@ const REDACTED_PATHS = [
 
 /** Strip URL userinfo credentials from error messages before logging or persisting diagnostics. */
 export function sanitizeDiagnosticText(input: string): string {
-  return input.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^/@\s]+)@/g, "$1[redacted]@");
+  return input
+    .replace(/\b(?:https?|postgres(?:ql)?|rediss?):\/\/[^\s"'<>]+/gi, "[redacted URL]")
+    .replace(/\b(Bearer|Basic)\s+[^\s,;]+/gi, "$1 [redacted]")
+    .replace(
+      /\b((?:authorization|password|secret|api[_-]?key|token)\s*[:=]\s*)[^\s,;]+/gi,
+      "$1[redacted]",
+    )
+    .slice(0, 2048);
 }
 
 export function createLogger(config: AppConfig): Logger {

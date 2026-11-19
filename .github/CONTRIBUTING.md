@@ -155,17 +155,63 @@ Manage app repository access in the [organization integration settings](https://
 
 ## Automatic pull request checks
 
-CI runs on opened, updated, and reopened pull requests. The `Automatic PR CI`
-action authorizes waiting fork CI when the author satisfies the issue assignment
-policy, including the documented bot, organization role, and code owner exemptions.
-It checks waiting runs every five minutes and when issues are assigned. GitHub
-may delay scheduled runs; maintainers can also dispatch the action manually.
+CI runs on opened, updated, reopened, and edited pull requests, including changes
+from draft to ready for review. `Automatic PR CI` responds to those PR events
+without waiting for a scheduled sweep. It authorizes waiting fork CI only when the
+author is assigned to every referenced issue, or satisfies a documented trusted
+bot, organization-role, or code-owner exemption. Issue-assignment events and the
+five-minute scheduled sweep remain recovery paths. GitHub event delivery and runner
+availability can still delay execution; conflicted PRs may have no runnable CI.
 
-The authorization job uses only default-branch policy code. It never checks out PR
-code, downloads contributed artifacts, approves a code review, or merges a PR.
-Only the current fork head's `ci.yml` pull request run can be authorized; changed
-heads or unverifiable assignments remain unapproved. The approved CI jobs retain
-read-only permissions and receive no repository deployment or signing secrets.
+The approval job uses a `pull_request_target` event restricted to `main`. It never
+checks out a branch, downloads contributed artifacts, or executes PR code. It loads
+only default-branch authorization modules through the GitHub API. Only the current
+fork head's ordinary `ci.yml` run can be approved. The job waits briefly for a newly
+submitted or edited PR's CI run to register, rechecks all issue assignments, and
+checks the PR head and description again immediately before approval. It cannot
+approve a code review or merge a PR. PR build jobs retain read-only permissions and
+receive no deployment or signing secrets.
+
+The workflow-security scan permits the privileged trigger only in this exact,
+reviewed approval workflow, pinned by SHA-256 in `scan_workflow_security.py`. A
+workflow edit invalidates that exception until its trust boundary is reviewed and
+the fingerprint updated. Every other medium/high Zizmor finding, including a
+privileged trigger in another workflow, still blocks the gate. Repository ignore
+comments and configuration cannot suppress findings.
+
+## PR description requirements
+
+The gate checks human descriptions against `.github/pull_request_template.md` at
+the PR's base commit. Keep its level-two sections in order, answer each section,
+and retain and select applicable checklist items. If a section does not apply,
+write `Not applicable:` followed by the reason. Hidden comments, code examples,
+blank answers, and unfilled TODO/TBD placeholders do not satisfy the template.
+Description edits rerun CI. This validates the description's structure and
+attestations; reviewers still assess whether its claims match the change.
+
+Authenticated `dependabot[bot]` and `renovate[bot]` accounts are exempt only from
+description formatting. Their full build and security checks remain required.
+
+## Source and dependency security
+
+The required gate includes CodeQL's `security-extended` analysis for
+JavaScript/TypeScript and Python, without executing a project build. High and
+critical source findings block; all findings are retained as SARIF artifacts for
+14 days. The analysis uses read-only permissions and does not require a paid plan
+for these public repositories. Existing dependency, secret, workflow and
+contract-specific checks remain required. These tools do not prove that arbitrary
+code is free of malware.
+
+For dependency behavior and suspected malware detection, the
+[Socket Security GitHub App](https://github.com/apps/socket-security) offers a
+[free plan for public repositories](https://socket.dev/pricing). It can identify
+known malware, suspicious install scripts, obfuscation, typosquatting, and risky
+API usage. Install it through GitHub's app installation screen and select the
+three StellarHyperion repositories. Installation is separate from these committed
+checks and requires the organization's GitHub browser authorization. This change
+does not claim that the Socket app is already installed. Review its first alerts
+and check names before making its external check required; do not bypass existing
+gates to accommodate an alert.
 
 Run its regression tests locally:
 
