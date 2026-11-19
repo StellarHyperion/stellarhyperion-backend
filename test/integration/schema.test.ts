@@ -14,6 +14,7 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runner } from "node-pg-migrate";
+import { Client } from "pg";
 
 import {
   auditTransferAndClaimInvariants,
@@ -161,6 +162,81 @@ suite("the schema", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+
+  it("releases migration ownership when PostgreSQL interrupts the runner", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "hyperion-migration-interrupted-"));
+    const file = join(directory, "1790900000000_interrupted.sql");
+    const schema = `${MIGRATION_TEST_SCHEMA}_interrupted`;
+    const interruptedClient = new Client({
+      connectionString: CONNECTION ?? "",
+      application_name: "hyperion-migration-interrupted",
+    });
+    const connectionErrors: Error[] = [];
+    interruptedClient.on("error", (error: Error) => connectionErrors.push(error));
+    const run = () =>
+      runner({
+        databaseUrl: {
+          connectionString: CONNECTION ?? "",
+          application_name: "hyperion-migration-interrupted",
+        },
+        dir: directory,
+        migrationsTable: "pgmigrations",
+        schema,
+        createSchema: true,
+        direction: "up",
+        advisoryLockMode: "wait",
+        log: () => undefined,
+      });
+    try {
+      await writeFile(
+        file,
+        "-- Up Migration\nSELECT pg_sleep(30); CREATE TABLE interrupted_once(id integer PRIMARY KEY);\n-- Down Migration\nDROP TABLE interrupted_once;",
+      );
+      // Attach the rejection handler before interrupting the connection.
+      await interruptedClient.connect();
+      const interrupted = runner({
+        dbClient: interruptedClient,
+        dir: directory,
+        migrationsTable: "pgmigrations",
+        schema,
+        createSchema: true,
+        direction: "up",
+        advisoryLockMode: "wait",
+        log: () => undefined,
+      }).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      let pid: number | null = null;
+      for (let attempt = 0; attempt < 100 && pid === null; attempt += 1) {
+        const result = await db.query(
+          "SELECT pid FROM pg_stat_activity WHERE application_name='hyperion-migration-interrupted' AND query LIKE '%pg_sleep(30)%' AND state='active'",
+        );
+        const value = result.rows[0]?.pid;
+        if (typeof value === "number") pid = value;
+        else await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(pid).not.toBeNull();
+      await db.query("SELECT pg_terminate_backend($1)", [pid]);
+      expect(await interrupted).toBeInstanceOf(Error);
+      expect(
+        connectionErrors.every((error) => error.message === "Connection terminated unexpectedly"),
+      ).toBe(true);
+      await writeFile(
+        file,
+        "-- Up Migration\nCREATE TABLE interrupted_once(id integer PRIMARY KEY); INSERT INTO interrupted_once VALUES(1);\n-- Down Migration\nDROP TABLE interrupted_once;",
+      );
+      await expect(run()).resolves.toHaveLength(1);
+      const result = await db.query(
+        `SELECT count(*)::int AS count FROM "${schema}".interrupted_once`,
+      );
+      expect(result.rows[0]?.count).toBe(1);
+    } finally {
+      await interruptedClient.end();
+      await db.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 10_000);
 
   it("holds a u64 that bigint cannot", async () => {
     // The entire reason nonces and claim ids are NUMERIC(20,0). Postgres int8 stops at 2^63-1 and
