@@ -10,6 +10,11 @@
  * runs the unit suite rather than failing in a way somebody learns to ignore.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { runner } from "node-pg-migrate";
+import { Client } from "pg";
 
 import {
   auditTransferAndClaimInvariants,
@@ -24,6 +29,7 @@ const suite = CONNECTION === undefined ? describe.skip : describe;
 const CHECK_VIOLATION = "23514";
 const UNIQUE_VIOLATION = "23505";
 const NUMERIC_OUT_OF_RANGE = "22003";
+const MIGRATION_TEST_SCHEMA = `migration_lock_test_${process.pid}_${Date.now()}`;
 
 const U64_MAX = "18446744073709551615";
 const U256_MAX = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
@@ -73,6 +79,164 @@ suite("the schema", () => {
       expect(names, `${table} is missing; has the migration run`).toContain(table);
     }
   });
+
+  it("serializes real SQL migration runners and applies each step once", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "hyperion-migration-lock-"));
+    const file = join(directory, "1790900000000_lock-test.sql");
+    await writeFile(
+      file,
+      "-- Up Migration\nSELECT pg_sleep(1); CREATE TABLE lock_once (id integer PRIMARY KEY); INSERT INTO lock_once VALUES (1);\n-- Down Migration\nDROP TABLE lock_once;",
+    );
+    const run = (applicationName: string) =>
+      runner({
+        databaseUrl: { connectionString: CONNECTION ?? "", application_name: applicationName },
+        dir: directory,
+        migrationsTable: "pgmigrations",
+        schema: MIGRATION_TEST_SCHEMA,
+        createSchema: true,
+        direction: "up",
+        advisoryLockMode: "wait",
+        log: () => undefined,
+      });
+    const first = run("hyperion-migration-lock-first");
+    let second: Promise<unknown> | undefined;
+    let secondRunnerWaiting = false;
+    try {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const { rows } = await db.query(
+          "SELECT 1 FROM pg_stat_activity WHERE application_name='hyperion-migration-lock-first' AND wait_event='PgSleep'",
+        );
+        if (rows.length) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      second = run("hyperion-migration-lock-second");
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const { rows } = await db.query(
+          "SELECT 1 FROM pg_stat_activity WHERE application_name='hyperion-migration-lock-second' AND wait_event_type='Lock' AND wait_event='advisory'",
+        );
+        if (rows.length) {
+          secondRunnerWaiting = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const outcomes = await Promise.allSettled([first, second]);
+      expect(outcomes.map((value) => value.status)).toEqual(["fulfilled", "fulfilled"]);
+      expect(secondRunnerWaiting).toBe(true);
+      const { rows } = await db.query(
+        `SELECT count(*)::integer AS count FROM "${MIGRATION_TEST_SCHEMA}".lock_once`,
+      );
+      expect(rows[0]?.count).toBe(1);
+    } finally {
+      await Promise.allSettled([first, ...(second ? [second] : [])]);
+      await db.query(`DROP SCHEMA IF EXISTS "${MIGRATION_TEST_SCHEMA}" CASCADE`);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("releases advisory ownership after a failed SQL migration and permits a clean retry", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "hyperion-migration-failure-"));
+    const file = join(directory, "1790900000000_failure-test.sql");
+    const schema = MIGRATION_TEST_SCHEMA + "_failed";
+    const run = () =>
+      runner({
+        databaseUrl: CONNECTION ?? "",
+        dir: directory,
+        migrationsTable: "pgmigrations",
+        schema,
+        createSchema: true,
+        direction: "up",
+        advisoryLockMode: "wait",
+        log: () => undefined,
+      });
+    try {
+      await writeFile(file, "-- Up Migration\nSELECT 1/0;\n-- Down Migration\nSELECT 1;");
+      await expect(run()).rejects.toThrow();
+      await writeFile(
+        file,
+        "-- Up Migration\nCREATE TABLE retry_once(id integer PRIMARY KEY); INSERT INTO retry_once VALUES (1);\n-- Down Migration\nDROP TABLE retry_once;",
+      );
+      await expect(run()).resolves.toHaveLength(1);
+    } finally {
+      await db.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("releases migration ownership when PostgreSQL interrupts the runner", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "hyperion-migration-interrupted-"));
+    const file = join(directory, "1790900000000_interrupted.sql");
+    const schema = `${MIGRATION_TEST_SCHEMA}_interrupted`;
+    const interruptedClient = new Client({
+      connectionString: CONNECTION ?? "",
+      application_name: "hyperion-migration-interrupted",
+    });
+    const connectionErrors: Error[] = [];
+    interruptedClient.on("error", (error: Error) => connectionErrors.push(error));
+    const run = () =>
+      runner({
+        databaseUrl: {
+          connectionString: CONNECTION ?? "",
+          application_name: "hyperion-migration-interrupted",
+        },
+        dir: directory,
+        migrationsTable: "pgmigrations",
+        schema,
+        createSchema: true,
+        direction: "up",
+        advisoryLockMode: "wait",
+        log: () => undefined,
+      });
+    try {
+      await writeFile(
+        file,
+        "-- Up Migration\nSELECT pg_sleep(30); CREATE TABLE interrupted_once(id integer PRIMARY KEY);\n-- Down Migration\nDROP TABLE interrupted_once;",
+      );
+      // Attach the rejection handler before interrupting the connection.
+      await interruptedClient.connect();
+      const interrupted = runner({
+        dbClient: interruptedClient,
+        dir: directory,
+        migrationsTable: "pgmigrations",
+        schema,
+        createSchema: true,
+        direction: "up",
+        advisoryLockMode: "wait",
+        log: () => undefined,
+      }).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      let pid: number | null = null;
+      for (let attempt = 0; attempt < 100 && pid === null; attempt += 1) {
+        const result = await db.query(
+          "SELECT pid FROM pg_stat_activity WHERE application_name='hyperion-migration-interrupted' AND query LIKE '%pg_sleep(30)%' AND state='active'",
+        );
+        const value = result.rows[0]?.pid;
+        if (typeof value === "number") pid = value;
+        else await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(pid).not.toBeNull();
+      await db.query("SELECT pg_terminate_backend($1)", [pid]);
+      expect(await interrupted).toBeInstanceOf(Error);
+      expect(
+        connectionErrors.every((error) => error.message === "Connection terminated unexpectedly"),
+      ).toBe(true);
+      await writeFile(
+        file,
+        "-- Up Migration\nCREATE TABLE interrupted_once(id integer PRIMARY KEY); INSERT INTO interrupted_once VALUES(1);\n-- Down Migration\nDROP TABLE interrupted_once;",
+      );
+      await expect(run()).resolves.toHaveLength(1);
+      const result = await db.query(
+        `SELECT count(*)::int AS count FROM "${schema}".interrupted_once`,
+      );
+      expect(result.rows[0]?.count).toBe(1);
+    } finally {
+      await interruptedClient.end();
+      await db.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 10_000);
 
   it("holds a u64 that bigint cannot", async () => {
     // The entire reason nonces and claim ids are NUMERIC(20,0). Postgres int8 stops at 2^63-1 and

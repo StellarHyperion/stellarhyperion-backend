@@ -23,6 +23,10 @@ npm run build
 node --env-file=.env dist/main.js
 ```
 
+Migration commands use PostgreSQL's session-level advisory lock and wait for another migration
+runner to finish before checking and applying pending steps. The lock is released when the runner
+finishes or its database connection closes. API instances do not run migrations at startup.
+
 The SDK is installed from the committed protocol tarball. `npm run dev` does not load `.env` automatically; export the variables first or run `node --env-file=.env --watch --experimental-strip-types src/main.ts`.
 
 ### Startup schema compatibility check
