@@ -48,7 +48,11 @@ export interface QueryResultRows {
 
 /** What both the pool and a transaction offer, so a repository never knows which it has. */
 export interface Queryable {
-  query(text: string, params?: readonly unknown[]): Promise<QueryResultRows>;
+  query(
+    text: string,
+    params?: readonly unknown[],
+    options?: QueryOptions,
+  ): Promise<QueryResultRows>;
 }
 
 /**
