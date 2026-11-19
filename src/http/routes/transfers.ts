@@ -35,6 +35,22 @@ export type TransferLifecycleStage =
   | "settled"
   | "failed";
 
+export interface SourceProvenance {
+  readonly status: "confirmed";
+  readonly chain: string;
+  readonly txHash: string;
+  readonly block: string;
+  readonly logIndex: number | null;
+}
+
+export interface DestinationProvenance {
+  readonly status: "confirmed" | "unverified";
+  readonly chain: string;
+  readonly txHash: string | null;
+  readonly block: string | null;
+  readonly logIndex: number | null;
+}
+
 export interface FormattedTransfer {
   readonly id: string;
   readonly stage: TransferLifecycleStage;
@@ -53,6 +69,7 @@ export interface FormattedTransfer {
     readonly block: string;
     readonly txHash: string;
     readonly observedAt: string;
+    readonly provenance: SourceProvenance;
   };
   readonly destination: {
     readonly token: string | null;
@@ -65,6 +82,7 @@ export interface FormattedTransfer {
     readonly block: string | null;
     readonly txHash: string | null;
     readonly deliveredAt: string | null;
+    readonly provenance: DestinationProvenance;
   };
   readonly rail: {
     readonly status: string | null;
@@ -162,6 +180,13 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
       block: text(row, "origin_block"),
       txHash: text(row, "origin_tx"),
       observedAt: new Date(row.observed_at as string | number | Date).toISOString(),
+      provenance: {
+        status: "confirmed",
+        chain,
+        txHash: text(row, "origin_tx"),
+        block: text(row, "origin_block"),
+        logIndex: integerOrNull(row, "origin_log_index"),
+      },
     },
     destination: {
       token: receivedToken,
@@ -176,6 +201,13 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
       deliveredAt: row.delivered_at
         ? new Date(row.delivered_at as string | number | Date).toISOString()
         : null,
+      provenance: {
+        status: delivered ? "confirmed" : "unverified",
+        chain: destinationChain,
+        txHash: textOrNull(row, "destination_tx"),
+        block: textOrNull(row, "destination_block"),
+        logIndex: integerOrNull(row, "destination_log_index"),
+      },
     },
     rail:
       railStatus === null
@@ -196,6 +228,77 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
         }
       : null,
   };
+}
+
+const ROUTE_NAMES = ["cctp", "axelar-its", "axelar-gmp", "allbridge"] as const;
+
+function invalidFilter(message: string): Error {
+  const error = new Error(message);
+  (error as Error & { statusCode?: number }).statusCode = 400;
+  return error;
+}
+
+function validateIdentifierFilter(name: string, value: string): void {
+  if (value.length === 0 || value.length > 128 || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw invalidFilter(
+      `${name} must be a non-empty printable identifier of at most 128 characters`,
+    );
+  }
+}
+
+function validateTransferFilters(
+  config: AppConfig,
+  filters: Readonly<{
+    originChain?: string | undefined;
+    destinationChain?: string | undefined;
+    route?: string | undefined;
+    sender?: string | undefined;
+    recipient?: string | undefined;
+    search?: string | undefined;
+  }>,
+): void {
+  const { originChain, destinationChain, route, sender, recipient, search } = filters;
+  const deployments = config.deployments.networks;
+
+  for (const [name, chain] of [
+    ["originChain", originChain],
+    ["destinationChain", destinationChain],
+  ] as const) {
+    if (chain !== undefined && (!isChainKey(chain) || deployments[chain] === undefined)) {
+      throw invalidFilter(`${name} must name a configured deployment`);
+    }
+  }
+  if (
+    originChain !== undefined &&
+    destinationChain !== undefined &&
+    originChain === destinationChain
+  ) {
+    throw invalidFilter("originChain and destinationChain must differ");
+  }
+  if (route !== undefined) {
+    if (!/^[0-3]$/.test(route)) throw invalidFilter("route must be an integer from 0 to 3");
+    const routeName = ROUTE_NAMES[Number(route)]!;
+    for (const chain of [originChain, destinationChain]) {
+      if (chain === undefined) continue;
+      if (!isChainKey(chain)) throw invalidFilter(`${chain} is not a configured deployment`);
+      const deployment = deployments[chain];
+      const hasAdapter =
+        deployment !== undefined &&
+        Object.prototype.hasOwnProperty.call(deployment.adapters, routeName);
+      const hasToken =
+        deployment !== undefined &&
+        Object.values(deployment.tokens).some((token) =>
+          token.routes.some((supportedRoute: unknown) => Number(supportedRoute) === Number(route)),
+        );
+      if (!hasAdapter || !hasToken)
+        throw invalidFilter(`route ${route} is not supported by ${chain}`);
+    }
+  }
+  if (sender !== undefined) validateIdentifierFilter("sender", sender);
+  if (recipient !== undefined) validateIdentifierFilter("recipient", recipient);
+  if (search !== undefined && (search.length > 128 || /[\u0000-\u001f\u007f]/.test(search))) {
+    throw invalidFilter("search must be at most 128 printable characters");
+  }
 }
 
 const TRANSFER_QUERY = `
@@ -551,6 +654,15 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
 
       const { originChain, destinationChain, route, sender, recipient, search, limit, offset } =
         request.query;
+
+      validateTransferFilters(deps.config, {
+        originChain,
+        destinationChain,
+        route,
+        sender,
+        recipient,
+        search,
+      });
 
       const conditions: string[] = [];
       const params: unknown[] = [];

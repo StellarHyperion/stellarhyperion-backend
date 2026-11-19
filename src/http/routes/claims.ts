@@ -8,7 +8,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
-import { integer, text, textOrNull, timestampOrNull } from "../../db/rows.js";
+import { integer, integerOrNull, text, textOrNull, timestampOrNull } from "../../db/rows.js";
 import {
   LIST_CACHE_CONTROL,
   computeCanonicalETag,
@@ -16,6 +16,7 @@ import {
 } from "../etag.js";
 import { negotiateSchemaVersion, withSchemaMetadata } from "../schema-version.js";
 import type { ServerDeps } from "../server.js";
+import type { DestinationProvenance, SourceProvenance } from "./transfers.js";
 
 export interface FormattedClaim {
   readonly id: string;
@@ -30,6 +31,10 @@ export interface FormattedClaim {
   readonly settled: boolean;
   readonly createdAt: string;
   readonly observedAt: string;
+  readonly provenance: {
+    readonly source: SourceProvenance | null;
+    readonly destination: DestinationProvenance;
+  };
 }
 
 function formatClaimRow(row: Record<string, unknown>): FormattedClaim {
@@ -46,8 +51,36 @@ function formatClaimRow(row: Record<string, unknown>): FormattedClaim {
     settled: row.settled === true,
     createdAt: new Date(row.created_at as string | number | Date).toISOString(),
     observedAt: new Date(row.observed_at as string | number | Date).toISOString(),
+    provenance: {
+      source:
+        textOrNull(row, "source_tx") === null || textOrNull(row, "source_block") === null
+          ? null
+          : {
+              status: "confirmed",
+              chain: text(row, "source_chain"),
+              txHash: text(row, "source_tx"),
+              block: text(row, "source_block"),
+              logIndex: integerOrNull(row, "source_log_index"),
+            },
+      destination: {
+        status: "unverified",
+        chain: text(row, "chain"),
+        txHash: null,
+        block: null,
+        logIndex: null,
+      },
+    },
   };
 }
+
+const CLAIM_SELECT = `
+  SELECT c.chain || ':' || c.claim_id::text AS id, c.chain, c.claim_id, c.recipient, c.token, c.amount, c.route,
+         c.source_chain, c.source_nonce, c.created_at, c.settled, c.settled_at, c.settled_by, c.settled_tx, c.observed_at,
+         t.origin_tx AS source_tx, t.origin_block AS source_block, t.origin_log_index AS source_log_index
+    FROM pending_claim c
+    LEFT JOIN outbound_transfer t
+      ON t.origin_chain = c.source_chain AND t.nonce = c.source_nonce
+`;
 
 export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
@@ -64,10 +97,8 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
 
       const { chain, claimId } = request.params;
       const { rows } = await db.query(
-        `SELECT chain || ':' || claim_id::text AS id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
-                created_at, settled, settled_at, settled_by, settled_tx, observed_at
-           FROM pending_claim
-          WHERE chain = $1 AND claim_id = $2
+        `${CLAIM_SELECT}
+          WHERE c.chain = $1 AND c.claim_id = $2
           LIMIT 1`,
         [chain, claimId],
       );
@@ -124,15 +155,15 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
 
       if (chain) {
         params.push(chain);
-        conditions.push(`chain = $${String(params.length)}`);
+        conditions.push(`c.chain = $${String(params.length)}`);
       }
       if (recipient) {
         params.push(recipient);
-        conditions.push(`recipient = $${String(params.length)}`);
+        conditions.push(`c.recipient = $${String(params.length)}`);
       }
       if (settled !== undefined) {
         params.push(settled === "true");
-        conditions.push(`settled = $${String(params.length)}`);
+        conditions.push(`c.settled = $${String(params.length)}`);
       }
 
       const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
@@ -145,11 +176,9 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       const offsetClause = `OFFSET $${String(params.length)}`;
 
       const { rows } = await db.query(
-        `SELECT chain || ':' || claim_id::text AS id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
-                created_at, settled, observed_at
-           FROM pending_claim
+        `${CLAIM_SELECT}
           ${whereClause}
-          ORDER BY chain ASC, claim_id DESC
+          ORDER BY c.chain ASC, c.claim_id DESC
           ${limitClause}
           ${offsetClause}`,
         params,
