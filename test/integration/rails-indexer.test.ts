@@ -1094,7 +1094,7 @@ suite("database load and bounded-latency benchmarks", () => {
   suite("benchmarks against real Postgres", () => {
     let db: Database;
 
-    beforeAll(async () => {
+    beforeAll(() => {
       db = Database.open(CONNECTION ?? "", {
         applicationName: "hyperion-benchmark",
       });
