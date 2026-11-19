@@ -42,6 +42,49 @@ describe("REST API endpoints", () => {
   const config = loadConfig({ env: completeEnv() });
   const { logger } = capturingLogger();
 
+  it.each([
+    [400, "bad_request"],
+    [404, "not_found"],
+    [408, "timeout"],
+    [503, "unavailable"],
+    [504, "timeout"],
+    [500, "internal_error"],
+  ] as const)("normalizes HTTP %s without exposing database details", async (statusCode, code) => {
+    const app = buildServer({
+      config,
+      logger,
+      db: new MockDb({}) as unknown as Database,
+      readiness: [],
+    });
+    app.get("/test/error", () => {
+      throw Object.assign(
+        new Error("SELECT private_table; postgres://user:password@database/private"),
+        { statusCode },
+      );
+    });
+    const response = await app.inject({ method: "GET", url: "/test/error" });
+    expect(response.statusCode).toBe(statusCode);
+    expect(response.json()).toMatchObject({ code });
+    expect(response.body).not.toMatch(/private_table|password|postgres:/);
+    await app.close();
+  });
+
+  it("preserves legacy route error and adds the stable validation category", async () => {
+    const app = buildServer({
+      config,
+      logger,
+      db: new MockDb({}) as unknown as Database,
+      readiness: [],
+    });
+    const response = await app.inject({
+      method: "GET",
+      url: "/v1/transfers?cursor=invalid",
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ code: "bad_request", error: "invalid_cursor" });
+    await app.close();
+  });
+
   it("serves transfer status by origin chain and nonce", async () => {
     const db = new MockDb({
       outbound_transfer: [
@@ -117,6 +160,20 @@ describe("REST API endpoints", () => {
 
     expect(res.statusCode).toBe(404);
     expect(res.json().error).toBe("not_found");
+    expect(res.json().code).toBe("not_found");
+  });
+
+  it("uses a stable error code without exposing route details", async () => {
+    const app = buildServer({
+      config,
+      logger,
+      db: new MockDb({}) as unknown as Database,
+      readiness: [],
+    });
+    const res = await app.inject({ method: "GET", url: "/no-such-route?secret=not-for-response" });
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toMatchObject({ error: "not_found", code: "not_found" });
+    expect(res.body).not.toContain("secret");
   });
 
   it("lists transfers with pagination metadata", async () => {
