@@ -481,12 +481,15 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
           if (error) reject(error);
           else resolve();
         };
-        const drained = () => done();
-        const disconnected = () => done(new Error("Stream closed."));
-        const timer = setTimeout(
-          () => done(new Error("Stream backpressure exceeded its budget.")),
-          PUBLIC_READ_BUDGET_MS,
-        );
+        const drained = () => {
+          done();
+        };
+        const disconnected = () => {
+          done(new Error("Stream closed."));
+        };
+        const timer = setTimeout(() => {
+          done(new Error("Stream backpressure exceeded its budget."));
+        }, PUBLIC_READ_BUDGET_MS);
         reply.raw.once("drain", drained);
         reply.raw.once("close", disconnected);
       });
@@ -546,7 +549,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
             end();
           }
         } catch (error) {
-          if (error instanceof StreamCursorError && !closed) {
+          if (error instanceof StreamCursorError) {
             try {
               await event("resync", { error: error.code, message: error.message, resync: true });
             } catch {
@@ -563,7 +566,9 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       if (closed || polling) return;
       polling = true;
       void write(": ping\n\n")
-        .catch(() => end())
+        .catch(() => {
+          end();
+        })
         .finally(() => {
           polling = false;
         });

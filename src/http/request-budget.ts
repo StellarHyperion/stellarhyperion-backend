@@ -35,7 +35,7 @@ export async function requestQuery(
   };
   request.raw.once("aborted", abort);
   request.raw.socket.once("close", abort);
-  if (request.raw.aborted || request.raw.socket.destroyed) abort();
+  if (request.raw.socket.destroyed) abort();
 
   try {
     return await db.query(sql, params, { signal: controller.signal });

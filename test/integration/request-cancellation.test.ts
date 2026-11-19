@@ -11,7 +11,9 @@ const connection = process.env.TEST_DATABASE_URL;
   it("cancels server work and reuses the same connection without cancelling its next query", async () => {
     const initial = (await db.query("SELECT pg_backend_pid() AS pid")).rows[0]?.pid;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error("request abandoned")), 50);
+    const timer = setTimeout(() => {
+      controller.abort(new Error("request abandoned"));
+    }, 50);
     const start = performance.now();
     try {
       await expect(
@@ -26,7 +28,9 @@ const connection = process.env.TEST_DATABASE_URL;
   });
   it("rolls back a cancelled transaction and leaves its connection usable", async () => {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error("transaction read expired")), 50);
+    const timer = setTimeout(() => {
+      controller.abort(new Error("transaction read expired"));
+    }, 50);
     try {
       await expect(
         db.transaction((tx) => tx.query("SELECT pg_sleep(2)", [], { signal: controller.signal })),

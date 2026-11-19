@@ -1,3 +1,4 @@
+import { text } from "../db/rows.js";
 import type { Queryable } from "../db/pool.js";
 
 export const STREAM_REPLAY_LIMIT = 100;
@@ -63,5 +64,6 @@ export async function latestStreamTransition(db: Queryable, transferId: string):
     "SELECT id::text FROM rail_attestation_history WHERE transfer_id=$1 ORDER BY id DESC LIMIT 1",
     [transferId],
   );
-  return String(result.rows[0]?.id ?? "0");
+  const row = result.rows[0];
+  return row === undefined ? "0" : text(row, "id");
 }

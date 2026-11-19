@@ -199,10 +199,10 @@ export class Database implements Transactional {
         ? null
         : (await client.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]?.pid;
     signal?.throwIfAborted();
-    let cancellation: Promise<void> | null = null;
+    const cancellation: { promise?: Promise<void> } = {};
     const cancel = () => {
-      if (pid === null || pid === undefined || cancellation !== null) return;
-      cancellation = (async () => {
+      if (pid === null || pid === undefined || cancellation.promise !== undefined) return;
+      cancellation.promise = (async () => {
         const canceller = new Client({
           ...this.connectionConfig,
           application_name: "hyperion-public-cancel",
@@ -231,7 +231,7 @@ export class Database implements Transactional {
       throw error;
     } finally {
       signal?.removeEventListener("abort", cancel);
-      await cancellation;
+      if (cancellation.promise !== undefined) await cancellation.promise;
     }
   }
 
