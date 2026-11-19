@@ -30,6 +30,7 @@ import { RouteKind } from "@hyperion/protocol";
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
 import { inspectRailBacklog, type InspectRailBacklogOptions } from "../rails/backlog.js";
 import { IrisClient } from "../rails/cctp/iris.js";
+import { safeCircuitKey } from "../rails/circuit.js";
 import { RailPass, type RailProgress } from "../rails/pass.js";
 import { requeueTerminalTransfer } from "../rails/requeue.js";
 import type {
@@ -80,6 +81,7 @@ interface Pass extends ReadinessSource {
   tick(signal: AbortSignal): Promise<boolean>;
   release?(): Promise<unknown>;
   readonly progress?: { readonly block?: bigint; readonly ledger?: number } | RailProgress | null;
+  circuitState?(): unknown;
 }
 
 export interface PolledWorkerOptions {
@@ -159,6 +161,7 @@ export class PolledWorker implements Worker {
       metadata: {
         ticks: stats.ticks,
         running: stats.running,
+        ...(this.pass.circuitState === undefined ? {} : { circuits: this.pass.circuitState() }),
       },
     });
   }
@@ -350,11 +353,15 @@ export function buildRailPasses(
   const clients: readonly { readonly route: RouteKind; readonly client: RailClient }[] = [
     {
       route: RouteKind.Cctp,
-      client: new IrisClient(network, { baseUrl: config.irisUrl }),
+      client: new IrisClient(network, {
+        baseUrl: config.irisUrl,
+        providerId: safeCircuitKey(config.irisUrl),
+      }),
     },
     {
       route: RouteKind.AxelarIts,
       client: new AxelarGmpClient(config.axelarUrl, {
+        providerId: safeCircuitKey(config.axelarUrl),
         onUnknownStatus: (status) => {
           logger.warn(
             { rail: "axelar", status },

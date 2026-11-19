@@ -29,6 +29,7 @@ import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
+import { ProviderCircuitBreaker, safeCircuitKey, type ProviderCircuitSnapshot } from "./circuit.js";
 import {
   writeInbound,
   writeAttestation,
@@ -49,6 +50,7 @@ import {
   type BacklogInspectionReport,
   type PendingTransfer,
   type RailClient,
+  type RailLookup,
   type RailRetryClass,
   type CctpVerificationFailure,
 } from "./types.js";
@@ -74,6 +76,9 @@ export interface RailPassOptions {
   readonly maxCheckFailures: number;
   readonly now?: () => Date;
   readonly config?: AppConfig;
+  readonly circuits?: ProviderCircuitBreaker;
+  readonly circuitFailureThreshold?: number;
+  readonly circuitCooldownMs?: number;
 }
 
 export interface RailProgress {
@@ -87,8 +92,21 @@ export interface RailProgress {
 export class RailPass {
   private lastProgress: RailProgress | null = null;
   private cooldownUntil: Date | null = null;
+  private readonly circuits: ProviderCircuitBreaker;
 
-  constructor(private readonly options: RailPassOptions) {}
+  constructor(private readonly options: RailPassOptions) {
+    this.circuits =
+      options.circuits ??
+      new ProviderCircuitBreaker({
+        ...(options.circuitFailureThreshold === undefined
+          ? {}
+          : { failureThreshold: options.circuitFailureThreshold }),
+        ...(options.circuitCooldownMs === undefined
+          ? {}
+          : { cooldownMs: options.circuitCooldownMs }),
+        now: () => this.now(),
+      });
+  }
 
   get name(): string {
     return `rail:${this.options.client.rail}`;
@@ -104,6 +122,10 @@ export class RailPass {
 
   get progress(): RailProgress | null {
     return this.lastProgress;
+  }
+
+  circuitState(): readonly ProviderCircuitSnapshot[] {
+    return this.circuits.snapshot();
   }
 
   /** Inspect this rail's backlog without polling providers or mutating pass state. */
@@ -127,6 +149,14 @@ export class RailPass {
         name: this.name,
         state: "degraded",
         detail: `rate limited by the rail until ${cooldown.toISOString()}, so no transfer status is moving`,
+      };
+    }
+    const paused = this.circuitState();
+    if (paused.length > 0) {
+      return {
+        name: this.name,
+        state: "degraded",
+        detail: `provider discovery or destination proof verification is paused for ${paused.map((circuit) => circuit.key).join(", ")}; no delivery claim is made`,
       };
     }
     if (progress === null) {
@@ -178,7 +208,11 @@ export class RailPass {
 
     // One locked transfer per transaction: replicas skip active work and cannot commit stale
     // schedules. A crash rolls back the claim; no process-local ownership survives a restart.
-    while (selected < batchSize && !signal.aborted) {
+    while (
+      selected < batchSize &&
+      !signal.aborted &&
+      !this.circuits.isPaused(this.discoveryCircuitKey)
+    ) {
       const outcome = await db.transaction(async (tx) => {
         const queue = await pendingForRail(tx, {
           route: this.options.route,
@@ -237,6 +271,7 @@ export class RailPass {
     if (signal.aborted) return false;
     const cooldown = this.cooldownUntil;
     if (cooldown !== null && cooldown > this.now()) return false;
+    if (this.circuits.isPaused(this.discoveryCircuitKey)) return false;
     return this.options.db.transaction(async (tx) => {
       const transfer = await pendingTransferById(
         tx,
@@ -285,7 +320,18 @@ export class RailPass {
       return true;
     }
 
-    const lookup = await this.options.client.look(transfer, signal);
+    if (!this.circuits.allow(this.discoveryCircuitKey)) return false;
+    let lookup: RailLookup;
+    try {
+      lookup = await this.options.client.look(transfer, signal);
+    } catch (error) {
+      this.circuits.recordFailure(
+        this.discoveryCircuitKey,
+        circuitReason(error, this.options.client.rail),
+      );
+      throw error;
+    }
+    this.circuits.recordSuccess(this.discoveryCircuitKey);
     signal.throwIfAborted();
     if (lookup.kind === "missing") {
       // Normal. The rail has not indexed the burn yet, which is where every transfer starts.
@@ -319,42 +365,57 @@ export class RailPass {
       null;
     let verificationFailure: CctpVerificationFailure | null = null;
     if (this.options.config) {
-      const its =
-        report.execution || report.forwardTxHash
-          ? await verifyItsDelivery(this.options.config, db, transfer, report)
-          : null;
-      diagnostics = its !== null && "diagnostics" in its ? its.diagnostics : [];
-      itsVerificationState = its === null ? null : "diagnostics" in its ? its.state : "verified";
-      let verified: VerifiedDelivery | null = its !== null && !("diagnostics" in its) ? its : null;
-      if (!verified) {
-        const cctp = await inspectCctpDelivery(this.options.config, db, transfer, report);
-        verified = cctp.delivery;
-        verificationFailure = cctp.failure;
-      }
-      if (verified) {
-        signal.throwIfAborted();
-        if (transfer.route === RouteKind.AxelarIts && "evidence" in verified) {
-          const evidence = verified.evidence as AxelarDeliveryEvidenceRow;
-          const evidenceId = await writeAxelarDeliveryEvidence(db, evidence);
-          await writeInbound(db, verified.at, verified.row);
-          await linkAxelarDeliveryEvidence(db, evidence, evidenceId);
-        } else await writeInbound(db, verified.at, verified.row);
-        await this.write(db, transfer, {
-          status: "delivered",
-          railStatus: report.railStatus,
-          reference: report.reference,
-          attestedAt: report.attestedAt,
-          checkedAt: at,
-          failures: 0,
-          retryAttempts: 0,
-          error: null,
-          nextAttemptAt: null,
-          retryClass: null,
-          diagnostics,
-          itsVerificationState,
-          verificationFailure: null,
-        });
-        return true;
+      const verificationKey = this.verificationCircuitKey(transfer.destinationChain);
+      if (this.circuits.allow(verificationKey)) {
+        try {
+          const its =
+            report.execution || report.forwardTxHash
+              ? await verifyItsDelivery(this.options.config, db, transfer, report)
+              : null;
+          diagnostics = its !== null && "diagnostics" in its ? its.diagnostics : [];
+          itsVerificationState =
+            its === null ? null : "diagnostics" in its ? its.state : "verified";
+          let verified: VerifiedDelivery | null =
+            its !== null && !("diagnostics" in its) ? its : null;
+          if (!verified) {
+            const cctp = await inspectCctpDelivery(this.options.config, db, transfer, report);
+            verified = cctp.delivery;
+            verificationFailure = cctp.failure;
+          }
+          this.circuits.recordSuccess(verificationKey);
+          if (verified) {
+            signal.throwIfAborted();
+            if (transfer.route === RouteKind.AxelarIts && "evidence" in verified) {
+              const evidence = verified.evidence as AxelarDeliveryEvidenceRow;
+              const evidenceId = await writeAxelarDeliveryEvidence(db, evidence);
+              await writeInbound(db, verified.at, verified.row);
+              await linkAxelarDeliveryEvidence(db, evidence, evidenceId);
+            } else await writeInbound(db, verified.at, verified.row);
+            await this.write(db, transfer, {
+              status: "delivered",
+              railStatus: report.railStatus,
+              reference: report.reference,
+              attestedAt: report.attestedAt,
+              checkedAt: at,
+              failures: 0,
+              retryAttempts: 0,
+              error: null,
+              nextAttemptAt: null,
+              retryClass: null,
+              diagnostics,
+              itsVerificationState,
+              verificationFailure: null,
+            });
+            return true;
+          }
+        } catch (error) {
+          signal.throwIfAborted();
+          this.circuits.recordFailure(
+            verificationKey,
+            circuitReason(error, this.options.client.rail),
+          );
+          throw error;
+        }
       }
     }
     const candidateStatus =
@@ -483,6 +544,18 @@ export class RailPass {
     });
   }
 
+  private get providerCircuitIdentity(): string {
+    return safeCircuitKey(this.options.client.providerId ?? this.options.client.rail);
+  }
+
+  private get discoveryCircuitKey(): string {
+    return `discovery:${this.providerCircuitIdentity}`;
+  }
+
+  private verificationCircuitKey(destinationChain: string): string {
+    return `proof:${this.providerCircuitIdentity}:${safeCircuitKey(destinationChain)}`;
+  }
+
   private nextCheckAt(at: Date): Date {
     return new Date(at.getTime() + this.options.recheckAfterMs);
   }
@@ -504,6 +577,13 @@ export class RailPass {
   private now(): Date {
     return this.options.now?.() ?? new Date();
   }
+}
+
+function circuitReason(error: unknown, rail: string): string {
+  if (error instanceof RailError) {
+    return `${rail}: ${error.kind === "rateLimited" ? "rate_limited" : error.kind}`;
+  }
+  return `${rail}: transient`;
 }
 
 function safeFailureReason(error: unknown): string {
