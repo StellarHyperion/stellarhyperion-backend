@@ -57,7 +57,7 @@ async function initializeApp(): Promise<FastifyInstance> {
 
 function getApp(): Promise<FastifyInstance> {
   if (app) return Promise.resolve(app);
-  initializing ??= initializeApp().catch((error) => {
+  initializing ??= initializeApp().catch((error: unknown) => {
     initializing = null;
     throw error;
   });

@@ -25,7 +25,9 @@ export class BudgetTracker {
   advanceStage(): boolean {
     const index = ORDER.indexOf(this.stage);
     if (index === ORDER.length - 1) return false;
-    this.stage = ORDER[index + 1]!;
+    const next = ORDER[index + 1];
+    if (next === undefined) return false;
+    this.stage = next;
     this.stageStartedAt = this.now();
     return true;
   }
