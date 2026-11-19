@@ -4,12 +4,16 @@ import { describe, expect, it } from "vitest";
 import { encodeAbiParameters, encodeEventTopics, hexToBytes, type Hex } from "viem";
 import {
   CCTP_RECEIPT_ABI,
+  inspectCctpMessage,
+  inspectCctpPayment,
   matchingCctpPayment,
   verifiedCctpMessage,
   type ExpectedCctpTransfer,
 } from "../../src/rails/cctp/events.js";
 import type { DeliveryLog } from "../../src/rails/axelar/events.js";
 import { reportFor } from "../../src/rails/cctp/iris.js";
+import { writeAttestation } from "../../src/chains/writers.js";
+import type { Queryable } from "../../src/db/pool.js";
 
 const expected: ExpectedCctpTransfer = {
   sourceToken: "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
@@ -76,6 +80,8 @@ describe("CCTP forwarded destination proof", () => {
     expect(matchingCctpPayment([paid, received], raw, expected)).toBe(paid);
     expect(matchingCctpPayment([received], raw, expected)).toBeNull();
     expect(matchingCctpPayment([paid], raw, expected)).toBeNull();
+    expect(inspectCctpPayment([received], raw, expected).failure).toBe("mint_missing");
+    expect(inspectCctpPayment([paid], raw, expected).failure).toBe("receipt_missing");
   });
   it.each(["sourceToken", "sourceAdapter", "sourceMessenger"] as const)(
     "binds the %s to the indexed source deployment",
@@ -84,6 +90,25 @@ describe("CCTP forwarded destination proof", () => {
       expect(verifiedCctpMessage(raw, { ...expected, [field]: replacement })).toBeNull();
     },
   );
+  it("reports bounded field-level diagnostics for domain, token, recipient, and amount mismatches", () => {
+    const wrongSourceDomain = hexToBytes(raw);
+    new DataView(wrongSourceDomain.buffer).setUint32(4, 6);
+    expect(inspectCctpMessage(toHex(wrongSourceDomain), expected).failure).toBe(
+      "source_domain_mismatch",
+    );
+    expect(inspectCctpMessage(raw, { ...expected, destinationDomain: 6 }).failure).toBe(
+      "destination_domain_mismatch",
+    );
+    expect(
+      inspectCctpMessage(raw, { ...expected, sourceToken: expected.sourceAdapter }).failure,
+    ).toBe("token_mismatch");
+    expect(inspectCctpMessage(raw, { ...expected, recipient: expected.token }).failure).toBe(
+      "recipient_mismatch",
+    );
+    expect(
+      inspectCctpMessage(raw, { ...expected, sourceAmount: expected.sourceAmount + 10n }).failure,
+    ).toBe("amount_mismatch");
+  });
   it.each(["destinationMessenger", "recipient"] as const)("refuses a different %s", (field) => {
     expect(verifiedCctpMessage(raw, { ...expected, [field]: expected.token })).toBeNull();
   });
@@ -140,5 +165,45 @@ describe("CCTP forwarded destination proof", () => {
     expect(
       reportFor({ status: "complete", forwardTxHash: "invalid" }).forwardTxHash,
     ).toBeUndefined();
+  });
+  it("keeps full-width message identifiers and omits oversized provider payloads", () => {
+    const reference = `0x${"ab".repeat(32)}`;
+    const report = reportFor({
+      status: "complete",
+      eventNonce: reference,
+      delayReason: "token=provider-secret",
+      message: `0x${"ab".repeat(8192)}`,
+    });
+    expect(report.reference).toBe(reference);
+    expect(report.railStatus).toBe("complete");
+    expect(report.messageBytes).toBeNull();
+  });
+  it("persists only the bounded verification failure code with the attestation", async () => {
+    let statement = "";
+    let parameters: readonly unknown[] = [];
+    const db: Queryable = {
+      query(sql, values = []) {
+        statement = sql;
+        parameters = values;
+        return Promise.resolve({ rows: [], rowCount: 1 });
+      },
+    };
+    await writeAttestation(db, {
+      transferId: 7n,
+      route: 0,
+      status: "pending",
+      railStatus: "complete",
+      railReference: `0x${"ab".repeat(32)}`,
+      attestedAt: null,
+      checkedAt: new Date("2026-11-19T09:00:00Z"),
+      checkFailures: 0,
+      lastError: null,
+      retryAttempts: 0,
+      nextAttemptAt: new Date("2026-11-19T09:01:00Z"),
+      retryClass: null,
+      verificationFailure: "recipient_mismatch",
+    });
+    expect(statement).toContain("verification_failure = EXCLUDED.verification_failure");
+    expect(parameters[13]).toBe("recipient_mismatch");
   });
 });

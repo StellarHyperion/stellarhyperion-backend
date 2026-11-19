@@ -1,6 +1,7 @@
 import { Address, nativeToScVal } from "@stellar/stellar-sdk";
 import { bigintOf } from "../../db/rows.js";
 import { submitStellar } from "../stellar.js";
+import { recordKeeperSubmission } from "../outcomes.js";
 import type { ClaimSettlementPayload, ClaimSettlementResult, KeeperContext } from "../types.js";
 export async function processClaimSettlement(
   ctx: KeeperContext,
@@ -19,7 +20,12 @@ export async function processClaimSettlement(
     "SELECT claim_id FROM pending_claim WHERE chain = $1 AND NOT settled ORDER BY claim_id ASC LIMIT $2",
     [chain.chain, payload.limit ?? 20],
   );
-  if (!ctx.config.keeper.stellarSecret)
+  if (ctx.config.keeper.stellarSecrets.length === 0) {
+    await recordKeeperSubmission(ctx.db, {
+      jobName: "claim-settlement",
+      signerPublicKey: "dry-run",
+      stage: "simulated",
+    });
     return {
       settled: 0,
       attempted: 0,
@@ -27,15 +33,20 @@ export async function processClaimSettlement(
       dryRun: true,
       detail: "No signer configured; no settlement was attempted.",
     };
+  }
   let settled = 0;
   for (const row of rows) {
     const id = bigintOf(row, "claim_id");
     try {
       const hash = await submitStellar(
         ctx.config,
+        ctx.db,
+        chain.chain,
         chain.routerContractId,
         "settle_claim",
+        "settle_claim",
         (sender) => [new Address(sender).toScVal(), nativeToScVal(id, { type: "u64" })],
+        { db: ctx.db, jobName: "claim-settlement" },
       );
       ctx.logger.info(
         { claimId: String(id), hash },

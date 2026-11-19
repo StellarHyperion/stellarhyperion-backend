@@ -9,6 +9,9 @@
 import { buildIndexer } from "./chains/runner.js";
 import { loadConfig } from "./config/config.js";
 import { ConfigError } from "./config/env.js";
+import { checkDatabasePolicy } from "./db/policy.js";
+import { checkSchemaCompatibility } from "./db/schema.js";
+import { runBudgetedCatchUp } from "./runtime/budget.js";
 import { Database } from "./db/pool.js";
 import { buildServer } from "./http/server.js";
 import { createApiRedis } from "./http/rate-limit-redis.js";
@@ -36,10 +39,18 @@ async function main(): Promise<void> {
 
   const db = Database.open(config.databaseUrl, {
     applicationName: "hyperion-backend",
+    readOnly: config.databaseRole === "read-only",
     logger,
     slowQueryThresholdMs: 1_000,
   });
   shutdown.add("postgres", () => db.close());
+  try {
+    await checkSchemaCompatibility(db, config.schemaVersion);
+    await checkDatabasePolicy(db, config);
+  } catch (error) {
+    await db.close();
+    throw error;
+  }
 
   const redis = config.redisUrl.length > 0 ? createApiRedis(config.redisUrl) : undefined;
   if (redis)
@@ -67,6 +78,13 @@ async function main(): Promise<void> {
   await server.listen({ host: config.http.host, port: config.http.port });
   // After listen, so the probes are answering before the first page is read. A watcher that
   // starts first makes its initial RPC calls while nothing can report on them.
+  if (config.catchUpEnabled) {
+    await runBudgetedCatchUp(indexer.workers, config.catchUpBudgetMs, async (reason) => {
+      logger.info({ reason }, "scheduled catch-up stages complete; committed progress retained");
+      await shutdown.run(reason);
+    });
+    return;
+  }
   indexer.start();
   logger.info(
     {

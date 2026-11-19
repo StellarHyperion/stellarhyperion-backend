@@ -23,7 +23,25 @@ npm run build
 node --env-file=.env dist/main.js
 ```
 
+Migration commands use PostgreSQL's session-level advisory lock and wait for another migration
+runner to finish before checking and applying pending steps. The lock is released when the runner
+finishes or its database connection closes. API instances do not run migrations at startup.
+
 The SDK is installed from the committed protocol tarball. `npm run dev` does not load `.env` automatically; export the variables first or run `node --env-file=.env --watch --experimental-strip-types src/main.ts`.
+
+### Startup schema compatibility check
+
+Before the server accepts requests or the indexer reads a cursor, the process verifies that the database has been migrated to the schema version this build expects (`SCHEMA_VERSION`, defaulting to the newest migration file). The check reads `pgmigrations` and refuses to start unless the complete shipped migration manifest matches the applied schema (including the newest step). It never runs migrations itself: apply them with `npm run migrate:up` first. The failure message names only the variable and the expected shape, never the database connection string.
+
+### Bounded catch-up runtime budget
+
+Enable `CATCH_UP_ENABLED=true` for scheduled runs; continuous containers have no lifetime limit. Apply migrations explicitly before startup. The scheduled process divides its wall-clock budget (`CATCH_UP_BUDGET_MS`, default 120000ms) among migrations, source scans, proof polling and graceful drain. A slow stage cannot consume the entire shutdown safety margin: source scans and proof polling receive bounded stage allocations with a reserved drain window and the run moves on when its slice is spent. Work already committed to the database survives budget expiration, and the shutdown log reports why the run stopped and which stage remains eligible for the next run.
+
+### Continuous-container readiness and graceful rollout
+
+Before indexing shared cursors, a replica acquires an expiring lease per chain/router in the existing cursor lease storage so two active replicas never advance the same cursor. The lease TTL (`INDEXER_LEASE_TTL_MS`, default 30000ms) is renewed while the replica is healthy and released during graceful shutdown. A replica that loses its lease stops indexing until it can re-acquire ownership.
+
+`INDEXER_LEASE_OWNER_ID` names this replica; it defaults to hostname plus process id, with an independently unique worker suffix. Health probes (`GET /ready`) report lease ownership together with Postgres, Redis and watcher state, so a load balancer takes a replica out of rotation when it cannot do its job and puts it back when it recovers. The Dockerfile exposes `/ready` as a HEALTHCHECK endpoint.
 
 Run the watchers and rail pollers in a continuous process or in regular scheduled catch-up windows. Deploying only `api/index.ts` provides reads from an existing database; it does not run indexing in the background. Set the frontend's `NEXT_PUBLIC_HYPERION_API_URL` to this service's origin. Public API reads support cross-origin GET requests.
 
@@ -37,6 +55,29 @@ The workflow is scheduled every five minutes and can be started manually. GitHub
 
 Deploy the API with `vercel deploy --prod`. Preview environments require their own database. Database credentials stay in Vercel and GitHub secrets, never in browser configuration, Git or logs. The managed PostgreSQL database is the durable state; restarting a worker must not repeat source transfers.
 
+Set `HYPERION_DATABASE_ENV` to the hosting `VERCEL_ENV` (`preview` or `production`).
+Apply migrations explicitly with a migration administrator, then provision the database once:
+
+```sql
+INSERT INTO public.hyperion_database_identity(environment) VALUES ('preview');
+```
+
+Use `production` for the production database. Startup compares this durable marker with both
+configured environment labels; changing a preview label cannot admit production credentials.
+The migration deliberately leaves the marker empty until an administrator binds the database.
+Local development and tests with `VERCEL_ENV=development` and nonproduction `NODE_ENV` do not
+require this hosting marker.
+
+The API requires a dedicated nonprivileged login with `USAGE` on the `public` schema and `SELECT`
+on the tables listed by `API_READ_TABLES` in `src/db/policy.ts` (including `pgmigrations` and the
+identity marker and `rail_attestation_history` for durable SSE replay). Existing API reader
+roles must receive this additional SELECT grant before enabling resumable streams. Grant no
+public-table write privileges or privileged role memberships. API
+connections also use `default_transaction_read_only`; startup verifies the actual role and grants,
+not only the `HYPERION_DATABASE_ROLE=read-only` label. The serverless entrypoint refuses enabled
+background writers. Indexer, rail or keeper processes require `HYPERION_DATABASE_ROLE=read-write`
+and a separately provisioned worker credential. Keep migration privileges separate from both.
+
 Vercel's installed Git integration publishes `main`. GitHub Actions runs validation and the scheduled indexer; it does not need a Vercel deployment token.
 
 ## What establishes status
@@ -45,7 +86,7 @@ Stellar router events establish source transfers and claim changes. The EVM watc
 
 For direct Stellar ITS transfers, Axelar's status API supplies a candidate destination transaction. Delivery is recorded only after the destination RPC confirms a successful receipt, sufficient confirmations, the matching ITS command/token/source/recipient/amount event and a matching token payment. The received asset is the ITS representation of Stellar USDC, with seven decimals. A rail API `executed` status alone is not delivery.
 
-For CCTP, Circle's forwarding hash is a candidate only. The backend binds the attested message to the source transfer, then verifies finalized Circle message execution and the exact native-USDC mint to the recipient in a successful confirmed canonical destination receipt. Activity exposes the actual received amount, token and six-decimal precision, separately from the source amount before forwarding fees. Real acceptance on all three destinations is recorded in `deployments/evidence/2026-10-29-cctp.json` in the contracts repository.
+For CCTP, Circle's forwarding hash is a candidate only. The backend binds the attested message to the source transfer, then verifies finalized Circle message execution and the exact native-USDC mint to the recipient in a successful confirmed canonical destination receipt. Activity exposes the actual received amount, token and six-decimal precision, separately from the source amount before forwarding fees. After applying `1792800000000_cctp-verification-failure-reasons`, transfer and backlog responses also expose a nullable `verificationFailure` category. Recipient, domain, token and amount mismatches remain distinct; missing evidence stays pending and retryable without consuming the provider failure budget. A category never proves delivery. Provider text is bounded and redacted, and oversized message/signature payloads are omitted. Real acceptance on all three destinations is recorded in `deployments/evidence/2026-10-29-cctp.json` in the contracts repository.
 
 Unknown or unreachable APIs produce errors; there are no fabricated deliveries or fallback attestations. Claims, route health and metrics query the actual migrated schema. Transfer amounts remain base-unit integer strings, with decimals/symbol supplied from deployment metadata when known.
 
@@ -69,6 +110,18 @@ npm run rails:backlog -- [--route 0|1] [--destination <chain>] [--stage <stage>]
 
 The report separates provider discovery from destination receipt verification, includes retry class and due state, and uses stable keyset pagination. It runs its database transaction as read-only.
 
+For a read-only source-to-payout audit of direct Axelar ITS transfers, use the reconciliation
+command. It joins the indexed source transfer, provider reference and destination proof inside one
+repeatable-read transaction; it never calls Axelar, tops up fees or writes state:
+
+```bash
+npm run rails:reconcile -- [--transfer-id <id>] [--limit <1..500>]
+```
+
+The report distinguishes a missing provider record, provider-only evidence, a missing destination
+proof, an amount mismatch and a fully reconciled payout. A provider status is never treated as a
+destination payment.
+
 ## Protocol fees and claims
 
 The active Stellar router charges 0.3% on outbound USDC and transfers that fee directly to its configured treasury during the source transaction. The backend indexes the recorded source fee; bridge and network fees are separate. Received amounts reflect actual destination payment after forwarding fees.
@@ -79,15 +132,61 @@ A claim number identifies funds parked by a destination router after an unsucces
 
 `KEEPER_ENABLED=true` enables BullMQ jobs for router `keep_alive` and Stellar `settle_claim`. Supply a funded testnet `KEEPER_STELLAR_SECRET` from your secret store to submit them. With no signer, jobs report zero confirmed changes and dry-run status. Secrets are redacted from structured logs.
 
-One process serializes its Stellar submissions to avoid sequence conflicts. Run only one active keeper signer process, or give replicas separate accounts. The keeper counts confirmations and leaves database claim/delivery changes to indexed events. It does not perform rail second-step delivery or gas top-ups. TTL maintenance covers configured router tokens/routes and recent indexed transfer/claim entries; it is not a guarantee that every adapter or upstream storage entry remains live.
+### Signed transaction checkpoints
+
+Before a signed keeper transaction is broadcast, its hash, intended operation, chain and contract are durably written to `keeper_checkpoint` with state `submitted`. Only a definitive terminal outcome changes the row to `confirmed` or `failed`; ambiguous responses and timeouts remain `submitted` and block new envelopes, so an unknown broadcast outcome can be reconciled by the saved hash before retrying. Recovery never generates a second claim payment attempt blindly, and no secret key or signed credential material appears in logs.
+
+PostgreSQL serializes submissions across replicas sharing a signer. Keep at least two pool connections available: one holds the signer lock while independent journal writes commit before broadcast. The keeper counts confirmations and leaves database claim/delivery changes to indexed events. It does not perform rail second-step delivery or gas top-ups. TTL maintenance covers configured router tokens/routes and recent indexed transfer/claim entries; it is not a guarantee that every adapter or upstream storage entry remains live.
+
+When simulation reports an archived Soroban footprint, the keeper submits the protocol's
+`restoreFootprint` operation for that exact footprint. Its signed public hash is journaled under
+the `restore` phase before broadcast. An uncertain restore blocks further signing until that
+hash is reconciled. After confirmed restoration, the keeper fetches a fresh signer sequence
+and simulates the unchanged `keep_alive` or `settle_claim` call again. Claims remain in the
+indexed database with their original recipient and amount; no database `archived` flag or
+router-specific restore method is assumed. A footprint still requiring restoration after this
+bounded attempt fails explicitly.
+
+### Reconciliation test tooling
+
+`test/tooling/proof-corpus.ts` runs independent mutations through the real CCTP and ITS
+receipt verifiers and records each mutation, expected outcome and observed verifier result.
+Recipient, amount, token, domain and canonical block hash mutations must be rejected;
+unrelated receipt logs must preserve a valid proof. Mock provider exceptions fail the harness.
+
+`docs/api-response-contracts.json` publishes the required transfer and claim response shapes.
+`test/tooling/api-contract.ts` validates actual Fastify responses against those shapes and
+compares recorded fixtures across versions, including nested field removal, integer-string
+coercion, token identity changes and additive metadata.
+
+With a dedicated migrated `TEST_DATABASE_URL`, `test/integration/load-benchmark.test.ts`
+creates deterministic 32- and 512-transfer histories through the actual ingestion writers,
+including pending/attested proof states, delivered rows and canonical replay. It emits
+`HYPERION_DATABASE_BENCHMARK` reports with ingestion/scan timings, query costs, buffer counts
+and `EXPLAIN ANALYZE` plan nodes. Bounds are regression limits on these fixtures, not a
+production throughput guarantee. The suite refuses to substitute an empty database query
+for a seeded history.
 
 ## API and checks
 
 - `GET /health`, `GET /ready`
-- `GET /v1/transfers`, with sender/recipient/chain/route/search/limit/offset filters
+- `GET /v1/transfers`, with sender/recipient/chain/route/search/limit/offset filters. Responses
+  also include an opaque `nextCursor`; pass it back with the same filters for stable keyset
+  pagination. Cursors are scoped to the descending transfer-id order and reject mismatched filters.
 - `GET /v1/transfers/by-tx/:txHash`, `GET /v1/transfers/:originChain/:nonce`
 - `GET /v1/claims`, `GET /v1/claims/:chain/:claimId`
 - `GET /v1/routes/health`, `GET /v1/metrics`
+
+Public reads have a ten-second request budget. A client disconnect cancels the in-flight
+PostgreSQL query through its `AbortSignal`. The database adapter uses a separate connection with
+the same role to cancel the exact active backend, and holds its borrowed connection until cancellation
+finishes so a delayed cancellation cannot affect a later request. The statement timeout remains the
+server-side safeguard. SSE uses opaque, transfer-scoped full-width history cursors. Reconnection with
+`Last-Event-ID` replays committed `rail_transition` events from PostgreSQL, including changes made while
+the client was disconnected, then emits the current `transfer_update` snapshot. Replay is bounded to
+100 transitions and cursors expire after 15 minutes. Invalid, expired or oversized replay windows return
+`409 cursor_expired` with `resync=true`; reconnect without the cursor. Slow clients wait for socket drain
+within a bounded budget, and disconnected clients stop polling.
 
 `npm run check` runs formatting, lint, type checking and tests. Schema/API regressions execute repository migrations in embedded PostgreSQL (PGlite). The full PostgreSQL integration suite requires `TEST_DATABASE_URL`; it is skipped when unset. Use `npm run build` for emitted production code.
 
@@ -135,6 +234,17 @@ reviewing a failed job.
 ## EVM scan finality and historical audits
 
 EVM watcher ownership is scoped to the chain and router. An expired owner may be replaced after a crash, and each cursor commit verifies ownership and its previous revision in the same transaction as event writes. Concurrent replay keeps the existing canonical event serialization and quarantine checks.
+
+Unsupported EVM signatures and malformed payloads retain canonical block hashes, signature,
+router and up to 64 KiB of raw data in the existing quarantine (at most 1000 records per chain).
+Oversized bodies retain metadata and topics without a raw body. After deploying a decoder that
+supports the event, use `npm run evm:quarantine -- replay <configured-chain> [limit 1..100]`
+with a configured router and database writer credential. Legacy diagnostics without raw data
+are preserved but cannot be replayed. Replay verifies the chain, deployment start, confirmed
+boundary and retained block hash, and uses the normal idempotent writers without advancing
+the live cursor. A replayed BridgeIn reconstructs its canonical transaction's ClaimParked
+context within a total 1000-log budget; missing or unsupported context requires operator review.
+No Hyperion EVM router is configured in the active deployment; the command does not infer one.
 
 `EVM_FINALITY_MODE=confirmations` preserves the chain registry's confirmation depth. Set `EVM_FINALITY_MODE=finalized` to require the RPC's finalized-block number and hash as additional evidence; scans never exceed either that block or the configured confirmation boundary. Unsupported tags fail the pass unless `EVM_FINALITY_ALLOW_FALLBACK=true` explicitly permits depth fallback. Invalid finalized evidence fails even with fallback enabled. `evm_scan_provenance` retains the configured policy, actual evidence, hashes and policy transitions for each committed range; weaker policies never rewrite earlier evidence.
 
@@ -218,3 +328,52 @@ The bundle records its generation time and the code revision (`HYPERION_REVISION
 or the local Git HEAD when available). URLs, nested authorization/signers and other sensitive
 values are redacted. Output files are created exclusively with mode 0600; choose a new filename
 for each capture. No RPC polling, transactions or wallet operations are performed.
+
+### Rail transition history and transfer cursors
+
+`rail_attestation_history` records actual committed lifecycle changes bound to the source transfer
+id, including changes made by reviewed requeue and destination-proof reorg reconciliation. Identical
+polls create no duplicate entry. Blind backward writes are rejected; repeated real requeue cycles
+retain every transition. History records normalized reasons and bounded public hashes/references,
+without provider response bodies or error credentials.
+
+`GET /v1/transfers` returns `nextCursor` for descending transfer-id pagination. Pass it as `cursor`
+with the same origin/destination/route/sender/recipient/search filters; changing filters or combining
+a cursor with a nonzero offset returns HTTP400 `invalid_cursor`. New inserts sort before the cursor
+and cannot duplicate an already read transfer. Existing offset reads remain available and keep
+their response offset field. A full page can return a cursor whose next page is empty.
+
+### Keeper outcomes and signer rotation
+
+Keeper maintenance records separate simulated, submitted, pending, confirmed and failed outcomes
+in `keeper_submission`. `/v1/metrics` returns aggregate counts without transaction-hash labels;
+public hashes are retained for recovery. API readers require SELECT on `keeper_submission`
+and `keeper_checkpoint` after migration179310. Dry runs never count as confirmed maintenance.
+
+Configure `KEEPER_STELLAR_SECRETS` as the comma-separated local signer secret sources and
+`KEEPER_STELLAR_ACTIVE_SIGNER` as one configured public key. Startup verifies the account's
+Stellar network and positive balance, then reconciles up to100 old pending public hashes before
+changing persistent signer ownership. Unknown outcomes block rotation. The same chain ownership
+lock protects submission, and old replicas refuse preparation after ownership changes. Every
+maintenance signing attempt rechecks funding/network and current ownership. Signer rotation
+changes the fee payer; router claim payout recipients remain fixed by the contract. Public
+readiness exposes the funded public key and integer-string balance in logs; private provider
+errors are replaced by bounded readiness reasons.
+
+### Read-only ITS source-to-payment audit
+
+`npm run rails:reconcile -- --transfer-id <id> --limit <1..500> --format json` reads one
+repeatable, read-only database snapshot and never contacts providers or performs top-ups.
+The report joins the exact source transfer, provider discovery reference and persisted canonical
+ITS command/token-manager/payment proof. Reconciled rows require the verified public source
+snapshot and matching destination chain, command, transaction, recipient, token and integer
+amount. Migration179320 adds nullable source bindings; legacy proofs without that snapshot are
+reported as `missing_source_binding`. Missing backend history and missing canonical proof are
+reported explicitly. Source changes during verification are rejected before proof admission.
+Recoverable provider gas errors remain retryable and cannot by themselves establish payment.
+
+### Public API error compatibility
+
+JSON errors retain their existing `error`, status code and route-specific fields. The additive `code` is one stable category: `bad_request`, `not_found`, `timeout`, `unavailable`, `internal_error` or `too_many_requests`. Clients can migrate to `code` while existing clients continue reading `error`. Errors include a safe message and request ID; empty indexed history remains HTTP 200 with an empty page. SSE resync frames retain their existing event contract.
+
+ITS verification stores at most six bounded public mismatch categories and an independent `its_verification_state`: `receipt_unavailable` leaves verification retryable, `payout_unverified` records invalid receipt/payment evidence, and `verified` requires the exact canonical ITS event and matching ERC-20 payment. Unrelated events in the same transaction do not invalidate an exact pair. Diagnostics never establish delivery.
