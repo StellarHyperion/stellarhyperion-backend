@@ -16,7 +16,7 @@ const connection = process.env.TEST_DATABASE_URL;
       ...loaded,
       indexer: {
         ...loaded.indexer,
-        stellar: { ...loaded.indexer.stellar!, chain: "keeper-checkpoint-test" },
+        stellar: { ...loaded.indexer.stellar!, chain: "stellar-testnet" as const },
       },
     };
     beforeAll(() => {

@@ -16,7 +16,7 @@ const connection = process.env.TEST_DATABASE_URL;
   let db: Database;
   const old = Keypair.random(),
     next = Keypair.random();
-  const chainKey = "keeper-rotation-test";
+  const chainKey = "stellar-testnet" as const;
   const hash = "ab".repeat(32);
   const loaded = loadConfig({
     env: completeEnv({

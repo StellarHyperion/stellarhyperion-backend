@@ -25,7 +25,7 @@ suite("real PostgreSQL archived keeper submission recovery", () => {
     ...loaded,
     indexer: {
       ...loaded.indexer,
-      stellar: { ...loaded.indexer.stellar!, chain: "keeper-restoration-test" },
+      stellar: { ...loaded.indexer.stellar!, chain: "stellar-testnet" as const },
     },
   };
   const chain = config.indexer.stellar;
