@@ -14,6 +14,13 @@
  */
 import { Pool } from "pg";
 import type { PoolClient, PoolConfig } from "pg";
+import {
+  auditTransferAndClaimInvariants,
+  compactRouteHealthSamples,
+  type CompactRouteHealthOptions,
+  type RouteHealthCompactionResult,
+  type TransferClaimAuditReport,
+} from "../chains/writers.js";
 
 export interface QueryResultRows {
   readonly rows: readonly Record<string, unknown>[];
@@ -114,6 +121,24 @@ export class Database implements Transactional {
     return rowCount;
   }
 
+  /**
+   * Compact old identical `route_health` samples in bounded batches while preserving change
+   * boundaries and recent diagnostic detail.
+   */
+  async compactRouteHealthSamples(
+    options: CompactRouteHealthOptions = {},
+  ): Promise<RouteHealthCompactionResult> {
+    return compactRouteHealthSamples(this, options);
+  }
+
+  /**
+   * Run read-only SQL audits for source amount conservation, claim liabilities, and
+   * delivery/settlement consistency.
+   */
+  async auditTransferAndClaimInvariants(): Promise<TransferClaimAuditReport> {
+    return auditTransferAndClaimInvariants(this);
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
@@ -124,6 +149,8 @@ export class Database implements Transactional {
 export interface MaintenanceTaskOptions {
   readonly intervalMs?: number;
   readonly olderThanDays?: number;
+  readonly routeHealthRetainRecentHours?: number;
+  readonly routeHealthBatchSize?: number;
   readonly logger?: {
     info?: (obj: unknown, msg: string) => void;
     error?: (obj: unknown, msg: string) => void;
@@ -132,7 +159,7 @@ export interface MaintenanceTaskOptions {
 }
 
 /**
- * Periodically runs the attestation cleanup maintenance task.
+ * Periodically runs the attestation cleanup and bounded route-health compaction maintenance tasks.
  * Returns a function to cancel the scheduled task.
  */
 export function startMaintenanceTask(
@@ -141,11 +168,23 @@ export function startMaintenanceTask(
 ): () => void {
   const intervalMs = options.intervalMs ?? 24 * 60 * 60 * 1000;
   const olderThanDays = options.olderThanDays ?? 30;
+  const routeHealthRetainRecentHours = options.routeHealthRetainRecentHours;
+  const routeHealthBatchSize = options.routeHealthBatchSize;
 
   const timer = setInterval(() => {
     void db.pruneCompletedAttestations(olderThanDays).catch((error: unknown) => {
       options.logger?.warn?.({ err: error }, "maintenance attestation pruning failed");
     });
+    void db
+      .compactRouteHealthSamples({
+        ...(routeHealthRetainRecentHours !== undefined
+          ? { retainRecentHours: routeHealthRetainRecentHours }
+          : {}),
+        ...(routeHealthBatchSize !== undefined ? { batchSize: routeHealthBatchSize } : {}),
+      })
+      .catch((error: unknown) => {
+        options.logger?.warn?.({ err: error }, "maintenance route_health compaction failed");
+      });
   }, intervalMs);
 
   timer.unref();

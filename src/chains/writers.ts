@@ -20,6 +20,7 @@
  * this indexer first saw the row, and a reorg does not change that.
  */
 import type { Queryable } from "../db/pool.js";
+import { integer, numericString, one, text, textOrNull, timestamp } from "../db/rows.js";
 import type { RailRetryClass } from "../rails/types.js";
 
 /** Where on a chain a row was observed. One shape for a ledger and for a block. */
@@ -419,3 +420,486 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
     ],
   );
 }
+
+// --------------------------------------------------------------------------------------------
+// Bounded route-health sample compaction (#61)
+// --------------------------------------------------------------------------------------------
+
+export interface CompactRouteHealthOptions {
+  /** Keep all samples newer than this many hours for recent diagnostic detail. Defaults to 24. */
+  readonly retainRecentHours?: number;
+  /** Maximum number of redundant interior samples to delete in one bounded pass. Defaults to 1000. */
+  readonly batchSize?: number;
+}
+
+export interface RouteHealthCompactionResult {
+  readonly deleted: number;
+}
+
+const DEFAULT_RETAIN_RECENT_HOURS = 24;
+const DEFAULT_COMPACTION_BATCH_SIZE = 1_000;
+const MAX_COMPACTION_BATCH_SIZE = 50_000;
+
+/**
+ * Compact old identical `route_health` samples in a single bounded batch while preserving every
+ * configuration/status change boundary and all samples inside the recent diagnostic window.
+ */
+export async function compactRouteHealthSamples(
+  db: Queryable,
+  options: CompactRouteHealthOptions = {},
+): Promise<RouteHealthCompactionResult> {
+  const retainRecentHours = options.retainRecentHours ?? DEFAULT_RETAIN_RECENT_HOURS;
+  const batchSize = options.batchSize ?? DEFAULT_COMPACTION_BATCH_SIZE;
+
+  if (!Number.isFinite(retainRecentHours) || retainRecentHours < 0) {
+    throw new RangeError(
+      `retainRecentHours must be a non-negative finite number, got ${retainRecentHours}`,
+    );
+  }
+  if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > MAX_COMPACTION_BATCH_SIZE) {
+    throw new RangeError(
+      `batchSize must be an integer between 1 and ${MAX_COMPACTION_BATCH_SIZE}, got ${batchSize}`,
+    );
+  }
+
+  const { rows } = await db.query(
+    `WITH ordered AS (
+       SELECT
+         id,
+         sampled_at,
+         available,
+         blocker,
+         flow_available,
+         median_seconds,
+         LAG(available) OVER w AS prev_available,
+         LAG(blocker) OVER w AS prev_blocker,
+         LAG(flow_available) OVER w AS prev_flow_available,
+         LAG(median_seconds) OVER w AS prev_median_seconds,
+         LEAD(available) OVER w AS next_available,
+         LEAD(blocker) OVER w AS next_blocker,
+         LEAD(flow_available) OVER w AS next_flow_available,
+         LEAD(median_seconds) OVER w AS next_median_seconds,
+         ROW_NUMBER() OVER w AS rn
+       FROM route_health
+       WINDOW w AS (
+         PARTITION BY origin_chain, destination_chain, route, token
+         ORDER BY sampled_at ASC, id ASC
+       )
+     ),
+     candidates AS (
+       SELECT r.id
+       FROM ordered
+       JOIN route_health r USING (id)
+       WHERE ordered.sampled_at < now() - ($1 * INTERVAL '1 hour')
+         AND rn > 1
+         AND prev_available IS NOT DISTINCT FROM ordered.available
+         AND prev_blocker IS NOT DISTINCT FROM ordered.blocker
+         AND prev_flow_available IS NOT DISTINCT FROM ordered.flow_available
+         AND prev_median_seconds IS NOT DISTINCT FROM ordered.median_seconds
+         AND next_available IS NOT DISTINCT FROM ordered.available
+         AND next_blocker IS NOT DISTINCT FROM ordered.blocker
+         AND next_flow_available IS NOT DISTINCT FROM ordered.flow_available
+         AND next_median_seconds IS NOT DISTINCT FROM ordered.median_seconds
+       ORDER BY ordered.sampled_at ASC, r.id ASC
+       LIMIT $2
+       FOR UPDATE OF r SKIP LOCKED
+     ),
+     deleted AS (
+       DELETE FROM route_health
+       WHERE id IN (SELECT id FROM candidates)
+       RETURNING id
+     )
+     SELECT count(*)::int AS deleted FROM deleted`,
+    [retainRecentHours, batchSize],
+  );
+
+  const row = one(rows, "compactRouteHealthSamples");
+  return { deleted: integer(row, "deleted") };
+}
+
+// --------------------------------------------------------------------------------------------
+// Read-only transfer and claim invariant auditor (#59)
+// --------------------------------------------------------------------------------------------
+
+export interface SourceAmountViolation {
+  readonly kind: "outbound_amount_equation_mismatch" | "inbound_amount_mismatch";
+  readonly chainKey: string;
+  readonly rowId: string;
+  readonly router: string;
+  readonly inboundId?: string;
+  readonly route: number;
+  readonly nonce: string;
+  readonly expectedAmount: string;
+  readonly actualAmount: string;
+  readonly detail: string;
+}
+
+export interface ClaimLiabilityViolation {
+  readonly kind:
+    "parked_delivery_missing_claim" | "parked_delivery_claim_mismatch" | "orphan_pending_claim";
+  readonly chainKey: string;
+  readonly claimId: string;
+  readonly route: number;
+  readonly sourceChain: string;
+  readonly sourceNonce: string;
+  readonly expectedAmount: string | null;
+  readonly actualAmount: string | null;
+  readonly detail: string;
+}
+
+export interface UnsettledClaimLiability {
+  readonly chainKey: string;
+  readonly token: string;
+  readonly openCount: number;
+  readonly totalAmount: string;
+}
+
+export interface DeliverySettlementViolation {
+  readonly kind:
+    | "delivered_attestation_without_inbound"
+    | "settled_claim_incomplete_metadata"
+    | "delivered_inbound_with_claim";
+  readonly chainKey: string;
+  readonly referenceId: string;
+  readonly detail: string;
+}
+
+export interface TransferClaimAuditReport {
+  readonly ok: boolean;
+  readonly sourceAmountViolations: readonly SourceAmountViolation[];
+  readonly claimLiabilityViolations: readonly ClaimLiabilityViolation[];
+  readonly deliverySettlementViolations: readonly DeliverySettlementViolation[];
+  readonly unsettledLiabilities: readonly UnsettledClaimLiability[];
+}
+
+/**
+ * Run read-only SQL invariant audits for:
+ * 1. Source amount conservation (`gross = fee + net`, non-negative amounts, `inbound.amount = outbound.net_amount`).
+ * 2. Claim liabilities (parked deliveries <-> pending_claim 1:1 pairing, amounts, and unsettled totals).
+ * 3. Delivery/settlement consistency (`rail_attestation.status = 'delivered'` backed by `inbound_delivery`,
+ *    complete claim settlement metadata, and no delivered inbound paired with a claim).
+ */
+export async function auditTransferAndClaimInvariants(
+  db: Queryable,
+): Promise<TransferClaimAuditReport> {
+  const sourceOutboundRes = await db.query(
+    `SELECT id, origin_router, origin_chain, route, nonce, gross_amount, fee, net_amount
+       FROM outbound_transfer
+      WHERE gross_amount <> fee + net_amount
+         OR gross_amount < 0
+         OR fee < 0
+         OR net_amount < 0
+      ORDER BY origin_chain, nonce`,
+  );
+
+  const sourcePairRes = await db.query(
+    `SELECT o.id, o.origin_router, i.id AS inbound_id, o.origin_chain, o.route, o.nonce, o.net_amount, i.amount AS inbound_amount
+       FROM outbound_transfer o
+       JOIN inbound_delivery i
+         ON i.destination_chain = o.destination_chain
+        AND i.route = o.route
+        AND i.source_chain = o.origin_chain
+        AND i.source_nonce = o.nonce
+        AND (i.source_transfer_id = o.id OR (i.source_transfer_id IS NULL AND
+             (SELECT count(*) FROM outbound_transfer legacy WHERE legacy.origin_chain = o.origin_chain
+              AND legacy.route = o.route AND legacy.nonce = o.nonce
+              AND legacy.destination_chain = o.destination_chain) = 1))
+      WHERE i.amount <> o.net_amount
+      ORDER BY o.origin_chain, o.nonce`,
+  );
+
+  const sourceAmountViolations: SourceAmountViolation[] = [
+    ...sourceOutboundRes.rows.map((row) => ({
+      kind: "outbound_amount_equation_mismatch" as const,
+      chainKey: text(row, "origin_chain"),
+      rowId: numericString(row, "id"),
+      router: text(row, "origin_router"),
+      route: integer(row, "route"),
+      nonce: numericString(row, "nonce"),
+      expectedAmount: numericString(row, "gross_amount"),
+      actualAmount: `${numericString(row, "fee")}+${numericString(row, "net_amount")}`,
+      detail: "outbound_transfer gross_amount must equal fee + net_amount with non-negative values",
+    })),
+    ...sourcePairRes.rows.map((row) => ({
+      kind: "inbound_amount_mismatch" as const,
+      inboundId: numericString(row, "inbound_id"),
+      chainKey: text(row, "origin_chain"),
+      rowId: numericString(row, "id"),
+      router: text(row, "origin_router"),
+      route: integer(row, "route"),
+      nonce: numericString(row, "nonce"),
+      expectedAmount: numericString(row, "net_amount"),
+      actualAmount: numericString(row, "inbound_amount"),
+      detail: "inbound_delivery amount does not match paired outbound_transfer net_amount",
+    })),
+  ];
+
+  const missingClaimRes = await db.query(
+    `SELECT i.destination_chain, i.claim_id, i.route, i.source_chain, i.source_nonce, i.amount
+       FROM inbound_delivery i
+       LEFT JOIN pending_claim c
+         ON c.chain = i.destination_chain
+        AND c.claim_id = i.claim_id
+      WHERE NOT i.delivered
+        AND c.claim_id IS NULL
+      ORDER BY i.destination_chain, i.claim_id`,
+  );
+
+  const mismatchClaimRes = await db.query(
+    `SELECT i.destination_chain, i.claim_id, i.route, i.source_chain, i.source_nonce,
+            i.amount AS inbound_amount, c.amount AS claim_amount
+       FROM inbound_delivery i
+       JOIN pending_claim c
+         ON c.chain = i.destination_chain
+        AND c.claim_id = i.claim_id
+      WHERE NOT i.delivered
+        AND (
+          c.amount <> i.amount
+          OR c.route <> i.route
+          OR c.source_chain <> i.source_chain
+          OR c.source_nonce <> i.source_nonce
+        )
+      ORDER BY i.destination_chain, i.claim_id`,
+  );
+
+  const orphanClaimRes = await db.query(
+    `SELECT c.chain, c.claim_id, c.route, c.source_chain, c.source_nonce, c.amount
+       FROM pending_claim c
+       LEFT JOIN inbound_delivery i
+         ON i.destination_chain = c.chain
+        AND i.claim_id = c.claim_id
+        AND NOT i.delivered
+      WHERE i.id IS NULL
+      ORDER BY c.chain, c.claim_id`,
+  );
+
+  const claimLiabilityViolations: ClaimLiabilityViolation[] = [
+    ...missingClaimRes.rows.map((row) => ({
+      kind: "parked_delivery_missing_claim" as const,
+      chainKey: text(row, "destination_chain"),
+      claimId: numericString(row, "claim_id"),
+      route: integer(row, "route"),
+      sourceChain: text(row, "source_chain"),
+      sourceNonce: numericString(row, "source_nonce"),
+      expectedAmount: numericString(row, "amount"),
+      actualAmount: null,
+      detail: "parked inbound_delivery has no matching pending_claim row",
+    })),
+    ...mismatchClaimRes.rows.map((row) => ({
+      kind: "parked_delivery_claim_mismatch" as const,
+      chainKey: text(row, "destination_chain"),
+      claimId: numericString(row, "claim_id"),
+      route: integer(row, "route"),
+      sourceChain: text(row, "source_chain"),
+      sourceNonce: numericString(row, "source_nonce"),
+      expectedAmount: numericString(row, "inbound_amount"),
+      actualAmount: numericString(row, "claim_amount"),
+      detail: "pending_claim hop or amount disagrees with parked inbound_delivery",
+    })),
+    ...orphanClaimRes.rows.map((row) => ({
+      kind: "orphan_pending_claim" as const,
+      chainKey: text(row, "chain"),
+      claimId: numericString(row, "claim_id"),
+      route: integer(row, "route"),
+      sourceChain: text(row, "source_chain"),
+      sourceNonce: numericString(row, "source_nonce"),
+      expectedAmount: null,
+      actualAmount: numericString(row, "amount"),
+      detail: "pending_claim has no matching parked inbound_delivery",
+    })),
+  ];
+
+  const unsettledRes = await db.query(
+    `SELECT chain, token, count(*)::int AS open_count, COALESCE(sum(amount), 0)::numeric AS total_amount
+       FROM pending_claim
+      WHERE NOT settled
+      GROUP BY chain, token
+      ORDER BY chain, token`,
+  );
+
+  const unsettledLiabilities: UnsettledClaimLiability[] = unsettledRes.rows.map((row) => ({
+    chainKey: text(row, "chain"),
+    token: text(row, "token"),
+    openCount: integer(row, "open_count"),
+    totalAmount: numericString(row, "total_amount"),
+  }));
+
+  const deliveredAttestationRes = await db.query(
+    `SELECT o.origin_chain, a.transfer_id
+       FROM rail_attestation a
+       JOIN outbound_transfer o ON o.id = a.transfer_id
+       LEFT JOIN inbound_delivery i
+         ON i.destination_chain = o.destination_chain
+        AND i.route = o.route
+        AND i.source_chain = o.origin_chain
+        AND i.source_nonce = o.nonce
+        AND i.delivered
+        AND (i.source_transfer_id = o.id OR (i.source_transfer_id IS NULL AND
+             (SELECT count(*) FROM outbound_transfer legacy WHERE legacy.origin_chain = o.origin_chain
+              AND legacy.route = o.route AND legacy.nonce = o.nonce
+              AND legacy.destination_chain = o.destination_chain) = 1))
+      WHERE a.status = 'delivered'
+        AND i.id IS NULL
+      ORDER BY a.transfer_id`,
+  );
+
+  const settledClaimMetaRes = await db.query(
+    `SELECT chain, claim_id
+       FROM pending_claim
+      WHERE (settled AND (settled_at IS NULL OR settled_by IS NULL OR settled_tx IS NULL))
+         OR (NOT settled AND (settled_at IS NOT NULL OR settled_by IS NOT NULL OR settled_tx IS NOT NULL))
+      ORDER BY chain, claim_id`,
+  );
+
+  const deliveredWithClaimRes = await db.query(
+    `SELECT i.destination_chain, i.id
+       FROM inbound_delivery i
+      WHERE i.delivered
+        AND (
+          i.claim_id IS NOT NULL
+          OR EXISTS (
+            SELECT 1
+              FROM pending_claim c
+             WHERE c.chain = i.destination_chain
+               AND c.route = i.route
+               AND c.source_chain = i.source_chain
+               AND c.source_nonce = i.source_nonce
+          )
+        )
+      ORDER BY i.destination_chain, i.id`,
+  );
+
+  const deliverySettlementViolations: DeliverySettlementViolation[] = [
+    ...deliveredAttestationRes.rows.map((row) => ({
+      kind: "delivered_attestation_without_inbound" as const,
+      chainKey: text(row, "origin_chain"),
+      referenceId: numericString(row, "transfer_id"),
+      detail: "rail_attestation status is delivered without a corresponding inbound_delivery",
+    })),
+    ...settledClaimMetaRes.rows.map((row) => ({
+      kind: "settled_claim_incomplete_metadata" as const,
+      chainKey: text(row, "chain"),
+      referenceId: numericString(row, "claim_id"),
+      detail:
+        "pending_claim settlement flag and settled_at/settled_by/settled_tx metadata are inconsistent",
+    })),
+    ...deliveredWithClaimRes.rows.map((row) => ({
+      kind: "delivered_inbound_with_claim" as const,
+      chainKey: text(row, "destination_chain"),
+      referenceId: numericString(row, "id"),
+      detail: "delivered inbound_delivery is unexpectedly linked to a claim_id or pending_claim",
+    })),
+  ];
+
+  const ok =
+    sourceAmountViolations.length === 0 &&
+    claimLiabilityViolations.length === 0 &&
+    deliverySettlementViolations.length === 0;
+
+  return {
+    ok,
+    sourceAmountViolations,
+    claimLiabilityViolations,
+    deliverySettlementViolations,
+    unsettledLiabilities,
+  };
+}
+
+// --------------------------------------------------------------------------------------------
+// Per-deployment expiring database leases (shared across Stellar and EVM watchers, #31 / #46)
+// --------------------------------------------------------------------------------------------
+
+export class LeaseLostError extends Error {
+  constructor(
+    readonly chainKey: string,
+    readonly contract: string,
+    readonly ownerId: string,
+  ) {
+    super(`watcher lease lost for ${chainKey} (${contract}) held by ${ownerId}`);
+    this.name = "LeaseLostError";
+  }
+}
+
+export interface WatcherLease {
+  readonly chainKey: string;
+  readonly contract: string;
+  readonly ownerId: string;
+  readonly leaseUntil: Date;
+}
+
+export async function acquireLease(
+  db: Queryable,
+  params: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly ownerId: string;
+    readonly ttlMs: number;
+  },
+): Promise<WatcherLease | null> {
+  const { rows, rowCount } = await db.query(
+    `INSERT INTO indexer_lease (chain_key, contract, owner_id, lease_until, updated_at)
+     VALUES ($1, $2, $3, now() + ($4 * interval '1 millisecond'), now())
+     ON CONFLICT (chain_key, contract) DO UPDATE
+       SET owner_id = EXCLUDED.owner_id,
+           lease_until = EXCLUDED.lease_until,
+           updated_at = now()
+       WHERE indexer_lease.lease_until <= now()
+          OR indexer_lease.owner_id = EXCLUDED.owner_id
+     RETURNING owner_id, lease_until`,
+    [params.chainKey, params.contract, params.ownerId, params.ttlMs],
+  );
+  const row = rows[0];
+  if (rowCount === 0 || row === undefined) return null;
+  return {
+    chainKey: params.chainKey,
+    contract: params.contract,
+    ownerId: text(row, "owner_id"),
+    leaseUntil: timestamp(row, "lease_until"),
+  };
+}
+
+export async function assertLeaseHeld(
+  db: Queryable,
+  params: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly ownerId: string;
+    readonly ttlMs?: number;
+  },
+): Promise<void> {
+  const { rowCount } = await db.query(
+    `UPDATE indexer_lease
+        SET lease_until = CASE
+              WHEN $4::bigint IS NULL THEN lease_until
+              ELSE clock_timestamp() + ($4 * interval '1 millisecond')
+            END,
+            updated_at = clock_timestamp()
+      WHERE chain_key = $1
+        AND contract = $2
+        AND owner_id = $3
+        AND lease_until > clock_timestamp()
+     RETURNING owner_id`,
+    [params.chainKey, params.contract, params.ownerId, params.ttlMs ?? null],
+  );
+  if (rowCount === 0) {
+    throw new LeaseLostError(params.chainKey, params.contract, params.ownerId);
+  }
+}
+
+export async function releaseLease(
+  db: Queryable,
+  params: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly ownerId: string;
+  },
+): Promise<boolean> {
+  const { rowCount } = await db.query(
+    `DELETE FROM indexer_lease
+      WHERE chain_key = $1 AND contract = $2 AND owner_id = $3`,
+    [params.chainKey, params.contract, params.ownerId],
+  );
+  return rowCount > 0;
+}
+
+export { textOrNull };

@@ -339,6 +339,8 @@ function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): W
     chainId: config.chainId,
     startBlock: config.startBlock,
     confirmations: config.confirmations,
+    finalityMode: config.finalityMode ?? "confirmations",
+    allowFinalityFallback: config.allowFinalityFallback ?? false,
     reorgDepth: config.reorgDepth,
     logRange: config.logRange,
     client: viemClient(config.rpcUrls, { logger: child }),

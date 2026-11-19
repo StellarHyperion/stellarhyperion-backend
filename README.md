@@ -131,3 +131,13 @@ Live and historical ingestion share durable event identity and serialized
 materialization, including route-health observations. Provider errors are
 reported with fixed public messages; inspect secure local provider logs when
 reviewing a failed job.
+
+## EVM scan finality and historical audits
+
+EVM watcher ownership is scoped to the chain and router. An expired owner may be replaced after a crash, and each cursor commit verifies ownership and its previous revision in the same transaction as event writes. Concurrent replay keeps the existing canonical event serialization and quarantine checks.
+
+`EVM_FINALITY_MODE=confirmations` preserves the chain registry's confirmation depth. Set `EVM_FINALITY_MODE=finalized` to require the RPC's finalized-block number and hash as additional evidence; scans never exceed either that block or the configured confirmation boundary. Unsupported tags fail the pass unless `EVM_FINALITY_ALLOW_FALLBACK=true` explicitly permits depth fallback. Invalid finalized evidence fails even with fallback enabled. `evm_scan_provenance` retains the configured policy, actual evidence, hashes and policy transitions for each committed range; weaker policies never rewrite earlier evidence.
+
+Scheduled route-health compaction removes bounded batches of old interior duplicates and skips rows locked by ingestion. It retains the first and last samples of each configuration run, every transition, and all samples in the recent retention window. Historical `route_health` queries therefore represent state transitions after compaction; they must not treat old row counts as raw sampling frequency or uptime percentages. Recent raw samples remain available within the configured retention window.
+
+`Database.auditTransferAndClaimInvariants()` reads source amount equations, claim liabilities and actual destination-delivery evidence. Its monetary values remain integer strings, and violations identify source row IDs and routers. Delivery joins use the bound source transfer or an unambiguous legacy hop; a reused deployment nonce cannot prove delivery for another source row.
