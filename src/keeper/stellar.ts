@@ -1,5 +1,12 @@
 import type { xdr } from "@stellar/stellar-sdk";
-import { BASE_FEE, Contract, Keypair, TransactionBuilder, nativeToScVal, rpc } from "@stellar/stellar-sdk";
+import {
+  BASE_FEE,
+  Contract,
+  Keypair,
+  TransactionBuilder,
+  nativeToScVal,
+  rpc,
+} from "@stellar/stellar-sdk";
 import type { AppConfig } from "../config/config.js";
 
 // One signer sequence at a time across scheduled Stellar jobs in this process.

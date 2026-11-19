@@ -105,6 +105,10 @@ export function destinationProofMutations(delivery: {
     { field: "amount", original: delivery.amount, mutated: flip(delivery.amount) },
     { field: "token", original: delivery.token, mutated: flip(delivery.token) },
     { field: "domain", original: delivery.domain, mutated: flip(delivery.domain) },
-    { field: "canonicalHash", original: delivery.canonicalHash, mutated: flip(delivery.canonicalHash) },
+    {
+      field: "canonicalHash",
+      original: delivery.canonicalHash,
+      mutated: flip(delivery.canonicalHash),
+    },
   ];
 }

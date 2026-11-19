@@ -1,7 +1,13 @@
 import { Address, nativeToScVal } from "@stellar/stellar-sdk";
 import { bigintOf } from "../../db/rows.js";
 import { submitStellar, submitRestore } from "../stellar.js";
-import type { ClaimSettlementPayload, ClaimSettlementResult, KeeperContext, RestorePayload, RestoreResult } from "../types.js";
+import type {
+  ClaimSettlementPayload,
+  ClaimSettlementResult,
+  KeeperContext,
+  RestorePayload,
+  RestoreResult,
+} from "../types.js";
 export async function processClaimSettlement(
   ctx: KeeperContext,
   payload: ClaimSettlementPayload = {},
