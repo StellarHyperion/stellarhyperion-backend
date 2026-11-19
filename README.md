@@ -70,7 +70,9 @@ require this hosting marker.
 
 The API requires a dedicated nonprivileged login with `USAGE` on the `public` schema and `SELECT`
 on the tables listed by `API_READ_TABLES` in `src/db/policy.ts` (including `pgmigrations` and the
-identity marker). Grant no public-table write privileges or privileged role memberships. API
+identity marker and `rail_attestation_history` for durable SSE replay). Existing API reader
+roles must receive this additional SELECT grant before enabling resumable streams. Grant no
+public-table write privileges or privileged role memberships. API
 connections also use `default_transaction_read_only`; startup verifies the actual role and grants,
 not only the `HYPERION_DATABASE_ROLE=read-only` label. The serverless entrypoint refuses enabled
 background writers. Indexer, rail or keeper processes require `HYPERION_DATABASE_ROLE=read-write`
@@ -162,6 +164,17 @@ for a seeded history.
 - `GET /v1/transfers/by-tx/:txHash`, `GET /v1/transfers/:originChain/:nonce`
 - `GET /v1/claims`, `GET /v1/claims/:chain/:claimId`
 - `GET /v1/routes/health`, `GET /v1/metrics`
+
+Public reads have a ten-second request budget. A client disconnect cancels the in-flight
+PostgreSQL query through its `AbortSignal`. The database adapter uses a separate connection with
+the same role to cancel the exact active backend, and holds its borrowed connection until cancellation
+finishes so a delayed cancellation cannot affect a later request. The statement timeout remains the
+server-side safeguard. SSE uses opaque, transfer-scoped full-width history cursors. Reconnection with
+`Last-Event-ID` replays committed `rail_transition` events from PostgreSQL, including changes made while
+the client was disconnected, then emits the current `transfer_update` snapshot. Replay is bounded to
+100 transitions and cursors expire after 15 minutes. Invalid, expired or oversized replay windows return
+`409 cursor_expired` with `resync=true`; reconnect without the cursor. Slow clients wait for socket drain
+within a bounded budget, and disconnected clients stop polling.
 
 `npm run check` runs formatting, lint, type checking and tests. Schema/API regressions execute repository migrations in embedded PostgreSQL (PGlite). The full PostgreSQL integration suite requires `TEST_DATABASE_URL`; it is skipped when unset. Use `npm run build` for emitted production code.
 

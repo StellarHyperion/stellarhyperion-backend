@@ -7,6 +7,7 @@ export const API_READ_TABLES = [
   "inbound_delivery",
   "pending_claim",
   "rail_attestation",
+  "rail_attestation_history",
   "route_health",
   "indexer_cursor",
   "indexer_worker_heartbeat",
