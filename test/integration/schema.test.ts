@@ -10,7 +10,16 @@
  * runs the unit suite rather than failing in a way somebody learns to ignore.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { runner } from "node-pg-migrate";
+import { Client } from "pg";
 
+import {
+  auditTransferAndClaimInvariants,
+  compactRouteHealthSamples,
+} from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
@@ -20,6 +29,7 @@ const suite = CONNECTION === undefined ? describe.skip : describe;
 const CHECK_VIOLATION = "23514";
 const UNIQUE_VIOLATION = "23505";
 const NUMERIC_OUT_OF_RANGE = "22003";
+const MIGRATION_TEST_SCHEMA = `migration_lock_test_${process.pid}_${Date.now()}`;
 
 const U64_MAX = "18446744073709551615";
 const U256_MAX = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
@@ -55,8 +65,12 @@ suite("the schema", () => {
     const names = rows.map((row) => String(row.table_name));
     for (const table of [
       "admin_action",
+      "axelar_delivery_evidence",
+      "axelar_status_quarantine",
       "inbound_delivery",
+      "indexed_history_digest",
       "indexer_cursor",
+      "indexer_worker_heartbeat",
       "outbound_transfer",
       "pending_claim",
       "rail_attestation",
@@ -65,6 +79,164 @@ suite("the schema", () => {
       expect(names, `${table} is missing; has the migration run`).toContain(table);
     }
   });
+
+  it("serializes real SQL migration runners and applies each step once", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "hyperion-migration-lock-"));
+    const file = join(directory, "1790900000000_lock-test.sql");
+    await writeFile(
+      file,
+      "-- Up Migration\nSELECT pg_sleep(1); CREATE TABLE lock_once (id integer PRIMARY KEY); INSERT INTO lock_once VALUES (1);\n-- Down Migration\nDROP TABLE lock_once;",
+    );
+    const run = (applicationName: string) =>
+      runner({
+        databaseUrl: { connectionString: CONNECTION ?? "", application_name: applicationName },
+        dir: directory,
+        migrationsTable: "pgmigrations",
+        schema: MIGRATION_TEST_SCHEMA,
+        createSchema: true,
+        direction: "up",
+        advisoryLockMode: "wait",
+        log: () => undefined,
+      });
+    const first = run("hyperion-migration-lock-first");
+    let second: Promise<unknown> | undefined;
+    let secondRunnerWaiting = false;
+    try {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const { rows } = await db.query(
+          "SELECT 1 FROM pg_stat_activity WHERE application_name='hyperion-migration-lock-first' AND wait_event='PgSleep'",
+        );
+        if (rows.length) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      second = run("hyperion-migration-lock-second");
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const { rows } = await db.query(
+          "SELECT 1 FROM pg_stat_activity WHERE application_name='hyperion-migration-lock-second' AND wait_event_type='Lock' AND wait_event='advisory'",
+        );
+        if (rows.length) {
+          secondRunnerWaiting = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const outcomes = await Promise.allSettled([first, second]);
+      expect(outcomes.map((value) => value.status)).toEqual(["fulfilled", "fulfilled"]);
+      expect(secondRunnerWaiting).toBe(true);
+      const { rows } = await db.query(
+        `SELECT count(*)::integer AS count FROM "${MIGRATION_TEST_SCHEMA}".lock_once`,
+      );
+      expect(rows[0]?.count).toBe(1);
+    } finally {
+      await Promise.allSettled([first, ...(second ? [second] : [])]);
+      await db.query(`DROP SCHEMA IF EXISTS "${MIGRATION_TEST_SCHEMA}" CASCADE`);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("releases advisory ownership after a failed SQL migration and permits a clean retry", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "hyperion-migration-failure-"));
+    const file = join(directory, "1790900000000_failure-test.sql");
+    const schema = MIGRATION_TEST_SCHEMA + "_failed";
+    const run = () =>
+      runner({
+        databaseUrl: CONNECTION ?? "",
+        dir: directory,
+        migrationsTable: "pgmigrations",
+        schema,
+        createSchema: true,
+        direction: "up",
+        advisoryLockMode: "wait",
+        log: () => undefined,
+      });
+    try {
+      await writeFile(file, "-- Up Migration\nSELECT 1/0;\n-- Down Migration\nSELECT 1;");
+      await expect(run()).rejects.toThrow();
+      await writeFile(
+        file,
+        "-- Up Migration\nCREATE TABLE retry_once(id integer PRIMARY KEY); INSERT INTO retry_once VALUES (1);\n-- Down Migration\nDROP TABLE retry_once;",
+      );
+      await expect(run()).resolves.toHaveLength(1);
+    } finally {
+      await db.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("releases migration ownership when PostgreSQL interrupts the runner", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "hyperion-migration-interrupted-"));
+    const file = join(directory, "1790900000000_interrupted.sql");
+    const schema = `${MIGRATION_TEST_SCHEMA}_interrupted`;
+    const interruptedClient = new Client({
+      connectionString: CONNECTION ?? "",
+      application_name: "hyperion-migration-interrupted",
+    });
+    const connectionErrors: Error[] = [];
+    interruptedClient.on("error", (error: Error) => connectionErrors.push(error));
+    const run = () =>
+      runner({
+        databaseUrl: {
+          connectionString: CONNECTION ?? "",
+          application_name: "hyperion-migration-interrupted",
+        },
+        dir: directory,
+        migrationsTable: "pgmigrations",
+        schema,
+        createSchema: true,
+        direction: "up",
+        advisoryLockMode: "wait",
+        log: () => undefined,
+      });
+    try {
+      await writeFile(
+        file,
+        "-- Up Migration\nSELECT pg_sleep(30); CREATE TABLE interrupted_once(id integer PRIMARY KEY);\n-- Down Migration\nDROP TABLE interrupted_once;",
+      );
+      // Attach the rejection handler before interrupting the connection.
+      await interruptedClient.connect();
+      const interrupted = runner({
+        dbClient: interruptedClient,
+        dir: directory,
+        migrationsTable: "pgmigrations",
+        schema,
+        createSchema: true,
+        direction: "up",
+        advisoryLockMode: "wait",
+        log: () => undefined,
+      }).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      let pid: number | null = null;
+      for (let attempt = 0; attempt < 100 && pid === null; attempt += 1) {
+        const result = await db.query(
+          "SELECT pid FROM pg_stat_activity WHERE application_name='hyperion-migration-interrupted' AND query LIKE '%pg_sleep(30)%' AND state='active'",
+        );
+        const value = result.rows[0]?.pid;
+        if (typeof value === "number") pid = value;
+        else await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(pid).not.toBeNull();
+      await db.query("SELECT pg_terminate_backend($1)", [pid]);
+      expect(await interrupted).toBeInstanceOf(Error);
+      expect(
+        connectionErrors.every((error) => error.message === "Connection terminated unexpectedly"),
+      ).toBe(true);
+      await writeFile(
+        file,
+        "-- Up Migration\nCREATE TABLE interrupted_once(id integer PRIMARY KEY); INSERT INTO interrupted_once VALUES(1);\n-- Down Migration\nDROP TABLE interrupted_once;",
+      );
+      await expect(run()).resolves.toHaveLength(1);
+      const result = await db.query(
+        `SELECT count(*)::int AS count FROM "${schema}".interrupted_once`,
+      );
+      expect(result.rows[0]?.count).toBe(1);
+    } finally {
+      await interruptedClient.end();
+      await db.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 10_000);
 
   it("holds a u64 that bigint cannot", async () => {
     // The entire reason nonces and claim ids are NUMERIC(20,0). Postgres int8 stops at 2^63-1 and
@@ -91,10 +263,7 @@ suite("the schema", () => {
       "DELETE FROM public.indexer_cursor WHERE chain_key IN ('hash-test', 'no-hash-test')",
     );
     await db.query(
-      `INSERT INTO public.indexer_cursor
-         (chain_key, family, contract, last_processed, last_processed_hash)
-       VALUES ('hash-test', 'evm', '0xrouter', 42, $1),
-              ('no-hash-test', 'stellar', 'CROUTER', 42, NULL)`,
+      "INSERT INTO public.indexer_cursor (chain_key, family, contract, last_processed, last_processed_hash) VALUES ('hash-test', 'evm', '0xrouter', 42, $1), ('no-hash-test', 'stellar', 'CROUTER', 42, NULL)",
       [`0x${"ab".repeat(32)}`],
     );
 
@@ -138,11 +307,11 @@ suite("outbound_transfer", () => {
     nonce += 1;
     await db.query(
       `INSERT INTO public.outbound_transfer
-         (origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
+         (origin_chain, origin_router, route, nonce, sender, token, gross_amount, fee, net_amount,
           destination_chain, destination, origin_block, origin_tx)
-       VALUES ('base-sepolia', 0, $1, '0xsender', '0xtoken', $2, $3, $4,
-               'stellar-testnet', 'GA5ZYIIV', 1, $5)`,
-      [String(nonce), gross, fee, net, `0xtx-${String(nonce)}`],
+       VALUES ('base-sepolia', $1, 0, $2, '0xsender', '0xtoken', $3, $4, $5,
+               'stellar-testnet', 'GA5ZYIIV', 1, $6)`,
+      [`router-${String(nonce)}`, String(nonce), gross, fee, net, `0xtx-${String(nonce)}`],
     );
   };
 
@@ -172,23 +341,38 @@ suite("outbound_transfer", () => {
     await expect(insert("1000", "0", "1000")).resolves.toBeUndefined();
   });
 
-  it("refuses two departures with the same nonce from one chain", async () => {
-    // The router's counter is monotonic per router, so this is the identity of a departure. A
-    // duplicate means the watcher re-read a page, and it should be a no-op rather than a second row.
+  it("allows the same nonce across router deployments", async () => {
     nonce += 1;
-    const values = [String(nonce), "1000", "3", "997", `0xtx-${String(nonce)}`];
-    const run = async (): Promise<void> => {
+    const insertFor = async (router: string, tx: string): Promise<void> => {
       await db.query(
         `INSERT INTO public.outbound_transfer
-           (origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
+           (origin_chain, origin_router, route, nonce, sender, token, gross_amount, fee, net_amount,
             destination_chain, destination, origin_block, origin_tx)
-         VALUES ('base-sepolia', 0, $1, '0xsender', '0xtoken', $2, $3, $4,
-                 'stellar-testnet', 'GA5ZYIIV', 1, $5)`,
-        values,
+         VALUES ('base-sepolia', $1, 0, $2, '0xsender', '0xtoken', 1000, 3, 997,
+                 'stellar-testnet', 'GA5ZYIIV', 1, $3)`,
+        [router, String(nonce), tx],
       );
     };
-    await run();
-    await expect(run()).rejects.toSatisfy((error: unknown) => codeOf(error) === UNIQUE_VIOLATION);
+    await insertFor("router-a", `0xtx-${String(nonce)}-a`);
+    await expect(insertFor("router-b", `0xtx-${String(nonce)}-b`)).resolves.toBeUndefined();
+  });
+
+  it("refuses two departures with the same nonce from one router deployment", async () => {
+    nonce += 1;
+    const insertFor = async (tx: string): Promise<void> => {
+      await db.query(
+        `INSERT INTO public.outbound_transfer
+           (origin_chain, origin_router, route, nonce, sender, token, gross_amount, fee, net_amount,
+            destination_chain, destination, origin_block, origin_tx)
+         VALUES ('base-sepolia', 'router-single', 0, $1, '0xsender', '0xtoken', 1000, 3, 997,
+                 'stellar-testnet', 'GA5ZYIIV', 1, $2)`,
+        [String(nonce), tx],
+      );
+    };
+    await insertFor(`0xtx-${String(nonce)}-a`);
+    await expect(insertFor(`0xtx-${String(nonce)}-b`)).rejects.toSatisfy(
+      (error: unknown) => codeOf(error) === UNIQUE_VIOLATION,
+    );
   });
 });
 
@@ -300,7 +484,7 @@ suite("maintenance and pruning", () => {
                'stellar-testnet', 'GA5ZYIIV', 1, '0xtx-2'),
               (999993, 'prune-test-3', 0, 999993, '0xsender', '0xtoken', 100, 0, 100,
                'stellar-testnet', 'GA5ZYIIV', 1, '0xtx-3')
-       ON CONFLICT (origin_chain, nonce) DO NOTHING`,
+       ON CONFLICT (origin_chain, origin_router, nonce) DO NOTHING`,
     );
 
     // Old completed attestation (40 days old)
@@ -334,5 +518,50 @@ suite("maintenance and pruning", () => {
     expect(ids).not.toContain(999991);
     expect(ids).toContain(999992);
     expect(ids).toContain(999993);
+  });
+
+  it("compacts old identical route_health samples in bounded batches while preserving change boundaries", async () => {
+    await db.query("DELETE FROM public.route_health WHERE origin_chain = 'compact-test'");
+    // 5 identical old samples (t-10d .. t-6d), then a state change (t-5d), then 2 recent samples (t-2h, t-1h)
+    await db.query(
+      `INSERT INTO public.route_health
+         (sampled_at, origin_chain, destination_chain, route, token, available, blocker, flow_available)
+       VALUES
+         (now() - INTERVAL '10 days', 'compact-test', 'stellar-testnet', 0, 'USDC', true, 0, 1000),
+         (now() - INTERVAL '9 days',  'compact-test', 'stellar-testnet', 0, 'USDC', true, 0, 1000),
+         (now() - INTERVAL '8 days',  'compact-test', 'stellar-testnet', 0, 'USDC', true, 0, 1000),
+         (now() - INTERVAL '7 days',  'compact-test', 'stellar-testnet', 0, 'USDC', true, 0, 1000),
+         (now() - INTERVAL '6 days',  'compact-test', 'stellar-testnet', 0, 'USDC', true, 0, 1000),
+         (now() - INTERVAL '5 days',  'compact-test', 'stellar-testnet', 0, 'USDC', false, 1, 0),
+         (now() - INTERVAL '2 hours', 'compact-test', 'stellar-testnet', 0, 'USDC', false, 1, 0),
+         (now() - INTERVAL '1 hours', 'compact-test', 'stellar-testnet', 0, 'USDC', false, 1, 0)`,
+    );
+
+    const firstPass = await compactRouteHealthSamples(db, { retainRecentHours: 24, batchSize: 2 });
+    expect(firstPass.deleted).toBe(2);
+
+    const secondPass = await compactRouteHealthSamples(db, {
+      retainRecentHours: 24,
+      batchSize: 10,
+    });
+    expect(secondPass.deleted).toBe(1);
+
+    const thirdPass = await compactRouteHealthSamples(db, { retainRecentHours: 24, batchSize: 10 });
+    expect(thirdPass.deleted).toBe(0);
+
+    const { rows } = await db.query(
+      "SELECT available, blocker FROM public.route_health WHERE origin_chain = 'compact-test' ORDER BY sampled_at ASC, id ASC",
+    );
+    // Kept: first (t-10d), last of first run (t-6d), change boundary (t-5d), and both recent (t-2h, t-1h)
+    expect(rows).toHaveLength(5);
+  });
+
+  it("audits transfer and claim invariants without mutating state", async () => {
+    const report = await auditTransferAndClaimInvariants(db);
+    expect(report).toHaveProperty("ok");
+    expect(Array.isArray(report.sourceAmountViolations)).toBe(true);
+    expect(Array.isArray(report.claimLiabilityViolations)).toBe(true);
+    expect(Array.isArray(report.deliverySettlementViolations)).toBe(true);
+    expect(Array.isArray(report.unsettledLiabilities)).toBe(true);
   });
 });

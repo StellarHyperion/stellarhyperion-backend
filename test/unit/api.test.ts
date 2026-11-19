@@ -62,7 +62,8 @@ describe("REST API endpoints", () => {
           origin_tx: "0xabc",
           observed_at: new Date("2026-10-07T12:00:00Z"),
           attestation_status: "attested",
-          rail_status: "complete",
+          rail_status: "complete token=provider-secret",
+          verification_failure: "recipient_mismatch",
           rail_reference: "iris-42",
           attested_at: new Date("2026-10-07T12:01:00Z"),
           last_error: null,
@@ -95,6 +96,8 @@ describe("REST API endpoints", () => {
     expect(body.origin.chain).toBe("sepolia");
     expect(body.origin.nonce).toBe("42");
     expect(body.rail.status).toBe("attested");
+    expect(body.rail.verificationFailure).toBe("recipient_mismatch");
+    expect(body.rail.railStatus).not.toContain("provider-secret");
     expect(body.rail.reference).toBe("iris-42");
   });
 
@@ -667,11 +670,25 @@ describe("REST API endpoints", () => {
 });
 
 describe("Readiness and health probes", () => {
-  const config = loadConfig({ env: completeEnv() });
+  const config = loadConfig({ env: completeEnv({ RAILS_ENABLED: "false" }) });
   const { logger } = capturingLogger();
 
   it("returns 200 when all components (Postgres, Redis, Watchers) are healthy", async () => {
-    const db = new MockDb({});
+    const db = new MockDb({
+      indexer_worker_heartbeat: ["stellar-testnet", "sepolia"].map((chain) => ({
+        worker_name: chain,
+        worker_kind: "chain",
+        chain_key: chain,
+        state: "ready",
+        detail: "current",
+        last_heartbeat_at: new Date(),
+        last_completed_at: new Date(),
+        last_cursor_block: "123",
+        consecutive_failures: 0,
+        last_error: null,
+        metadata: {},
+      })),
+    });
     const mockRedis = {
       ping: () => Promise.resolve("PONG"),
     };

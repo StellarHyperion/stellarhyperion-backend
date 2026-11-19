@@ -16,30 +16,32 @@ export class RequestBudgetExceededError extends Error {
 
 /**
  * Couples a database query to both the HTTP connection and a bounded read budget.
- * node-postgres uses the signal to cancel the server-side query and release its client.
+ * Database owns server-side cancellation and waits for it before releasing its client.
  */
 export async function requestQuery(
   request: FastifyRequest,
   db: Queryable,
   sql: string,
   params: readonly unknown[] = [],
+  budgetMs = PUBLIC_READ_BUDGET_MS,
 ): Promise<QueryResultRows> {
   const controller = new AbortController();
   const timer = setTimeout(() => {
     controller.abort(new RequestBudgetExceededError());
-  }, PUBLIC_READ_BUDGET_MS);
+  }, budgetMs);
 
   const abort = () => {
     controller.abort(new Error("request connection closed"));
   };
   request.raw.once("aborted", abort);
-  request.raw.once("close", abort);
+  request.raw.socket.once("close", abort);
+  if (request.raw.aborted || request.raw.socket.destroyed) abort();
 
   try {
     return await db.query(sql, params, { signal: controller.signal });
   } finally {
     clearTimeout(timer);
     request.raw.off("aborted", abort);
-    request.raw.off("close", abort);
+    request.raw.socket.off("close", abort);
   }
 }

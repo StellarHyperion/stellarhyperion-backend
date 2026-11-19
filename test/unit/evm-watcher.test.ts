@@ -37,6 +37,8 @@ function harness(
     readonly reorgDepth?: number;
     readonly logRange?: number;
     readonly client?: FakeEvmClient;
+    readonly finalityMode?: "confirmations" | "finalized";
+    readonly allowFinalityFallback?: boolean;
   } = {},
 ): Harness {
   const db = new RecordingDb();
@@ -49,6 +51,8 @@ function harness(
     chainId: ANVIL_CHAIN_ID,
     startBlock: ANVIL_START_BLOCK,
     confirmations: options.confirmations ?? 3,
+    finalityMode: options.finalityMode ?? "confirmations",
+    allowFinalityFallback: options.allowFinalityFallback ?? false,
     reorgDepth: options.reorgDepth ?? 5,
     logRange: options.logRange ?? 2_000,
     client,
@@ -75,14 +79,93 @@ function cursorRow(
 /** Cursor writes, read back from the parameters rather than from the watcher's own cache. */
 function cursorWrites(db: RecordingDb): { block: bigint; family: string; hash: string | null }[] {
   // writeCursor takes (chain_key, family, contract, last_processed, last_processed_at, hash).
-  return db.matching("INSERT INTO indexer_cursor").map((entry) => ({
-    block: BigInt(String(entry.params[3])),
-    family: String(entry.params[1]),
-    hash: typeof entry.params[5] === "string" ? entry.params[5] : null,
-  }));
+  return db.queries
+    .filter(
+      (entry) =>
+        entry.text.includes("INSERT INTO indexer_cursor") ||
+        entry.text.includes("UPDATE indexer_cursor"),
+    )
+    .map((entry) => ({
+      block: BigInt(String(entry.params[3])),
+      family: String(entry.params[1]),
+      hash: typeof entry.params[5] === "string" ? entry.params[5] : null,
+    }));
 }
 
 describe("the line it will not read past", () => {
+  it("records finalized-block evidence and stops at its boundary", async () => {
+    class FinalizedClient extends FakeEvmClient {
+      finalizedBlock() {
+        return Promise.resolve({ number: 20n, hash: this.stampFor(20n).hash });
+      }
+    }
+    const { watcher, db, client } = harness({
+      client: new FinalizedClient({ head: 100n }),
+      finalityMode: "finalized",
+    });
+    await watcher.tick(AbortSignal.timeout(5_000));
+    expect(client.logQueries[0]?.toBlock).toBe(20n);
+    const record = db.matching("INSERT INTO evm_scan_provenance")[0];
+    expect(record?.params.slice(13)).toEqual([
+      "finalized",
+      false,
+      "finalized",
+      "20",
+      client.stampFor(20n).hash,
+    ]);
+  });
+
+  it("requires explicit fallback when finalized tags are unsupported", async () => {
+    const strict = harness({ head: 100n, finalityMode: "finalized" });
+    await expect(strict.watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+      "fallback is disabled",
+    );
+    expect(cursorWrites(strict.db)).toEqual([]);
+    const fallback = harness({
+      head: 100n,
+      finalityMode: "finalized",
+      allowFinalityFallback: true,
+    });
+    await fallback.watcher.tick(AbortSignal.timeout(5_000));
+    expect(fallback.client.logQueries[0]?.toBlock).toBe(97n);
+    expect(fallback.db.matching("INSERT INTO evm_scan_provenance")[0]?.params.slice(13)).toEqual([
+      "finalized",
+      true,
+      "confirmations",
+      null,
+      null,
+    ]);
+  });
+
+  it("rejects impossible finalized evidence even if unsupported-tag fallback is enabled", async () => {
+    class InvalidClient extends FakeEvmClient {
+      finalizedBlock() {
+        return Promise.resolve({ number: 101n, hash: this.stampFor(101n).hash });
+      }
+    }
+    const { watcher, db } = harness({
+      client: new InvalidClient({ head: 100n }),
+      finalityMode: "finalized",
+      allowFinalityFallback: true,
+    });
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+      "invalid finalized block evidence",
+    );
+    expect(cursorWrites(db)).toEqual([]);
+  });
+
+  it("aborts the cursor transaction if ownership is lost during provider reads", async () => {
+    const { watcher, db, client } = harness({ head: 100n });
+    const original = client.logs.bind(client);
+    client.logs = (query) => {
+      db.leaseRow = { owner_id: "replacement-worker", lease_until: new Date(Date.now() + 60_000) };
+      return original(query);
+    };
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow("watcher lease lost");
+    expect(cursorWrites(db)).toEqual([]);
+    expect(db.rollbacks).toEqual([1]);
+  });
+
   it("stops at the head minus this chain's confirmations", async () => {
     // One block on Arc and twelve on Ethereum are the same kind of fact, which is why the number
     // comes from the registry per chain rather than from one constant here.
@@ -202,12 +285,38 @@ describe("when the chain changes its mind", () => {
 });
 
 describe("the range and the cursor as one commit", () => {
+  it("can replay a bounded range without moving the live cursor", async () => {
+    const client = new FakeEvmClient({ head: 60n });
+    const { watcher, db } = harness({ client, confirmations: 3 });
+
+    const result = await watcher.backfillRange(ANVIL_START_BLOCK, 57n, AbortSignal.timeout(5_000));
+
+    expect(result.written).toBeGreaterThan(0);
+    expect(cursorWrites(db)).toEqual([]);
+    expect(db.commits).toEqual([1]);
+  });
+
+  it("does not commit a historical range after cancellation", async () => {
+    const client = new FakeEvmClient({ head: 60n });
+    const { watcher, db } = harness({ client, confirmations: 3 });
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(watcher.backfillRange(ANVIL_START_BLOCK, 57n, controller.signal)).rejects.toThrow(
+      "backfill cancelled",
+    );
+    expect(db.commits).toEqual([]);
+    expect(cursorWrites(db)).toEqual([]);
+  });
+
   it("writes every row and the cursor inside the same transaction", async () => {
     const { watcher, db } = harness({ head: 60n, confirmations: 3 });
 
     await watcher.tick(AbortSignal.timeout(5_000));
 
-    const inserts = db.queries.filter((entry) => entry.text.includes("INSERT INTO"));
+    const inserts = db.queries.filter(
+      (entry) => entry.text.includes("INSERT INTO") && !entry.text.includes("indexer_lease"),
+    );
     expect(inserts.length).toBeGreaterThan(1);
     expect(new Set(inserts.map((entry) => entry.transaction)).size).toBe(1);
     expect(db.commits).toEqual([1]);
@@ -350,6 +459,37 @@ describe("an arrival, which the capture has none of", () => {
     return rows[0]?.params ?? [];
   }
 
+  it("excludes every reversed pair after the diagnostic budget is exhausted", async () => {
+    const logs = Array.from({ length: 60 }, (_, index) => {
+      const [parked, inbound] = parkedDelivery(60n);
+      const transactionHash: `0x${string}` = `0x${index.toString(16).padStart(64, "0")}`;
+      if (!parked || !inbound) throw new Error("missing pair");
+      return [
+        { ...inbound, logIndex: 0, transactionHash },
+        { ...parked, logIndex: 1, transactionHash },
+      ];
+    }).flat();
+    const { watcher, db } = harness({
+      client: new FakeEvmClient({ head: 100n, logs }),
+      confirmations: 0,
+    });
+    await watcher.tick(AbortSignal.timeout(5_000));
+    expect(db.matching("INSERT INTO inbound_delivery")).toHaveLength(0);
+    expect(db.matching("INSERT INTO pending_claim")).toHaveLength(0);
+    expect(db.matching("INSERT INTO evm_log_quarantine")).toHaveLength(100);
+    expect(cursorWrites(db)).toHaveLength(1);
+  });
+
+  it("normalizes provider enumeration order before pairing a valid arrival", async () => {
+    const client = new FakeEvmClient({ head: 100n, logs: parkedDelivery(60n) });
+    const getLogs = client.logs.bind(client);
+    client.logs = async (query) => [...(await getLogs(query))].reverse();
+    const { watcher, db } = harness({ client, confirmations: 0 });
+    await watcher.tick(AbortSignal.timeout(5_000));
+    expect(db.matching("INSERT INTO evm_log_quarantine")).toHaveLength(0);
+    expect(db.matching("INSERT INTO inbound_delivery")[0]?.params[8]).toBe(false);
+  });
+
   it("records a delivery that landed as delivered, with no claim", async () => {
     // A BridgeIn on its own. The log carries no flag saying it succeeded, so "no ClaimParked in
     // this transaction" is the only evidence there is.
@@ -425,6 +565,37 @@ describe("an arrival, which the capture has none of", () => {
     const params = inserted(db, "inbound_delivery");
     expect(params[8]).toBe(true);
     expect(params[9]).toBeNull();
+  });
+
+  it("quarantines an arrival that precedes its parked claim in the same transaction", async () => {
+    const [parked, arrival] = parkedDelivery(20n);
+    const misordered = [
+      { ...arrival!, logIndex: 0 },
+      { ...parked!, logIndex: 1 },
+    ];
+    const client = new FakeEvmClient({
+      logs: misordered,
+      head: 60n,
+    });
+    const { watcher, db } = harness({ client, confirmations: 3 });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    expect(db.matching("INSERT INTO evm_log_quarantine")).toHaveLength(2);
+    expect(db.matching("INSERT INTO inbound_delivery")).toHaveLength(0);
+    expect(db.matching("INSERT INTO pending_claim")).toHaveLength(0);
+  });
+
+  it("does not pair logs from the same hop when their blocks differ", async () => {
+    const [parked] = parkedDelivery(20n);
+    const later = { ...parked!, blockNumber: 21n };
+    const client = new FakeEvmClient({ logs: [later], head: 60n });
+    const { watcher, db } = harness({ client, confirmations: 3 });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    expect(db.matching("INSERT INTO pending_claim")).toHaveLength(1);
+    expect(db.matching("INSERT INTO evm_log_quarantine")).toHaveLength(0);
   });
 });
 

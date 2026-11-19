@@ -11,55 +11,30 @@ import type { AppConfig } from "../../config/config.js";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
-import { integer, text, textOrNull } from "../../db/rows.js";
-import type { ServerDeps } from "../server.js";
-import { requestQuery } from "../request-budget.js";
-
-const MAX_REPLAY_EVENTS = 100;
-const STREAM_HISTORY_TTL_MS = 15 * 60 * 1000;
-
-interface StreamEvent {
-  readonly id: number;
-  readonly serialized: string;
-}
-
-interface StreamHistory {
-  nextId: number;
-  touchedAt: number;
-  events: StreamEvent[];
-}
-
-const streamHistory = new Map<string, StreamHistory>();
-
-function historyFor(id: string): StreamHistory {
-  const now = Date.now();
-  for (const [key, history] of streamHistory) {
-    if (now - history.touchedAt > STREAM_HISTORY_TTL_MS) streamHistory.delete(key);
-  }
-  const existing = streamHistory.get(id);
-  if (existing !== undefined) {
-    existing.touchedAt = now;
-    return existing;
-  }
-  const created = { nextId: 1, touchedAt: now, events: [] };
-  streamHistory.set(id, created);
-  return created;
-}
-
-function rememberEvent(history: StreamHistory, serialized: string): StreamEvent {
-  const event = { id: history.nextId++, serialized };
-  history.events.push(event);
-  if (history.events.length > MAX_REPLAY_EVENTS) history.events.shift();
-  return event;
-}
-
-function lastEventId(request: FastifyRequest): number | null {
-  const raw = request.headers["last-event-id"];
-  if (raw === undefined) return null;
-  const value = Array.isArray(raw) ? raw[0] : raw;
-  if (value === undefined || !/^\d+$/.test(value)) return -1;
-  return Number(value);
-}
+import { requestQuery, PUBLIC_READ_BUDGET_MS } from "../request-budget.js";
+import {
+  encodeStreamCursor,
+  decodeStreamCursor,
+  readStreamTransitions,
+  latestStreamTransition,
+  StreamCursorError,
+} from "../stream-cursor.js";
+import { integer, integerOrNull, text, textOrNull, timestampOrNull } from "../../db/rows.js";
+import {
+  LIST_CACHE_CONTROL,
+  computeCanonicalETag,
+  sendConditionalDetailResponse,
+} from "../etag.js";
+import {
+  DEFAULT_RATE_LIMIT_WINDOW_MS,
+  DEFAULT_STREAM_RATE_LIMIT_MAX,
+  type ServerDeps,
+} from "../server.js";
+import { transferStreamIntervals } from "../stream-intervals.js";
+import { sanitizeRailDiagnostic } from "../../rails/diagnostics.js";
+import { CCTP_VERIFICATION_FAILURES, type CctpVerificationFailure } from "../../rails/types.js";
+import { negotiateSchemaVersion, withSchemaMetadata } from "../schema-version.js";
+import { CursorError, decodeCursor, encodeCursor, type CursorScope } from "../cursor.js";
 
 export type TransferLifecycleStage =
   | "initiated"
@@ -77,6 +52,7 @@ export interface FormattedTransfer {
   readonly route: number;
   readonly origin: {
     readonly chain: string;
+    readonly router: string | null;
     readonly nonce: string;
     readonly sender: string;
     readonly token: string;
@@ -104,6 +80,7 @@ export interface FormattedTransfer {
   readonly rail: {
     readonly status: string | null;
     readonly railStatus: string | null;
+    readonly verificationFailure: CctpVerificationFailure | null;
     readonly reference: string | null;
     readonly attestedAt: string | null;
     readonly lastError: string | null;
@@ -177,6 +154,7 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
   const railStatus = textOrNull(row, "attestation_status");
 
   const stage = deriveStage(delivered, hasClaim, claimSettled, railStatus);
+  const originRouter = textOrNull(row, "origin_router");
 
   return {
     id: text(row, "id"),
@@ -184,6 +162,7 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
     route: integer(row, "route"),
     origin: {
       chain: text(row, "origin_chain"),
+      router: originRouter === "" ? null : originRouter,
       nonce: text(row, "nonce"),
       sender: text(row, "sender"),
       token,
@@ -215,12 +194,13 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
         ? null
         : {
             status: railStatus,
-            railStatus: textOrNull(row, "rail_status"),
-            reference: textOrNull(row, "rail_reference"),
+            railStatus: sanitizeRailDiagnostic(textOrNull(row, "rail_status")),
+            verificationFailure: cctpFailureValue(textOrNull(row, "verification_failure")),
+            reference: sanitizeRailDiagnostic(textOrNull(row, "rail_reference")),
             attestedAt: row.attested_at
               ? new Date(row.attested_at as string | number | Date).toISOString()
               : null,
-            lastError: textOrNull(row, "last_error"),
+            lastError: sanitizeRailDiagnostic(textOrNull(row, "last_error")),
           },
     claim: hasClaim
       ? {
@@ -234,6 +214,7 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
 const TRANSFER_QUERY = `
   SELECT t.id,
          t.origin_chain,
+         t.origin_router,
          t.route,
          t.nonce,
          t.sender,
@@ -246,20 +227,27 @@ const TRANSFER_QUERY = `
          t.rail_ref,
          t.origin_block,
          t.origin_tx,
+         t.origin_log_index,
          t.observed_at,
          a.status AS attestation_status,
          a.rail_status,
+         a.verification_failure,
          a.rail_reference,
          a.attested_at,
          a.last_error,
          d.delivered AS inbound_delivered,
          d.destination_block,
          d.destination_tx,
+         d.rail_message_id,
+         d.destination_log_index,
          d.token AS received_token,
          d.amount AS received_amount,
          d.observed_at AS delivered_at,
          c.claim_id,
-         c.settled AS claim_settled
+         c.settled AS claim_settled,
+         c.settled_at AS claim_settled_at,
+         c.settled_by AS claim_settled_by,
+         c.settled_tx AS claim_settled_tx
     FROM outbound_transfer t
     LEFT JOIN rail_attestation a ON a.transfer_id = t.id
     LEFT JOIN inbound_delivery d
@@ -267,12 +255,26 @@ const TRANSFER_QUERY = `
      AND d.route = t.route
      AND d.source_chain = t.origin_chain
      AND d.source_nonce = t.nonce
+      AND (d.source_transfer_id = t.id OR (d.source_transfer_id IS NULL AND NOT EXISTS (
+        SELECT 1 FROM outbound_transfer other
+         WHERE other.origin_chain = t.origin_chain AND other.nonce = t.nonce
+           AND other.id <> t.id
+      )))
     LEFT JOIN pending_claim c
       ON c.chain = t.destination_chain
      AND c.route = t.route
      AND c.source_chain = t.origin_chain
      AND c.source_nonce = t.nonce
+      AND (c.source_transfer_id = t.id OR (c.source_transfer_id IS NULL AND NOT EXISTS (
+        SELECT 1 FROM outbound_transfer other
+         WHERE other.origin_chain = t.origin_chain AND other.nonce = t.nonce
+           AND other.id <> t.id
+      )))
 `;
+
+function cctpFailureValue(value: string | null): CctpVerificationFailure | null {
+  return CCTP_VERIFICATION_FAILURES.find((failure) => failure === value) ?? null;
+}
 
 function isDeliveryFinalized(transfer: FormattedTransfer): boolean {
   return (
@@ -280,18 +282,43 @@ function isDeliveryFinalized(transfer: FormattedTransfer): boolean {
   );
 }
 
+function buildTransferRevision(row: Record<string, unknown>, config: AppConfig) {
+  const transfer = formatRow(row, config);
+  const settledAt = timestampOrNull(row, "claim_settled_at");
+  return {
+    transfer,
+    etag: computeCanonicalETag("transfer-v1", {
+      transfer,
+      proof: {
+        originLogIndex: integerOrNull(row, "origin_log_index"),
+        originRailReference: textOrNull(row, "rail_ref"),
+        destinationLogIndex: integerOrNull(row, "destination_log_index"),
+        railMessageId: textOrNull(row, "rail_message_id"),
+        claimSettledAt: settledAt?.toISOString() ?? null,
+        claimSettledBy: textOrNull(row, "claim_settled_by"),
+        claimSettledTx: textOrNull(row, "claim_settled_tx"),
+      },
+    }),
+  };
+}
+
 export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
+
+  const queryTransferRevisionById = async (request: FastifyRequest, id: string) => {
+    const { rows } = await requestQuery(request, db, `${TRANSFER_QUERY} WHERE t.id = $1 LIMIT 1`, [
+      id,
+    ]);
+    const row = rows[0];
+    return row !== undefined ? buildTransferRevision(row, deps.config) : null;
+  };
 
   const queryTransferById = async (
     request: FastifyRequest,
     id: string,
   ): Promise<FormattedTransfer | null> => {
-    const { rows } = await requestQuery(request, db, `${TRANSFER_QUERY} WHERE t.id = $1 LIMIT 1`, [
-      id,
-    ]);
-    const row = rows[0];
-    return row !== undefined ? formatRow(row, deps.config) : null;
+    const revision = await queryTransferRevisionById(request, id);
+    return revision?.transfer ?? null;
   };
 
   // 1. Look up by originChain and nonce
@@ -301,14 +328,24 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       request: FastifyRequest<{ Params: { originChain: string; nonce: string } }>,
       reply: FastifyReply,
     ) => {
+      const version = negotiateSchemaVersion(request, reply);
+      if (version === null) return;
+
       const { originChain, nonce } = request.params;
       const { rows } = await requestQuery(
         request,
         db,
-        `${TRANSFER_QUERY} WHERE t.origin_chain = $1 AND t.nonce = $2 LIMIT 1`,
+        `${TRANSFER_QUERY} WHERE t.origin_chain = $1 AND t.nonce = $2 ORDER BY t.id LIMIT 2`,
         [originChain, nonce],
       );
 
+      if (rows.length > 1) {
+        return reply.code(409).send({
+          error: "ambiguous_transfer",
+          message:
+            "Multiple router deployments used this nonce. Look up the transfer by its source transaction or id.",
+        });
+      }
       const row = rows[0];
       if (row === undefined) {
         return reply.code(404).send({
@@ -317,7 +354,15 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         });
       }
 
-      return reply.send(formatRow(row, deps.config));
+      const revision = buildTransferRevision(row, deps.config);
+      return sendConditionalDetailResponse(
+        request,
+        reply,
+        withSchemaMetadata(revision.transfer, version),
+        version === "1.0"
+          ? revision.etag
+          : computeCanonicalETag("transfer-v1.1", { base: revision.etag }),
+      );
     },
   );
 
@@ -325,6 +370,9 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
   app.get(
     "/v1/transfers/by-tx/:txHash",
     async (request: FastifyRequest<{ Params: { txHash: string } }>, reply: FastifyReply) => {
+      const version = negotiateSchemaVersion(request, reply);
+      if (version === null) return;
+
       const { txHash } = request.params;
       const { rows } = await requestQuery(
         request,
@@ -341,7 +389,15 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         });
       }
 
-      return reply.send(formatRow(row, deps.config));
+      const revision = buildTransferRevision(row, deps.config);
+      return sendConditionalDetailResponse(
+        request,
+        reply,
+        withSchemaMetadata(revision.transfer, version),
+        version === "1.0"
+          ? revision.etag
+          : computeCanonicalETag("transfer-v1.1", { base: revision.etag }),
+      );
     },
   );
 
@@ -353,148 +409,203 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     }>,
     reply: FastifyReply,
   ) => {
+    const version = negotiateSchemaVersion(request, reply);
+    if (version === null) return;
     const { id } = request.params;
     const initial = await queryTransferById(request, id);
-    if (initial === null) {
-      return reply.code(404).send({
-        error: "not_found",
-        message: `no transfer found with id ${id}`,
-      });
+    if (initial === null)
+      return reply.code(404).send({ error: "not_found", message: "Transfer not found." });
+    const reads = {
+      query: (sql: string, params?: readonly unknown[]) => requestQuery(request, db, sql, params),
+    };
+    const latest = await latestStreamTransition(reads, id);
+    let afterId = latest;
+    let replay: readonly Record<string, unknown>[] = [];
+    const cursor = request.headers["last-event-id"];
+    if (cursor !== undefined) {
+      try {
+        if (typeof cursor !== "string") throw new StreamCursorError();
+        afterId = decodeStreamCursor(cursor, id);
+        if (BigInt(afterId) > BigInt(latest)) throw new StreamCursorError();
+        if (afterId !== "0") {
+          const known = await requestQuery(
+            request,
+            db,
+            "SELECT 1 FROM rail_attestation_history WHERE transfer_id=$1 AND id=$2::bigint",
+            [id, afterId],
+          );
+          if (known.rows.length !== 1) throw new StreamCursorError();
+        }
+        replay = await readStreamTransitions(reads, id, afterId);
+      } catch (error) {
+        if (!(error instanceof StreamCursorError)) throw error;
+        return reply.code(409).send({ error: error.code, message: error.message, resync: true });
+      }
     }
-
-    const history = historyFor(id);
-    const cursor = lastEventId(request);
-    const oldest = history.events[0]?.id;
-    const latest = history.events.at(-1)?.id ?? 0;
-    if (cursor === -1) {
-      return reply.code(400).send({
-        error: "invalid_cursor",
-        message: "Last-Event-ID must be a non-negative integer",
-      });
-    }
-    if (cursor !== null && ((oldest !== undefined && cursor < oldest - 1) || cursor > latest)) {
-      return reply.code(409).send({
-        error: "cursor_expired",
-        message: "the event cursor is no longer available; reconnect without it to resync",
-        resync: `/v1/transfers/${id}/stream`,
-      });
-    }
-
     reply.hijack();
     reply.raw.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
       "X-Accel-Buffering": "no",
+      "X-API-Schema-Version": version,
+      Vary: "X-API-Schema-Version",
     });
-
-    const safeWrite = (chunk: string): boolean => {
-      if (reply.raw.writableEnded || reply.raw.destroyed) {
-        return false;
-      }
-      return reply.raw.write(chunk);
-    };
-
-    const safeEnd = (): void => {
-      if (!reply.raw.writableEnded && !reply.raw.destroyed) {
-        reply.raw.end();
-      }
-    };
-
-    const writeEvent = (event: StreamEvent) =>
-      safeWrite(`id: ${event.id}\nevent: transfer_update\ndata: ${event.serialized}\n\n`);
-    if (cursor === null) {
-      writeEvent(rememberEvent(history, JSON.stringify(initial)));
-    } else {
-      for (const event of history.events) {
-        if (event.id > cursor) writeEvent(event);
-      }
-    }
-
-    if (isDeliveryFinalized(initial)) {
-      safeWrite(`event: complete\ndata: ${JSON.stringify(initial)}\n\n`);
-      safeEnd();
-      return;
-    }
-
-    let lastSerialized = JSON.stringify(initial);
     let closed = false;
-
-    const pollInterval = Math.max(Number(request.query.pollIntervalMs) || 1000, 1000);
-    const heartbeatInterval = Math.max(Number(request.query.heartbeatIntervalMs) || 15000, 5000);
-
+    let polling = false;
     let pollTimer: ReturnType<typeof setInterval> | null = null;
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-
     const cleanup = () => {
       if (closed) return;
       closed = true;
-      if (pollTimer !== null) {
-        clearInterval(pollTimer);
-      }
-      if (heartbeatTimer !== null) {
-        clearInterval(heartbeatTimer);
+      if (pollTimer !== null) clearInterval(pollTimer);
+      if (heartbeatTimer !== null) clearInterval(heartbeatTimer);
+      reply.raw.off("close", cleanup);
+      reply.raw.off("error", cleanup);
+    };
+    const end = () => {
+      cleanup();
+      if (!reply.raw.destroyed && !reply.raw.writableEnded) reply.raw.end();
+    };
+    reply.raw.once("close", cleanup);
+    reply.raw.once("error", cleanup);
+    const write = async (chunk: string) => {
+      if (closed || reply.raw.destroyed || reply.raw.writableEnded)
+        throw new Error("Stream closed.");
+      if (reply.raw.write(chunk)) return;
+      await new Promise<void>((resolve, reject) => {
+        const done = (error?: Error) => {
+          clearTimeout(timer);
+          reply.raw.off("drain", drained);
+          reply.raw.off("close", disconnected);
+          if (error) reject(error);
+          else resolve();
+        };
+        const drained = () => done();
+        const disconnected = () => done(new Error("Stream closed."));
+        const timer = setTimeout(
+          () => done(new Error("Stream backpressure exceeded its budget.")),
+          PUBLIC_READ_BUDGET_MS,
+        );
+        reply.raw.once("drain", drained);
+        reply.raw.once("close", disconnected);
+      });
+    };
+    const event = (name: string, data: unknown) =>
+      write(
+        `id: ${encodeStreamCursor(id, afterId)}\nevent: ${name}\ndata: ${JSON.stringify(data)}\n\n`,
+      );
+    const emitTransitions = async (rows: readonly Record<string, unknown>[]) => {
+      for (const row of rows) {
+        afterId = String(row.id);
+        await event("rail_transition", {
+          transferId: id,
+          historyId: afterId,
+          oldStatus: row.old_status,
+          newStatus: row.new_status,
+          reason: row.reason,
+          railStatus: row.rail_status,
+          evidenceReference: row.evidence_reference,
+          observedAt: new Date(row.observed_at as Date | string).toISOString(),
+        });
       }
     };
-
-    request.raw.on("close", cleanup);
-    reply.raw.on("close", cleanup);
-    reply.raw.on("error", cleanup);
-
-    pollTimer = setInterval(() => {
-      void (async () => {
-        if (closed || reply.raw.writableEnded || reply.raw.destroyed) {
-          cleanup();
-          return;
-        }
-
-        try {
-          const current = await queryTransferById(request, id);
-          if (current === null) return;
-
-          const currentSerialized = JSON.stringify(current);
-          if (currentSerialized !== lastSerialized) {
-            lastSerialized = currentSerialized;
-            writeEvent(rememberEvent(history, currentSerialized));
-
-            if (isDeliveryFinalized(current)) {
-              safeWrite(`event: complete\ndata: ${JSON.stringify(current)}\n\n`);
-              safeEnd();
-              cleanup();
-            }
-          }
-        } catch (error) {
-          request.log.warn({ err: error, id }, "transfer stream poll failed");
-        }
-      })();
-    }, pollInterval);
-
-    heartbeatTimer = setInterval(() => {
-      if (closed || reply.raw.writableEnded || reply.raw.destroyed) {
-        cleanup();
+    let lastSerialized = JSON.stringify(withSchemaMetadata(initial, version));
+    try {
+      await emitTransitions(replay);
+      await event("transfer_update", withSchemaMetadata(initial, version));
+      if (isDeliveryFinalized(initial)) {
+        await event("complete", withSchemaMetadata(initial, version));
+        end();
         return;
       }
-      safeWrite(": ping\n\n");
-    }, heartbeatInterval);
+    } catch {
+      end();
+      return;
+    }
+    const intervals = transferStreamIntervals(request.query);
+    pollTimer = setInterval(() => {
+      if (closed || polling) return;
+      polling = true;
+      void (async () => {
+        try {
+          await emitTransitions(await readStreamTransitions(reads, id, afterId));
+          const current = await queryTransferById(request, id);
+          if (current === null) {
+            end();
+            return;
+          }
+          const payload = withSchemaMetadata(current, version);
+          const serialized = JSON.stringify(payload);
+          if (serialized !== lastSerialized) {
+            await event("transfer_update", payload);
+            lastSerialized = serialized;
+          }
+          if (isDeliveryFinalized(current)) {
+            await event("complete", payload);
+            end();
+          }
+        } catch (error) {
+          if (error instanceof StreamCursorError && !closed) {
+            try {
+              await event("resync", { error: error.code, message: error.message, resync: true });
+            } catch {
+              /* Connection already closed. */
+            }
+          }
+          end();
+        } finally {
+          polling = false;
+        }
+      })();
+    }, intervals.poll);
+    heartbeatTimer = setInterval(() => {
+      if (closed || polling) return;
+      polling = true;
+      void write(": ping\n\n")
+        .catch(() => end())
+        .finally(() => {
+          polling = false;
+        });
+    }, intervals.heartbeat);
   };
 
-  app.get("/v1/transfers/:id/stream", handleStream);
-  app.get("/api/v1/transfers/:id/stream", handleStream);
+  const streamRouteConfig = {
+    config: {
+      rateLimit: {
+        max: deps.rateLimit?.streamMax ?? DEFAULT_STREAM_RATE_LIMIT_MAX,
+        timeWindow: deps.rateLimit?.timeWindowMs ?? DEFAULT_RATE_LIMIT_WINDOW_MS,
+      },
+    },
+  };
+
+  app.get("/v1/transfers/:id/stream", streamRouteConfig, handleStream);
+  app.get("/api/v1/transfers/:id/stream", streamRouteConfig, handleStream);
 
   // 4. Look up by ID
   const getTransferById = async (
     request: FastifyRequest<{ Params: { id: string } }>,
     reply: FastifyReply,
   ) => {
+    const version = negotiateSchemaVersion(request, reply);
+    if (version === null) return;
+
     const { id } = request.params;
-    const transfer = await queryTransferById(request, id);
-    if (transfer === null) {
+    const revision = await queryTransferRevisionById(request, id);
+    if (revision === null) {
       return reply.code(404).send({
         error: "not_found",
         message: `no transfer found with id ${id}`,
       });
     }
-    return reply.send(transfer);
+    return sendConditionalDetailResponse(
+      request,
+      reply,
+      withSchemaMetadata(revision.transfer, version),
+      version === "1.0"
+        ? revision.etag
+        : computeCanonicalETag("transfer-v1.1", { base: revision.etag }),
+    );
   };
 
   app.get("/v1/transfers/:id", getTransferById);
@@ -514,12 +625,39 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
           search?: string;
           limit?: string;
           offset?: string;
+          cursor?: string;
         };
       }>,
       reply: FastifyReply,
     ) => {
-      const { originChain, destinationChain, route, sender, recipient, search, limit, offset } =
-        request.query;
+      const version = negotiateSchemaVersion(request, reply);
+      if (version === null) return;
+      const {
+        originChain,
+        destinationChain,
+        route,
+        sender,
+        recipient,
+        search,
+        limit,
+        offset,
+        cursor,
+      } = request.query;
+
+      const scope: CursorScope = {
+        ...(originChain === undefined ? {} : { originChain }),
+        ...(destinationChain === undefined ? {} : { destinationChain }),
+        ...(route === undefined ? {} : { route }),
+        ...(sender === undefined ? {} : { sender }),
+        ...(recipient === undefined ? {} : { recipient }),
+        ...(search?.trim() ? { search: search.trim() } : {}),
+      };
+      if (cursor !== undefined && offset !== undefined && Number(offset) !== 0) {
+        return reply.code(400).send({
+          error: "invalid_cursor",
+          message: "cursor cannot be combined with offset",
+        });
+      }
 
       const conditions: string[] = [];
       const params: unknown[] = [];
@@ -553,28 +691,57 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         );
       }
 
-      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
       const parsedLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
       const parsedOffset = Math.max(Number(offset) || 0, 0);
 
+      if (cursor !== undefined) {
+        try {
+          const afterId = decodeCursor(cursor, scope);
+          params.push(afterId);
+          conditions.push(`t.id < $${String(params.length)}`);
+        } catch (error) {
+          if (error instanceof CursorError) {
+            return reply.code(400).send({ error: "invalid_cursor", message: error.message });
+          }
+          throw error;
+        }
+      }
+
+      const finalWhereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
       params.push(parsedLimit);
       const limitClause = `LIMIT $${String(params.length)}`;
-      params.push(parsedOffset);
-      const offsetClause = `OFFSET $${String(params.length)}`;
+      let offsetClause = "";
+      if (cursor === undefined) {
+        params.push(parsedOffset);
+        offsetClause = `OFFSET $${String(params.length)}`;
+      }
 
       const { rows } = await requestQuery(
         request,
         db,
-        `${TRANSFER_QUERY} ${whereClause} ORDER BY t.id DESC ${limitClause} ${offsetClause}`,
+        `${TRANSFER_QUERY.replace("SELECT t.id,", "SELECT DISTINCT ON (t.id) t.id,")} ${finalWhereClause} ORDER BY t.id DESC, d.destination_block DESC NULLS LAST, d.destination_log_index DESC NULLS LAST ${limitClause} ${offsetClause}`,
         params,
       );
 
-      return reply.send({
-        transfers: rows.map((row) => formatRow(row, deps.config)),
-        limit: parsedLimit,
-        offset: parsedOffset,
-        count: rows.length,
-      });
+      const lastRow = rows.at(-1);
+      const nextCursor =
+        rows.length === parsedLimit && lastRow !== undefined
+          ? encodeCursor(String(lastRow.id), scope)
+          : null;
+      reply.header("Cache-Control", LIST_CACHE_CONTROL);
+      return reply.send(
+        withSchemaMetadata(
+          {
+            transfers: rows.map((row) => formatRow(row, deps.config)),
+            limit: parsedLimit,
+            ...(cursor === undefined ? { offset: parsedOffset } : {}),
+            count: rows.length,
+            nextCursor,
+          },
+          version,
+        ),
+      );
     },
   );
 }
