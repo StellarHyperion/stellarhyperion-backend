@@ -371,3 +371,9 @@ amount. Migration179320 adds nullable source bindings; legacy proofs without tha
 reported as `missing_source_binding`. Missing backend history and missing canonical proof are
 reported explicitly. Source changes during verification are rejected before proof admission.
 Recoverable provider gas errors remain retryable and cannot by themselves establish payment.
+
+### Public API error compatibility
+
+JSON errors retain their existing `error`, status code and route-specific fields. The additive `code` is one stable category: `bad_request`, `not_found`, `timeout`, `unavailable`, `internal_error` or `too_many_requests`. Clients can migrate to `code` while existing clients continue reading `error`. Errors include a safe message and request ID; empty indexed history remains HTTP 200 with an empty page. SSE resync frames retain their existing event contract.
+
+ITS verification stores at most six bounded public mismatch categories and an independent `its_verification_state`: `receipt_unavailable` leaves verification retryable, `payout_unverified` records invalid receipt/payment evidence, and `verified` requires the exact canonical ITS event and matching ERC-20 payment. Unrelated events in the same transaction do not invalidate an exact pair. Diagnostics never establish delivery.
