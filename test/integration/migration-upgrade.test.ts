@@ -24,7 +24,7 @@ async function migrate(
     databaseUrl: CONNECTION ?? "",
     dir: options.dir ?? MIGRATIONS,
     direction: "up",
-    ...(options.file === undefined ? {} : { file: options.file }),
+    ...(options.file === undefined ? {} : { file: options.file.replace(/\.sql$/, "") }),
     migrationsSchema: SCHEMA,
     migrationsTable: "schema_migrations",
     schema: SCHEMA,
