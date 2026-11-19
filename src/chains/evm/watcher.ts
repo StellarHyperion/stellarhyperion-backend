@@ -31,7 +31,7 @@ import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
 import type { Position } from "../writers.js";
-import { ClaimPairing, applyRouterLog } from "./store.js";
+import { ClaimPairing, applyRouterLog, quarantineEvmLog } from "./store.js";
 import { decodeRouterLog, signatureOf } from "./logs.js";
 import type { EvmClient, RawEvmLog } from "./client.js";
 
@@ -44,6 +44,7 @@ import type { EvmClient, RawEvmLog } from "./client.js";
  * chain in the registry.
  */
 const CURRENT_WITHIN_BLOCKS = 2;
+const MAX_QUARANTINED_LOGS_PER_PASS = 100;
 
 export interface EvmWatcherOptions {
   readonly chainKey: string;
@@ -217,7 +218,23 @@ export class EvmWatcher {
     }
 
     const to = min(from + BigInt(this.options.logRange) - 1n, confirmed);
-    const logs = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
+    const fetched = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
+    if (
+      fetched.some(
+        (log) =>
+          log.address.toLowerCase() !== router.toLowerCase() ||
+          log.blockNumber < from ||
+          log.blockNumber > to,
+      )
+    )
+      throw new Error("provider returned logs outside the requested router or block range");
+    const logs = [...fetched].sort((a, b) =>
+      a.blockNumber < b.blockNumber
+        ? -1
+        : a.blockNumber > b.blockNumber
+          ? 1
+          : a.logIndex - b.logIndex,
+    );
 
     // Block timestamps, which `getLogs` does not return and three columns need. One call per block
     // that actually has logs, plus the range end for its hash, rather than one per block in range.
@@ -239,6 +256,8 @@ export class EvmWatcher {
     let written = 0;
     let ignored = 0;
     const pairing = new ClaimPairing();
+    const quarantined = this.findOrderingConflicts(logs);
+    let recordedQuarantines = 0;
 
     // One transaction for the range and the cursor advance past it. This is the restart guarantee,
     // and splitting it would turn every crash into either a lost range or a duplicated one.
@@ -247,6 +266,44 @@ export class EvmWatcher {
         if (log.removed) {
           // viem marks a log from an orphaned block. Indexing one would record a transfer that is
           // no longer on the chain.
+          ignored += 1;
+          continue;
+        }
+        const conflict = quarantined.get(logKey(log));
+        if (conflict !== undefined) {
+          const timestamp = blocks.get(log.blockNumber)?.timestamp;
+          if (timestamp === undefined) {
+            throw new Error(
+              `no timestamp for quarantined block ${log.blockNumber.toString()} on ${chainKey}`,
+            );
+          }
+          if (recordedQuarantines < MAX_QUARANTINED_LOGS_PER_PASS) {
+            recordedQuarantines += 1;
+            await quarantineEvmLog(
+              tx,
+              {
+                chainKey,
+                block: log.blockNumber,
+                txHash: log.transactionHash,
+                logIndex: log.logIndex,
+                eventName: conflict.eventName,
+                reason: conflict.reason,
+              },
+              new Date(Number(timestamp) * 1000),
+            );
+          }
+          if (recordedQuarantines < MAX_QUARANTINED_LOGS_PER_PASS)
+            logger.warn(
+              {
+                chain: chainKey,
+                block: log.blockNumber.toString(),
+                txHash: log.transactionHash,
+                logIndex: log.logIndex,
+                event: conflict.eventName,
+                reason: conflict.reason,
+              },
+              "quarantined EVM log with invalid lifecycle ordering",
+            );
           ignored += 1;
           continue;
         }
@@ -398,6 +455,50 @@ export class EvmWatcher {
     }
     return applied.kind === "written";
   }
+
+  private findOrderingConflicts(logs: readonly RawEvmLog[]): Map<string, OrderingConflict> {
+    const groups = new Map<string, { log: RawEvmLog; name: string }[]>();
+    const conflicts = new Map<string, OrderingConflict>();
+    for (const log of logs) {
+      if (log.removed) continue;
+      const decoded = decodeRouterLog(log);
+      if (decoded?.name !== "ClaimParked" && decoded?.name !== "BridgeIn") continue;
+      const route = decoded.args.route;
+      const sourceChain = decoded.args.sourceChain;
+      const sourceNonce = decoded.args.sourceNonce;
+      const key = `${log.blockNumber}|${log.transactionHash}|${String(route)}|${String(sourceChain)}|${String(sourceNonce)}`;
+      const group = groups.get(key) ?? [];
+      group.push({ log, name: decoded.name });
+      groups.set(key, group);
+    }
+    for (const group of groups.values()) {
+      const parked = group.filter((entry) => entry.name === "ClaimParked");
+      const inbound = group.filter((entry) => entry.name === "BridgeIn");
+      if (
+        parked.length > 1 ||
+        inbound.length > 1 ||
+        (parked[0] && inbound[0] && parked[0].log.logIndex >= inbound[0].log.logIndex)
+      ) {
+        for (const entry of group)
+          conflicts.set(logKey(entry.log), {
+            eventName: entry.name,
+            reason: "duplicate or reversed claim/delivery lifecycle ordering",
+          });
+      }
+    }
+
+    // Every conflicting log is excluded even after the diagnostic recording budget is exhausted.
+    return conflicts;
+  }
+}
+
+interface OrderingConflict {
+  readonly eventName: string;
+  readonly reason: string;
+}
+
+function logKey(log: Pick<RawEvmLog, "blockNumber" | "transactionHash" | "logIndex">): string {
+  return `${log.blockNumber.toString()}|${log.transactionHash}|${String(log.logIndex)}`;
 }
 
 function min(a: bigint, b: bigint): bigint {
