@@ -3,6 +3,7 @@ import type { Transaction, xdr } from "@stellar/stellar-sdk";
 import { BASE_FEE, Contract, Keypair, TransactionBuilder, rpc } from "@stellar/stellar-sdk";
 import type { AppConfig } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
+import { prepareWithRestore } from "./restore.js";
 
 export type KeeperOperation = "keep_alive" | "settle_claim";
 export interface StellarSubmissionOptions {
@@ -171,11 +172,10 @@ export function submitStellar(
         throw new Error("Keeper transaction failed on chain.");
       return hash;
     };
-    const prepared = options.prepareWithRestore
-      ? await options.prepareWithRestore(client, build, (transaction, phase) =>
-          submitPrepared(transaction, phase),
-        )
-      : await client.prepareTransaction(await build());
+    const prepare = options.prepareWithRestore ?? prepareWithRestore;
+    const prepared = await prepare(client, build, (transaction, phase) =>
+      submitPrepared(transaction, phase),
+    );
     return submitPrepared(prepared, "invoke");
   });
 }

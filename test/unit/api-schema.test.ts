@@ -6,6 +6,12 @@ import { buildServer } from "../../src/http/server.js";
 import { loadConfig } from "../../src/config/config.js";
 import { recordWorkerHeartbeat, readWorkerHeartbeats } from "../../src/runtime/readiness.js";
 import { completeEnv } from "../helpers.js";
+import {
+  captureResponse,
+  differentialReport,
+  validateResponse,
+  type ResponseShape,
+} from "../tooling/api-contract.js";
 import { capturingLogger } from "../stellar-fakes.js";
 
 // Execute the repository SQL in a real embedded PostgreSQL engine, without query-string mocks.
@@ -518,5 +524,64 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     expect(updatedProof.statusCode).toBe(200);
     expect(updatedProof.headers.etag).not.toBe(providerStatusOnly.headers.etag);
     expect(updatedProof.json().destination.delivered).toBe(false);
+  });
+});
+
+describe("public response differential runner", () => {
+  const shapes = JSON.parse(
+    readFileSync(new URL("../../docs/api-response-contracts.json", import.meta.url), "utf8"),
+  ) as Record<string, ResponseShape>;
+  it("checks real transfer and claim handlers against the published contract and classifies metadata additions", async () => {
+    for (const [kind, url] of [
+      ["transfer", "/v1/transfers/stellar-testnet/42"],
+      ["claim", "/v1/claims/stellar-testnet/7"],
+    ] as const) {
+      const shape = shapes[kind]!;
+      const previous = await captureResponse(app, url, "1.0", shape);
+      const current = await captureResponse(app, url, "1.1", shape);
+      const report = differentialReport(previous, current);
+      expect(report.breaking).toEqual([]);
+      expect(report.additive).toEqual(["$.schemaVersion", "$.metadata"]);
+      expect(current.statusCode).toBe(200);
+    }
+  });
+  it("detects removed nested fields, number coercion, full-width integer drift and token identity drift", () => {
+    const previous = {
+      version: "old",
+      statusCode: 200,
+      body: {
+        origin: {
+          amount: "18446744073709551615",
+          nonce: "18446744073709551615",
+          token: "USDC",
+          decimals: 7,
+          sender: "Gsender",
+        },
+      },
+    };
+    const current = {
+      version: "new",
+      statusCode: 200,
+      body: {
+        origin: {
+          amount: Number("18446744073709551615"),
+          nonce: "18446744073709551614",
+          token: "USDT",
+          decimals: 6,
+        },
+      },
+    };
+    const report = differentialReport(previous, current);
+    expect(report.breaking).toContain("$.origin.sender");
+    expect(report.wideIntegerChanges).toEqual(["$.origin.amount", "$.origin.nonce"]);
+    expect(report.tokenRepresentationChanges).toEqual(["$.origin.token", "$.origin.decimals"]);
+    expect(
+      validateResponse(current.body, {
+        fields: { origin: { fields: { amount: "integer-string" } } },
+      }),
+    ).toEqual(["$.origin.amount: expected integer-string"]);
+    expect(differentialReport(previous, { ...previous, statusCode: 500 }).breaking).toEqual([
+      "$statusCode",
+    ]);
   });
 });
