@@ -1,6 +1,8 @@
 import { StrKey } from "@stellar/stellar-sdk";
 import {
   CHAINS,
+  isRouteKind,
+  adapterFor,
   RAIL_CONTRACTS,
   assetOn,
   isChainKey,
@@ -303,7 +305,9 @@ export function validateTransferFilters(
     throw invalidFilter("originChain and destinationChain must differ");
   if (route !== undefined) {
     if (!/^[0-3]$/.test(route)) throw invalidFilter("route must be an integer from 0 to 3");
-    const routeName = ROUTE_NAMES[Number(route)]!;
+    const numericRoute = Number(route);
+    if (!isRouteKind(numericRoute)) throw invalidFilter("unsupported route");
+    const routeName = ROUTE_NAMES[numericRoute]!;
     const sources =
       originChain !== undefined && isChainKey(originChain)
         ? [deployments[originChain]]
@@ -311,10 +315,8 @@ export function validateTransferFilters(
     const sourceSupported = sources.some(
       (deployment) =>
         deployment !== undefined &&
-        Object.prototype.hasOwnProperty.call(deployment.adapters, routeName) &&
-        Object.values(deployment.tokens).some((token) =>
-          token.routes.some((supported) => supported === routeName),
-        ),
+        adapterFor(config.deployments, deployment.chain, numericRoute) !== null &&
+        Object.values(deployment.tokens).some((token) => token.routes.includes(numericRoute)),
     );
     if (!sourceSupported)
       throw invalidFilter("route has no configured source deployment and asset");
@@ -323,9 +325,7 @@ export function validateTransferFilters(
       const registry = RAIL_CONTRACTS[destinationChain];
       const supported =
         deployment !== undefined &&
-        Object.values(deployment.tokens).some((token) =>
-          token.routes.some((supported) => supported === routeName),
-        );
+        Object.values(deployment.tokens).some((token) => token.routes.includes(numericRoute));
       if (
         !supported &&
         !(routeName === "cctp"
