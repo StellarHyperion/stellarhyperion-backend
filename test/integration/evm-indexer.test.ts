@@ -16,6 +16,10 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import {
+  readEvmFinalityPolicyChanges,
+  readLatestEvmScanProvenance,
+} from "../../src/chains/evm/store.js";
 import { EvmWatcher } from "../../src/chains/evm/watcher.js";
 import { Database } from "../../src/db/pool.js";
 import {
@@ -49,6 +53,9 @@ suite("replaying the anvil deployment's logs", () => {
       await db.query(`DELETE FROM ${table} WHERE ${column} = $1`, [CHAIN]);
     }
     await db.query("DELETE FROM indexer_cursor WHERE chain_key = $1", [CHAIN]);
+    await db.query("DELETE FROM indexer_lease WHERE chain_key = $1", [CHAIN]);
+    await db.query("DELETE FROM evm_scan_provenance WHERE chain_key = $1", [CHAIN]);
+    await db.query("DELETE FROM evm_applied_event WHERE chain_key = $1", [CHAIN]);
   };
 
   /** Run the watcher to the confirmation line, the way the poller would. */
@@ -62,6 +69,7 @@ suite("replaying the anvil deployment's logs", () => {
       confirmations: 0,
       reorgDepth: 5,
       logRange,
+      releaseLeaseOnTick: true,
       client: new FakeEvmClient({ head: ANVIL_HEAD }),
       db,
       logger,
@@ -196,6 +204,104 @@ suite("replaying the anvil deployment's logs", () => {
 
     await clean();
     await drain();
+  });
+
+  it("records finality-policy provenance per committed scan and exposes policy changes", async () => {
+    await clean();
+    const { logger } = capturingLogger();
+    const first = new EvmWatcher({
+      chainKey: CHAIN,
+      router: ANVIL_ROUTER,
+      chainId: ANVIL_CHAIN_ID,
+      startBlock: ANVIL_START_BLOCK,
+      confirmations: 2,
+      reorgDepth: 5,
+      logRange: 2_000,
+      ownerId: "worker-a",
+      releaseLeaseOnTick: true,
+      client: new FakeEvmClient({ head: ANVIL_HEAD }),
+      db,
+      logger,
+    });
+    await first.tick(AbortSignal.timeout(5_000));
+
+    const latest = await readLatestEvmScanProvenance(db, CHAIN, ANVIL_ROUTER);
+    expect(latest).not.toBeNull();
+    expect(latest?.confirmations).toBe(2);
+    expect(latest?.reorgDepth).toBe(5);
+    expect(latest?.policyChanged).toBe(false);
+
+    // Rewind cursor slightly and run with a changed confirmations policy
+    await db.query("DELETE FROM indexer_cursor WHERE chain_key = $1", [CHAIN]);
+    const second = new EvmWatcher({
+      chainKey: CHAIN,
+      router: ANVIL_ROUTER,
+      chainId: ANVIL_CHAIN_ID,
+      startBlock: ANVIL_START_BLOCK,
+      confirmations: 0,
+      reorgDepth: 6,
+      logRange: 2_000,
+      ownerId: "worker-b",
+      releaseLeaseOnTick: true,
+      client: new FakeEvmClient({ head: ANVIL_HEAD }),
+      db,
+      logger,
+    });
+    await second.tick(AbortSignal.timeout(5_000));
+
+    expect(second.policyChanges).toHaveLength(1);
+    const changes = await readEvmFinalityPolicyChanges(db, CHAIN, ANVIL_ROUTER);
+    expect(changes).toHaveLength(1);
+    expect(changes[0]).toMatchObject({
+      confirmations: 0,
+      reorgDepth: 6,
+      previousConfirmations: 2,
+      previousReorgDepth: 5,
+    });
+  });
+
+  it("coordinates multiple EVM watchers via expiring per-deployment database leases", async () => {
+    await clean();
+    const { logger } = capturingLogger();
+    const client = new FakeEvmClient({ head: ANVIL_HEAD });
+
+    const primary = new EvmWatcher({
+      chainKey: CHAIN,
+      router: ANVIL_ROUTER,
+      chainId: ANVIL_CHAIN_ID,
+      startBlock: ANVIL_START_BLOCK,
+      confirmations: 0,
+      reorgDepth: 5,
+      logRange: 2,
+      ownerId: "primary",
+      leaseTtlMs: 30_000,
+      client,
+      db,
+      logger,
+    });
+    const contender = new EvmWatcher({
+      chainKey: CHAIN,
+      router: ANVIL_ROUTER,
+      chainId: ANVIL_CHAIN_ID,
+      startBlock: ANVIL_START_BLOCK,
+      confirmations: 0,
+      reorgDepth: 5,
+      logRange: 2,
+      ownerId: "contender",
+      leaseTtlMs: 30_000,
+      client,
+      db,
+      logger,
+    });
+
+    await primary.tick(AbortSignal.timeout(5_000));
+    const progressedByContender = await contender.tick(AbortSignal.timeout(5_000));
+    expect(progressedByContender).toBe(false);
+    expect(contender.progress).toBeNull();
+
+    await primary.release();
+    await contender.tick(AbortSignal.timeout(5_000));
+    expect(contender.progress).not.toBeNull();
   });
 });
 

@@ -79,6 +79,32 @@ export function boolean(row: Row, column: string): boolean {
   return value;
 }
 
+export function booleanOrNull(row: Row, column: string): boolean | null {
+  const value = row[column];
+  if (value === null || value === undefined) return null;
+  return boolean(row, column);
+}
+
+/**
+ * A `NUMERIC(n,0)` as an exact integer string, preserving full-width precision.
+ */
+export function numericString(row: Row, column: string): string {
+  const value = row[column];
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "number" && Number.isSafeInteger(value)) return String(value);
+  if (typeof value === "string") {
+    if (!/^-?\d+$/.test(value)) throw new RowError(column, `is not a whole number: ${value}`);
+    return value;
+  }
+  throw new RowError(column, `is not a numeric, it is ${typeOf(value)}`);
+}
+
+export function numericStringOrNull(row: Row, column: string): string | null {
+  const value = row[column];
+  if (value === null || value === undefined) return null;
+  return numericString(row, column);
+}
+
 export function timestamp(row: Row, column: string): Date {
   const value = row[column];
   if (value instanceof Date) return value;

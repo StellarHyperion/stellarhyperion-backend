@@ -23,7 +23,25 @@ npm run build
 node --env-file=.env dist/main.js
 ```
 
+Migration commands use PostgreSQL's session-level advisory lock and wait for another migration
+runner to finish before checking and applying pending steps. The lock is released when the runner
+finishes or its database connection closes. API instances do not run migrations at startup.
+
 The SDK is installed from the committed protocol tarball. `npm run dev` does not load `.env` automatically; export the variables first or run `node --env-file=.env --watch --experimental-strip-types src/main.ts`.
+
+### Startup schema compatibility check
+
+Before the server accepts requests or the indexer reads a cursor, the process verifies that the database has been migrated to the schema version this build expects (`SCHEMA_VERSION`, defaulting to the newest migration file). The check reads `pgmigrations` and refuses to start unless the complete shipped migration manifest matches the applied schema (including the newest step). It never runs migrations itself: apply them with `npm run migrate:up` first. The failure message names only the variable and the expected shape, never the database connection string.
+
+### Bounded catch-up runtime budget
+
+Enable `CATCH_UP_ENABLED=true` for scheduled runs; continuous containers have no lifetime limit. Apply migrations explicitly before startup. The scheduled process divides its wall-clock budget (`CATCH_UP_BUDGET_MS`, default 120000ms) among migrations, source scans, proof polling and graceful drain. A slow stage cannot consume the entire shutdown safety margin: source scans and proof polling receive bounded stage allocations with a reserved drain window and the run moves on when its slice is spent. Work already committed to the database survives budget expiration, and the shutdown log reports why the run stopped and which stage remains eligible for the next run.
+
+### Continuous-container readiness and graceful rollout
+
+Before indexing shared cursors, a replica acquires an expiring lease per chain/router in the existing cursor lease storage so two active replicas never advance the same cursor. The lease TTL (`INDEXER_LEASE_TTL_MS`, default 30000ms) is renewed while the replica is healthy and released during graceful shutdown. A replica that loses its lease stops indexing until it can re-acquire ownership.
+
+`INDEXER_LEASE_OWNER_ID` names this replica; it defaults to hostname plus process id, with an independently unique worker suffix. Health probes (`GET /ready`) report lease ownership together with Postgres, Redis and watcher state, so a load balancer takes a replica out of rotation when it cannot do its job and puts it back when it recovers. The Dockerfile exposes `/ready` as a HEALTHCHECK endpoint.
 
 Run the watchers and rail pollers in a continuous process or in regular scheduled catch-up windows. Deploying only `api/index.ts` provides reads from an existing database; it does not run indexing in the background. Set the frontend's `NEXT_PUBLIC_HYPERION_API_URL` to this service's origin. Public API reads support cross-origin GET requests.
 
@@ -37,6 +55,27 @@ The workflow is scheduled every five minutes and can be started manually. GitHub
 
 Deploy the API with `vercel deploy --prod`. Preview environments require their own database. Database credentials stay in Vercel and GitHub secrets, never in browser configuration, Git or logs. The managed PostgreSQL database is the durable state; restarting a worker must not repeat source transfers.
 
+Set `HYPERION_DATABASE_ENV` to the hosting `VERCEL_ENV` (`preview` or `production`).
+Apply migrations explicitly with a migration administrator, then provision the database once:
+
+```sql
+INSERT INTO public.hyperion_database_identity(environment) VALUES ('preview');
+```
+
+Use `production` for the production database. Startup compares this durable marker with both
+configured environment labels; changing a preview label cannot admit production credentials.
+The migration deliberately leaves the marker empty until an administrator binds the database.
+Local development and tests with `VERCEL_ENV=development` and nonproduction `NODE_ENV` do not
+require this hosting marker.
+
+The API requires a dedicated nonprivileged login with `USAGE` on the `public` schema and `SELECT`
+on the tables listed by `API_READ_TABLES` in `src/db/policy.ts` (including `pgmigrations` and the
+identity marker). Grant no public-table write privileges or privileged role memberships. API
+connections also use `default_transaction_read_only`; startup verifies the actual role and grants,
+not only the `HYPERION_DATABASE_ROLE=read-only` label. The serverless entrypoint refuses enabled
+background writers. Indexer, rail or keeper processes require `HYPERION_DATABASE_ROLE=read-write`
+and a separately provisioned worker credential. Keep migration privileges separate from both.
+
 Vercel's installed Git integration publishes `main`. GitHub Actions runs validation and the scheduled indexer; it does not need a Vercel deployment token.
 
 ## What establishes status
@@ -45,15 +84,29 @@ Stellar router events establish source transfers and claim changes. The EVM watc
 
 For direct Stellar ITS transfers, Axelar's status API supplies a candidate destination transaction. Delivery is recorded only after the destination RPC confirms a successful receipt, sufficient confirmations, the matching ITS command/token/source/recipient/amount event and a matching token payment. The received asset is the ITS representation of Stellar USDC, with seven decimals. A rail API `executed` status alone is not delivery.
 
-For CCTP, Circle's forwarding hash is a candidate only. The backend binds the attested message to the source transfer, then verifies finalized Circle message execution and the exact native-USDC mint to the recipient in a successful confirmed canonical destination receipt. Activity exposes the actual received amount, token and six-decimal precision, separately from the source amount before forwarding fees. Real acceptance on all three destinations is recorded in `deployments/evidence/2026-10-29-cctp.json` in the contracts repository.
+For CCTP, Circle's forwarding hash is a candidate only. The backend binds the attested message to the source transfer, then verifies finalized Circle message execution and the exact native-USDC mint to the recipient in a successful confirmed canonical destination receipt. Activity exposes the actual received amount, token and six-decimal precision, separately from the source amount before forwarding fees. After applying `1792800000000_cctp-verification-failure-reasons`, transfer and backlog responses also expose a nullable `verificationFailure` category. Recipient, domain, token and amount mismatches remain distinct; missing evidence stays pending and retryable without consuming the provider failure budget. A category never proves delivery. Provider text is bounded and redacted, and oversized message/signature payloads are omitted. Real acceptance on all three destinations is recorded in `deployments/evidence/2026-10-29-cctp.json` in the contracts repository.
 
 Unknown or unreachable APIs produce errors; there are no fabricated deliveries or fallback attestations. Claims, route health and metrics query the actual migrated schema. Transfer amounts remain base-unit integer strings, with decimals/symbol supplied from deployment metadata when known.
 
-EVM logs whose signature or payload is not understood are retained in `evm_log_quarantine` as raw,
-non-materialized evidence. The table keeps the newest 10,000 logs per chain; use
-`readQuarantinedEvmLogs` or `replayQuarantinedEvmLogs` after deploying a decoder upgrade. Unknown
-events never become fabricated transfers, and replay leaves the quarantine evidence intact until an
-operator has verified the materialized result.
+## Rail retry recovery
+
+Rail lookup failures persist a normalized `retry_class` and `next_attempt_at`. Transient failures use capped exponential backoff; rate limits use the provider's retry delay. Permanent failures and transfers that exhaust the configured evidence-failure count are held for operator recovery and are not retried automatically. After correcting the underlying issue and reviewing the source transfer, an operator may explicitly re-enable one transfer with:
+
+```bash
+npm run migrate:up
+npm run build
+npm run rail:requeue -- --transfer-id 123 --reviewed-by operator-name --reason "Provider evidence is now available"
+```
+
+Transfers in `failed` or `expired`, or pending/attested transfers held for `permanent`/`exhausted` evidence failures, can be reopened. Each requeue atomically records the prior state, operator and reason. A matching destination delivery or claim blocks requeue, and the original source transfer is never rewritten. Add `--evaluate-now` to make one immediate rail lookup after requeue; otherwise the regular worker picks it up. Provider error text and credentials are not exposed through the public transfer API or retry logs.
+
+Inspect active rail backlog without starting workers or changing lifecycle state:
+
+```bash
+npm run rails:backlog -- [--route 0|1] [--destination <chain>] [--stage <stage>] [--retry-class <class>] [--overdue-only] [--limit <n>] [--cursor <token>] [--sort asc|desc] [--format table|json]
+```
+
+The report separates provider discovery from destination receipt verification, includes retry class and due state, and uses stable keyset pagination. It runs its database transaction as read-only.
 
 ## Protocol fees and claims
 
@@ -65,12 +118,47 @@ A claim number identifies funds parked by a destination router after an unsucces
 
 `KEEPER_ENABLED=true` enables BullMQ jobs for router `keep_alive` and Stellar `settle_claim`. Supply a funded testnet `KEEPER_STELLAR_SECRET` from your secret store to submit them. With no signer, jobs report zero confirmed changes and dry-run status. Secrets are redacted from structured logs.
 
-One process serializes its Stellar submissions to avoid sequence conflicts. Run only one active keeper signer process, or give replicas separate accounts. The keeper counts confirmations and leaves database claim/delivery changes to indexed events. It does not perform rail second-step delivery or gas top-ups. TTL maintenance covers configured router tokens/routes and recent indexed transfer/claim entries; it is not a guarantee that every adapter or upstream storage entry remains live.
+### Signed transaction checkpoints
+
+Before a signed keeper transaction is broadcast, its hash, intended operation, chain and contract are durably written to `keeper_checkpoint` with state `submitted`. Only a definitive terminal outcome changes the row to `confirmed` or `failed`; ambiguous responses and timeouts remain `submitted` and block new envelopes, so an unknown broadcast outcome can be reconciled by the saved hash before retrying. Recovery never generates a second claim payment attempt blindly, and no secret key or signed credential material appears in logs.
+
+PostgreSQL serializes submissions across replicas sharing a signer. Keep at least two pool connections available: one holds the signer lock while independent journal writes commit before broadcast. The keeper counts confirmations and leaves database claim/delivery changes to indexed events. It does not perform rail second-step delivery or gas top-ups. TTL maintenance covers configured router tokens/routes and recent indexed transfer/claim entries; it is not a guarantee that every adapter or upstream storage entry remains live.
+
+When simulation reports an archived Soroban footprint, the keeper submits the protocol's
+`restoreFootprint` operation for that exact footprint. Its signed public hash is journaled under
+the `restore` phase before broadcast. An uncertain restore blocks further signing until that
+hash is reconciled. After confirmed restoration, the keeper fetches a fresh signer sequence
+and simulates the unchanged `keep_alive` or `settle_claim` call again. Claims remain in the
+indexed database with their original recipient and amount; no database `archived` flag or
+router-specific restore method is assumed. A footprint still requiring restoration after this
+bounded attempt fails explicitly.
+
+### Reconciliation test tooling
+
+`test/tooling/proof-corpus.ts` runs independent mutations through the real CCTP and ITS
+receipt verifiers and records each mutation, expected outcome and observed verifier result.
+Recipient, amount, token, domain and canonical block hash mutations must be rejected;
+unrelated receipt logs must preserve a valid proof. Mock provider exceptions fail the harness.
+
+`docs/api-response-contracts.json` publishes the required transfer and claim response shapes.
+`test/tooling/api-contract.ts` validates actual Fastify responses against those shapes and
+compares recorded fixtures across versions, including nested field removal, integer-string
+coercion, token identity changes and additive metadata.
+
+With a dedicated migrated `TEST_DATABASE_URL`, `test/integration/load-benchmark.test.ts`
+creates deterministic 32- and 512-transfer histories through the actual ingestion writers,
+including pending/attested proof states, delivered rows and canonical replay. It emits
+`HYPERION_DATABASE_BENCHMARK` reports with ingestion/scan timings, query costs, buffer counts
+and `EXPLAIN ANALYZE` plan nodes. Bounds are regression limits on these fixtures, not a
+production throughput guarantee. The suite refuses to substitute an empty database query
+for a seeded history.
 
 ## API and checks
 
 - `GET /health`, `GET /ready`
-- `GET /v1/transfers`, with sender/recipient/chain/route/search/limit/offset filters
+- `GET /v1/transfers`, with sender/recipient/chain/route/search/limit/offset filters. Responses
+  also include an opaque `nextCursor`; pass it back with the same filters for stable keyset
+  pagination. Cursors are scoped to the descending transfer-id order and reject mismatched filters.
 - `GET /v1/transfers/by-tx/:txHash`, `GET /v1/transfers/:originChain/:nonce`
 - `GET /v1/claims`, `GET /v1/claims/:chain/:claimId`
 - `GET /v1/routes/health`, `GET /v1/metrics`
@@ -88,3 +176,133 @@ Signed source transactions and independently checked destination payments are pu
 The [October 29 CI run](https://github.com/StellarHyperion/stellarhyperion-backend/actions/runs/40881373948) passed formatting, lint, types, the production build and all 220 tests. `npm audit` reported zero known vulnerabilities after compatible locked HTTP redirect and test-tooling patches. These results cover dependency and regression checks; they are not a formal security audit.
 
 MIT.
+
+Rail workers claim one transfer inside a PostgreSQL transaction using `FOR UPDATE SKIP LOCKED`, so another replica skips active polling. Source identity, verified delivery and the retry schedule commit together. Aborted polling rolls back. Transient and rate-limit attempts have a separate durable counter and do not exhaust the permanent/evidence failure budget; explicit Retry-After delays are respected.
+
+### Router-scoped source identity
+
+Outbound nonces are unique within an emitting router. Numeric transfer IDs remain stable;
+responses include `origin.router` (null for legacy rows whose deployment is not yet proved).
+A chain/nonce detail lookup returns 409 when more than one deployment used the nonce.
+Use the source transaction or numeric ID to disambiguate. Receipt verifiers bind destination
+evidence to the exact source row. Unbound legacy evidence is joined only for an unambiguous
+source nonce; provider status cannot select a deployment or establish delivery. Historical
+rows acquire their router during exact source-event replay without changing their IDs.
+
+### EVM historical jobs
+
+Use `npm run evm:backfill -- start <operator> <chain> <from> <to>` on a trusted
+local machine with database access. The returned job ID supports `resume` and
+`cancel` commands with the same operator. Owner is audit metadata, not HTTP
+authentication. The public API exposes only bounded job status reads.
+
+Jobs commit range progress in the same PostgreSQL transaction as their events.
+Stopping the process rolls back its unfinished range; resume uses the saved
+next block without moving the live cursor. Ranges stay below the configured
+confirmation line, at most 100000 blocks per job and one configured log page
+per transaction. Active jobs are limited to 100 and terminal history to 1000.
+Live and historical ingestion share durable event identity and serialized
+materialization, including route-health observations. Provider errors are
+reported with fixed public messages; inspect secure local provider logs when
+reviewing a failed job.
+
+## EVM scan finality and historical audits
+
+EVM watcher ownership is scoped to the chain and router. An expired owner may be replaced after a crash, and each cursor commit verifies ownership and its previous revision in the same transaction as event writes. Concurrent replay keeps the existing canonical event serialization and quarantine checks.
+
+`EVM_FINALITY_MODE=confirmations` preserves the chain registry's confirmation depth. Set `EVM_FINALITY_MODE=finalized` to require the RPC's finalized-block number and hash as additional evidence; scans never exceed either that block or the configured confirmation boundary. Unsupported tags fail the pass unless `EVM_FINALITY_ALLOW_FALLBACK=true` explicitly permits depth fallback. Invalid finalized evidence fails even with fallback enabled. `evm_scan_provenance` retains the configured policy, actual evidence, hashes and policy transitions for each committed range; weaker policies never rewrite earlier evidence.
+
+Scheduled route-health compaction removes bounded batches of old interior duplicates and skips rows locked by ingestion. It retains the first and last samples of each configuration run, every transition, and all samples in the recent retention window. Historical `route_health` queries therefore represent state transitions after compaction; they must not treat old row counts as raw sampling frequency or uptime percentages. Recent raw samples remain available within the configured retention window.
+
+`Database.auditTransferAndClaimInvariants()` reads source amount equations, claim liabilities and actual destination-delivery evidence. Its monetary values remain integer strings, and violations identify source row IDs and routers. Delivery joins use the bound source transfer or an unambiguous legacy hop; a reused deployment nonce cannot prove delivery for another source row.
+
+## Metadata versions, request budgets and durable freshness
+
+Public transfer, claim and route responses default to schema `1.0` and retain their legacy shape.
+Request `X-API-Schema-Version: 1.1` (or `schemaVersion=1.1` for EventSource) to receive the
+`schemaVersion` and `metadata.source=indexed_postgres` envelope. Monetary and token identity
+fields are identical in both versions. Unsupported versions return 400 with the supported list.
+Versioned responses carry distinct ETags and vary on `X-API-Schema-Version`.
+
+Production API requests default to 120 requests per client per minute, with 20 SSE connections
+per minute. `/health` and `/ready` probes, including query-bearing probes, are exempt;
+operational metrics and backfill inspection use the ordinary budget. `buildServer` accepts a
+bounded `rateLimit` policy and explicit `trustProxy` configuration. Forwarded client headers
+are ignored by default; production proxy trust should name the validated proxy addresses.
+When `REDIS_URL` is configured, both continuous and serverless API entry points connect
+with bounded command/connect timeouts; an injected ioredis client shares counters across replicas using the same key prefix; without
+one the bounded cache is local to that process. Redis errors fail requests closed and expose
+only the generic internal error. 429 responses include `Retry-After` and `retryAfterMs`.
+
+Background chain and rail workers persist heartbeats after every completed or failed poll,
+including the actual cursor and consecutive failures. Worker IDs are limited to 128 safe
+characters; diagnostic text and nested metadata are bounded and redact credentials. Older
+writes cannot overwrite newer activity. `/ready` degrades missing configured chain-worker
+heartbeats and timestamps older than 120 seconds, invalid timestamps, or timestamps over 30 seconds
+in the future. A healthy database or a local ready report cannot mask stale persisted activity.
+API replicas with indexing disabled still report the durable heartbeats present in PostgreSQL.
+
+`Database.computeHistoryDigest`/`recordHistoryDigest`/`verifyHistoryDigest` cover indexed
+outbound transfers, inbound deliveries and claims linked to a delivery within the requested
+inclusive block range. Exact integer strings and deployment/source identities contribute to
+the SHA-256 digest; surrogate row IDs, observation times and API presentation do not.
+Rows are read in deterministic pages of 1,000 under a repeatable-read snapshot. A plain
+`Queryable` must already provide snapshot isolation when used concurrently with ingestion.
+Unlinked claims are outside a block-range digest because they have no delivery block evidence.
+
+## Freshness targets and deployment readiness
+
+`/v1/metrics` now reports `freshnessSlo` using persisted source cursors/history gaps and
+source-bound destination delivery or settled-claim evidence. A parked delivery or provider
+status alone cannot settle a backlog entry. Ambiguous legacy hops remain pending.
+Every report identifies the source-scan or destination-proof stage, its chain/lane and target.
+Missing or invalid/future cursor timestamps produce `unknown` with `met=false`; open and
+reconciling history gaps breach source progress. API-only processes evaluate remote durable
+history. Other deployment modes with indexing explicitly disabled label source monitoring
+`disabled` rather than presenting an absent watcher as healthy.
+
+Defaults are 120 seconds for source scan lag, 100 pending proofs per lane and 15 minutes for
+oldest proof age. Set `FRESHNESS_MAX_SCAN_LAG_MS`, `FRESHNESS_MAX_PROOF_BACKLOG_COUNT`,
+`FRESHNESS_MAX_PROOF_BACKLOG_AGE_MS` and optional JSON `FRESHNESS_LANE_TARGETS` to override them.
+Lane keys use `origin->destination`, with `maxSourceScanLagMs`, `maxProofBacklogCount` and
+`maxProofBacklogAgeMs`. The strictest configured lane scan target applies to its origin.
+
+`DEPLOYMENT_MODE` accepts `all-in-one`, `api-only`, `indexer-only`, `keeper-only` or `custom`;
+component flags determine the default mode. `READINESS_DB_POLICY`, `READINESS_INDEXER_POLICY`,
+`READINESS_RAILS_POLICY` and `READINESS_KEEPER_POLICY` accept `required`, `optional` or
+`disabled`. Required dependencies without readiness evidence are down. Required down
+returns 503; stale/degraded evidence remains visible as degraded. Optional down degrades
+without returning 503. Disabled checks explicitly carry `effectiveState=disabled` and do not
+certify absent workers. `/ready` includes the resolved mode and dependency policy.
+
+## Database telemetry and diagnostics
+
+`/v1/metrics.database` reports pool active/idle/queued connections, saturation and latency/error
+counts by a fixed set of workload labels. Ingestion writes and API reads have separate labels.
+Each workload retains at most 256 recent latency samples by default (configurable 1–4096 via
+`Database.open`); SQL text, parameters and wallet identifiers are never retained in telemetry
+or slow-query messages. Saturation is visible while requests queue, before a timeout.
+
+Run `npm run diagnostics -- --output diagnostics.json` to collect configuration presence,
+migrations/table counts, persisted worker freshness, source revisions, proof backlog and local
+pool telemetry. `--compact` emits compact JSON; without `--output`, the bundle goes to stdout.
+Every database connection enforces read-only statements. Failed probes retain normalized
+codes and actionable descriptions, so unavailable data is distinguishable from empty history.
+The bundle records its generation time and the code revision (`HYPERION_REVISION`, `GITHUB_SHA`
+or the local Git HEAD when available). URLs, nested authorization/signers and other sensitive
+values are redacted. Output files are created exclusively with mode 0600; choose a new filename
+for each capture. No RPC polling, transactions or wallet operations are performed.
+
+### Rail transition history and transfer cursors
+
+`rail_attestation_history` records actual committed lifecycle changes bound to the source transfer
+id, including changes made by reviewed requeue and destination-proof reorg reconciliation. Identical
+polls create no duplicate entry. Blind backward writes are rejected; repeated real requeue cycles
+retain every transition. History records normalized reasons and bounded public hashes/references,
+without provider response bodies or error credentials.
+
+`GET /v1/transfers` returns `nextCursor` for descending transfer-id pagination. Pass it as `cursor`
+with the same origin/destination/route/sender/recipient/search filters; changing filters or combining
+a cursor with a nonzero offset returns HTTP400 `invalid_cursor`. New inserts sort before the cursor
+and cannot duplicate an already read transfer. Existing offset reads remain available and keep
+their response offset field. A full page can return a cursor whose next page is empty.

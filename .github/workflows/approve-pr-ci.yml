@@ -1,6 +1,9 @@
 name: Automatic PR CI
 
 on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited, ready_for_review]
   issues:
     types: [assigned]
   schedule:
@@ -14,7 +17,7 @@ permissions:
   actions: write
 
 concurrency:
-  group: automatic-pr-ci-${{ github.repository }}
+  group: automatic-pr-ci-${{ github.repository }}-${{ github.event.pull_request.number || 'sweep' }}
   cancel-in-progress: false
 
 jobs:

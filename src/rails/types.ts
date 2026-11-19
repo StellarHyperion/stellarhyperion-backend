@@ -23,6 +23,30 @@
  */
 export type AttestationStatus = "pending" | "attested" | "delivered" | "failed" | "expired";
 
+export const CCTP_VERIFICATION_FAILURES = [
+  "forward_tx_missing",
+  "message_missing",
+  "invalid_message",
+  "configuration_unavailable",
+  "source_transfer_missing",
+  "source_domain_mismatch",
+  "destination_domain_mismatch",
+  "messenger_mismatch",
+  "source_adapter_mismatch",
+  "token_mismatch",
+  "recipient_mismatch",
+  "amount_mismatch",
+  "fee_mismatch",
+  "finality_mismatch",
+  "receipt_missing",
+  "receipt_mismatch",
+  "mint_missing",
+  "receipt_reverted",
+  "confirmations_pending",
+  "non_canonical_receipt",
+] as const;
+export type CctpVerificationFailure = (typeof CCTP_VERIFICATION_FAILURES)[number];
+
 /** Terminal states. Nothing polls a transfer again once it reaches one. */
 export const TERMINAL: readonly AttestationStatus[] = ["delivered", "failed", "expired"];
 
@@ -33,6 +57,11 @@ export function isTerminal(status: AttestationStatus): boolean {
 export interface RailReport {
   readonly forwardTxHash?: `0x${string}`;
   readonly execution?: { readonly txHash: `0x${string}`; readonly commandId: `0x${string}` };
+  readonly quarantine?: {
+    readonly schema: string;
+    readonly providerReference: string | null;
+    readonly payload: unknown;
+  };
   readonly status: AttestationStatus;
   /**
    * The rail's own word for it, verbatim.
@@ -73,6 +102,9 @@ export type RailErrorKind =
    */
   | "rateLimited";
 
+/** Normalized database values describing how, or whether, a failed lookup may be retried. */
+export type RailRetryClass = "transient" | "rate_limited" | "permanent" | "exhausted";
+
 export class RailError extends Error {
   constructor(
     readonly rail: string,
@@ -97,8 +129,23 @@ export interface PendingTransfer {
   /** Null until the first check. */
   readonly status: AttestationStatus | null;
   readonly checkFailures: number;
+  readonly retryAttempts: number;
   /** True when an inbound delivery already exists, which settles it without asking the rail. */
   readonly delivered: boolean;
+}
+
+/** An operator's review, required before a terminal transfer can re-enter the rail queue. */
+export interface RailRequeueRequest {
+  readonly transferId: bigint;
+  readonly reviewedBy: string;
+  readonly reason: string;
+}
+
+/** The prior terminal state recorded alongside the requeue audit entry. */
+export interface RailRequeueResult {
+  readonly transferId: bigint;
+  readonly route: number;
+  readonly priorStatus: "pending" | "attested" | "failed" | "expired";
 }
 
 /** What a rail client has to offer the pass that polls it. */
@@ -106,4 +153,78 @@ export interface RailClient {
   readonly rail: string;
   /** Throws `RailError`; returns `missing` rather than throwing for a transfer not yet indexed. */
   look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup>;
+}
+
+export type MissingProofStage =
+  "provider_discovery" | "destination_receipt_verification" | "attestation_reconciliation";
+
+export type BacklogRetryState = "never_checked" | "cooling_down" | "not_due" | "overdue" | "held";
+
+export interface BacklogDelayBreakdown {
+  readonly totalAgeMs: number;
+  readonly providerDiscoveryDelayMs: number | null;
+  readonly receiptVerificationDelayMs: number | null;
+  readonly overdueByMs: number;
+}
+
+export interface BacklogCandidate {
+  readonly transferId: string;
+  readonly route: number;
+  readonly originChain: string;
+  readonly destinationChain: string;
+  readonly nonce: string;
+  readonly grossAmount: string;
+  readonly fee: string;
+  readonly netAmount: string;
+  readonly originBlock: string;
+  readonly originTx: string;
+  readonly observedAt: string;
+  readonly attestationStatus: AttestationStatus | null;
+  readonly railStatus: string | null;
+  readonly verificationFailure: CctpVerificationFailure | null;
+  readonly railReference: string | null;
+  readonly attestedAt: string | null;
+  readonly lastCheckedAt: string | null;
+  readonly checkFailures: number;
+  readonly retryAttempts: number;
+  readonly retryClass: RailRetryClass | null;
+  readonly retryState: BacklogRetryState;
+  readonly lastError: string | null;
+  readonly missingProofStage: MissingProofStage;
+  readonly overdue: boolean;
+  readonly delays: BacklogDelayBreakdown;
+}
+
+export interface BacklogInspectionReport {
+  readonly generatedAt: string;
+  readonly readOnly: true;
+  readonly parameters: {
+    readonly routes: readonly number[];
+    readonly destinationChain: string | null;
+    readonly stage: MissingProofStage | null;
+    readonly retryClass: RailRetryClass | null;
+    readonly overdueOnly: boolean;
+    readonly recheckAfterMs: number;
+    readonly maxCheckFailures: number;
+  };
+  readonly summary: {
+    readonly totalMatching: number;
+    readonly overdueCount: number;
+    readonly heldCount: number;
+    readonly oldestAgeMs: number | null;
+    readonly maxProviderDiscoveryDelayMs: number | null;
+    readonly maxReceiptVerificationDelayMs: number | null;
+    readonly byDestination: Readonly<Record<string, number>>;
+    readonly byRoute: Readonly<Record<string, number>>;
+    readonly byStage: Readonly<Record<MissingProofStage, number>>;
+    readonly byRetryClass: Readonly<Record<string, number>>;
+    readonly byRetryState: Readonly<Record<BacklogRetryState, number>>;
+  };
+  readonly pageInfo: {
+    readonly limit: number;
+    readonly sort: "asc" | "desc";
+    readonly hasMore: boolean;
+    readonly nextCursor: string | null;
+  };
+  readonly candidates: readonly BacklogCandidate[];
 }
