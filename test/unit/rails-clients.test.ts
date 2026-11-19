@@ -17,6 +17,9 @@ import {
   isIrisMessage,
   isIrisResponsePayload,
   IrisClient,
+  MAX_IRIS_ATTESTATION_BYTES,
+  MAX_IRIS_MESSAGE_BYTES,
+  MAX_IRIS_RESPONSE_BYTES,
   reportFor,
 } from "../../src/rails/cctp/iris.js";
 import { RailError, type PendingTransfer } from "../../src/rails/types.js";
@@ -371,6 +374,36 @@ describe("Circle's Iris", () => {
         error.kind === "transient" &&
         error.message.includes("invalid iris message in response payload"),
     );
+  });
+
+  it("rejects an oversized provider envelope before parsing it", async () => {
+    const { fetch } = answering(200, {
+      data: [{ status: "pending_confirmations" }],
+      padding: "x".repeat(MAX_IRIS_RESPONSE_BYTES),
+    });
+    await expect(new IrisClient("testnet", { fetch }).look(TRANSFER)).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof RailError &&
+        error.kind === "permanent" &&
+        error.message.includes("resource limit exceeded"),
+    );
+  });
+
+  it("classifies oversized messages and attestations as resource-limit failures", async () => {
+    for (const [field, size] of [
+      ["message", MAX_IRIS_MESSAGE_BYTES],
+      ["attestation", MAX_IRIS_ATTESTATION_BYTES],
+    ] as const) {
+      const { fetch } = answering(200, {
+        data: [{ status: "complete", [field]: "x".repeat(size + 1) }],
+      });
+      await expect(new IrisClient("testnet", { fetch }).look(TRANSFER)).rejects.toSatisfy(
+        (error: unknown) =>
+          error instanceof RailError &&
+          error.kind === "permanent" &&
+          error.message.includes(`resource limit exceeded: ${field}`),
+      );
+    }
   });
 
   it("maps various status strings across v1 and v2 formats", () => {
