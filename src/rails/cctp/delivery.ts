@@ -10,7 +10,7 @@ import {
 } from "@hyperion/protocol";
 import { createPublicClient, http, type Hex } from "viem";
 import type { AppConfig } from "../../config/config.js";
-import type { Transactional } from "../../db/pool.js";
+import type { Queryable } from "../../db/pool.js";
 import { bigintOf, text } from "../../db/rows.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 import type { VerifiedDelivery } from "../axelar/delivery.js";
@@ -18,7 +18,7 @@ import { matchingCctpPayment, verifiedCctpMessage, type ExpectedCctpTransfer } f
 
 export async function verifyCctpDelivery(
   config: AppConfig,
-  db: Transactional,
+  db: Queryable,
   transfer: PendingTransfer,
   report: RailReport,
 ): Promise<VerifiedDelivery | null> {
