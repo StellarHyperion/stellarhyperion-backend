@@ -11,8 +11,48 @@ import { createLogger } from "../src/logging/logger.js";
 
 let app: FastifyInstance | null = null;
 let initializing: Promise<FastifyInstance> | null = null;
+let db: Database | null = null;
 
-async function initializeApp(): Promise<FastifyInstance> {
+export async function checkAppHealth(): Promise<void> {
+  if (!db || !app) {
+    app = null;
+    initializing = null;
+    db = null;
+    throw new Error("Application not initialized");
+  }
+  try {
+    await db.ping();
+  } catch (error) {
+    const deadApp = app;
+    const deadDb = db;
+    app = null;
+    initializing = null;
+    db = null;
+    await deadApp.close().catch(() => undefined);
+    await deadDb.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function closeApp(): Promise<void> {
+  const currentApp = app;
+  const currentDb = db;
+  app = null;
+  initializing = null;
+  db = null;
+  if (currentApp) {
+    await currentApp.close().catch(() => undefined);
+  }
+  if (currentDb) {
+    await currentDb.close().catch(() => undefined);
+  }
+}
+
+export function getDb(): Database | null {
+  return db;
+}
+
+export async function initializeApp(): Promise<FastifyInstance> {
   if (app) return app;
 
   process.env.VERCEL_ENV ??= "production";
@@ -36,23 +76,25 @@ async function initializeApp(): Promise<FastifyInstance> {
   const logger = createLogger(config);
   const startedAt = new Date();
 
-  const db = Database.open(config.databaseUrl, {
+  const candidateDb = Database.open(config.databaseUrl, {
     applicationName: "hyperion-vercel-api",
     connectionTimeoutMs: 2000,
     readOnly: true,
+    max: 2,
+    maxConnections: 2,
   });
   try {
-    await checkSchemaCompatibility(db, config.schemaVersion);
-    await checkDatabasePolicy(db, config);
+    await checkSchemaCompatibility(candidateDb, config.schemaVersion);
+    await checkDatabasePolicy(candidateDb, config);
   } catch (error) {
-    await db.close();
+    await candidateDb.close();
     throw error;
   }
 
   const candidate = buildServer({
     config,
     logger,
-    db,
+    db: candidateDb,
     ...(config.redisUrl.length > 0 ? { redis: createApiRedis(config.redisUrl) } : {}),
     readiness: [],
     startedAt,
@@ -62,15 +104,19 @@ async function initializeApp(): Promise<FastifyInstance> {
     await candidate.ready();
   } catch (error) {
     await candidate.close();
-    await db.close();
+    await candidateDb.close();
     throw error;
   }
+  db = candidateDb;
   app = candidate;
   return candidate;
 }
 
-function getApp(): Promise<FastifyInstance> {
-  if (app) return Promise.resolve(app);
+export async function getApp(): Promise<FastifyInstance> {
+  if (app) {
+    await checkAppHealth();
+    return app;
+  }
   initializing ??= initializeApp().catch((error: unknown) => {
     initializing = null;
     throw error;

@@ -78,6 +78,14 @@ and a separately provisioned worker credential. Keep migration privileges separa
 
 Vercel's installed Git integration publishes `main`. GitHub Actions runs validation and the scheduled indexer; it does not need a Vercel deployment token.
 
+### Serverless deployment (Vercel)
+
+Serverless invocations via `api/index.ts` reuse a cached Fastify application and database connection pool across warm invocations within an execution environment. To avoid exhausting connection limits across concurrent serverless instances, the database pool is restricted to a maximum of 2 connections (`max: 2`).
+
+On each invocation that reuses a cached application instance, a health check (`checkAppHealth`) pings the database (`db.ping()`). If the connection has dropped or failed during idle periods, cached application and database instances are torn down and reset (`app = null`, `initializing = null`), forcing clean re-initialization on the next call rather than caching broken connections.
+
+Background processes must be disabled in serverless functions: `INDEXER_ENABLED=false`, `RAILS_ENABLED=false`, and `KEEPER_ENABLED=false`. Furthermore, database credentials must use `HYPERION_DATABASE_ROLE=read-only`.
+
 ## What establishes status
 
 Stellar router events establish source transfers and claim changes. The EVM watcher indexes configured Hyperion routers with confirmation and reorg checks. The default record does not deploy an EVM Hyperion router.

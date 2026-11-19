@@ -68,6 +68,8 @@ export interface OpenOptions {
   readonly readOnly?: boolean;
   /** Low by default. Two watchers and an HTTP server do not need twenty connections. */
   readonly maxConnections?: number;
+  /** Alias for maxConnections matching pg PoolConfig. */
+  readonly max?: number;
   readonly connectionTimeoutMs?: number;
   readonly statementTimeoutMs?: number;
   readonly applicationName?: string;
@@ -96,7 +98,7 @@ export class Database implements Transactional {
   }
 
   static open(connectionString: string, options: OpenOptions = {}): Database {
-    const maxConnections = options.maxConnections ?? 10;
+    const maxConnections = options.maxConnections ?? options.max ?? 10;
     const config: PoolConfig = {
       connectionString,
       max: maxConnections,
