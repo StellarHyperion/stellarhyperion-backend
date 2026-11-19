@@ -40,7 +40,10 @@ export async function processClaimSettlement(
     try {
       const hash = await submitStellar(
         ctx.config,
+        ctx.db,
+        chain.chain,
         chain.routerContractId,
+        "settle_claim",
         "settle_claim",
         (sender) => [new Address(sender).toScVal(), nativeToScVal(id, { type: "u64" })],
         { db: ctx.db, jobName: "claim-settlement" },

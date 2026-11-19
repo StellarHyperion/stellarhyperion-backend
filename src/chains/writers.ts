@@ -1,3 +1,4 @@
+import { bounded, safeString } from "../rails/axelar/gmp.js";
 /**
  * Every statement that writes an indexed row, in one file, for both chain families.
  *
@@ -395,6 +396,142 @@ export interface AttestationRow {
   readonly retryAttempts: number;
   readonly nextAttemptAt: Date | null;
   readonly retryClass: RailRetryClass | null;
+}
+
+export interface AxelarQuarantineRow {
+  readonly transferId: bigint;
+  readonly sourceTxHash: string;
+  readonly providerReference: string | null;
+  readonly schema: string;
+  readonly payload: unknown;
+}
+
+export interface AxelarDeliveryEvidenceRow {
+  readonly transferId: bigint;
+  readonly destinationChain: string;
+  readonly commandId: string;
+  readonly executionTxHash: string;
+  readonly receiptBlock: bigint;
+  readonly receiptBlockHash: string;
+  readonly itsAddress: string;
+  readonly tokenId: string;
+  readonly registeredToken: string;
+  readonly tokenManager: string;
+  readonly tokenManagerBlock: bigint;
+  readonly tokenManagerBlockHash: string;
+  readonly paymentLogIndex: number;
+  readonly paymentRecipient: string;
+  readonly paymentAmount: bigint;
+}
+
+export async function writeAxelarQuarantine(
+  db: Queryable,
+  row: AxelarQuarantineRow,
+): Promise<void> {
+  await db.query(
+    `INSERT INTO axelar_status_quarantine
+       (transfer_id, source_tx_hash, provider_reference, provider_reference_key, schema, payload)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (transfer_id, source_tx_hash, provider_reference_key)
+     DO UPDATE SET schema = EXCLUDED.schema,
+                   payload = EXCLUDED.payload,
+                   last_seen_at = now(),
+                   replay_count = axelar_status_quarantine.replay_count + 1`,
+    [
+      row.transferId.toString(),
+      row.sourceTxHash,
+      row.providerReference === null ? null : safeString(row.providerReference),
+      row.providerReference === null ? "" : safeString(row.providerReference),
+      safeString(row.schema),
+      JSON.stringify(bounded(row.payload)),
+    ],
+  );
+}
+
+export async function writeAxelarDeliveryEvidence(
+  db: Queryable,
+  row: AxelarDeliveryEvidenceRow,
+): Promise<bigint> {
+  await db.query(
+    `UPDATE axelar_delivery_evidence
+        SET status = 'superseded'
+      WHERE transfer_id = $1 AND status = 'canonical'
+        AND (command_id, execution_tx_hash, payment_log_index)
+            IS DISTINCT FROM ($2, $3, $4)`,
+    [row.transferId.toString(), row.commandId, row.executionTxHash, row.paymentLogIndex],
+  );
+  const { rows } = await db.query(
+    `INSERT INTO axelar_delivery_evidence
+       (transfer_id, destination_chain, status, command_id, execution_tx_hash, receipt_status,
+        receipt_block, receipt_block_hash, its_address, token_id, registered_token, token_manager,
+        token_manager_block, token_manager_block_hash, payment_log_index, payment_recipient,
+        payment_amount, last_revalidated_at)
+     VALUES ($1, $2, 'canonical', $3, $4, 'success', $5, $6, $7, $8, $9, $10, $11, $12,
+             $13, $14, $15, now())
+     ON CONFLICT (transfer_id, command_id, execution_tx_hash, payment_log_index) DO UPDATE
+       SET status = 'canonical',
+           destination_chain = EXCLUDED.destination_chain,
+           receipt_status = EXCLUDED.receipt_status,
+           receipt_block = EXCLUDED.receipt_block,
+           receipt_block_hash = EXCLUDED.receipt_block_hash,
+           its_address = EXCLUDED.its_address,
+           token_id = EXCLUDED.token_id,
+           registered_token = EXCLUDED.registered_token,
+           token_manager = EXCLUDED.token_manager,
+           token_manager_block = EXCLUDED.token_manager_block,
+           token_manager_block_hash = EXCLUDED.token_manager_block_hash,
+           payment_recipient = EXCLUDED.payment_recipient,
+           payment_amount = EXCLUDED.payment_amount,
+           last_revalidated_at = now()
+     RETURNING id`,
+    [
+      row.transferId.toString(),
+      row.destinationChain,
+      row.commandId,
+      row.executionTxHash,
+      row.receiptBlock.toString(),
+      row.receiptBlockHash,
+      row.itsAddress,
+      row.tokenId,
+      row.registeredToken,
+      row.tokenManager,
+      row.tokenManagerBlock.toString(),
+      row.tokenManagerBlockHash,
+      row.paymentLogIndex,
+      row.paymentRecipient,
+      row.paymentAmount.toString(),
+    ],
+  );
+  const id = rows[0]?.id;
+  if (typeof id !== "string" && typeof id !== "number" && typeof id !== "bigint")
+    throw new Error("Axelar delivery evidence insert did not return its id.");
+  return BigInt(id);
+}
+
+export async function linkAxelarDeliveryEvidence(
+  db: Queryable,
+  row: AxelarDeliveryEvidenceRow,
+  evidenceId: bigint,
+): Promise<void> {
+  const { rowCount } = await db.query(
+    `UPDATE inbound_delivery
+        SET axelar_evidence_id = $5
+      WHERE destination_chain = $1 AND route = 1
+        AND destination_block = $2 AND destination_tx = $3
+        AND destination_log_index = $6
+        AND delivered = true
+        AND (source_chain, source_nonce) =
+            (SELECT origin_chain, nonce FROM outbound_transfer WHERE id = $4)`,
+    [
+      row.destinationChain,
+      row.receiptBlock.toString(),
+      row.executionTxHash,
+      row.transferId.toString(),
+      evidenceId.toString(),
+      row.paymentLogIndex,
+    ],
+  );
+  if (rowCount !== 1) throw new Error("Axelar evidence did not match its inbound delivery.");
 }
 
 export async function writeAttestation(db: Queryable, row: AttestationRow): Promise<void> {

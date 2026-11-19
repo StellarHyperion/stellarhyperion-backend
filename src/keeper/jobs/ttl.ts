@@ -50,7 +50,10 @@ export async function processTtlBump(
   const vector = (values: xdr.ScVal[]) => xdr.ScVal.scvVec(values);
   const hash = await submitStellar(
     ctx.config,
+    ctx.db,
+    chain.chain,
     chain.routerContractId,
+    "keep_alive",
     "keep_alive",
     () => [
       vector(tokens.map((token) => new Address(token).toScVal())),
@@ -58,7 +61,6 @@ export async function processTtlBump(
       vector(claims.map((id) => nativeToScVal(id, { type: "u64" }))),
       vector(transfers.map((id) => nativeToScVal(id, { type: "u64" }))),
     ],
-    { db: ctx.db, jobName: "ttl-bump" },
   );
   ctx.logger.info({ hash }, "router keep_alive confirmed");
   return {
