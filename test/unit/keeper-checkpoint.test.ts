@@ -1,7 +1,6 @@
 import { Account, Keypair, rpc } from "@stellar/stellar-sdk";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../../src/config/config.js";
-import type { Transactional } from "../../src/db/pool.js";
 import { submitStellar } from "../../src/keeper/stellar.js";
 import { BudgetTracker, runBudgetedCatchUp } from "../../src/runtime/budget.js";
 import { checkSchemaCompatibility, EXPECTED_SCHEMA_VERSION } from "../../src/db/schema.js";
@@ -55,7 +54,7 @@ function fixture() {
   const submit = () =>
     submitStellar(
       config,
-      db as Transactional,
+      db,
       config.indexer.stellar!.chain,
       config.indexer.stellar!.routerContractId,
       "keep_alive",

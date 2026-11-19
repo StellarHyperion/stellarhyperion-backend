@@ -59,6 +59,8 @@ suite("the schema", () => {
     const names = rows.map((row) => String(row.table_name));
     for (const table of [
       "admin_action",
+      "axelar_delivery_evidence",
+      "axelar_status_quarantine",
       "inbound_delivery",
       "indexed_history_digest",
       "indexer_cursor",

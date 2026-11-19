@@ -9,12 +9,14 @@ import {
 const recipient = "0x1111111111111111111111111111111111111111";
 const its = "0x2222222222222222222222222222222222222222";
 const token = "0x3333333333333333333333333333333333333333";
+const tokenManager = "0x4444444444444444444444444444444444444444";
 const commandId: Hex = `0x${"ab".repeat(32)}`;
 const tokenId: Hex = `0x${"cd".repeat(32)}`;
 const source = stringToHex("Gsource");
 const expected: ExpectedDelivery = {
   its,
   token,
+  tokenManager,
   commandId,
   tokenId,
   sourceChain: "stellar-2026-q1-2",
@@ -40,7 +42,7 @@ const paid: DeliveryLog = {
   topics: encodeEventTopics({
     abi: ITS_ABI,
     eventName: "Transfer",
-    args: { from: its, to: recipient },
+    args: { from: tokenManager, to: recipient },
   }) as [Hex, ...Hex[]],
   data: encodeAbiParameters([{ type: "uint256" }], [expected.amount]),
   logIndex: 3,
@@ -59,6 +61,7 @@ describe("Destination delivery evidence", () => {
     "sourceChain",
     "sourceAddress",
     "recipient",
+    "tokenManager",
   ] as const)("rejects mismatched %s", (key) => {
     expect(matchingPayment([received, paid], { ...expected, [key]: "different" })).toBeNull();
   });

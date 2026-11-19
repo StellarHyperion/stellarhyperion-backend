@@ -33,6 +33,11 @@ export function isTerminal(status: AttestationStatus): boolean {
 export interface RailReport {
   readonly forwardTxHash?: `0x${string}`;
   readonly execution?: { readonly txHash: `0x${string}`; readonly commandId: `0x${string}` };
+  readonly quarantine?: {
+    readonly schema: string;
+    readonly providerReference: string | null;
+    readonly payload: unknown;
+  };
   readonly status: AttestationStatus;
   /**
    * The rail's own word for it, verbatim.
