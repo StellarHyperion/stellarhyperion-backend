@@ -55,6 +55,10 @@ export async function quarantineEvmLog(
   entry: EvmLogQuarantine,
   observedAt: Date,
 ): Promise<void> {
+  // Serialize retention with insertion so concurrent replicas keep the same database bound.
+  await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+    "evm-quarantine:" + entry.chainKey,
+  ]);
   await db.query(
     `INSERT INTO evm_log_quarantine
        (chain_key, block_number, transaction_hash, log_index, event_name, reason, observed_at)
@@ -69,6 +73,15 @@ export async function quarantineEvmLog(
       entry.reason,
       observedAt,
     ],
+  );
+  await db.query(
+    `DELETE FROM evm_log_quarantine
+      WHERE chain_key = $1 AND (block_number, transaction_hash, log_index, reason) IN (
+        SELECT block_number, transaction_hash, log_index, reason FROM evm_log_quarantine
+         WHERE chain_key = $1
+         ORDER BY block_number DESC, transaction_hash, log_index, reason OFFSET 1000
+      )`,
+    [entry.chainKey],
   );
 }
 

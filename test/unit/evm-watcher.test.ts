@@ -350,6 +350,37 @@ describe("an arrival, which the capture has none of", () => {
     return rows[0]?.params ?? [];
   }
 
+  it("excludes every reversed pair after the diagnostic budget is exhausted", async () => {
+    const logs = Array.from({ length: 60 }, (_, index) => {
+      const [parked, inbound] = parkedDelivery(60n);
+      const transactionHash = `0x${index.toString(16).padStart(64, "0")}` as `0x${string}`;
+      if (!parked || !inbound) throw new Error("missing pair");
+      return [
+        { ...inbound, logIndex: 0, transactionHash },
+        { ...parked, logIndex: 1, transactionHash },
+      ];
+    }).flat();
+    const { watcher, db } = harness({
+      client: new FakeEvmClient({ head: 100n, logs }),
+      confirmations: 0,
+    });
+    await watcher.tick(AbortSignal.timeout(5_000));
+    expect(db.matching("INSERT INTO inbound_delivery")).toHaveLength(0);
+    expect(db.matching("INSERT INTO pending_claim")).toHaveLength(0);
+    expect(db.matching("INSERT INTO evm_log_quarantine")).toHaveLength(100);
+    expect(cursorWrites(db)).toHaveLength(1);
+  });
+
+  it("normalizes provider enumeration order before pairing a valid arrival", async () => {
+    const client = new FakeEvmClient({ head: 100n, logs: parkedDelivery(60n) });
+    const getLogs = client.logs.bind(client);
+    client.logs = async (query) => [...(await getLogs(query))].reverse();
+    const { watcher, db } = harness({ client, confirmations: 0 });
+    await watcher.tick(AbortSignal.timeout(5_000));
+    expect(db.matching("INSERT INTO evm_log_quarantine")).toHaveLength(0);
+    expect(db.matching("INSERT INTO inbound_delivery")[0]?.params[8]).toBe(false);
+  });
+
   it("records a delivery that landed as delivered, with no claim", async () => {
     // A BridgeIn on its own. The log carries no flag saying it succeeded, so "no ClaimParked in
     // this transaction" is the only evidence there is.
