@@ -25,6 +25,20 @@ node --env-file=.env dist/main.js
 
 The SDK is installed from the committed protocol tarball. `npm run dev` does not load `.env` automatically; export the variables first or run `node --env-file=.env --watch --experimental-strip-types src/main.ts`.
 
+### Startup schema compatibility check
+
+Before the server accepts requests or the indexer reads a cursor, the process verifies that the database has been migrated to the schema version this build expects (`SCHEMA_VERSION`, defaulting to the newest migration file). The check reads `pgmigrations` and refuses to start unless the complete shipped migration manifest matches the applied schema (including the newest step). It never runs migrations itself: apply them with `npm run migrate:up` first. The failure message names only the variable and the expected shape, never the database connection string.
+
+### Bounded catch-up runtime budget
+
+Enable `CATCH_UP_ENABLED=true` for scheduled runs; continuous containers have no lifetime limit. Apply migrations explicitly before startup. The scheduled process divides its wall-clock budget (`CATCH_UP_BUDGET_MS`, default 120000ms) among migrations, source scans, proof polling and graceful drain. A slow stage cannot consume the entire shutdown safety margin: source scans and proof polling receive bounded stage allocations with a reserved drain window and the run moves on when its slice is spent. Work already committed to the database survives budget expiration, and the shutdown log reports why the run stopped and which stage remains eligible for the next run.
+
+### Continuous-container readiness and graceful rollout
+
+Before indexing shared cursors, a replica acquires an expiring lease per chain/router in the existing cursor lease storage so two active replicas never advance the same cursor. The lease TTL (`INDEXER_LEASE_TTL_MS`, default 30000ms) is renewed while the replica is healthy and released during graceful shutdown. A replica that loses its lease stops indexing until it can re-acquire ownership.
+
+`INDEXER_LEASE_OWNER_ID` names this replica; it defaults to hostname plus process id, with an independently unique worker suffix. Health probes (`GET /ready`) report lease ownership together with Postgres, Redis and watcher state, so a load balancer takes a replica out of rotation when it cannot do its job and puts it back when it recovers. The Dockerfile exposes `/ready` as a HEALTHCHECK endpoint.
+
 Run the watchers and rail pollers in a continuous process or in regular scheduled catch-up windows. Deploying only `api/index.ts` provides reads from an existing database; it does not run indexing in the background. Set the frontend's `NEXT_PUBLIC_HYPERION_API_URL` to this service's origin. Public API reads support cross-origin GET requests.
 
 ## Deploy on Vercel
@@ -79,7 +93,40 @@ A claim number identifies funds parked by a destination router after an unsucces
 
 `KEEPER_ENABLED=true` enables BullMQ jobs for router `keep_alive` and Stellar `settle_claim`. Supply a funded testnet `KEEPER_STELLAR_SECRET` from your secret store to submit them. With no signer, jobs report zero confirmed changes and dry-run status. Secrets are redacted from structured logs.
 
-One process serializes its Stellar submissions to avoid sequence conflicts. Run only one active keeper signer process, or give replicas separate accounts. The keeper counts confirmations and leaves database claim/delivery changes to indexed events. It does not perform rail second-step delivery or gas top-ups. TTL maintenance covers configured router tokens/routes and recent indexed transfer/claim entries; it is not a guarantee that every adapter or upstream storage entry remains live.
+### Signed transaction checkpoints
+
+Before a signed keeper transaction is broadcast, its hash, intended operation, chain and contract are durably written to `keeper_checkpoint` with state `submitted`. Only a definitive terminal outcome changes the row to `confirmed` or `failed`; ambiguous responses and timeouts remain `submitted` and block new envelopes, so an unknown broadcast outcome can be reconciled by the saved hash before retrying. Recovery never generates a second claim payment attempt blindly, and no secret key or signed credential material appears in logs.
+
+PostgreSQL serializes submissions across replicas sharing a signer. Keep at least two pool connections available: one holds the signer lock while independent journal writes commit before broadcast. The keeper counts confirmations and leaves database claim/delivery changes to indexed events. It does not perform rail second-step delivery or gas top-ups. TTL maintenance covers configured router tokens/routes and recent indexed transfer/claim entries; it is not a guarantee that every adapter or upstream storage entry remains live.
+
+When simulation reports an archived Soroban footprint, the keeper submits the protocol's
+`restoreFootprint` operation for that exact footprint. Its signed public hash is journaled under
+the `restore` phase before broadcast. An uncertain restore blocks further signing until that
+hash is reconciled. After confirmed restoration, the keeper fetches a fresh signer sequence
+and simulates the unchanged `keep_alive` or `settle_claim` call again. Claims remain in the
+indexed database with their original recipient and amount; no database `archived` flag or
+router-specific restore method is assumed. A footprint still requiring restoration after this
+bounded attempt fails explicitly.
+
+### Reconciliation test tooling
+
+`test/tooling/proof-corpus.ts` runs independent mutations through the real CCTP and ITS
+receipt verifiers and records each mutation, expected outcome and observed verifier result.
+Recipient, amount, token, domain and canonical block hash mutations must be rejected;
+unrelated receipt logs must preserve a valid proof. Mock provider exceptions fail the harness.
+
+`docs/api-response-contracts.json` publishes the required transfer and claim response shapes.
+`test/tooling/api-contract.ts` validates actual Fastify responses against those shapes and
+compares recorded fixtures across versions, including nested field removal, integer-string
+coercion, token identity changes and additive metadata.
+
+With a dedicated migrated `TEST_DATABASE_URL`, `test/integration/load-benchmark.test.ts`
+creates deterministic 32- and 512-transfer histories through the actual ingestion writers,
+including pending/attested proof states, delivered rows and canonical replay. It emits
+`HYPERION_DATABASE_BENCHMARK` reports with ingestion/scan timings, query costs, buffer counts
+and `EXPLAIN ANALYZE` plan nodes. Bounds are regression limits on these fixtures, not a
+production throughput guarantee. The suite refuses to substitute an empty database query
+for a seeded history.
 
 ## API and checks
 

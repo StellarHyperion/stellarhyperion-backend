@@ -11,6 +11,8 @@
  * cast. That is the point of the shared package: there is one description of where Hyperion is
  * deployed, one validator for it, and the backend is not allowed its own opinion.
  */
+import { hostname } from "node:os";
+import { EXPECTED_SCHEMA_VERSION } from "../db/schema.js";
 import { readFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 
@@ -25,6 +27,8 @@ import {
   isStellarChain,
   isStellarDeployment,
   parseDeploymentSet,
+  RAIL_CONTRACTS,
+  RouteKind,
 } from "@hyperion/protocol";
 
 import type { EnumSpec, VarSpec } from "./env.js";
@@ -132,6 +136,11 @@ export interface AppConfig {
   readonly readinessPolicy: ReadinessDependencyPolicies;
   readonly freshnessSlo: FreshnessSloConfig;
   readonly shutdownTimeoutMs: number;
+  readonly schemaVersion: string;
+  readonly catchUpBudgetMs: number;
+  readonly catchUpEnabled: boolean;
+  readonly indexerLeaseTtlMs: number;
+  readonly indexerLeaseOwnerId: string;
 }
 
 /** Injected so the unit suite can hand over a record without touching a disk or a process. */
@@ -350,6 +359,53 @@ const SHUTDOWN_TIMEOUT_MS: VarSpec = {
   min: 100,
   printable: true,
   purpose: "How long shutdown waits for in-flight work before it stops waiting.",
+};
+
+const SCHEMA_VERSION: VarSpec = {
+  name: "SCHEMA_VERSION",
+  kind: "string",
+  required: false,
+  fallback: EXPECTED_SCHEMA_VERSION,
+  printable: true,
+  purpose: "Expected shipped migration version; an override cannot weaken schema admission.",
+};
+const CATCH_UP_BUDGET_MS: VarSpec = {
+  name: "CATCH_UP_BUDGET_MS",
+  kind: "integer",
+  required: false,
+  fallback: "120000",
+  min: 1000,
+  max: 3600000,
+  printable: true,
+  purpose:
+    "Total budget for explicit scheduled catch-up mode; continuous servers have no lifetime limit.",
+};
+const CATCH_UP_ENABLED: VarSpec = {
+  name: "CATCH_UP_ENABLED",
+  kind: "boolean",
+  required: false,
+  fallback: "false",
+  printable: true,
+  purpose:
+    "Run bounded source-scan and proof-polling stages then drain instead of serving continuously.",
+};
+const INDEXER_LEASE_TTL_MS: VarSpec = {
+  name: "INDEXER_LEASE_TTL_MS",
+  kind: "integer",
+  required: false,
+  fallback: "30000",
+  min: 5000,
+  max: 300000,
+  printable: true,
+  purpose: "TTL for the existing cursor ownership lease, fenced inside each write transaction.",
+};
+const INDEXER_LEASE_OWNER_ID: VarSpec = {
+  name: "INDEXER_LEASE_OWNER_ID",
+  kind: "string",
+  required: false,
+  fallback: "",
+  printable: true,
+  purpose: "Replica ownership prefix; each worker also has a unique identity.",
 };
 
 const DEPLOYMENT_MODE: EnumSpec<DeploymentMode> = {
@@ -591,6 +647,14 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const deploymentsPath = reader.string(DEPLOYMENTS_FILE);
   const indexerEnabled = reader.boolean(INDEXER_ENABLED);
   const shutdownTimeoutMs = reader.integer(SHUTDOWN_TIMEOUT_MS);
+  const schemaVersion = reader.string(SCHEMA_VERSION);
+  if (schemaVersion !== EXPECTED_SCHEMA_VERSION)
+    reader.reject(SCHEMA_VERSION, "must match this build's shipped migration version");
+  const catchUpBudgetMs = reader.integer(CATCH_UP_BUDGET_MS);
+  const catchUpEnabled = reader.boolean(CATCH_UP_ENABLED);
+  const indexerLeaseTtlMs = reader.integer(INDEXER_LEASE_TTL_MS);
+  const indexerLeaseOwnerId =
+    reader.string(INDEXER_LEASE_OWNER_ID) || `${hostname()}:${process.pid}`;
 
   const railsEnabled = reader.boolean(RAILS_ENABLED);
   const irisOverride = reader.url(IRIS_API_URL);
@@ -716,6 +780,11 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       lanes: freshnessLanes,
     },
     shutdownTimeoutMs,
+    schemaVersion,
+    catchUpBudgetMs,
+    catchUpEnabled,
+    indexerLeaseTtlMs,
+    indexerLeaseOwnerId,
   };
 }
 
@@ -875,6 +944,30 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
       DEPLOYMENTS_FILE,
       `names ${wrongNetwork.join(", ")}, which is not a ${input.network} chain. Split the record or change HYPERION_NETWORK.`,
     );
+  }
+
+  const stellarDeployment = Object.values(input.deployments.networks).find(
+    (deployment) => isStellarDeployment(deployment) && RouteKind.AxelarIts in deployment.adapters,
+  );
+  if (stellarDeployment !== undefined) {
+    // Direct ITS payouts use the deployed protocol service, not a Hyperion EVM router.
+    // Restrict admission to valid receiver metadata on this network; receipt verification
+    // independently checks the actual destination service, peer, token and payment.
+    const hasReceiver = chainsFor(input.network).some((chain) => {
+      if (!isEvmChain(chain)) return false;
+      const receiver = RAIL_CONTRACTS[chain.key]?.axelar?.interchainTokenService;
+      return (
+        receiver !== undefined &&
+        /^0x[0-9a-fA-F]{40}$/.test(receiver) &&
+        !/^0x0{40}$/.test(receiver)
+      );
+    });
+    if (!hasReceiver) {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        "enables axelar-its without a supported deployed destination receiver; admission is blocked until receiver metadata is present",
+      );
+    }
   }
 
   for (const [key, deployment] of Object.entries(input.deployments.networks)) {
