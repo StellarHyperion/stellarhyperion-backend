@@ -25,9 +25,11 @@ import type { InboundRow, Position } from "../../chains/writers.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 
 import { ITS_ABI, matchingPayment } from "./events.js";
+import type { LaneAcceptanceEvidence } from "../acceptance.js";
 export interface VerifiedDelivery {
   readonly at: Position;
   readonly row: InboundRow;
+  readonly evidence: LaneAcceptanceEvidence;
 }
 
 // The rail API supplies a candidate receipt. Only matching confirmed chain events establish delivery.
@@ -136,6 +138,15 @@ export async function verifyItsDelivery(
       amount,
       delivered: true,
       claimId: null,
+    },
+    evidence: {
+      sourceIndexed: true,
+      providerDiscovered: true,
+      destinationReceiptVerified: true,
+      paymentMatched: true,
+      tokenMatched: true,
+      amountMatched: true,
+      networkMatched: true,
     },
   };
 }

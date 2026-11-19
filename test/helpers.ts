@@ -36,3 +36,29 @@ export function completeEnv(
     ...overrides,
   };
 }
+
+/** Run workers together and retain every outcome, including rejected transactions. */
+export async function runConcurrent<T>(
+  workers: number,
+  task: (worker: number) => Promise<T>,
+): Promise<PromiseSettledResult<T>[]> {
+  if (!Number.isInteger(workers) || workers < 1) throw new RangeError("workers must be positive");
+  return Promise.allSettled(Array.from({ length: workers }, (_, worker) => task(worker)));
+}
+
+/** A start gate for tests that must prove work overlaps rather than merely repeats. */
+export function concurrencyBarrier(parties: number): {
+  readonly wait: () => Promise<void>;
+} {
+  if (!Number.isInteger(parties) || parties < 2) throw new RangeError("parties must be at least 2");
+  let arrived = 0;
+  let release: (() => void) | null = null;
+  const opened = new Promise<void>((resolve) => (release = resolve));
+  return {
+    wait: () => {
+      arrived += 1;
+      if (arrived === parties) release?.();
+      return opened;
+    },
+  };
+}

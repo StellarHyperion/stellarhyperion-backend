@@ -40,6 +40,7 @@ import {
   type RailClient,
   type RailRetryClass,
 } from "./types.js";
+import { evaluateLaneAcceptance } from "./acceptance.js";
 
 /**
  * How many outstanding transfers still counts as keeping up.
@@ -290,6 +291,14 @@ export class RailPass {
         (await verifyItsDelivery(this.options.config, db, transfer, report)) ??
         (await verifyCctpDelivery(this.options.config, db, transfer, report));
       if (verified) {
+        const admission = evaluateLaneAcceptance(verified.evidence);
+        if (admission.state !== "accepted") {
+          this.options.logger.warn(
+            { route: transfer.route, prerequisites: admission.prerequisites },
+            admission.reason,
+          );
+          return false;
+        }
         signal.throwIfAborted();
         await writeInbound(db, verified.at, verified.row);
         await this.write(db, transfer, {
