@@ -1,4 +1,12 @@
-import { CHAINS, assetOn, isChainKey, isEvmChain, toEvmAddress } from "@hyperion/protocol";
+import { StrKey } from "@stellar/stellar-sdk";
+import {
+  CHAINS,
+  RAIL_CONTRACTS,
+  assetOn,
+  isChainKey,
+  isEvmChain,
+  toEvmAddress,
+} from "@hyperion/protocol";
 import type { AppConfig } from "../../config/config.js";
 /**
  * Transfer status and lookup REST API endpoints.
@@ -251,15 +259,16 @@ function invalidFilter(message: string): Error {
   return error;
 }
 
-function validateIdentifierFilter(name: string, value: string): void {
-  if (value.length === 0 || value.length > 128 || /[\u0000-\u001f\u007f]/.test(value)) {
-    throw invalidFilter(
-      `${name} must be a non-empty printable identifier of at most 128 characters`,
-    );
+function validateIdentifierFilter(name: string, value: string, chain?: string): void {
+  const evm = /^0x[0-9a-fA-F]{40}$/.test(value) || /^0x0{24}[0-9a-fA-F]{40}$/.test(value);
+  const stellar = StrKey.isValidEd25519PublicKey(value) || StrKey.isValidContract(value);
+  const family = chain !== undefined && isChainKey(chain) ? CHAINS[chain].family : undefined;
+  if (!(family === "stellar" ? stellar : family === "evm" ? evm : evm || stellar)) {
+    throw invalidFilter(`${name} must be a canonical identity for the selected chain`);
   }
 }
 
-function validateTransferFilters(
+export function validateTransferFilters(
   config: AppConfig,
   filters: Readonly<{
     originChain?: string | undefined;
@@ -272,46 +281,62 @@ function validateTransferFilters(
 ): void {
   const { originChain, destinationChain, route, sender, recipient, search } = filters;
   const deployments = config.deployments.networks;
-
   for (const [name, chain] of [
     ["originChain", originChain],
     ["destinationChain", destinationChain],
   ] as const) {
-    if (chain !== undefined && (!isChainKey(chain) || deployments[chain] === undefined)) {
-      throw invalidFilter(`${name} must name a configured deployment`);
+    if (
+      chain !== undefined &&
+      (!isChainKey(chain) ||
+        CHAINS[chain].network !== config.network ||
+        (name === "originChain" && deployments[chain] === undefined))
+    ) {
+      throw invalidFilter(`${name} must name a supported chain on the configured network`);
     }
   }
-  if (
-    originChain !== undefined &&
-    destinationChain !== undefined &&
-    originChain === destinationChain
-  ) {
+  if (originChain !== undefined && originChain === destinationChain)
     throw invalidFilter("originChain and destinationChain must differ");
-  }
   if (route !== undefined) {
     if (!/^[0-3]$/.test(route)) throw invalidFilter("route must be an integer from 0 to 3");
     const routeName = ROUTE_NAMES[Number(route)]!;
-    for (const chain of [originChain, destinationChain]) {
-      if (chain === undefined) continue;
-      if (!isChainKey(chain)) throw invalidFilter(`${chain} is not a configured deployment`);
-      const deployment = deployments[chain];
-      const hasAdapter =
+    const sources =
+      originChain !== undefined && isChainKey(originChain)
+        ? [deployments[originChain]]
+        : Object.values(deployments);
+    const sourceSupported = sources.some(
+      (deployment) =>
         deployment !== undefined &&
-        Object.prototype.hasOwnProperty.call(deployment.adapters, routeName);
-      const hasToken =
+        Object.prototype.hasOwnProperty.call(deployment.adapters, routeName) &&
+        Object.values(deployment.tokens).some((token) =>
+          token.routes.some((supported) => supported === routeName),
+        ),
+    );
+    if (!sourceSupported)
+      throw invalidFilter("route has no configured source deployment and asset");
+    if (destinationChain !== undefined && isChainKey(destinationChain)) {
+      const deployment = deployments[destinationChain];
+      const registry = RAIL_CONTRACTS[destinationChain];
+      const supported =
         deployment !== undefined &&
         Object.values(deployment.tokens).some((token) =>
-          token.routes.some((supportedRoute: unknown) => Number(supportedRoute) === Number(route)),
+          token.routes.some((supported) => supported === routeName),
         );
-      if (!hasAdapter || !hasToken)
-        throw invalidFilter(`route ${route} is not supported by ${chain}`);
+      if (
+        !supported &&
+        !(routeName === "cctp"
+          ? registry?.cctp
+          : routeName === "axelar-its"
+            ? registry?.axelar
+            : false)
+      ) {
+        throw invalidFilter("route has no supported destination representation");
+      }
     }
   }
-  if (sender !== undefined) validateIdentifierFilter("sender", sender);
-  if (recipient !== undefined) validateIdentifierFilter("recipient", recipient);
-  if (search !== undefined && (search.length > 128 || /[\u0000-\u001f\u007f]/.test(search))) {
+  if (sender !== undefined) validateIdentifierFilter("sender", sender, originChain);
+  if (recipient !== undefined) validateIdentifierFilter("recipient", recipient, destinationChain);
+  if (search !== undefined && (search.length > 128 || /[\u0000-\u001f\u007f]/.test(search)))
     throw invalidFilter("search must be at most 128 printable characters");
-  }
 }
 
 const TRANSFER_QUERY = `
@@ -793,11 +818,23 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       }
       if (sender) {
         params.push(sender);
-        conditions.push(`t.sender = $${String(params.length)}`);
+        conditions.push(
+          sender.startsWith("0x")
+            ? `lower(t.sender) = lower($${String(params.length)})`
+            : `t.sender = $${String(params.length)}`,
+        );
       }
       if (recipient) {
-        params.push(recipient);
-        conditions.push(`t.destination = $${String(params.length)}`);
+        params.push(
+          recipient.startsWith("0x") && recipient.length === 42
+            ? `0x${recipient.slice(2).padStart(64, "0")}`
+            : recipient,
+        );
+        conditions.push(
+          recipient.startsWith("0x")
+            ? `lower(t.destination) = lower($${String(params.length)})`
+            : `t.destination = $${String(params.length)}`,
+        );
       }
 
       if (search?.trim()) {
