@@ -1,4 +1,4 @@
-import { Account, Keypair, rpc } from "@stellar/stellar-sdk";
+import { Account, Keypair, SorobanDataBuilder, rpc, xdr } from "@stellar/stellar-sdk";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../../src/config/config.js";
 import { submitStellar } from "../../src/keeper/stellar.js";
@@ -24,13 +24,35 @@ function fixture() {
       pending = { hash: params[0], intent_key: params[5], phase: params[6] };
     if (sql.includes("UPDATE keeper_checkpoint")) pending = null;
     return Promise.resolve({
-      rows: sql.includes("state = 'submitted' ORDER BY") && pending ? [pending] : [],
+      rows: sql.includes("SELECT active_signer,network_passphrase")
+        ? [
+            {
+              active_signer: signer.publicKey(),
+              network_passphrase: config.indexer.stellar!.networkPassphrase,
+            },
+          ]
+        : sql.includes("state = 'submitted' ORDER BY") && pending
+          ? [pending]
+          : [],
       rowCount: 1,
     });
   }
   const client = {
     getNetwork: () => Promise.resolve({ passphrase: config.indexer.stellar!.networkPassphrase }),
+    getAccountEntry: () => Promise.resolve({ balance: 100000000n }),
     getAccount: () => Promise.resolve(new Account(signer.publicKey(), "1")),
+    simulateTransaction: () => {
+      preparations++;
+      return Promise.resolve({
+        _parsed: true,
+        id: "fixture",
+        latestLedger: 1,
+        events: [],
+        transactionData: new SorobanDataBuilder(),
+        minResourceFee: "0",
+        result: { auth: [], retval: xdr.ScVal.scvVoid() },
+      });
+    },
     prepareTransaction: (transaction: unknown) => {
       preparations++;
       return Promise.resolve(transaction);

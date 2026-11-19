@@ -2,6 +2,7 @@ import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 import { bigintOf } from "../../db/rows.js";
 import { submitStellar } from "../stellar.js";
 import type { KeeperContext, TtlBumpPayload, TtlBumpResult } from "../types.js";
+import { recordKeeperSubmission } from "../outcomes.js";
 export async function processTtlBump(
   ctx: KeeperContext,
   payload: TtlBumpPayload = {},
@@ -31,8 +32,13 @@ export async function processTtlBump(
   );
   const claims = claimRows.rows.map((row) => bigintOf(row, "claim_id"));
   const transfers = transferRows.rows.map((row) => bigintOf(row, "nonce"));
-  const dryRun = ctx.config.keeper.stellarSecret === null;
-  if (dryRun)
+  const dryRun = ctx.config.keeper.stellarSecrets.length === 0;
+  if (dryRun) {
+    await recordKeeperSubmission(ctx.db, {
+      jobName: "ttl-bump",
+      signerPublicKey: "dry-run",
+      stage: "simulated",
+    });
     return {
       bumpedTokens: 0,
       bumpedClaims: 0,
@@ -40,6 +46,7 @@ export async function processTtlBump(
       dryRun: true,
       detail: `No signer: ${tokens.length} tokens, ${claims.length} claims, ${transfers.length} transfers need maintenance.`,
     };
+  }
   const vector = (values: xdr.ScVal[]) => xdr.ScVal.scvVec(values);
   const hash = await submitStellar(
     ctx.config,
@@ -54,6 +61,7 @@ export async function processTtlBump(
       vector(claims.map((id) => nativeToScVal(id, { type: "u64" }))),
       vector(transfers.map((id) => nativeToScVal(id, { type: "u64" }))),
     ],
+    { db: ctx.db, jobName: "ttl-bump" },
   );
   ctx.logger.info({ hash }, "router keep_alive confirmed");
   return {

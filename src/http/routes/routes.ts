@@ -12,6 +12,7 @@ import { integer, text, textOrNull } from "../../db/rows.js";
 import { negotiateSchemaVersion, withSchemaMetadata } from "../schema-version.js";
 import { LIST_CACHE_CONTROL } from "../etag.js";
 import type { ServerDeps } from "../server.js";
+import { requestQuery } from "../request-budget.js";
 
 export interface FormattedRouteHealth {
   readonly originChain: string;
@@ -36,7 +37,9 @@ export function registerRouteHealthRoutes(app: FastifyInstance, deps: ServerDeps
     if (version === null) return;
 
     // Return latest sample per (origin_chain, destination_chain, route, token)
-    const { rows } = await db.query(
+    const { rows } = await requestQuery(
+      request,
+      db,
       `SELECT DISTINCT ON (origin_chain, destination_chain, route, token)
               origin_chain,
               destination_chain,

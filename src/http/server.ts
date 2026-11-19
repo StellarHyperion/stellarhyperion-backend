@@ -15,6 +15,7 @@ import { registerHealthRoutes } from "./routes/health.js";
 import { registerMetricsRoutes } from "./routes/metrics.js";
 import { registerRouteHealthRoutes } from "./routes/routes.js";
 import { registerTransferRoutes } from "./routes/transfers.js";
+import { RequestBudgetExceededError } from "./request-budget.js";
 
 export const DEFAULT_RATE_LIMIT_MAX = 120;
 export const DEFAULT_STREAM_RATE_LIMIT_MAX = 20;
@@ -45,6 +46,33 @@ function errorEnvelope(
     ...(requestId === undefined ? {} : { requestId }),
     ...extra,
   };
+}
+
+function errorCode(status: number): ApiErrorCode {
+  return status === 404
+    ? "not_found"
+    : status === 408 || status === 504
+      ? "timeout"
+      : status === 429
+        ? "too_many_requests"
+        : status === 503
+          ? "unavailable"
+          : status >= 500
+            ? "internal_error"
+            : "bad_request";
+}
+function publicErrorMessage(code: ApiErrorCode): string {
+  return code === "internal_error"
+    ? "the server could not complete that request"
+    : code === "timeout"
+      ? "the request timed out"
+      : code === "unavailable"
+        ? "the service is temporarily unavailable"
+        : code === "not_found"
+          ? "the requested resource was not found"
+          : code === "too_many_requests"
+            ? "rate limit exceeded; retry after the deployment request budget resets"
+            : "the request was invalid";
 }
 
 export interface RateLimitPolicyOptions {
@@ -103,20 +131,34 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     bodyLimit: 64 * 1024,
   });
 
-  // Keep the legacy `error` field while guaranteeing every JSON error has the stable code alias.
-  app.addHook("onSend", (_request, _reply, payload, done) => {
-    if (typeof payload !== "string") {
+  // Preserve legacy fields while adding a stable category and bounded public message.
+  app.addHook("onSend", (request, reply, payload, done) => {
+    if (reply.statusCode < 400 || typeof payload !== "string") {
       done(null, payload);
       return;
     }
     try {
-      const body = JSON.parse(payload) as Record<string, unknown>;
-      if (typeof body.error === "string" && body.code === undefined) {
-        done(null, JSON.stringify({ ...body, code: body.error }));
+      const body: unknown = JSON.parse(payload);
+      if (body === null || typeof body !== "object" || Array.isArray(body)) {
+        done(null, payload);
         return;
       }
+      const existing = body as Record<string, unknown>;
+      const code = errorCode(reply.statusCode);
+      done(
+        null,
+        JSON.stringify({
+          ...existing,
+          error: typeof existing.error === "string" ? existing.error : code,
+          code,
+          message:
+            typeof existing.message === "string" ? existing.message : publicErrorMessage(code),
+          requestId: request.id,
+        }),
+      );
+      return;
     } catch {
-      // Non-JSON payloads, including SSE frames, pass through unchanged.
+      /* Non-JSON payloads, including SSE frames, pass through. */
     }
     done(null, payload);
   });
@@ -211,19 +253,16 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   app.setErrorHandler((error: FastifyError, request, reply) => {
+    if (error instanceof RequestBudgetExceededError) {
+      void reply.code(504).send({
+        error: "request_budget_exceeded",
+        message: "The public read exceeded its request budget.",
+        requestId: request.id,
+      });
+      return;
+    }
     const status = error.statusCode ?? 500;
-    const code: ApiErrorCode =
-      status === 404
-        ? "not_found"
-        : status === 408 || status === 504
-          ? "timeout"
-          : status === 429
-            ? "too_many_requests"
-            : status === 503
-              ? "unavailable"
-              : status >= 500
-                ? "internal_error"
-                : "bad_request";
+    const code = errorCode(status);
     if (status === 429) {
       const seconds = Number(reply.getHeader("retry-after"));
       void reply.code(429).send({
@@ -238,16 +277,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // The log gets the error, the response does not. An internal error message is the kind of
     // thing that carries a table name, a file path or, on a bad day, a connection string.
     request.log.error({ err: error, status }, "request failed");
-    const message =
-      code === "internal_error"
-        ? "the server could not complete that request"
-        : code === "timeout"
-          ? "the request timed out"
-          : code === "unavailable"
-            ? "the service is temporarily unavailable"
-            : code === "not_found"
-              ? "the requested resource was not found"
-              : "the request was invalid";
+    const message = publicErrorMessage(code);
     void reply.code(status).send(errorEnvelope(code, message, request.id));
   });
 

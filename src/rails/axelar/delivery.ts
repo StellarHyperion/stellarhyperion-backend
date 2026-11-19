@@ -37,7 +37,15 @@ export interface VerifiedItsDelivery extends VerifiedDelivery {
 }
 
 export interface VerificationFailure {
+  readonly state: "receipt_unavailable" | "payout_unverified";
   readonly diagnostics: readonly VerificationDiagnostic[];
+}
+
+export type ItsVerificationState = "receipt_unavailable" | "payout_unverified" | "verified";
+
+export interface ItsVerificationResult {
+  readonly state: ItsVerificationState;
+  readonly delivery: VerifiedItsDelivery | null;
 }
 
 export interface AxelarCanonicalityClient {
@@ -129,6 +137,10 @@ export async function revalidateItsDeliveryProofs(
         String(row.id),
       ]);
       await tx.query(
+        "SELECT set_config('hyperion.rail_reconcile_transfer',$1,true), set_config('hyperion.rail_reconcile_reason','destination_proof_reorg',true)",
+        [String(row.transfer_id)],
+      );
+      await tx.query(
         `UPDATE rail_attestation SET status = 'attested', updated_at = now(),
             next_attempt_at = now(), retry_class = NULL
           WHERE transfer_id = $1 AND status = 'delivered'
@@ -172,7 +184,7 @@ export async function verifyItsDelivery(
   const its = RAIL_CONTRACTS[transfer.destinationChain]?.axelar?.interchainTokenService;
   if (!isEvmChain(destination) || !its?.startsWith("0x")) return null;
   const { rows } = await db.query(
-    "SELECT sender, token, net_amount, destination FROM outbound_transfer WHERE id = $1",
+    "SELECT origin_chain,origin_router,nonce,origin_tx,sender,token,net_amount,destination_chain,destination FROM outbound_transfer WHERE id = $1",
     [String(transfer.transferId)],
   );
   const stored = rows[0];
@@ -211,12 +223,30 @@ export async function verifyItsDelivery(
   });
   if ((await client.getChainId()) !== destination.chainId)
     throw new Error("Destination RPC chain mismatch.");
-  const receipt = await client.getTransactionReceipt({ hash: execution.txHash });
-  if (receipt.status !== "success") return null;
+  const receipt = await client.getTransactionReceipt({ hash: execution.txHash }).catch(() => null);
+  if (!receipt) return { state: "receipt_unavailable", diagnostics: [] };
+  if (receipt.status !== "success")
+    return {
+      state: "payout_unverified",
+      diagnostics: [
+        {
+          category: "payment_evidence",
+          expected: "successful destination receipt",
+          observed: "reverted",
+        },
+      ],
+    };
   const head = await client.getBlockNumber();
-  if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations)) return null;
+  if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations))
+    return { state: "receipt_unavailable", diagnostics: [] };
   const block = await client.getBlock({ blockNumber: receipt.blockNumber });
-  if (block.hash !== receipt.blockHash) return null;
+  if (block.hash !== receipt.blockHash)
+    return {
+      state: "payout_unverified",
+      diagnostics: [
+        { category: "payment_evidence", expected: block.hash, observed: receipt.blockHash },
+      ],
+    };
   const destinationToken = await client.readContract({
     address: its as `0x${string}`,
     abi: ITS_ABI,
@@ -247,7 +277,8 @@ export async function verifyItsDelivery(
     recipient,
     amount,
   });
-  if (!inspection.payment) return { diagnostics: inspection.diagnostics };
+  if (!inspection.payment)
+    return { state: "payout_unverified", diagnostics: inspection.diagnostics };
   return {
     at: {
       chainKey: transfer.destinationChain,
@@ -269,6 +300,17 @@ export async function verifyItsDelivery(
       claimId: null,
     },
     evidence: {
+      sourceBinding: {
+        chain: text(stored, "origin_chain"),
+        router: text(stored, "origin_router"),
+        nonce: bigintOf(stored, "nonce").toString(),
+        transaction: text(stored, "origin_tx"),
+        sender: text(stored, "sender"),
+        token,
+        amount: amount.toString(),
+        destinationChain: text(stored, "destination_chain"),
+        destination: text(stored, "destination"),
+      },
       transferId: transfer.transferId,
       destinationChain: transfer.destinationChain,
       commandId: execution.commandId,

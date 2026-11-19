@@ -1,3 +1,4 @@
+import { sanitizeDiagnosticText } from "../../logging/logger.js";
 import { decodeEventLog, parseAbi, type Hex } from "viem";
 export const ITS_ABI = parseAbi([
   "function registeredTokenAddress(bytes32 tokenId) view returns (address)",
@@ -43,16 +44,91 @@ function bounded(value: unknown): string | null {
     typeof value === "bigint" || typeof value === "string" || typeof value === "number"
       ? String(value)
       : Object.prototype.toString.call(value);
-  return text.length <= 128 ? text : `${text.slice(0, 64)}…${text.slice(-63)}`;
+  const safe = sanitizeDiagnosticText(text);
+  return safe.length <= 128 ? safe : `${safe.slice(0, 64)}…${safe.slice(-63)}`;
 }
 
-/** Inspect delivery evidence without exposing raw provider responses. */
+export interface DeliveryEvidence<T extends DeliveryLog = DeliveryLog> {
+  readonly received: T | null;
+  readonly payment: T | null;
+}
+
+/** Inspect the two independent destination proofs without collapsing a missing one into failure. */
+export function inspectDeliveryEvidence<T extends DeliveryLog>(
+  logs: readonly T[],
+  expected: ExpectedDelivery,
+): DeliveryEvidence<T> {
+  let received: T | null = null;
+  let payment: T | null = null;
+  for (const log of logs) {
+    try {
+      const event = decodeEventLog({ abi: ITS_ABI, topics: log.topics, data: log.data });
+      if (
+        event.eventName === "InterchainTransferReceived" &&
+        log.address.toLowerCase() === expected.its.toLowerCase()
+      ) {
+        const args = event.args;
+        if (
+          args.commandId.toLowerCase() === expected.commandId.toLowerCase() &&
+          args.tokenId.toLowerCase() === expected.tokenId.toLowerCase() &&
+          args.sourceChain === expected.sourceChain &&
+          args.sourceAddress.toLowerCase() === expected.sourceAddress.toLowerCase() &&
+          args.destinationAddress.toLowerCase() === expected.recipient.toLowerCase() &&
+          args.amount === expected.amount
+        )
+          received = log;
+      }
+      if (
+        event.eventName === "Transfer" &&
+        log.address.toLowerCase() === expected.token.toLowerCase() &&
+        event.args.from.toLowerCase() === expected.tokenManager.toLowerCase() &&
+        event.args.to.toLowerCase() === expected.recipient.toLowerCase() &&
+        event.args.value === expected.amount &&
+        log.logIndex !== null
+      )
+        payment = log;
+    } catch {
+      /* Receipts contain unrelated events; they cannot establish this delivery. */
+    }
+  }
+  return { received, payment };
+}
+
+export function normalizeVerificationDiagnostics(
+  items: readonly VerificationDiagnostic[],
+): readonly VerificationDiagnostic[] {
+  const categories: readonly VerificationMismatchCategory[] = [
+    "source_identity",
+    "command",
+    "token",
+    "recipient",
+    "amount",
+    "payment_evidence",
+  ];
+  const result: VerificationDiagnostic[] = [];
+  for (const item of items) {
+    if (
+      !categories.includes(item.category) ||
+      result.some((previous) => previous.category === item.category)
+    )
+      continue;
+    result.push({
+      category: item.category,
+      expected: bounded(item.expected),
+      observed: bounded(item.observed),
+    });
+    if (result.length === categories.length) break;
+  }
+  return result;
+}
+
+/** Return bounded public diagnostics only when no exact receipt/payment pair exists. */
 export function inspectPayment<T extends DeliveryLog>(
   logs: readonly T[],
   expected: ExpectedDelivery,
 ): PaymentInspection<T> {
-  let received = false;
-  let payment: T | null = null;
+  const evidence = inspectDeliveryEvidence(logs, expected);
+  if (evidence.received && evidence.payment) return { payment: evidence.payment, diagnostics: [] };
   const diagnostics: VerificationDiagnostic[] = [];
   const add = (
     category: VerificationMismatchCategory,
@@ -66,13 +142,12 @@ export function inspectPayment<T extends DeliveryLog>(
         observed: bounded(observedValue),
       });
   };
-
-  for (const log of logs) {
-    try {
-      const event = decodeEventLog({ abi: ITS_ABI, topics: log.topics, data: log.data });
-      if (event.eventName === "InterchainTransferReceived") {
-        if (log.address.toLowerCase() !== expected.its.toLowerCase()) continue;
-        received = true;
+  if (!evidence.received) {
+    for (const log of logs) {
+      if (log.address.toLowerCase() !== expected.its.toLowerCase()) continue;
+      try {
+        const event = decodeEventLog({ abi: ITS_ABI, topics: log.topics, data: log.data });
+        if (event.eventName !== "InterchainTransferReceived") continue;
         const args = event.args;
         if (args.commandId.toLowerCase() !== expected.commandId.toLowerCase())
           add("command", expected.commandId, args.commandId);
@@ -85,29 +160,20 @@ export function inspectPayment<T extends DeliveryLog>(
         if (args.destinationAddress.toLowerCase() !== expected.recipient.toLowerCase())
           add("recipient", expected.recipient, args.destinationAddress);
         if (args.amount !== expected.amount) add("amount", expected.amount, args.amount);
+      } catch {
+        /* Unrelated receipt logs do not establish delivery. */
       }
-      if (
-        event.eventName === "Transfer" &&
-        log.address.toLowerCase() === expected.token.toLowerCase() &&
-        event.args.from.toLowerCase() === expected.tokenManager.toLowerCase() &&
-        event.args.to.toLowerCase() === expected.recipient.toLowerCase() &&
-        event.args.value === expected.amount &&
-        log.logIndex !== null
-      )
-        payment = log;
-    } catch {
-      /* Unrelated or malformed receipt events cannot establish delivery. */
     }
   }
-  if (!received) add("payment_evidence", "InterchainTransferReceived", null);
-  if (received && payment === null) add("payment_evidence", expected.amount, null);
-  const mismatch = diagnostics.some((item) => item.category !== "payment_evidence");
-  return { payment: received && !mismatch ? payment : null, diagnostics };
+  if (!evidence.received || !evidence.payment)
+    add("payment_evidence", "canonical ITS receipt and matching ERC-20 payment", null);
+  return { payment: null, diagnostics };
 }
 
 export function matchingPayment<T extends DeliveryLog>(
   logs: readonly T[],
   expected: ExpectedDelivery,
 ): T | null {
-  return inspectPayment(logs, expected).payment;
+  const evidence = inspectDeliveryEvidence(logs, expected);
+  return evidence.received === null ? null : evidence.payment;
 }

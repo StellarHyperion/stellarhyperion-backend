@@ -13,9 +13,11 @@ class Db {
   query(sql: string, params: readonly unknown[] = []) {
     this.calls.push({ sql, params });
     return Promise.resolve({
-      rows: sql.includes("pending_claim")
-        ? [{ claim_id: "1" }, { claim_id: "2" }]
-        : [{ nonce: "3" }],
+      rows: sql.includes("INSERT INTO keeper_submission")
+        ? [{ id: "9223372036854775000" }]
+        : sql.includes("pending_claim")
+          ? [{ claim_id: "1" }, { claim_id: "2" }]
+          : [{ nonce: "3" }],
       rowCount: 2,
     });
   }
