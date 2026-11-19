@@ -17,6 +17,7 @@ import {
   isIrisMessage,
   isIrisResponsePayload,
   IrisClient,
+  IrisResourceLimitError,
   MAX_IRIS_ATTESTATION_BYTES,
   MAX_IRIS_MESSAGE_BYTES,
   MAX_IRIS_RESPONSE_BYTES,
@@ -404,6 +405,77 @@ describe("Circle's Iris", () => {
           error.message.includes(`resource limit exceeded: ${field}`),
       );
     }
+  });
+
+  it("cancels a chunked oversized response with no declared length before accepting JSON", async () => {
+    let cancelled = false;
+    let reads = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        reads++;
+        controller.enqueue(new Uint8Array(65536));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const fetch = (() => Promise.resolve(new Response(body))) as typeof globalThis.fetch;
+    await expect(new IrisClient("testnet", { fetch }).look(TRANSFER)).rejects.toMatchObject({
+      category: "provider_resource_limit",
+      kind: "permanent",
+    });
+    expect(cancelled).toBe(true);
+    expect(reads).toBeLessThanOrEqual(MAX_IRIS_RESPONSE_BYTES / 65536 + 2);
+  });
+
+  it("rejects a declared oversized body without reading and retains resource classification for error envelopes", async () => {
+    for (const status of [200, 500]) {
+      let cancelled = false;
+      const body = new ReadableStream<Uint8Array>({
+        cancel() {
+          cancelled = true;
+        },
+      });
+      const fetch = (() =>
+        Promise.resolve(
+          new Response(body, {
+            status,
+            headers: { "content-length": String(MAX_IRIS_RESPONSE_BYTES + 1) },
+          }),
+        )) as typeof globalThis.fetch;
+      await expect(new IrisClient("testnet", { fetch }).look(TRANSFER)).rejects.toBeInstanceOf(
+        IrisResourceLimitError,
+      );
+      expect(cancelled).toBe(true);
+    }
+  });
+
+  it("caps nested fast-attestation fields and preserves valid supported v2 responses", async () => {
+    const oversized = answering(200, {
+      messages: [
+        {
+          status: "complete",
+          fastAttestation: { signature: "x".repeat(MAX_IRIS_ATTESTATION_BYTES + 1) },
+        },
+      ],
+    });
+    await expect(
+      new IrisClient("testnet", { fetch: oversized.fetch }).look(TRANSFER),
+    ).rejects.toMatchObject({ category: "provider_resource_limit" });
+    const valid = answering(200, {
+      messages: [
+        {
+          status: "complete",
+          message: "0x1234",
+          attestation: `0x${"ab".repeat(65)}`,
+          eventNonce: "18446744073709551615",
+        },
+      ],
+    });
+    expect(await new IrisClient("testnet", { fetch: valid.fetch }).look(TRANSFER)).toMatchObject({
+      kind: "found",
+      report: { status: "attested", reference: "18446744073709551615" },
+    });
   });
 
   it("maps various status strings across v1 and v2 formats", () => {

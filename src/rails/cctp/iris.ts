@@ -61,6 +61,13 @@ export const MAX_IRIS_MESSAGE_BYTES = 64 * 1024;
 export const MAX_IRIS_ATTESTATION_BYTES = 128 * 1024;
 const MAX_IRIS_ERROR_BYTES = 16 * 1024;
 
+export class IrisResourceLimitError extends RailError {
+  readonly category = "provider_resource_limit";
+  constructor(detail: string) {
+    super("cctp", "permanent", `resource limit exceeded: ${detail}`);
+  }
+}
+
 export interface FastAttestationMetadata {
   readonly signature?: unknown;
   readonly attestation?: unknown;
@@ -307,7 +314,7 @@ export class IrisClient implements RailClient {
 
     const limit = messageLimitViolation(message);
     if (limit !== null) {
-      throw new RailError(this.rail, "permanent", `resource limit exceeded: ${limit}`);
+      throw new IrisResourceLimitError(limit);
     }
 
     return { kind: "found", report: reportFor(message) };
@@ -578,14 +585,21 @@ async function describeError(response: Response): Promise<string> {
     if (typeof body.error === "string") return body.error;
     if (typeof body.message === "string") return body.message;
     return "no reason given";
-  } catch {
+  } catch (error) {
+    if (error instanceof IrisResourceLimitError) throw error;
     return "no reason given";
   }
 }
 
 async function readJson(response: Response, maxBytes: number): Promise<unknown> {
   if (response.body === null) {
-    return JSON.parse(await response.text());
+    throw new SyntaxError("empty provider body");
+  }
+
+  const contentLength = response.headers.get("content-length");
+  if (contentLength !== null && /^\d+$/.test(contentLength) && Number(contentLength) > maxBytes) {
+    await response.body.cancel().catch(() => undefined);
+    throw new IrisResourceLimitError(`response exceeds ${maxBytes} bytes`);
   }
 
   const reader = response.body.getReader();
@@ -597,12 +611,8 @@ async function readJson(response: Response, maxBytes: number): Promise<unknown> 
       if (done) break;
       size += value.byteLength;
       if (size > maxBytes) {
-        await reader.cancel();
-        throw new RailError(
-          "cctp",
-          "permanent",
-          `resource limit exceeded: response exceeds ${maxBytes} bytes`,
-        );
+        await reader.cancel().catch(() => undefined);
+        throw new IrisResourceLimitError(`response exceeds ${maxBytes} bytes`);
       }
       chunks.push(value);
     }
