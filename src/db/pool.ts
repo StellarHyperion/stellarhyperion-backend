@@ -16,6 +16,20 @@ import { performance } from "node:perf_hooks";
 
 import { Pool } from "pg";
 import type { PoolClient, PoolConfig } from "pg";
+import {
+  computeHistoryDigest as computeRangeDigest,
+  recordHistoryDigest as storeRangeDigest,
+  verifyHistoryDigest as verifyRangeDigest,
+  type ComputeHistoryDigestOptions,
+  type DigestVerificationResult,
+  type HistoryDigestResult,
+  type StoredHistoryDigest,
+  auditTransferAndClaimInvariants,
+  compactRouteHealthSamples,
+  type CompactRouteHealthOptions,
+  type RouteHealthCompactionResult,
+  type TransferClaimAuditReport,
+} from "../chains/writers.js";
 
 import {
   DbTelemetryCollector,
@@ -50,6 +64,8 @@ export interface Transactional extends Queryable {
 }
 
 export interface OpenOptions {
+  /** Enforce read-only statements on every connection, including diagnostics probes. */
+  readonly readOnly?: boolean;
   /** Low by default. Two watchers and an HTTP server do not need twenty connections. */
   readonly maxConnections?: number;
   readonly connectionTimeoutMs?: number;
@@ -84,6 +100,7 @@ export class Database implements Transactional {
     const config: PoolConfig = {
       connectionString,
       max: maxConnections,
+      ...(options.readOnly ? { options: "-c default_transaction_read_only=on" } : {}),
       connectionTimeoutMillis: options.connectionTimeoutMs ?? 10_000,
       // Named so `pg_stat_activity` says which process is holding a connection. During an
       // incident that is the difference between knowing and guessing.
@@ -185,6 +202,23 @@ export class Database implements Transactional {
     }
   }
 
+  /** Compute a deterministic range digest for indexed event and monetary records (#63). */
+  async computeHistoryDigest(options: ComputeHistoryDigestOptions): Promise<HistoryDigestResult> {
+    return computeRangeDigest(this, options);
+  }
+
+  /** Persist a computed range digest for later backfill/restore verification (#63). */
+  async recordHistoryDigest(result: HistoryDigestResult): Promise<StoredHistoryDigest> {
+    return storeRangeDigest(this, result);
+  }
+
+  /** Recompute and verify a range digest against an expected or stored digest (#63). */
+  async verifyHistoryDigest(
+    options: ComputeHistoryDigestOptions & { readonly expectedDigest?: string },
+  ): Promise<DigestVerificationResult> {
+    return verifyRangeDigest(this, options);
+  }
+
   /**
    * Lightweight maintenance task that cleans up completed attestation audit rows older than 30 days.
    * Returns the count of deleted rows.
@@ -199,6 +233,24 @@ export class Database implements Transactional {
     return rowCount;
   }
 
+  /**
+   * Compact old identical `route_health` samples in bounded batches while preserving change
+   * boundaries and recent diagnostic detail.
+   */
+  async compactRouteHealthSamples(
+    options: CompactRouteHealthOptions = {},
+  ): Promise<RouteHealthCompactionResult> {
+    return compactRouteHealthSamples(this, options);
+  }
+
+  /**
+   * Run read-only SQL audits for source amount conservation, claim liabilities, and
+   * delivery/settlement consistency.
+   */
+  async auditTransferAndClaimInvariants(): Promise<TransferClaimAuditReport> {
+    return auditTransferAndClaimInvariants(this);
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
@@ -209,6 +261,8 @@ export class Database implements Transactional {
 export interface MaintenanceTaskOptions {
   readonly intervalMs?: number;
   readonly olderThanDays?: number;
+  readonly routeHealthRetainRecentHours?: number;
+  readonly routeHealthBatchSize?: number;
   readonly logger?: {
     info?: (obj: unknown, msg: string) => void;
     error?: (obj: unknown, msg: string) => void;
@@ -217,7 +271,7 @@ export interface MaintenanceTaskOptions {
 }
 
 /**
- * Periodically runs the attestation cleanup maintenance task.
+ * Periodically runs the attestation cleanup and bounded route-health compaction maintenance tasks.
  * Returns a function to cancel the scheduled task.
  */
 export function startMaintenanceTask(
@@ -226,11 +280,23 @@ export function startMaintenanceTask(
 ): () => void {
   const intervalMs = options.intervalMs ?? 24 * 60 * 60 * 1000;
   const olderThanDays = options.olderThanDays ?? 30;
+  const routeHealthRetainRecentHours = options.routeHealthRetainRecentHours;
+  const routeHealthBatchSize = options.routeHealthBatchSize;
 
   const timer = setInterval(() => {
     void db.pruneCompletedAttestations(olderThanDays).catch((error: unknown) => {
       options.logger?.warn?.({ err: error }, "maintenance attestation pruning failed");
     });
+    void db
+      .compactRouteHealthSamples({
+        ...(routeHealthRetainRecentHours !== undefined
+          ? { retainRecentHours: routeHealthRetainRecentHours }
+          : {}),
+        ...(routeHealthBatchSize !== undefined ? { batchSize: routeHealthBatchSize } : {}),
+      })
+      .catch((error: unknown) => {
+        options.logger?.warn?.({ err: error }, "maintenance route_health compaction failed");
+      });
   }, intervalMs);
 
   timer.unref();

@@ -38,12 +38,15 @@ export interface SourceScanLagStatus {
   readonly targetMaxLagMs: number;
   readonly openHistoryGaps: number;
   readonly reconcilingHistoryGaps: number;
-  readonly status: "ok" | "breached" | "unknown";
+  readonly status: "ok" | "breached" | "unknown" | "disabled";
+  readonly stage: "source_scan";
+  readonly monitoring: "local" | "remote" | "disabled";
   readonly reason: string | null;
 }
 
 export interface LaneProofBacklogStatus {
   readonly lane: string;
+  readonly stage: "destination_proof";
   readonly originChain: string;
   readonly destinationChain: string;
   readonly pendingCount: number;
@@ -57,7 +60,7 @@ export interface LaneProofBacklogStatus {
 
 export interface FreshnessSloReport {
   readonly evaluatedAt: string;
-  readonly status: "ok" | "breached";
+  readonly status: "ok" | "breached" | "unknown";
   readonly met: boolean;
   readonly breaches: readonly string[];
   readonly sources: readonly SourceScanLagStatus[];
@@ -79,11 +82,12 @@ export function resolveLaneTarget(
 
 export async function evaluateFreshnessSlo(
   db: Queryable,
-  config: Pick<AppConfig, "indexer" | "freshnessSlo">,
+  config: Pick<AppConfig, "indexer" | "freshnessSlo" | "deploymentMode">,
   now = new Date(),
 ): Promise<FreshnessSloReport> {
   const nowMs = now.getTime();
   const breaches: string[] = [];
+  let unknown = false;
 
   // 1. Durable cursor freshness
   const cursorResult = await db.query(
@@ -136,12 +140,41 @@ export async function evaluateFreshnessSlo(
   for (const chain of [...configuredChains].sort()) {
     const cursor = cursorsByChain.get(chain);
     const gaps = gapsByChain.get(chain) ?? { open: 0, reconciling: 0 };
-    const target = resolveLaneTarget(config.freshnessSlo, chain);
+    const chainTarget = resolveLaneTarget(config.freshnessSlo, chain);
+    const laneLags = Object.keys(config.freshnessSlo.lanes)
+      .filter((lane) => lane.startsWith(`${chain}->`))
+      .map((lane) => resolveLaneTarget(config.freshnessSlo, lane).maxSourceScanLagMs);
+    const target = {
+      ...chainTarget,
+      maxSourceScanLagMs: Math.min(chainTarget.maxSourceScanLagMs, ...laneLags),
+    };
+    const monitoring = config.indexer.enabled
+      ? ("local" as const)
+      : config.deploymentMode === "api-only"
+        ? ("remote" as const)
+        : ("disabled" as const);
+    if (monitoring === "disabled") {
+      sources.push({
+        chain,
+        cursorBlock: cursor?.cursorBlock ?? null,
+        updatedAt: cursor?.updatedAt?.toISOString() ?? null,
+        lagMs: null,
+        targetMaxLagMs: target.maxSourceScanLagMs,
+        openHistoryGaps: gaps.open,
+        reconcilingHistoryGaps: gaps.reconciling,
+        status: "disabled",
+        stage: "source_scan",
+        monitoring,
+        reason: "watcher intentionally disabled for this deployment mode",
+      });
+      continue;
+    }
 
     if (cursor === undefined || cursor.updatedAt === null) {
-      const hasGapBreach = gaps.open > 0;
+      const hasGapBreach = gaps.open + gaps.reconciling > 0;
+      if (!hasGapBreach) unknown = true;
       const reason = hasGapBreach
-        ? `${String(gaps.open)} open history gap(s) with no cursor timestamp`
+        ? `${String(gaps.open + gaps.reconciling)} incomplete history gap(s) with no cursor timestamp`
         : "no cursor recorded yet";
       if (hasGapBreach) {
         breaches.push(`source:${chain}: ${reason}`);
@@ -155,18 +188,40 @@ export async function evaluateFreshnessSlo(
         openHistoryGaps: gaps.open,
         reconcilingHistoryGaps: gaps.reconciling,
         status: hasGapBreach ? "breached" : "unknown",
+        stage: "source_scan",
+        monitoring,
         reason,
       });
       continue;
     }
 
-    const lagMs = Math.max(0, nowMs - cursor.updatedAt.getTime());
+    const elapsed = nowMs - cursor.updatedAt.getTime();
+    if (!Number.isFinite(elapsed) || elapsed < -30_000) {
+      unknown = true;
+      sources.push({
+        chain,
+        cursorBlock: cursor.cursorBlock,
+        updatedAt: Number.isFinite(cursor.updatedAt.getTime())
+          ? cursor.updatedAt.toISOString()
+          : null,
+        lagMs: null,
+        targetMaxLagMs: target.maxSourceScanLagMs,
+        openHistoryGaps: gaps.open,
+        reconcilingHistoryGaps: gaps.reconciling,
+        status: "unknown",
+        stage: "source_scan",
+        monitoring,
+        reason: "invalid or future cursor timestamp",
+      });
+      continue;
+    }
+    const lagMs = Math.max(0, elapsed);
     const reasons: string[] = [];
     if (lagMs > target.maxSourceScanLagMs) {
       reasons.push(`scan lag ${String(lagMs)}ms exceeds ${String(target.maxSourceScanLagMs)}ms`);
     }
-    if (gaps.open > 0) {
-      reasons.push(`${String(gaps.open)} open history gap(s)`);
+    if (gaps.open + gaps.reconciling > 0) {
+      reasons.push(`${String(gaps.open + gaps.reconciling)} incomplete history gap(s)`);
     }
     const status = reasons.length > 0 ? "breached" : "ok";
     const reason = reasons.length > 0 ? reasons.join("; ") : null;
@@ -183,6 +238,8 @@ export async function evaluateFreshnessSlo(
       openHistoryGaps: gaps.open,
       reconcilingHistoryGaps: gaps.reconciling,
       status,
+      stage: "source_scan",
+      monitoring,
       reason,
     });
   }
@@ -197,8 +254,23 @@ export async function evaluateFreshnessSlo(
       WHERE NOT EXISTS (
         SELECT 1
           FROM inbound_delivery d
-         WHERE d.origin_chain = t.origin_chain
-           AND d.nonce = t.nonce
+         WHERE d.destination_chain = t.destination_chain
+           AND d.route = t.route AND d.source_chain = t.origin_chain
+           AND d.source_nonce = t.nonce
+           AND (d.source_transfer_id = t.id OR (
+             d.source_transfer_id IS NULL AND NOT EXISTS (
+               SELECT 1 FROM outbound_transfer peer WHERE peer.id <> t.id
+                 AND peer.origin_chain = t.origin_chain AND peer.nonce = t.nonce
+                 AND peer.route = t.route AND peer.destination_chain = t.destination_chain
+             )
+           ))
+           AND (d.delivered = true OR EXISTS (
+             SELECT 1 FROM pending_claim c WHERE c.chain = d.destination_chain
+               AND c.claim_id = d.claim_id AND c.route = d.route
+               AND c.source_chain = d.source_chain AND c.source_nonce = d.source_nonce
+               AND c.settled = true AND c.settled_tx IS NOT NULL
+               AND (c.source_transfer_id = t.id OR (c.source_transfer_id IS NULL AND d.source_transfer_id IS NULL))
+           ))
       )
       GROUP BY t.origin_chain, t.destination_chain
       ORDER BY t.origin_chain, t.destination_chain`,
@@ -237,6 +309,7 @@ export async function evaluateFreshnessSlo(
 
     lanes.push({
       lane,
+      stage: "destination_proof",
       originChain,
       destinationChain,
       pendingCount,
@@ -249,10 +322,10 @@ export async function evaluateFreshnessSlo(
     });
   }
 
-  const met = breaches.length === 0;
+  const met = breaches.length === 0 && !unknown;
   return {
     evaluatedAt: now.toISOString(),
-    status: met ? "ok" : "breached",
+    status: breaches.length > 0 ? "breached" : unknown ? "unknown" : "ok",
     met,
     breaches,
     sources,

@@ -4,6 +4,8 @@
  * Usage:
  *   npm run diagnostics -- [--output <file>] [--compact]
  */
+import { execFileSync } from "node:child_process";
+import { sanitizeDiagnosticText } from "../logging/logger.js";
 import { writeFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 
@@ -72,14 +74,30 @@ async function run(): Promise<void> {
     applicationName: "hyperion-diagnostics",
     maxConnections: 2,
     statementTimeoutMs: 15_000,
+    readOnly: true,
   });
 
   try {
-    const bundle = await generateDiagnosticsBundle({ config, db });
+    let revision = process.env.HYPERION_REVISION ?? process.env.GITHUB_SHA;
+    if (revision === undefined) {
+      try {
+        revision = execFileSync("git", ["rev-parse", "HEAD"], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+        }).trim();
+      } catch {
+        /* Build artifacts may have no Git checkout. */
+      }
+    }
+    const bundle = await generateDiagnosticsBundle({
+      config,
+      db,
+      ...(revision ? { revision } : {}),
+    });
     const json = JSON.stringify(bundle, null, args.compact ? undefined : 2);
     if (args.outputPath !== null) {
       const target = resolvePath(process.cwd(), args.outputPath);
-      writeFileSync(target, `${json}\n`, "utf8");
+      writeFileSync(target, `${json}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
       process.stderr.write(`Diagnostics bundle written to ${target}\n`);
     } else {
       process.stdout.write(`${json}\n`);
@@ -89,4 +107,9 @@ async function run(): Promise<void> {
   }
 }
 
-await run();
+await run().catch((error: unknown) => {
+  process.stderr.write(
+    `Diagnostics failed: ${sanitizeDiagnosticText(error instanceof Error ? error.message : String(error))}\n`,
+  );
+  process.exitCode = 1;
+});

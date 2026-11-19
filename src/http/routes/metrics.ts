@@ -1,3 +1,4 @@
+import { evaluateFreshnessSlo } from "../../runtime/freshness.js";
 /**
  * Metrics REST API endpoint.
  *
@@ -7,7 +8,11 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
-import { evaluateFreshnessSlo } from "../../runtime/freshness.js";
+import {
+  evaluateHeartbeatFreshness,
+  readWorkerHeartbeats,
+  type WorkerHeartbeatRecord,
+} from "../../runtime/readiness.js";
 import type { ServerDeps } from "../server.js";
 
 export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): void {
@@ -70,16 +75,52 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       }
     }
 
-    // 7. Configurable freshness SLO evaluation (#108)
-    const freshnessSlo = await evaluateFreshnessSlo(db, deps.config);
+    // 7. Persistent worker heartbeats & freshness (#107)
+    let heartbeatRecords: WorkerHeartbeatRecord[] = [];
+    try {
+      heartbeatRecords = await readWorkerHeartbeats(db);
+    } catch (error) {
+      if (
+        typeof error !== "object" ||
+        error === null ||
+        !("code" in error) ||
+        (error as { code?: unknown }).code !== "42P01"
+      ) {
+        throw error;
+      }
+    }
 
-    // 8. Bounded database pool & query latency telemetry (#110)
+    const now = new Date();
+    let staleWorkers = 0;
+    let degradedWorkers = 0;
+    let downWorkers = 0;
+    const workers = heartbeatRecords.map((hb) => {
+      const freshness = evaluateHeartbeatFreshness(hb, now);
+      if (freshness.stale) staleWorkers += 1;
+      if (freshness.report.state === "degraded") degradedWorkers += 1;
+      if (freshness.report.state === "down") downWorkers += 1;
+      return {
+        name: hb.workerName,
+        kind: hb.workerKind,
+        chain: hb.chainKey,
+        state: freshness.report.state,
+        detail: freshness.report.detail,
+        lastHeartbeatAt: hb.lastHeartbeatAt.toISOString(),
+        lastCompletedAt: hb.lastCompletedAt ? hb.lastCompletedAt.toISOString() : null,
+        lastCursorBlock: hb.lastCursorBlock,
+        consecutiveFailures: hb.consecutiveFailures,
+        lastError: hb.lastError,
+        stale: freshness.stale,
+        ageSeconds: freshness.ageSeconds,
+      };
+    });
+
+    const freshnessSlo = await evaluateFreshnessSlo(db, deps.config);
     const database = typeof db.telemetrySnapshot === "function" ? db.telemetrySnapshot() : null;
 
     return reply.send({
       service: "hyperion-backend",
       network: deps.config.network,
-      deploymentMode: deps.config.deploymentMode,
       uptimeSeconds: Math.floor((Date.now() - startedAt.getTime()) / 1000),
       transfers: {
         totalOutbound,
@@ -91,6 +132,14 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       historyGaps,
       freshnessSlo,
       database,
+      deploymentMode: deps.config.deploymentMode,
+      workers,
+      freshness: {
+        totalWorkers: workers.length,
+        staleWorkers,
+        degradedWorkers,
+        downWorkers,
+      },
     });
   });
 }

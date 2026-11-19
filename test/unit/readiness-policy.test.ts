@@ -12,6 +12,21 @@ import { completeEnv } from "../helpers.js";
 import { capturingLogger } from "../stellar-fakes.js";
 
 describe("readiness dependency policy configuration (#116)", () => {
+  it("does not certify absent disabled workers or missing required dependencies", () => {
+    const evaluated = evaluateReadiness([{ name: "indexer", state: "ready", detail: "disabled" }], {
+      database: "required",
+      indexer: "disabled",
+      rails: "disabled",
+      keeper: "disabled",
+    });
+    expect(evaluated.checks.find((check) => check.name === "indexer")?.effectiveState).toBe(
+      "disabled",
+    );
+    expect(evaluated.state).toBe("down");
+    expect(evaluated.checks).toContainEqual(
+      expect.objectContaining({ dependency: "database", state: "down", required: true }),
+    );
+  });
   it("infers deployment modes from component flags when DEPLOYMENT_MODE is omitted", () => {
     expect(
       inferDeploymentMode({ indexerEnabled: false, railsEnabled: false, keeperEnabled: false }),

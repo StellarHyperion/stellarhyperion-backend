@@ -94,6 +94,11 @@ export function classifySqlWorkload(sql: string): DbWorkload {
   if (normalized.includes("rail_attestation")) {
     return "rails";
   }
+  if (
+    /^(?:insert|update|delete|with)\b/.test(normalized) &&
+    (normalized.includes("outbound_transfer") || normalized.includes("inbound_delivery"))
+  )
+    return "indexer";
   if (normalized.includes("pending_claim")) {
     return "claims";
   }
@@ -185,10 +190,31 @@ export class DbTelemetryCollector {
   private readonly maxSamplesPerWorkload: number;
 
   constructor(maxSamplesPerWorkload = DEFAULT_MAX_SAMPLES_PER_WORKLOAD) {
-    this.maxSamplesPerWorkload = Math.max(1, maxSamplesPerWorkload);
+    if (
+      !Number.isSafeInteger(maxSamplesPerWorkload) ||
+      maxSamplesPerWorkload < 1 ||
+      maxSamplesPerWorkload > 4096
+    )
+      throw new RangeError("database latency sample capacity must be1–4096");
+    this.maxSamplesPerWorkload = maxSamplesPerWorkload;
   }
 
   record(workload: DbWorkload, durationMs: number, ok: boolean, nowMs = Date.now()): void {
+    const boundedWorkloads: readonly string[] = [
+      "health",
+      "metrics",
+      "transfers",
+      "claims",
+      "routes",
+      "indexer",
+      "rails",
+      "keeper",
+      "maintenance",
+      "diagnostics",
+      "transaction",
+      "other",
+    ];
+    if (!boundedWorkloads.includes(workload)) workload = "other";
     let ring = this.workloads.get(workload);
     if (ring === undefined) {
       ring = new BoundedLatencyRing(this.maxSamplesPerWorkload);

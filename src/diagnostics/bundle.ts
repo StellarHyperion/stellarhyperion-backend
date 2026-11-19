@@ -8,12 +8,14 @@
 import type { AppConfig } from "../config/config.js";
 import type { Queryable } from "../db/pool.js";
 import type { DbTelemetrySnapshot } from "../db/telemetry.js";
+import { readWorkerHeartbeats, evaluateHeartbeatFreshness } from "../runtime/readiness.js";
+import { sanitizeDiagnosticText } from "../logging/logger.js";
+import { classifySqlWorkload } from "../db/telemetry.js";
 import { integer, text, textOrNull, timestampOrNull } from "../db/rows.js";
 import { evaluateFreshnessSlo, type FreshnessSloReport } from "../runtime/freshness.js";
 
 const SENSITIVE_KEY_RE =
-  /^(password|secret|databaseurl|redisurl|connectionstring|stellarsecret|apikey|token)$/i;
-const SENSITIVE_QUERY_RE = /key|token|secret|password|auth/i;
+  /password|secret|authorization|signer|private.?key|api.?key|token|seed|mnemonic|cookie|connection.?string/i;
 
 const CORE_TABLES = [
   "outbound_transfer",
@@ -21,6 +23,8 @@ const CORE_TABLES = [
   "pending_claim",
   "rail_attestation",
   "indexer_cursor",
+  "indexer_worker_heartbeat",
+  "indexed_history_digest",
   "indexer_lease",
   "stellar_history_gap",
   "stellar_backfill_cursor",
@@ -35,6 +39,7 @@ export interface GenerateDiagnosticsOptions {
   readonly config: AppConfig;
   readonly db: DiagnosticsDb;
   readonly now?: Date;
+  readonly revision?: string;
 }
 
 export interface DiagnosticsBundle {
@@ -44,7 +49,15 @@ export interface DiagnosticsBundle {
     readonly network: AppConfig["network"];
     readonly deploymentMode: AppConfig["deploymentMode"];
     readonly readOnly: true;
+    readonly revision: string | null;
   };
+  readonly probes: readonly {
+    readonly workload: string;
+    readonly table: string | null;
+    readonly status: "ok" | "failed";
+    readonly code: string | null;
+    readonly detail: string;
+  }[];
   readonly config: Record<string, unknown>;
   readonly schema: {
     readonly migrationsAvailable: boolean;
@@ -52,6 +65,7 @@ export interface DiagnosticsBundle {
     readonly tableCounts: Readonly<Record<string, number | null>>;
   };
   readonly workerFreshness: {
+    readonly heartbeats: readonly Record<string, unknown>[];
     readonly cursors: readonly Record<string, unknown>[];
     readonly leases: readonly Record<string, unknown>[];
     readonly historyGaps: {
@@ -77,39 +91,38 @@ export interface DiagnosticsBundle {
   readonly databaseTelemetry: DbTelemetrySnapshot | null;
 }
 
+/** RPC paths and query strings can contain tokens; keep only credential-free origins. */
 export function sanitizeUrl(raw: string): string {
   try {
     const parsed = new URL(raw);
-    if (parsed.username !== "" || parsed.password !== "") {
-      parsed.username = "[redacted]";
-      parsed.password = "";
-    }
-    for (const key of [...parsed.searchParams.keys()]) {
-      if (SENSITIVE_QUERY_RE.test(key)) {
-        parsed.searchParams.set(key, "[redacted]");
-      }
-    }
-    return parsed.toString();
+    return parsed.protocol === "https:" || parsed.protocol === "http:"
+      ? parsed.origin
+      : "[redacted-url]";
   } catch {
     return "[redacted-url]";
   }
 }
 
-export function sanitizeDiagnosticsValue<T>(value: T): T {
+export function sanitizeDiagnosticsValue<T>(value: T, depth = 0): T {
+  if (depth > 8) return null as T;
+  if (typeof value === "string")
+    return sanitizeDiagnosticText(value).replace(/\bS[A-Z2-7]{55}\b/g, "[redacted signer]") as T;
   if (typeof value === "bigint") {
     return value.toString() as unknown as T;
   }
   if (Array.isArray(value)) {
     const items: unknown[] = value;
-    return items.map((item) => sanitizeDiagnosticsValue(item)) as unknown as T;
+    return items
+      .slice(0, 128)
+      .map((item) => sanitizeDiagnosticsValue(item, depth + 1)) as unknown as T;
   }
   if (value !== null && typeof value === "object" && !(value instanceof Date)) {
     const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>).slice(0, 64)) {
       if (SENSITIVE_KEY_RE.test(k)) {
         out[k] = "[redacted]";
       } else {
-        out[k] = sanitizeDiagnosticsValue(v);
+        out[k] = sanitizeDiagnosticsValue(v, depth + 1);
       }
     }
     return out as T;
@@ -186,7 +199,41 @@ export function sanitizeDiagnosticsConfig(config: AppConfig): Record<string, unk
 export async function generateDiagnosticsBundle(
   options: GenerateDiagnosticsOptions,
 ): Promise<DiagnosticsBundle> {
-  const { config, db } = options;
+  const { config } = options;
+  const probes: {
+    workload: string;
+    table: string | null;
+    status: "ok" | "failed";
+    code: string | null;
+    detail: string;
+  }[] = [];
+  const db: DiagnosticsDb = {
+    query: async (sql, params) => {
+      const workload = classifySqlWorkload(sql);
+      const table = /\bFROM\s+([a-z_]+)/i.exec(sql)?.[1] ?? null;
+      try {
+        const result = await options.db.query(sql, params);
+        probes.push({ workload, table, status: "ok", code: null, detail: "read completed" });
+        return result;
+      } catch (error) {
+        const rawCode =
+          typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
+        const code = /^[A-Z0-9]{5}$/.test(rawCode) ? rawCode : null;
+        const detail =
+          code === "42P01"
+            ? "table unavailable; apply repository migrations"
+            : code === "42703"
+              ? "schema mismatch; check deployed code and migrations"
+              : code === "57014"
+                ? "database read timed out; check workload and saturation"
+                : code?.startsWith("28")
+                  ? "database authentication failed; verify configured credentials"
+                  : "database read failed; verify connectivity and schema";
+        probes.push({ workload, table, status: "failed", code, detail });
+        throw error;
+      }
+    },
+  };
   const now = options.now ?? new Date();
 
   const [
@@ -198,15 +245,38 @@ export async function generateDiagnosticsBundle(
     freshnessSlo,
     railAttestations,
     claims,
+    heartbeats,
   ] = await Promise.all([
     readSchemaStatus(db),
     readCursors(db),
     readLeases(db),
     readHistoryGaps(db),
     readBackfillCursors(db),
-    evaluateFreshnessSlo(db, config, now),
+    evaluateFreshnessSlo(db, config, now).catch(() => ({
+      evaluatedAt: now.toISOString(),
+      status: "unknown" as const,
+      met: false,
+      breaches: [],
+      sources: [],
+      lanes: [],
+    })),
     readRailAttestations(db),
     readClaims(db),
+    readWorkerHeartbeats(db)
+      .then((records) =>
+        records.map((hb) => ({
+          name: hb.workerName,
+          kind: hb.workerKind,
+          chain: hb.chainKey,
+          state: evaluateHeartbeatFreshness(hb, now).report.state,
+          detail: evaluateHeartbeatFreshness(hb, now).report.detail,
+          lastHeartbeatAt: hb.lastHeartbeatAt.toISOString(),
+          lastCompletedAt: hb.lastCompletedAt?.toISOString() ?? null,
+          cursorBlock: hb.lastCursorBlock,
+          lastError: hb.lastError,
+        })),
+      )
+      .catch(() => []),
   ]);
 
   const bundle: DiagnosticsBundle = {
@@ -216,10 +286,14 @@ export async function generateDiagnosticsBundle(
       network: config.network,
       deploymentMode: config.deploymentMode,
       readOnly: true,
+      revision:
+        options.revision && /^[a-f0-9]{7,64}$/i.test(options.revision) ? options.revision : null,
     },
+    probes,
     config: sanitizeDiagnosticsConfig(config),
     schema,
     workerFreshness: {
+      heartbeats,
       cursors,
       leases,
       historyGaps,
@@ -231,7 +305,8 @@ export async function generateDiagnosticsBundle(
       railAttestations,
       claims,
     },
-    databaseTelemetry: typeof db.telemetrySnapshot === "function" ? db.telemetrySnapshot() : null,
+    databaseTelemetry:
+      typeof options.db.telemetrySnapshot === "function" ? options.db.telemetrySnapshot() : null,
   };
 
   return sanitizeDiagnosticsValue(bundle);

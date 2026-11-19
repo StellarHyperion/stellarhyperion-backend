@@ -5,15 +5,48 @@ import { DbTelemetryCollector } from "../../src/db/telemetry.js";
 import {
   generateDiagnosticsBundle,
   sanitizeUrl,
+  sanitizeDiagnosticsValue,
   type DiagnosticsDb,
 } from "../../src/diagnostics/bundle.js";
 import { completeEnv } from "../helpers.js";
 
 describe("operational diagnostics bundle (#113)", () => {
+  it("redacts nested authorization, signer and URL path credentials", () => {
+    const sanitized = sanitizeDiagnosticsValue({
+      nested: {
+        authorization: "Bearer do-not-export",
+        signerValue: "do-not-export",
+        privateKey: "do-not-export",
+        message: "rpc https://host/v2/do-not-export failed",
+      },
+    });
+    expect(JSON.stringify(sanitized)).not.toContain("do-not-export");
+  });
+
+  it("retains normalized failed probes and revision when the database is unavailable", async () => {
+    const db: DiagnosticsDb = {
+      query: () =>
+        Promise.reject(Object.assign(new Error("https://private@host failed"), { code: "57014" })),
+    };
+    const bundle = await generateDiagnosticsBundle({
+      config: loadConfig({ env: completeEnv() }),
+      db,
+      revision: "abc123456",
+      now: new Date("2026-11-19T00:00:00Z"),
+    });
+    expect(bundle.metadata.revision).toBe("abc123456");
+    expect(bundle.metadata.generatedAt).toBe("2026-11-19T00:00:00.000Z");
+    expect(bundle.probes.length).toBeGreaterThan(0);
+    expect(
+      bundle.probes.every((probe) => probe.status === "failed" && probe.code === "57014"),
+    ).toBe(true);
+    expect(bundle.workerFreshness.freshnessSlo.status).toBe("unknown");
+    expect(JSON.stringify(bundle)).not.toContain("private");
+  });
   it("strips credentials and secret query parameters from URLs", () => {
     expect(
       sanitizeUrl("https://user:supersecret@rpc.example.com/v2?apiKey=secret123&net=test"),
-    ).toBe("https://%5Bredacted%5D@rpc.example.com/v2?apiKey=%5Bredacted%5D&net=test");
+    ).toBe("https://rpc.example.com");
   });
 
   it("generates a sanitized read-only bundle of config, schema, freshness and backlog", async () => {

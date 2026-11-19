@@ -18,9 +18,11 @@
     "diagnostics": "node dist/cli/diagnostics.js",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/main.js",
+    "rails:backlog": "node --env-file-if-exists=.env --experimental-strip-types src/rails/inspect.ts",
     "migrate": "node-pg-migrate --envPath .env --migrations-dir migrations --migrations-table pgmigrations",
     "migrate:up": "npm run migrate -- up",
     "migrate:down": "npm run migrate -- down",
+    "rail:requeue": "node --env-file-if-exists=.env dist/rails/requeue-cli.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -30,7 +32,8 @@
     "lint:fix": "eslint . --fix",
     "fmt": "prettier --write \"**/*.{ts,mts,mjs,cjs,json,md,yml,yaml}\"",
     "fmt:check": "prettier --check \"**/*.{ts,mts,mjs,cjs,json,md,yml,yaml}\"",
-    "check": "npm run fmt:check && npm run lint && npm run typecheck && npm run test"
+    "check": "npm run fmt:check && npm run lint && npm run typecheck && npm run test",
+    "evm:backfill": "node --env-file-if-exists=.env dist/chains/evm/backfill-cli.js"
   },
   "dependencies": {
     "@fastify/rate-limit": "^11.2.0",

@@ -8,6 +8,7 @@ describe("database pool & query latency telemetry (#110)", () => {
     expect(classifySqlWorkload("BEGIN")).toBe("transaction");
     expect(classifySqlWorkload("SELECT * FROM indexer_cursor")).toBe("indexer");
     expect(classifySqlWorkload("SELECT * FROM outbound_transfer WHERE id = $1")).toBe("transfers");
+    expect(classifySqlWorkload("INSERT INTO outbound_transfer VALUES ($1)")).toBe("indexer");
     expect(classifySqlWorkload("SELECT * FROM pending_claim")).toBe("claims");
     expect(classifySqlWorkload("SELECT * FROM rail_attestation")).toBe("rails");
     expect(classifySqlWorkload("DELETE FROM rail_attestation WHERE status = 'delivered'")).toBe(
@@ -16,6 +17,13 @@ describe("database pool & query latency telemetry (#110)", () => {
     expect(classifySqlWorkload("SELECT * FROM route_health")).toBe("routes");
     expect(classifySqlWorkload("SELECT name FROM pgmigrations")).toBe("diagnostics");
   });
+
+  it.each([0, -1, 4097, Number.NaN, Infinity, 1.5])(
+    "rejects unbounded sample capacity %s",
+    (capacity) => {
+      expect(() => new DbTelemetryCollector(capacity)).toThrow(RangeError);
+    },
+  );
 
   it("keeps bounded latency samples per workload and computes percentiles", () => {
     const collector = new DbTelemetryCollector(4);

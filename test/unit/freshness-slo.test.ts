@@ -19,11 +19,42 @@ function mockDb(handlers: Record<string, readonly Record<string, unknown>[]>): Q
 }
 
 describe("configurable freshness SLO evaluation (#108)", () => {
+  it("cannot report met SLOs when enabled sources have no durable evidence", async () => {
+    const report = await evaluateFreshnessSlo(mockDb({}), loadConfig({ env: completeEnv() }));
+    expect(report.met).toBe(false);
+    expect(report.status).toBe("unknown");
+    expect(report.sources.every((source) => source.status === "unknown")).toBe(true);
+  });
+
+  it("distinguishes intentionally disabled watchers from missing remote API-only evidence", async () => {
+    const config = loadConfig({
+      env: completeEnv({
+        INDEXER_ENABLED: "false",
+        KEEPER_ENABLED: "false",
+        RAILS_ENABLED: "false",
+        DEPLOYMENT_MODE: "custom",
+      }),
+    });
+    const disabled = await evaluateFreshnessSlo(mockDb({}), config);
+    expect(disabled.sources.every((source) => source.status === "disabled")).toBe(true);
+    const remote = await evaluateFreshnessSlo(mockDb({}), {
+      ...config,
+      deploymentMode: "api-only",
+    });
+    expect(remote.met).toBe(false);
+    expect(
+      remote.sources.every(
+        (source) => source.monitoring === "remote" && source.status === "unknown",
+      ),
+    ).toBe(true);
+  });
   it("evaluates source scan lag and destination proof backlog against per-lane targets", async () => {
     const now = new Date("2026-11-19T00:00:00.000Z");
     const config = loadConfig({
       env: completeEnv({
         INDEXER_ENABLED: "false", // works even when API runs without in-process indexer
+        RAILS_ENABLED: "false",
+        KEEPER_ENABLED: "false",
         FRESHNESS_MAX_SCAN_LAG_MS: "60000",
         FRESHNESS_MAX_PROOF_BACKLOG_COUNT: "5",
         FRESHNESS_MAX_PROOF_BACKLOG_AGE_MS: "300000",
