@@ -42,8 +42,25 @@ export async function runConcurrent<T>(
   workers: number,
   task: (worker: number) => Promise<T>,
 ): Promise<PromiseSettledResult<T>[]> {
-  if (!Number.isInteger(workers) || workers < 1) throw new RangeError("workers must be positive");
+  if (!Number.isInteger(workers) || workers < 1 || workers > 32)
+    throw new RangeError("workers must be between 1 and 32");
   return Promise.allSettled(Array.from({ length: workers }, (_, worker) => task(worker)));
+}
+
+/** Concurrency stress uses TEST_DATABASE_URL only; remote or non-test databases require a separate opt-in. */
+export function validateConcurrencyDatabase(connection: string, allowRemote = false): void {
+  const url = new URL(connection);
+  if (!["postgres:", "postgresql:"].includes(url.protocol))
+    throw new Error("PostgreSQL test URL required");
+  if (
+    !allowRemote &&
+    (!["127.0.0.1", "localhost", "[::1]"].includes(url.hostname) ||
+      !/test|session|concurrency/.test(url.pathname))
+  ) {
+    throw new Error(
+      "concurrency requires a dedicated local test database or explicit HYPERION_ALLOW_REMOTE_CONCURRENCY_TEST_DATABASE=true",
+    );
+  }
 }
 
 /** A start gate for tests that must prove work overlaps rather than merely repeats. */
