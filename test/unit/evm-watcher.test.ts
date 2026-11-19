@@ -353,7 +353,7 @@ describe("an arrival, which the capture has none of", () => {
   it("excludes every reversed pair after the diagnostic budget is exhausted", async () => {
     const logs = Array.from({ length: 60 }, (_, index) => {
       const [parked, inbound] = parkedDelivery(60n);
-      const transactionHash = `0x${index.toString(16).padStart(64, "0")}` as `0x${string}`;
+      const transactionHash: `0x${string}` = `0x${index.toString(16).padStart(64, "0")}`;
       if (!parked || !inbound) throw new Error("missing pair");
       return [
         { ...inbound, logIndex: 0, transactionHash },
