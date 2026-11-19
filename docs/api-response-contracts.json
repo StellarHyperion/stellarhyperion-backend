@@ -1,0 +1,105 @@
+{
+  "claim": {
+    "fields": {
+      "id": "string",
+      "chain": "string",
+      "claimId": "integer-string",
+      "recipient": "string",
+      "token": "string",
+      "amount": "integer-string",
+      "route": "number",
+      "sourceChain": "string",
+      "sourceNonce": "integer-string",
+      "settled": "boolean",
+      "createdAt": "string",
+      "observedAt": "string"
+    }
+  },
+  "transfer": {
+    "fields": {
+      "id": "string",
+      "stage": "string",
+      "route": "number",
+      "origin": {
+        "fields": {
+          "chain": "string",
+          "router": {
+            "nullable": "string"
+          },
+          "nonce": "integer-string",
+          "sender": "string",
+          "token": "string",
+          "symbol": {
+            "nullable": "string"
+          },
+          "decimals": {
+            "nullable": "number"
+          },
+          "grossAmount": "integer-string",
+          "fee": "integer-string",
+          "netAmount": "integer-string",
+          "block": "integer-string",
+          "txHash": "string",
+          "observedAt": "string"
+        }
+      },
+      "destination": {
+        "fields": {
+          "token": {
+            "nullable": "string"
+          },
+          "amount": {
+            "nullable": "integer-string"
+          },
+          "symbol": {
+            "nullable": "string"
+          },
+          "decimals": {
+            "nullable": "number"
+          },
+          "chain": "string",
+          "recipient": "string",
+          "delivered": "boolean",
+          "block": {
+            "nullable": "integer-string"
+          },
+          "txHash": {
+            "nullable": "string"
+          },
+          "deliveredAt": {
+            "nullable": "string"
+          }
+        }
+      },
+      "rail": {
+        "nullable": {
+          "fields": {
+            "status": {
+              "nullable": "string"
+            },
+            "railStatus": {
+              "nullable": "string"
+            },
+            "reference": {
+              "nullable": "string"
+            },
+            "attestedAt": {
+              "nullable": "string"
+            },
+            "lastError": {
+              "nullable": "string"
+            }
+          }
+        }
+      },
+      "claim": {
+        "nullable": {
+          "fields": {
+            "id": "string",
+            "settled": "boolean"
+          }
+        }
+      }
+    }
+  }
+}

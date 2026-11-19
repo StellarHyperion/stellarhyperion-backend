@@ -1,4 +1,4 @@
-import { Account, Keypair, rpc } from "@stellar/stellar-sdk";
+import { Account, Keypair, SorobanDataBuilder, rpc, xdr } from "@stellar/stellar-sdk";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../../src/config/config.js";
 import { submitStellar } from "../../src/keeper/stellar.js";
@@ -31,6 +31,18 @@ function fixture() {
   const client = {
     getNetwork: () => Promise.resolve({ passphrase: config.indexer.stellar!.networkPassphrase }),
     getAccount: () => Promise.resolve(new Account(signer.publicKey(), "1")),
+    simulateTransaction: () => {
+      preparations++;
+      return Promise.resolve({
+        _parsed: true,
+        id: "fixture",
+        latestLedger: 1,
+        events: [],
+        transactionData: new SorobanDataBuilder(),
+        minResourceFee: "0",
+        result: { auth: [], retval: xdr.ScVal.scvVoid() },
+      });
+    },
     prepareTransaction: (transaction: unknown) => {
       preparations++;
       return Promise.resolve(transaction);

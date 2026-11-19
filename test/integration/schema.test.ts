@@ -187,10 +187,7 @@ suite("the schema", () => {
       "DELETE FROM public.indexer_cursor WHERE chain_key IN ('hash-test', 'no-hash-test')",
     );
     await db.query(
-      `INSERT INTO public.indexer_cursor
-         (chain_key, family, contract, last_processed, last_processed_hash)
-       VALUES ('hash-test', 'evm', '0xrouter', 42, $1),
-              ('no-hash-test', 'stellar', 'CROUTER', 42, NULL)`,
+      "INSERT INTO public.indexer_cursor (chain_key, family, contract, last_processed, last_processed_hash) VALUES ('hash-test', 'evm', '0xrouter', 42, $1), ('no-hash-test', 'stellar', 'CROUTER', 42, NULL)",
       [`0x${"ab".repeat(32)}`],
     );
 
