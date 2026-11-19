@@ -104,3 +104,13 @@ The [October 29 CI run](https://github.com/StellarHyperion/stellarhyperion-backe
 MIT.
 
 Rail workers claim one transfer inside a PostgreSQL transaction using `FOR UPDATE SKIP LOCKED`, so another replica skips active polling. Source identity, verified delivery and the retry schedule commit together. Aborted polling rolls back. Transient and rate-limit attempts have a separate durable counter and do not exhaust the permanent/evidence failure budget; explicit Retry-After delays are respected.
+
+### Router-scoped source identity
+
+Outbound nonces are unique within an emitting router. Numeric transfer IDs remain stable;
+responses include `origin.router` (null for legacy rows whose deployment is not yet proved).
+A chain/nonce detail lookup returns 409 when more than one deployment used the nonce.
+Use the source transaction or numeric ID to disambiguate. Receipt verifiers bind destination
+evidence to the exact source row. Unbound legacy evidence is joined only for an unambiguous
+source nonce; provider status cannot select a deployment or establish delivery. Historical
+rows acquire their router during exact source-event replay without changing their IDs.

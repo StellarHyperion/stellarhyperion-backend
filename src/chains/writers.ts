@@ -25,6 +25,8 @@ import type { RailRetryClass } from "../rails/types.js";
 /** Where on a chain a row was observed. One shape for a ledger and for a block. */
 export interface Position {
   readonly chainKey: string;
+  /** Present for rows emitted by a watched router; rail evidence has no local router context. */
+  readonly router?: string;
   /** Ledger sequence on Stellar, block number on an EVM chain. */
   readonly block: bigint;
   readonly txHash: string;
@@ -56,6 +58,8 @@ export interface OutboundRow {
 }
 
 export interface InboundRow {
+  /** Exact source row established by a receipt verifier, never by provider status alone. */
+  readonly sourceTransferId?: bigint;
   readonly route: number;
   readonly sourceChain: string;
   readonly sourceNonce: bigint;
@@ -107,13 +111,44 @@ export interface HealthSample {
 }
 
 export async function writeOutbound(db: Queryable, at: Position, row: OutboundRow): Promise<void> {
+  const router = at.router ?? "";
+  if (router) {
+    // Preserve IDs, attestations and delivery links when replay proves a legacy row's deployment.
+    await db.query(
+      `UPDATE outbound_transfer SET origin_router = $1
+        WHERE origin_chain = $2 AND nonce = $3 AND origin_router = ''
+          AND origin_tx = $4 AND origin_block = $5
+          AND origin_log_index IS NOT DISTINCT FROM $6
+          AND sender = $7 AND token = $8 AND gross_amount = $9
+          AND fee = $10 AND net_amount = $11 AND route = $12
+          AND destination_chain = $13 AND destination = $14
+          AND NOT EXISTS (SELECT 1 FROM outbound_transfer known
+            WHERE known.origin_chain = $2 AND known.origin_router = $1 AND known.nonce = $3)`,
+      [
+        router,
+        at.chainKey,
+        row.nonce.toString(),
+        at.txHash,
+        at.block.toString(),
+        at.logIndex,
+        row.sender,
+        row.token,
+        row.grossAmount.toString(),
+        row.fee.toString(),
+        row.netAmount.toString(),
+        row.route,
+        row.destinationChain,
+        row.destination,
+      ],
+    );
+  }
   await db.query(
     `INSERT INTO outbound_transfer
-       (origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
+       (origin_chain, origin_router, route, nonce, sender, token, gross_amount, fee, net_amount,
         destination_chain, destination, rail_ref, origin_block, origin_tx, origin_log_index,
         observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-     ON CONFLICT (origin_chain, nonce) DO UPDATE
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+     ON CONFLICT (origin_chain, origin_router, nonce) DO UPDATE
        SET route = EXCLUDED.route,
            sender = EXCLUDED.sender,
            token = EXCLUDED.token,
@@ -128,6 +163,7 @@ export async function writeOutbound(db: Queryable, at: Position, row: OutboundRo
            origin_log_index = EXCLUDED.origin_log_index`,
     [
       at.chainKey,
+      router,
       row.route,
       row.nonce.toString(),
       row.sender,
@@ -151,9 +187,9 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
     `INSERT INTO inbound_delivery
        (destination_chain, route, source_chain, source_nonce, rail_message_id, recipient, token,
         amount, delivered, claim_id, destination_block, destination_tx, destination_log_index,
-        observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-     ON CONFLICT (destination_chain, route, source_chain, source_nonce) DO UPDATE
+        observed_at, source_transfer_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+     ON CONFLICT (destination_chain, route, source_chain, source_nonce, source_transfer_id) DO UPDATE
        SET rail_message_id = COALESCE(EXCLUDED.rail_message_id, inbound_delivery.rail_message_id),
            recipient = EXCLUDED.recipient,
            token = EXCLUDED.token,
@@ -178,6 +214,7 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
       at.txHash,
       at.logIndex,
       at.observedAt,
+      row.sourceTransferId?.toString() ?? null,
     ],
   );
 }
