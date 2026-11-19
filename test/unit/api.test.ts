@@ -78,10 +78,10 @@ describe("REST API endpoints", () => {
     });
     const response = await app.inject({
       method: "GET",
-      url: "/v1/transfers/not-a-chain/not-a-nonce",
+      url: "/v1/transfers?cursor=invalid",
     });
     expect(response.statusCode).toBe(400);
-    expect(response.json()).toMatchObject({ code: "bad_request", error: "bad_request" });
+    expect(response.json()).toMatchObject({ code: "bad_request", error: "invalid_cursor" });
     await app.close();
   });
 
