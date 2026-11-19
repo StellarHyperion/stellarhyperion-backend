@@ -31,6 +31,18 @@ import {
 
 import type { EnumSpec, VarSpec } from "./env.js";
 import { EnvReader } from "./env.js";
+import {
+  DEFAULT_LANE_FRESHNESS_TARGET,
+  type FreshnessSloConfig,
+  type LaneFreshnessTarget,
+} from "../runtime/freshness.js";
+import {
+  inferDeploymentMode,
+  resolveReadinessPolicy,
+  type DependencyPolicy,
+  type DeploymentMode,
+  type ReadinessDependencyPolicies,
+} from "../runtime/readiness.js";
 
 /**
  * Axelar's status API, per network.
@@ -50,6 +62,8 @@ export type LogLevel = "trace" | "debug" | "info" | "warn" | "error" | "fatal";
 export interface StellarWatchConfig {
   readonly chain: ChainKey;
   readonly rpcUrl: string;
+  /** Explicitly configured historical event provider URL for bounded backfill (#30). */
+  readonly historicalRpcUrl?: string | null;
   readonly networkPassphrase: string;
   /** The router contract id, from the deployment record. */
   readonly routerContractId: string;
@@ -70,6 +84,8 @@ export interface EvmWatchConfig {
   readonly startBlock: bigint;
   /** From the chain registry. How many blocks before a log is believed. */
   readonly confirmations: number;
+  readonly finalityMode?: "confirmations" | "finalized";
+  readonly allowFinalityFallback?: boolean;
   /** How far back to wind the cursor when a reorg is found below the confirmation depth. */
   readonly reorgDepth: number;
   readonly logRange: number;
@@ -114,6 +130,9 @@ export interface AppConfig {
   readonly indexer: IndexerConfig;
   readonly rails: RailsConfig;
   readonly keeper: KeeperConfig;
+  readonly deploymentMode: DeploymentMode;
+  readonly readinessPolicy: ReadinessDependencyPolicies;
+  readonly freshnessSlo: FreshnessSloConfig;
   readonly shutdownTimeoutMs: number;
 }
 
@@ -335,6 +354,92 @@ const SHUTDOWN_TIMEOUT_MS: VarSpec = {
   purpose: "How long shutdown waits for in-flight work before it stops waiting.",
 };
 
+const DEPLOYMENT_MODE: EnumSpec<DeploymentMode> = {
+  name: "DEPLOYMENT_MODE",
+  kind: "enum",
+  required: false,
+  choices: ["all-in-one", "api-only", "indexer-only", "keeper-only", "custom"],
+  printable: true,
+  purpose: "Explicit process role used to resolve required versus optional readiness dependencies.",
+};
+
+const POLICY_CHOICES: readonly DependencyPolicy[] = ["required", "optional", "disabled"];
+
+const READINESS_DB_POLICY: EnumSpec<DependencyPolicy> = {
+  name: "READINESS_DB_POLICY",
+  kind: "enum",
+  required: false,
+  choices: POLICY_CHOICES,
+  printable: true,
+  purpose: "Readiness policy override for database dependency (required, optional, disabled).",
+};
+
+const READINESS_INDEXER_POLICY: EnumSpec<DependencyPolicy> = {
+  name: "READINESS_INDEXER_POLICY",
+  kind: "enum",
+  required: false,
+  choices: POLICY_CHOICES,
+  printable: true,
+  purpose: "Readiness policy override for indexer dependency (required, optional, disabled).",
+};
+
+const READINESS_RAILS_POLICY: EnumSpec<DependencyPolicy> = {
+  name: "READINESS_RAILS_POLICY",
+  kind: "enum",
+  required: false,
+  choices: POLICY_CHOICES,
+  printable: true,
+  purpose: "Readiness policy override for rail pollers dependency (required, optional, disabled).",
+};
+
+const READINESS_KEEPER_POLICY: EnumSpec<DependencyPolicy> = {
+  name: "READINESS_KEEPER_POLICY",
+  kind: "enum",
+  required: false,
+  choices: POLICY_CHOICES,
+  printable: true,
+  purpose: "Readiness policy override for keeper/Redis dependency (required, optional, disabled).",
+};
+
+const FRESHNESS_MAX_SCAN_LAG_MS: VarSpec = {
+  name: "FRESHNESS_MAX_SCAN_LAG_MS",
+  kind: "integer",
+  required: false,
+  fallback: String(DEFAULT_LANE_FRESHNESS_TARGET.maxSourceScanLagMs),
+  min: 1_000,
+  printable: true,
+  purpose: "Default source scan lag SLO target in milliseconds.",
+};
+
+const FRESHNESS_MAX_PROOF_BACKLOG_COUNT: VarSpec = {
+  name: "FRESHNESS_MAX_PROOF_BACKLOG_COUNT",
+  kind: "integer",
+  required: false,
+  fallback: String(DEFAULT_LANE_FRESHNESS_TARGET.maxProofBacklogCount),
+  min: 0,
+  printable: true,
+  purpose: "Default maximum unsettled destination proof backlog count per lane.",
+};
+
+const FRESHNESS_MAX_PROOF_BACKLOG_AGE_MS: VarSpec = {
+  name: "FRESHNESS_MAX_PROOF_BACKLOG_AGE_MS",
+  kind: "integer",
+  required: false,
+  fallback: String(DEFAULT_LANE_FRESHNESS_TARGET.maxProofBacklogAgeMs),
+  min: 1_000,
+  printable: true,
+  purpose: "Default maximum age in milliseconds of oldest pending destination proof per lane.",
+};
+
+const FRESHNESS_LANE_TARGETS: VarSpec = {
+  name: "FRESHNESS_LANE_TARGETS",
+  kind: "string",
+  required: false,
+  printable: true,
+  purpose:
+    "Optional JSON object mapping '<origin>-><dest>' or '<chain>' to per-lane freshness SLO overrides.",
+};
+
 const STELLAR_RPC_URL: VarSpec = {
   name: "STELLAR_RPC_URL",
   kind: "url",
@@ -343,6 +448,16 @@ const STELLAR_RPC_URL: VarSpec = {
   printable: true,
   purpose:
     "Soroban RPC. Defaults to the chain registry endpoint, which is public and will rate limit you under real load.",
+};
+
+const STELLAR_HISTORICAL_RPC_URL: VarSpec = {
+  name: "STELLAR_HISTORICAL_RPC_URL",
+  kind: "url",
+  protocols: ["http", "https"],
+  required: false,
+  printable: false,
+  purpose:
+    "Explicitly configured historical Soroban event provider URL for bounded backfill of retention gaps.",
 };
 
 const STELLAR_START_LEDGER: VarSpec = {
@@ -384,6 +499,25 @@ const EVM_POLL_INTERVAL_MS: VarSpec = {
   min: 250,
   printable: true,
   purpose: "How often each EVM chain is polled for new logs.",
+};
+
+const EVM_FINALITY_MODE: EnumSpec<"confirmations" | "finalized"> = {
+  name: "EVM_FINALITY_MODE",
+  kind: "enum",
+  required: false,
+  fallback: "confirmations",
+  printable: true,
+  choices: ["confirmations", "finalized"],
+  purpose: "Use configured confirmation depth or explicit finalized-block evidence for EVM scans.",
+};
+const EVM_FINALITY_ALLOW_FALLBACK: VarSpec = {
+  name: "EVM_FINALITY_ALLOW_FALLBACK",
+  kind: "boolean",
+  required: false,
+  fallback: "false",
+  printable: true,
+  purpose:
+    "Explicitly permit confirmation-depth fallback when finalized-block tags are unavailable. Defaults to false.",
 };
 
 const EVM_LOG_RANGE: VarSpec = {
@@ -474,12 +608,17 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     ? reader.string(KEEPER_STELLAR_SECRET)
     : null;
   const stellarRpcOverride = reader.url(STELLAR_RPC_URL);
+  const stellarHistoricalRpcUrl = reader.has(STELLAR_HISTORICAL_RPC_URL.name)
+    ? reader.url(STELLAR_HISTORICAL_RPC_URL)
+    : null;
   const startLedgerOverride = reader.has(STELLAR_START_LEDGER.name)
     ? reader.integer(STELLAR_START_LEDGER)
     : null;
   const pageSize = reader.integer(STELLAR_EVENT_PAGE_SIZE);
   const stellarPollIntervalMs = reader.integer(STELLAR_POLL_INTERVAL_MS);
   const evmPollIntervalMs = reader.integer(EVM_POLL_INTERVAL_MS);
+  const evmFinalityMode = reader.choice(EVM_FINALITY_MODE);
+  const evmFinalityAllowFallback = reader.boolean(EVM_FINALITY_ALLOW_FALLBACK);
   const logRange = reader.integer(EVM_LOG_RANGE);
   const reorgDepthOverride = reader.has(EVM_REORG_DEPTH.name)
     ? reader.integer(EVM_REORG_DEPTH)
@@ -492,14 +631,53 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     deployments,
     enabled: indexerEnabled,
     stellarRpcOverride,
+    stellarHistoricalRpcUrl,
     startLedgerOverride,
     pageSize,
     stellarPollIntervalMs,
     evmPollIntervalMs,
+    evmFinalityMode,
+    evmFinalityAllowFallback,
     logRange,
     reorgDepthOverride,
     env,
   });
+
+  const deploymentMode: DeploymentMode = reader.has(DEPLOYMENT_MODE.name)
+    ? reader.choice(DEPLOYMENT_MODE)
+    : inferDeploymentMode({
+        indexerEnabled,
+        railsEnabled,
+        keeperEnabled,
+      });
+
+  const readinessPolicy = resolveReadinessPolicy({
+    mode: deploymentMode,
+    indexerEnabled,
+    railsEnabled,
+    keeperEnabled,
+    overrides: {
+      ...(reader.has(READINESS_DB_POLICY.name)
+        ? { database: reader.choice(READINESS_DB_POLICY) }
+        : {}),
+      ...(reader.has(READINESS_INDEXER_POLICY.name)
+        ? { indexer: reader.choice(READINESS_INDEXER_POLICY) }
+        : {}),
+      ...(reader.has(READINESS_RAILS_POLICY.name)
+        ? { rails: reader.choice(READINESS_RAILS_POLICY) }
+        : {}),
+      ...(reader.has(READINESS_KEEPER_POLICY.name)
+        ? { keeper: reader.choice(READINESS_KEEPER_POLICY) }
+        : {}),
+    },
+  });
+
+  const freshnessMaxScanLagMs = reader.integer(FRESHNESS_MAX_SCAN_LAG_MS);
+  const freshnessMaxProofBacklogCount = reader.integer(FRESHNESS_MAX_PROOF_BACKLOG_COUNT);
+  const freshnessMaxProofBacklogAgeMs = reader.integer(FRESHNESS_MAX_PROOF_BACKLOG_AGE_MS);
+  const freshnessLanes = reader.has(FRESHNESS_LANE_TARGETS.name)
+    ? parseLaneTargets(reader, reader.string(FRESHNESS_LANE_TARGETS))
+    : {};
 
   // One throw, after everything has had a chance to complain.
   reader.finish();
@@ -529,8 +707,89 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       concurrency: keeperConcurrency,
       stellarSecret: keeperStellarSecret,
     },
+    deploymentMode,
+    readinessPolicy,
+    freshnessSlo: {
+      defaults: {
+        maxSourceScanLagMs: freshnessMaxScanLagMs,
+        maxProofBacklogCount: freshnessMaxProofBacklogCount,
+        maxProofBacklogAgeMs: freshnessMaxProofBacklogAgeMs,
+      },
+      lanes: freshnessLanes,
+    },
     shutdownTimeoutMs,
   };
+}
+
+function parseLaneTargets(
+  reader: EnvReader,
+  raw: string,
+): Readonly<Record<string, Partial<LaneFreshnessTarget>>> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    reader.reject(
+      FRESHNESS_LANE_TARGETS,
+      `invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return {};
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    reader.reject(FRESHNESS_LANE_TARGETS, "expected a JSON object mapping lane names to targets");
+    return {};
+  }
+
+  const result: Record<string, Partial<LaneFreshnessTarget>> = {};
+  for (const [lane, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      reader.reject(FRESHNESS_LANE_TARGETS, `lane '${lane}' must be an object`);
+      continue;
+    }
+    const entry = value as Record<string, unknown>;
+    const target: {
+      maxSourceScanLagMs?: number;
+      maxProofBacklogCount?: number;
+      maxProofBacklogAgeMs?: number;
+    } = {};
+
+    if (entry.maxSourceScanLagMs !== undefined) {
+      if (typeof entry.maxSourceScanLagMs !== "number" || entry.maxSourceScanLagMs < 1_000) {
+        reader.reject(
+          FRESHNESS_LANE_TARGETS,
+          `lane '${lane}'.maxSourceScanLagMs must be a number >= 1000`,
+        );
+      } else {
+        target.maxSourceScanLagMs = entry.maxSourceScanLagMs;
+      }
+    }
+    if (entry.maxProofBacklogCount !== undefined) {
+      if (
+        typeof entry.maxProofBacklogCount !== "number" ||
+        !Number.isInteger(entry.maxProofBacklogCount) ||
+        entry.maxProofBacklogCount < 0
+      ) {
+        reader.reject(
+          FRESHNESS_LANE_TARGETS,
+          `lane '${lane}'.maxProofBacklogCount must be an integer >= 0`,
+        );
+      } else {
+        target.maxProofBacklogCount = entry.maxProofBacklogCount;
+      }
+    }
+    if (entry.maxProofBacklogAgeMs !== undefined) {
+      if (typeof entry.maxProofBacklogAgeMs !== "number" || entry.maxProofBacklogAgeMs < 1_000) {
+        reader.reject(
+          FRESHNESS_LANE_TARGETS,
+          `lane '${lane}'.maxProofBacklogAgeMs must be a number >= 1000`,
+        );
+      } else {
+        target.maxProofBacklogAgeMs = entry.maxProofBacklogAgeMs;
+      }
+    }
+    result[lane] = target;
+  }
+  return result;
 }
 
 const EMPTY_SET: DeploymentSet = { schemaVersion: 1, generatedAt: "", networks: {} };
@@ -580,10 +839,13 @@ interface PlanInput {
   readonly deployments: DeploymentSet;
   readonly enabled: boolean;
   readonly stellarRpcOverride: string;
+  readonly stellarHistoricalRpcUrl: string | null;
   readonly startLedgerOverride: number | null;
   readonly pageSize: number;
   readonly stellarPollIntervalMs: number;
   readonly evmPollIntervalMs: number;
+  readonly evmFinalityMode: "confirmations" | "finalized";
+  readonly evmFinalityAllowFallback: boolean;
   readonly logRange: number;
   readonly reorgDepthOverride: number | null;
   readonly env: Readonly<Record<string, string | undefined>>;
@@ -621,10 +883,17 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
     (deployment) => isStellarDeployment(deployment) && RouteKind.AxelarIts in deployment.adapters,
   );
   if (stellarDeployment !== undefined) {
-    const hasReceiver = Object.entries(input.deployments.networks).some(([key, deployment]) => {
-      const chain = CHAINS[key as ChainKey];
-      if (!isEvmDeployment(deployment) || !isEvmChain(chain)) return false;
-      return RAIL_CONTRACTS[key as ChainKey]?.axelar?.interchainTokenService !== undefined;
+    // Direct ITS payouts use the deployed protocol service, not a Hyperion EVM router.
+    // Restrict admission to valid receiver metadata on this network; receipt verification
+    // independently checks the actual destination service, peer, token and payment.
+    const hasReceiver = chainsFor(input.network).some((chain) => {
+      if (!isEvmChain(chain)) return false;
+      const receiver = RAIL_CONTRACTS[chain.key]?.axelar?.interchainTokenService;
+      return (
+        receiver !== undefined &&
+        /^0x[0-9a-fA-F]{40}$/.test(receiver) &&
+        !/^0x0{40}$/.test(receiver)
+      );
     });
     if (!hasReceiver) {
       reader.reject(
@@ -661,6 +930,7 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
       stellar = {
         chain: chainKey,
         rpcUrl: input.stellarRpcOverride === "" ? chain.defaultRpcUrl : input.stellarRpcOverride,
+        historicalRpcUrl: input.stellarHistoricalRpcUrl,
         networkPassphrase: chain.networkPassphrase,
         routerContractId: deployment.router,
         startLedger: input.startLedgerOverride ?? deployment.deployedAt.ledger,
@@ -697,6 +967,8 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
         routerAddress: deployment.router,
         startBlock: BigInt(deployment.deployedAt.blockNumber),
         confirmations: chain.confirmations,
+        finalityMode: input.evmFinalityMode,
+        allowFinalityFallback: input.evmFinalityAllowFallback,
         // The chain's own confirmations is the right default per chain: one on Arc, where
         // Malachite finality is genuinely final, and twelve on Ethereum, where it is not.
         reorgDepth: input.reorgDepthOverride ?? chain.confirmations,

@@ -47,6 +47,18 @@ suite("replaying the live router's history", () => {
       await db.query(`DELETE FROM ${table} WHERE ${column} = $1`, [CHAIN]);
     }
     await db.query("DELETE FROM indexer_cursor WHERE chain_key = $1", [CHAIN]);
+    for (const table of [
+      "indexer_lease",
+      "stellar_history_gap",
+      "stellar_backfill_cursor",
+      "stellar_event_identity",
+      "stellar_event_conflict",
+      "stellar_scan_journal",
+      "stellar_event_quarantine",
+      "stellar_deployment_revision",
+    ]) {
+      await db.query(`DELETE FROM ${table} WHERE chain_key = $1`, [CHAIN]);
+    }
   };
 
   /** Run the watcher to the head, the way the poller would, and say how many passes it took. */
@@ -66,6 +78,7 @@ suite("replaying the live router's history", () => {
       passes += 1;
       if (passes > 20) throw new Error("the watcher never reported catching up");
     }
+    await watcher.drain();
     return passes + 1;
   };
 
@@ -215,21 +228,28 @@ suite("replaying the live router's history", () => {
     await drain();
   });
 
-  it("refuses to carry the cursor over to a router at another address", async () => {
+  it("starts a replacement deployment while preserving earlier administrative history", async () => {
     const { logger } = capturingLogger();
     const other = new StellarWatcher({
       chainKey: CHAIN,
       router: "CBK3TPRQR5A3H2AWESOUX4MVYOP63VNQ5EYHCX26EEJUC5B5FLB4DV5O",
       startLedger: FIRST_EVENT_LEDGER,
       pageSize: 200,
-      rpc: new FakeRpc({ events: ROUTER_HISTORY, latestLedger: HEAD }),
+      rpc: new FakeRpc({ events: [], latestLedger: HEAD }),
       db,
       logger,
     });
 
-    await expect(other.tick(AbortSignal.timeout(20_000))).rejects.toThrow(
-      /needs its cursor reset rather than reused/,
+    const before = await snapshot(db);
+    await other.tick(AbortSignal.timeout(20_000));
+    expect(await snapshot(db)).toEqual(before);
+    const { rows } = await db.query(
+      "SELECT contract, deployment_revision FROM indexer_cursor WHERE chain_key = $1",
+      [CHAIN],
     );
+    expect(rows[0]?.contract).toBe("CBK3TPRQR5A3H2AWESOUX4MVYOP63VNQ5EYHCX26EEJUC5B5FLB4DV5O");
+    expect(rows[0]?.deployment_revision).toBe(2);
+    await other.drain();
   });
 });
 

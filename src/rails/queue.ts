@@ -4,8 +4,8 @@
  * One query, and the shape of it is the whole design. A transfer needs looking at when it has left
  * one chain and has not arrived on the other, which is two conditions the schema expresses in two
  * different tables: no `rail_attestation` row yet, or one that is still `pending` or `attested`.
- * A `LEFT JOIN` covers both without a union, and the ordering matches the partial index B2 already
- * created for exactly this.
+ * A `LEFT JOIN` covers both without a union, and the ordering matches the partial index over
+ * persisted retry times.
  *
  * The `delivered` column is the part worth reading twice. It is computed from our own
  * `inbound_delivery` table rather than from a rail, because an inbound row means the money arrived
@@ -16,11 +16,25 @@ import type { Queryable } from "../db/pool.js";
 import { bigintOf, integer, text, textOrNull } from "../db/rows.js";
 import type { AttestationStatus, PendingTransfer } from "./types.js";
 
+export {
+  BacklogValidationError,
+  formatBacklogReportText,
+  inspectRailBacklog,
+  type InspectRailBacklogOptions,
+} from "./backlog.js";
+
+export { requeueTerminalTransfer } from "./requeue.js";
+
 const STATUSES: readonly string[] = ["pending", "attested", "delivered", "failed", "expired"];
 
 export interface QueueQuery {
   readonly route: number;
   readonly limit: number;
+  readonly now: Date;
+  /** Only inside the transaction that processes and writes this transfer. */
+  readonly lock?: boolean;
+  readonly excludedTransferIds?: readonly bigint[];
+  readonly onlyTransferId?: bigint;
   /**
    * Skip transfers checked more recently than this.
    *
@@ -45,25 +59,79 @@ export async function pendingForRail(
             t.origin_tx,
             a.status,
             COALESCE(a.check_failures, 0) AS check_failures,
+            COALESCE(a.retry_attempts, 0) AS retry_attempts,
             EXISTS (
               SELECT 1 FROM inbound_delivery d
-               WHERE d.destination_chain = t.destination_chain
+               WHERE d.delivered = true
+                 AND d.destination_chain = t.destination_chain
                  AND d.route = t.route
                  AND d.source_chain = t.origin_chain
                  AND d.source_nonce = t.nonce
+      AND (d.source_transfer_id = t.id OR (d.source_transfer_id IS NULL AND NOT EXISTS (
+        SELECT 1 FROM outbound_transfer other
+         WHERE other.origin_chain = t.origin_chain AND other.nonce = t.nonce
+           AND other.id <> t.id
+      )))
+                 AND d.recipient = CASE
+                   WHEN t.destination ~ '^0x0{24}[0-9a-fA-F]{40}$'
+                     THEN lower('0x' || right(t.destination, 40))
+                   WHEN t.destination ~ '^0x[0-9a-fA-F]{40}$' THEN lower(t.destination)
+                   ELSE t.destination END
             ) AS delivered
        FROM outbound_transfer t
        LEFT JOIN rail_attestation a ON a.transfer_id = t.id
       WHERE t.route = $1
+        AND NOT (t.id = ANY($6::bigint[]))
+        AND ($7::bigint IS NULL OR t.id = $7)
         AND (a.transfer_id IS NULL OR a.status IN ('pending', 'attested'))
         AND COALESCE(a.check_failures, 0) < $2
-        AND (a.last_checked_at IS NULL OR a.last_checked_at < $3)
-      ORDER BY a.last_checked_at NULLS FIRST, t.id
-      LIMIT $4`,
-    [query.route, query.maxCheckFailures, query.notCheckedSince, query.limit],
+        AND a.retry_class IS DISTINCT FROM 'permanent'
+        AND a.retry_class IS DISTINCT FROM 'exhausted'
+        AND (
+          (a.next_attempt_at IS NOT NULL AND a.next_attempt_at <= $3)
+          OR
+          (a.next_attempt_at IS NULL AND
+            (a.last_checked_at IS NULL OR a.last_checked_at < $4))
+        )
+      ORDER BY a.next_attempt_at NULLS FIRST, a.last_checked_at NULLS FIRST, t.id
+      LIMIT $5
+      ${query.lock === true ? "FOR UPDATE OF t SKIP LOCKED" : ""}`,
+    [
+      query.route,
+      query.maxCheckFailures,
+      query.now,
+      query.notCheckedSince,
+      query.limit,
+      (query.excludedTransferIds ?? []).map(String),
+      query.onlyTransferId?.toString() ?? null,
+    ],
   );
 
-  return rows.map((row) => ({
+  return rows.map((row) => mapPendingRow(row));
+}
+
+/** Fetch one active transfer for an operator-requested immediate re-evaluation. */
+export async function pendingTransferById(
+  db: Queryable,
+  route: number,
+  transferId: bigint,
+  maxCheckFailures = 5,
+): Promise<PendingTransfer | null> {
+  const now = new Date();
+  const rows = await pendingForRail(db, {
+    route,
+    limit: 1,
+    now,
+    notCheckedSince: now,
+    maxCheckFailures,
+    onlyTransferId: transferId,
+    lock: true,
+  });
+  return rows[0] ?? null;
+}
+
+function mapPendingRow(row: Record<string, unknown>): PendingTransfer {
+  return {
     transferId: bigintOf(row, "id"),
     route: integer(row, "route"),
     originChain: text(row, "origin_chain"),
@@ -72,8 +140,9 @@ export async function pendingForRail(
     originTx: text(row, "origin_tx"),
     status: readStatus(row.status === undefined ? null : textOrNull(row, "status")),
     checkFailures: integer(row, "check_failures"),
+    retryAttempts: integer(row, "retry_attempts"),
     delivered: row.delivered === true,
-  }));
+  };
 }
 
 /**

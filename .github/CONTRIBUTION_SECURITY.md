@@ -56,6 +56,8 @@ migration execution, role changes, and deployment promotion remain maintainer re
 ## Local verification
 
 Use supported Node 22 and `npm ci --ignore-scripts`. Then run the repository's normal checks. Workflow
-syntax is checked with actionlint; Zizmor runs offline with medium/high findings blocking the gate.
+syntax is checked with actionlint. Zizmor runs offline with medium/high findings blocking the gate,
+except for the byte-pinned, reviewed approval workflow trigger described in CONTRIBUTING.md.
+The gate also requires CodeQL source analysis and the established PR description template.
 Inspect endpoint-policy failures from the hosted run and add only endpoints required by reviewed
 commands. Never broaden the allowlist merely to make an unexpected request pass.

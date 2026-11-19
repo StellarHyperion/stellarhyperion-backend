@@ -22,14 +22,21 @@ import type {
 } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
 import { Poller } from "../runtime/poller.js";
-import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
-import { fixedReadiness } from "../runtime/readiness.js";
+import type { ReadinessReport, ReadinessSource, WorkerKind } from "../runtime/readiness.js";
+import { fixedReadiness, recordWorkerHeartbeat } from "../runtime/readiness.js";
 import { RouteKind } from "@hyperion/protocol";
 
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
+import { inspectRailBacklog, type InspectRailBacklogOptions } from "../rails/backlog.js";
 import { IrisClient } from "../rails/cctp/iris.js";
-import { RailPass } from "../rails/pass.js";
-import type { RailClient } from "../rails/types.js";
+import { RailPass, type RailProgress } from "../rails/pass.js";
+import { requeueTerminalTransfer } from "../rails/requeue.js";
+import type {
+  BacklogInspectionReport,
+  RailClient,
+  RailRequeueRequest,
+  RailRequeueResult,
+} from "../rails/types.js";
 import { KeeperWorker } from "../keeper/worker.js";
 import { viemClient } from "./evm/client.js";
 import { EvmWatcher } from "./evm/watcher.js";
@@ -55,15 +62,29 @@ export interface Worker extends ReadinessSource {
 export interface IndexerHandle {
   readonly workers: readonly Worker[];
   readonly readiness: readonly ReadinessSource[];
+  /** Read-only operator inspection; it does not start workers or change transfer state. */
+  inspectBacklog(options?: InspectRailBacklogOptions): Promise<BacklogInspectionReport>;
   /** Begin polling. Separate from building, the way `listen` is separate from `buildServer`. */
   start(): void;
   stop(): Promise<void>;
+  requeueTransfer(
+    request: RailRequeueRequest,
+    options?: { readonly evaluateNow?: boolean },
+  ): Promise<RailRequeueResult>;
 }
 
 /** One pass is one `tick`, and the component reports its own health. */
 interface Pass extends ReadinessSource {
   readonly name: string;
   tick(signal: AbortSignal): Promise<boolean>;
+  release?(): Promise<unknown>;
+  readonly progress?: { readonly block?: bigint; readonly ledger?: number } | RailProgress | null;
+}
+
+export interface PolledWorkerOptions {
+  readonly db?: Transactional;
+  readonly workerKind?: WorkerKind;
+  readonly chainKey?: string | null;
 }
 
 /**
@@ -75,17 +96,69 @@ interface Pass extends ReadinessSource {
  */
 export class PolledWorker implements Worker {
   private readonly poller: Poller;
+  private readonly db: Transactional | undefined;
+  private readonly workerKind: WorkerKind;
+  private readonly chainKey: string | null;
 
   constructor(
     private readonly pass: Pass,
     intervalMs: number,
     logger: Logger,
+    options: PolledWorkerOptions = {},
   ) {
+    this.db = options.db;
+    this.workerKind = options.workerKind ?? "other";
+    this.chainKey = options.chainKey ?? null;
     this.poller = new Poller({
       name: pass.name,
       intervalMs,
       logger,
-      tick: (signal) => pass.tick(signal),
+      tick: async (signal) => {
+        let error: unknown;
+        let completed = false;
+        try {
+          const result = await pass.tick(signal);
+          completed = true;
+          return result;
+        } catch (failure) {
+          error = failure;
+          throw failure;
+        } finally {
+          if (this.db !== undefined) {
+            await this.persistHeartbeat(completed, error).catch((err: unknown) => {
+              logger.warn({ err, worker: pass.name }, "failed to persist worker heartbeat");
+            });
+          }
+        }
+      },
+    });
+  }
+
+  private async persistHeartbeat(completed: boolean, error?: unknown): Promise<void> {
+    if (this.db === undefined) return;
+    const stats = this.poller.stats;
+    const report = await (completed ? this.pass.readiness() : this.readiness());
+    const progress = this.pass.progress;
+    const consecutiveFailures = completed ? 0 : stats.consecutiveFailures + 1;
+    await recordWorkerHeartbeat(this.db, {
+      workerName: this.name,
+      workerKind: this.workerKind,
+      chainKey: this.chainKey,
+      state: consecutiveFailures >= FAILURES_BEFORE_DEGRADED ? "degraded" : report.state,
+      detail: report.detail,
+      completed,
+      lastCursorBlock:
+        progress && "block" in progress
+          ? (progress.block ?? null)
+          : progress && "ledger" in progress
+            ? BigInt(progress.ledger)
+            : null,
+      consecutiveFailures,
+      lastError: completed ? null : error instanceof Error ? error.message : String(error),
+      metadata: {
+        ticks: stats.ticks,
+        running: stats.running,
+      },
     });
   }
 
@@ -97,8 +170,11 @@ export class PolledWorker implements Worker {
     this.poller.start();
   }
 
-  stop(): Promise<void> {
-    return this.poller.stop();
+  async stop(): Promise<void> {
+    await this.poller.stop();
+    if (this.pass.release !== undefined) {
+      await this.pass.release().catch(() => undefined);
+    }
   }
 
   async readiness(): Promise<ReadinessReport> {
@@ -130,6 +206,29 @@ export interface BuildIndexerDeps {
  */
 export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   const { config, logger, db } = deps;
+  const passes = buildRailPasses(config.rails, config.network, db, logger, config);
+  const inspectBacklog = (
+    options: InspectRailBacklogOptions = {},
+  ): Promise<BacklogInspectionReport> =>
+    inspectRailBacklog(db, {
+      ...options,
+      recheckAfterMs: config.rails.recheckAfterMs,
+      maxCheckFailures: config.rails.maxCheckFailures,
+    });
+  const requeueTransfer: IndexerHandle["requeueTransfer"] = async (request, options) => {
+    if (options?.evaluateNow === true && !config.rails.enabled) {
+      throw new Error("immediate rail evaluation is disabled by configuration");
+    }
+    const result = await requeueTerminalTransfer(db, request);
+    if (options?.evaluateNow === true) {
+      const pass = passes.find((candidate) => candidate.route === result.route);
+      if (pass === undefined) {
+        throw new Error(`no rail evaluator is configured for route ${String(result.route)}`);
+      }
+      await pass.evaluateTransfer(result.transferId);
+    }
+    return result;
+  };
 
   if (!config.indexer.enabled) {
     return {
@@ -141,8 +240,10 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
           "disabled by configuration, so this replica answers questions and watches nothing",
         ),
       ],
+      inspectBacklog,
       start: () => undefined,
       stop: () => Promise.resolve(),
+      requeueTransfer,
     };
   }
 
@@ -171,7 +272,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // They are not conditional on a router being watched: a transfer indexed by a previous run is
   // still waiting on its rail whether or not this replica is watching the chain it left.
   if (config.rails.enabled) {
-    for (const worker of railWorkers(config.rails, config.network, db, logger, config)) {
+    for (const worker of railWorkersFromPasses(passes, config.rails, db, logger)) {
       workers.push(worker);
     }
   } else {
@@ -213,6 +314,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   return {
     workers,
     readiness: [...workers, ...extra],
+    inspectBacklog,
     start: () => {
       for (const worker of workers) worker.start();
       if (workers.length > 0) {
@@ -225,6 +327,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
       // number of chains.
       await Promise.all(workers.map((worker) => worker.stop()));
     },
+    requeueTransfer,
   };
 }
 
@@ -236,13 +339,13 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
  * which the queue already settles without a request. A poller for it would make a request a tick
  * for an answer that does not exist.
  */
-function railWorkers(
+export function buildRailPasses(
   config: RailsConfig,
   network: AppConfig["network"],
   db: Transactional,
   logger: Logger,
   appConfig: AppConfig,
-): readonly Worker[] {
+): readonly RailPass[] {
   const clients: readonly { readonly route: RouteKind; readonly client: RailClient }[] = [
     {
       route: RouteKind.Cctp,
@@ -263,7 +366,7 @@ function railWorkers(
 
   return clients.map(({ route, client }) => {
     const child = logger.child({ rail: client.rail, route });
-    const pass = new RailPass({
+    return new RailPass({
       route,
       config: appConfig,
       client,
@@ -273,7 +376,22 @@ function railWorkers(
       recheckAfterMs: config.recheckAfterMs,
       maxCheckFailures: config.maxCheckFailures,
     });
-    return new PolledWorker(pass, config.pollIntervalMs, child);
+  });
+}
+
+function railWorkersFromPasses(
+  passes: readonly RailPass[],
+  config: RailsConfig,
+  db: Transactional,
+  logger: Logger,
+): readonly Worker[] {
+  return passes.map((pass) => {
+    const child = logger.child({ rail: pass.rail, route: pass.route });
+    return new PolledWorker(pass, config.pollIntervalMs, child, {
+      db,
+      workerKind: "rail",
+      chainKey: null,
+    });
   });
 }
 
@@ -285,13 +403,19 @@ function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): W
     chainId: config.chainId,
     startBlock: config.startBlock,
     confirmations: config.confirmations,
+    finalityMode: config.finalityMode ?? "confirmations",
+    allowFinalityFallback: config.allowFinalityFallback ?? false,
     reorgDepth: config.reorgDepth,
     logRange: config.logRange,
     client: viemClient(config.rpcUrls, { logger: child }),
     db,
     logger: child,
   });
-  return new PolledWorker(watcher, config.pollIntervalMs, child);
+  return new PolledWorker(watcher, config.pollIntervalMs, child, {
+    db,
+    workerKind: "chain",
+    chainKey: config.chain,
+  });
 }
 
 function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Logger): Worker {
@@ -302,8 +426,17 @@ function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Lo
     startLedger: config.startLedger,
     pageSize: config.pageSize,
     rpc: new StellarRpc(config.rpcUrl),
+    ...(config.historicalRpcUrl !== undefined &&
+    config.historicalRpcUrl !== null &&
+    config.historicalRpcUrl !== ""
+      ? { historicalRpc: new StellarRpc(config.historicalRpcUrl) }
+      : {}),
     db,
     logger: child,
   });
-  return new PolledWorker(watcher, config.pollIntervalMs, child);
+  return new PolledWorker(watcher, config.pollIntervalMs, child, {
+    db,
+    workerKind: "chain",
+    chainKey: config.chain,
+  });
 }
