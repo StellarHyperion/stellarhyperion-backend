@@ -10,9 +10,9 @@ import {
   BacklogValidationError,
   formatBacklogReportText,
   inspectRailBacklog,
-  sanitizeRailDiagnostic,
   type InspectRailBacklogOptions,
 } from "./backlog.js";
+import { sanitizeRailDiagnostic } from "./diagnostics.js";
 import type { MissingProofStage, RailRetryClass } from "./types.js";
 
 export interface ParsedBacklogArguments {

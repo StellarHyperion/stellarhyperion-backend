@@ -66,6 +66,7 @@ beforeAll(async () => {
     "1792400000000_indexer-worker-heartbeat.sql",
     "1792500000000_axelar-delivery-evidence.sql",
     "1792600000000_keeper-checkpoints.sql",
+    "1792800000000_cctp-verification-failure-reasons.sql",
     "1792900000000_rail-transition-history.sql",
   ]) {
     const sql = readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8").split(

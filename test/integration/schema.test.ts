@@ -28,7 +28,6 @@ const suite = CONNECTION === undefined ? describe.skip : describe;
 const CHECK_VIOLATION = "23514";
 const UNIQUE_VIOLATION = "23505";
 const NUMERIC_OUT_OF_RANGE = "22003";
-const MIGRATION_TEST_SCHEMA = `migration_lock_test_${process.pid}_${Date.now()}`;
 
 const U64_MAX = "18446744073709551615";
 const U256_MAX = "115792089237316195423570985008687907853269984665640564039457584007913129639935";

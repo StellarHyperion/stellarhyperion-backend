@@ -19,7 +19,7 @@
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/main.js",
     "rails:backlog": "node --env-file-if-exists=.env --experimental-strip-types src/rails/inspect.ts",
-    "migrate": "node-pg-migrate --envPath .env --migrations-dir migrations --migrations-table pgmigrations --advisory-lock-mode wait",
+    "migrate": "node-pg-migrate --envPath .env --migrations-dir migrations --migrations-table pgmigrations",
     "migrate:up": "npm run migrate -- up",
     "migrate:down": "npm run migrate -- down",
     "rail:requeue": "node --env-file-if-exists=.env dist/rails/requeue-cli.js",
