@@ -401,9 +401,102 @@ describe("REST API endpoints", () => {
     expect(res.statusCode).toBe(200);
     expect(res.headers["content-type"]).toBe("text/event-stream");
     expect(res.headers["cache-control"]).toBe("no-cache");
+    expect(res.payload).toMatch(/^id: [A-Za-z0-9_-]+\nevent: transfer_update/);
     expect(res.payload).toContain("event: transfer_update\ndata: ");
     expect(res.payload).toContain("event: complete\ndata: ");
     expect(res.payload).toContain('"stage":"delivered"');
+  });
+
+  it("replays an accepted Last-Event-ID cursor", async () => {
+    const db = new MockDb({
+      outbound_transfer: [
+        {
+          id: "resume-1",
+          origin_chain: "sepolia",
+          route: 0,
+          nonce: "45",
+          sender: "0x1111",
+          token: "0x2222",
+          gross_amount: "1000",
+          fee: "10",
+          net_amount: "990",
+          destination_chain: "stellar-testnet",
+          destination: "GBB...",
+          rail_ref: null,
+          origin_block: "100",
+          origin_tx: "0xresume",
+          observed_at: new Date("2026-10-07T12:00:00Z"),
+          attestation_status: "delivered",
+          rail_status: "complete",
+          rail_reference: "resume-45",
+          attested_at: new Date("2026-10-07T12:01:00Z"),
+          last_error: null,
+          inbound_delivered: true,
+          destination_block: "500",
+          destination_tx: "0xdef",
+          delivered_at: new Date("2026-10-07T12:05:00Z"),
+          claim_id: null,
+          claim_settled: false,
+        },
+      ],
+    });
+    const app = buildServer({ config, logger, db: db as unknown as Database, readiness: [] });
+
+    const first = await app.inject("/v1/transfers/resume-1/stream");
+    expect(first.statusCode).toBe(200);
+    const cursor = first.payload.split("\n")[0]?.slice(4) ?? "";
+    expect(cursor).toMatch(/^[A-Za-z0-9_-]+$/);
+
+    const resumed = await app.inject({
+      method: "GET",
+      url: "/v1/transfers/resume-1/stream",
+      headers: { "last-event-id": cursor },
+    });
+    expect(resumed.statusCode).toBe(200);
+    expect(resumed.payload).toMatch(/^id: [A-Za-z0-9_-]+\nevent: transfer_update/);
+  });
+
+  it("rejects malformed SSE cursors with a client error", async () => {
+    const db = new MockDb({
+      outbound_transfer: [
+        {
+          id: "resume-invalid",
+          origin_chain: "sepolia",
+          route: 0,
+          nonce: "46",
+          sender: "0x1111",
+          token: "0x2222",
+          gross_amount: "1000",
+          fee: "10",
+          net_amount: "990",
+          destination_chain: "stellar-testnet",
+          destination: "GBB...",
+          rail_ref: null,
+          origin_block: "100",
+          origin_tx: "0xinvalid",
+          observed_at: new Date("2026-10-07T12:00:00Z"),
+          attestation_status: "delivered",
+          rail_status: "complete",
+          rail_reference: "invalid-46",
+          attested_at: new Date("2026-10-07T12:01:00Z"),
+          last_error: null,
+          inbound_delivered: true,
+          destination_block: "500",
+          destination_tx: "0xdef",
+          delivered_at: new Date("2026-10-07T12:05:00Z"),
+          claim_id: null,
+          claim_settled: false,
+        },
+      ],
+    });
+    const app = buildServer({ config, logger, db: db as unknown as Database, readiness: [] });
+    const response = await app.inject({
+      method: "GET",
+      url: "/v1/transfers/resume-invalid/stream",
+      headers: { "last-event-id": "not-a-cursor" },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ error: "cursor_expired", resync: true });
   });
 
   it("emits transfer_update on status change and sends periodic ping comments", async () => {

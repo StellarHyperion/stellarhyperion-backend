@@ -22,6 +22,8 @@ export type DbWorkload =
 
 export interface QueryOptions {
   readonly workload?: DbWorkload;
+  /** Cancel only the borrowed connection's current query, without reusing it first. */
+  readonly signal?: AbortSignal;
 }
 
 export interface PoolSaturationSnapshot {
