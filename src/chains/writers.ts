@@ -21,6 +21,7 @@
  */
 import { createHash } from "node:crypto";
 import type { Queryable, Transactional } from "../db/pool.js";
+import type { VerificationDiagnostic } from "../rails/axelar/events.js";
 import {
   bigintOf,
   boolean,
@@ -395,14 +396,15 @@ export interface AttestationRow {
   readonly retryAttempts: number;
   readonly nextAttemptAt: Date | null;
   readonly retryClass: RailRetryClass | null;
+  readonly diagnostics?: readonly VerificationDiagnostic[];
 }
 
 export async function writeAttestation(db: Queryable, row: AttestationRow): Promise<void> {
   await db.query(
     `INSERT INTO rail_attestation
        (transfer_id, route, status, rail_status, rail_reference, attested_at, last_checked_at,
-        check_failures, last_error, next_attempt_at, retry_class, retry_attempts)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        check_failures, last_error, next_attempt_at, retry_class, retry_attempts, diagnostics)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
      ON CONFLICT (transfer_id) DO UPDATE
        SET status = EXCLUDED.status,
            rail_status = COALESCE(EXCLUDED.rail_status, rail_attestation.rail_status),
@@ -417,6 +419,7 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
            retry_attempts = EXCLUDED.retry_attempts,
            next_attempt_at = EXCLUDED.next_attempt_at,
            retry_class = EXCLUDED.retry_class,
+           diagnostics = EXCLUDED.diagnostics,
            updated_at = now()`,
     [
       row.transferId.toString(),
@@ -431,6 +434,7 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
       row.nextAttemptAt,
       row.retryClass,
       row.retryAttempts,
+      JSON.stringify(row.diagnostics ?? []),
     ],
   );
 }

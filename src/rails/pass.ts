@@ -20,6 +20,7 @@
 import type { AppConfig } from "../config/config.js";
 import { verifyItsDelivery } from "./axelar/delivery.js";
 import { verifyCctpDelivery } from "./cctp/delivery.js";
+import type { VerificationDiagnostic } from "./axelar/events.js";
 import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
@@ -285,10 +286,14 @@ export class RailPass {
     }
 
     const { report } = lookup;
+    let diagnostics: readonly VerificationDiagnostic[] = [];
     if (this.options.config && (report.execution || report.forwardTxHash)) {
+      const its = await verifyItsDelivery(this.options.config, db, transfer, report);
+      diagnostics = its !== null && "diagnostics" in its ? its.diagnostics : [];
       const verified =
-        (await verifyItsDelivery(this.options.config, db, transfer, report)) ??
-        (await verifyCctpDelivery(this.options.config, db, transfer, report));
+        its !== null && !("diagnostics" in its)
+          ? its
+          : await verifyCctpDelivery(this.options.config, db, transfer, report);
       if (verified) {
         signal.throwIfAborted();
         await writeInbound(db, verified.at, verified.row);
@@ -303,6 +308,7 @@ export class RailPass {
           error: null,
           nextAttemptAt: null,
           retryClass: null,
+          diagnostics,
         });
         return true;
       }
@@ -319,6 +325,7 @@ export class RailPass {
       error: null,
       nextAttemptAt: isTerminal(status) ? null : this.nextCheckAt(at),
       retryClass: null,
+      diagnostics,
     });
     return isTerminal(status);
   }
@@ -392,6 +399,7 @@ export class RailPass {
       readonly error: string | null;
       readonly nextAttemptAt: Date | null;
       readonly retryClass: RailRetryClass | null;
+      readonly diagnostics?: readonly VerificationDiagnostic[];
     },
   ): Promise<void> {
     await writeAttestation(db, {
@@ -407,6 +415,7 @@ export class RailPass {
       lastError: fields.error,
       nextAttemptAt: fields.nextAttemptAt,
       retryClass: fields.retryClass,
+      diagnostics: fields.diagnostics ?? [],
     });
   }
 

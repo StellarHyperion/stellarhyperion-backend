@@ -114,6 +114,20 @@ describe("REST API endpoints", () => {
 
     expect(res.statusCode).toBe(404);
     expect(res.json().error).toBe("not_found");
+    expect(res.json().code).toBe("not_found");
+  });
+
+  it("uses a stable error code without exposing route details", async () => {
+    const app = buildServer({
+      config,
+      logger,
+      db: new MockDb({}) as unknown as Database,
+      readiness: [],
+    });
+    const res = await app.inject({ method: "GET", url: "/no-such-route?secret=not-for-response" });
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toMatchObject({ error: "not_found", code: "not_found" });
+    expect(res.body).not.toContain("secret");
   });
 
   it("lists transfers with pagination metadata", async () => {

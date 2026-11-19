@@ -20,6 +20,32 @@ export const DEFAULT_STREAM_RATE_LIMIT_MAX = 20;
 export const DEFAULT_RATE_LIMIT_WINDOW_MS = 60_000;
 export const DEFAULT_RATE_LIMIT_CACHE_SIZE = 10_000;
 
+export type ApiErrorCode =
+  "bad_request" | "not_found" | "timeout" | "unavailable" | "internal_error" | "too_many_requests";
+
+export interface ApiErrorEnvelope {
+  readonly error: ApiErrorCode;
+  readonly code: ApiErrorCode;
+  readonly message: string;
+  readonly requestId?: string;
+  readonly retryAfterMs?: number;
+}
+
+function errorEnvelope(
+  error: ApiErrorCode,
+  message: string,
+  requestId?: string,
+  extra: Pick<ApiErrorEnvelope, "retryAfterMs"> = {},
+): ApiErrorEnvelope {
+  return {
+    error,
+    code: error,
+    message,
+    ...(requestId === undefined ? {} : { requestId }),
+    ...extra,
+  };
+}
+
 export interface RateLimitPolicyOptions {
   readonly enabled?: boolean;
   readonly max?: number;
@@ -74,6 +100,24 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     requestIdHeader: "x-request-id",
     logController: new LogController({ disableRequestLogging: deps.config.nodeEnv === "test" }),
     bodyLimit: 64 * 1024,
+  });
+
+  // Keep the legacy `error` field while guaranteeing every JSON error has the stable code alias.
+  app.addHook("onSend", (_request, _reply, payload, done) => {
+    if (typeof payload !== "string") {
+      done(null, payload);
+      return;
+    }
+    try {
+      const body = JSON.parse(payload) as Record<string, unknown>;
+      if (typeof body.error === "string" && body.code === undefined) {
+        done(null, JSON.stringify({ ...body, code: body.error }));
+        return;
+      }
+    } catch {
+      // Non-JSON payloads, including SSE frames, pass through unchanged.
+    }
+    done(null, payload);
   });
 
   // This API exposes public chain data and never accepts a signed transaction or a key.
@@ -142,6 +186,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     errorResponseBuilder: (_req, context) => ({
       statusCode: context.statusCode,
       error: "too_many_requests",
+      code: "too_many_requests",
       message:
         "rate limit exceeded; status endpoints must not be polled faster than the deployment budget",
       retryAfterMs: context.ttl,
@@ -158,18 +203,30 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   app.setNotFoundHandler((request, reply) => {
-    void reply.code(404).send({
-      error: "not_found",
-      message: `no route for ${request.method} ${request.url}`,
-    });
+    void reply
+      .code(404)
+      .send(errorEnvelope("not_found", "the requested resource was not found", request.id));
   });
 
   app.setErrorHandler((error: FastifyError, request, reply) => {
     const status = error.statusCode ?? 500;
+    const code: ApiErrorCode =
+      status === 404
+        ? "not_found"
+        : status === 408 || status === 504
+          ? "timeout"
+          : status === 429
+            ? "too_many_requests"
+            : status === 503
+              ? "unavailable"
+              : status >= 500
+                ? "internal_error"
+                : "bad_request";
     if (status === 429) {
       const seconds = Number(reply.getHeader("retry-after"));
       void reply.code(429).send({
         error: "too_many_requests",
+        code: "too_many_requests",
         message: "rate limit exceeded; retry after the deployment request budget resets",
         retryAfterMs: Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : timeWindow,
         requestId: request.id,
@@ -179,11 +236,17 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // The log gets the error, the response does not. An internal error message is the kind of
     // thing that carries a table name, a file path or, on a bad day, a connection string.
     request.log.error({ err: error, status }, "request failed");
-    void reply.code(status).send({
-      error: status >= 500 ? "internal_error" : "bad_request",
-      message: status >= 500 ? "the server could not complete that request" : error.message,
-      requestId: request.id,
-    });
+    const message =
+      code === "internal_error"
+        ? "the server could not complete that request"
+        : code === "timeout"
+          ? "the request timed out"
+          : code === "unavailable"
+            ? "the service is temporarily unavailable"
+            : code === "not_found"
+              ? "the requested resource was not found"
+              : "the request was invalid";
+    void reply.code(status).send(errorEnvelope(code, message, request.id));
   });
 
   return app;

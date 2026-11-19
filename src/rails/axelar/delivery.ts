@@ -24,10 +24,14 @@ import { bigintOf, text } from "../../db/rows.js";
 import type { InboundRow, Position } from "../../chains/writers.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 
-import { ITS_ABI, matchingPayment } from "./events.js";
+import { ITS_ABI, inspectPayment, type VerificationDiagnostic } from "./events.js";
 export interface VerifiedDelivery {
   readonly at: Position;
   readonly row: InboundRow;
+}
+
+export interface VerificationFailure {
+  readonly diagnostics: readonly VerificationDiagnostic[];
 }
 
 // The rail API supplies a candidate receipt. Only matching confirmed chain events establish delivery.
@@ -36,7 +40,7 @@ export async function verifyItsDelivery(
   db: Queryable,
   transfer: PendingTransfer,
   report: RailReport,
-): Promise<VerifiedDelivery | null> {
+): Promise<VerifiedDelivery | VerificationFailure | null> {
   const execution = report.execution;
   const source = config.indexer.stellar;
   if (
@@ -104,7 +108,7 @@ export async function verifyItsDelivery(
   if (!adapterConfig.its) return null;
   const sourceName = await view(adapterConfig.its, "chain_name");
   if (typeof sourceName !== "string") return null;
-  const payment = matchingPayment(receipt.logs, {
+  const inspection = inspectPayment(receipt.logs, {
     its,
     token: destinationToken,
     commandId: execution.commandId,
@@ -114,7 +118,7 @@ export async function verifyItsDelivery(
     recipient,
     amount,
   });
-  if (!payment) return null;
+  if (!inspection.payment) return { diagnostics: inspection.diagnostics };
   const block = await client.getBlock({ blockNumber: receipt.blockNumber });
   if (block.hash !== receipt.blockHash) return null;
   return {
@@ -122,7 +126,7 @@ export async function verifyItsDelivery(
       chainKey: transfer.destinationChain,
       block: receipt.blockNumber,
       txHash: receipt.transactionHash,
-      logIndex: payment.logIndex,
+      logIndex: inspection.payment.logIndex,
       observedAt: new Date(Number(block.timestamp) * 1000),
     },
     row: {

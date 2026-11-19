@@ -3,6 +3,7 @@ import { encodeAbiParameters, encodeEventTopics, stringToHex, type Hex } from "v
 import {
   ITS_ABI,
   matchingPayment,
+  inspectPayment,
   type DeliveryLog,
   type ExpectedDelivery,
 } from "../../src/rails/axelar/events.js";
@@ -66,6 +67,22 @@ describe("Destination delivery evidence", () => {
     expect(
       matchingPayment([received, paid], { ...expected, amount: expected.amount + 1n }),
     ).toBeNull();
+  });
+  it("returns bounded structured diagnostics for invalid evidence", () => {
+    const inspection = inspectPayment([received, paid], {
+      ...expected,
+      recipient: "0x4444444444444444444444444444444444444444",
+    });
+    expect(inspection.payment).toBeNull();
+    expect(inspection.diagnostics).toEqual(
+      expect.arrayContaining([
+        {
+          category: "recipient",
+          expected: "0x4444444444444444444444444444444444444444",
+          observed: recipient,
+        },
+      ]),
+    );
   });
   it("does not lose a matching receipt event when another transfer shares the transaction", () => {
     const unrelated = { ...received, address: token as Hex };
