@@ -2,6 +2,7 @@ name: ci
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
   push:
     branches: [main]
   merge_group:
@@ -22,6 +23,12 @@ env:
 jobs:
   supply-chain:
     uses: ./.github/workflows/supply-chain.yml
+
+  source-security:
+    uses: ./.github/workflows/source-security.yml
+
+  pr-description:
+    uses: ./.github/workflows/pr-description.yml
 
   backend:
     name: lint, typecheck, test, build
@@ -107,10 +114,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [backend, supply-chain]
+    needs: [backend, supply-chain, source-security, pr-description]
     steps:
       - name: Require successful checks
         env:
           CHECK_RESULT: ${{ needs.backend.result }}
           SECURITY_RESULT: ${{ needs.supply-chain.result }}
-        run: test "$CHECK_RESULT" = success && test "$SECURITY_RESULT" = success
+          SOURCE_SECURITY_RESULT: ${{ needs.source-security.result }}
+          DESCRIPTION_RESULT: ${{ needs.pr-description.result }}
+        run: test "$CHECK_RESULT" = success && test "$SECURITY_RESULT" = success && test "$SOURCE_SECURITY_RESULT" = success && test "$DESCRIPTION_RESULT" = success

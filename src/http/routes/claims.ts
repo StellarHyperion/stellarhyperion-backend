@@ -8,7 +8,13 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
-import { integer, text } from "../../db/rows.js";
+import { integer, text, textOrNull, timestampOrNull } from "../../db/rows.js";
+import {
+  LIST_CACHE_CONTROL,
+  computeCanonicalETag,
+  sendConditionalDetailResponse,
+} from "../etag.js";
+import { negotiateSchemaVersion, withSchemaMetadata } from "../schema-version.js";
 import type { ServerDeps } from "../server.js";
 
 export interface FormattedClaim {
@@ -53,10 +59,13 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       request: FastifyRequest<{ Params: { chain: string; claimId: string } }>,
       reply: FastifyReply,
     ) => {
+      const version = negotiateSchemaVersion(request, reply);
+      if (version === null) return;
+
       const { chain, claimId } = request.params;
       const { rows } = await db.query(
         `SELECT chain || ':' || claim_id::text AS id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
-                created_at, settled, observed_at
+                created_at, settled, settled_at, settled_by, settled_tx, observed_at
            FROM pending_claim
           WHERE chain = $1 AND claim_id = $2
           LIMIT 1`,
@@ -71,7 +80,22 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
         });
       }
 
-      return reply.send(formatClaimRow(row));
+      const claim = formatClaimRow(row);
+      const settledAt = timestampOrNull(row, "settled_at");
+      const etag = computeCanonicalETag("claim-v1", {
+        claim,
+        settlement: {
+          settledAt: settledAt?.toISOString() ?? null,
+          settledBy: textOrNull(row, "settled_by"),
+          settledTx: textOrNull(row, "settled_tx"),
+        },
+      });
+      return sendConditionalDetailResponse(
+        request,
+        reply,
+        withSchemaMetadata(claim, version),
+        version === "1.0" ? etag : computeCanonicalETag("claim-v1.1", { base: etag }),
+      );
     },
   );
 
@@ -90,6 +114,9 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       }>,
       reply: FastifyReply,
     ) => {
+      const version = negotiateSchemaVersion(request, reply);
+      if (version === null) return;
+
       const { chain, recipient, settled, limit, offset } = request.query;
 
       const conditions: string[] = [];
@@ -128,12 +155,18 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
         params,
       );
 
-      return reply.send({
-        claims: rows.map(formatClaimRow),
-        limit: parsedLimit,
-        offset: parsedOffset,
-        count: rows.length,
-      });
+      reply.header("Cache-Control", LIST_CACHE_CONTROL);
+      return reply.send(
+        withSchemaMetadata(
+          {
+            claims: rows.map(formatClaimRow),
+            limit: parsedLimit,
+            offset: parsedOffset,
+            count: rows.length,
+          },
+          version,
+        ),
+      );
     },
   );
 }

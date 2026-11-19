@@ -17,7 +17,14 @@ import type { FastifyInstance } from "fastify";
 
 import type { ServerDeps } from "../server.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
-import { checkRedisHealth, worstOf } from "../../runtime/readiness.js";
+import {
+  checkRedisHealth,
+  evaluateReadiness,
+  evaluateHeartbeatFreshness,
+  readWorkerHeartbeats,
+  worstOf,
+} from "../../runtime/readiness.js";
+import { sanitizeDiagnosticText } from "../../logging/logger.js";
 
 const LIVENESS_MEANING =
   "This process is running and answering. It says nothing about Postgres or the chains. Use /ready for that.";
@@ -37,7 +44,8 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
   }));
 
   app.get("/ready", async (_request, reply) => {
-    const checks: ReadinessReport[] = [await checkDatabase(deps), await checkRedis(deps)];
+    const dbCheck = await checkDatabase(deps);
+    const checks: ReadinessReport[] = [dbCheck, await checkRedis(deps)];
 
     for (const source of deps.readiness) {
       try {
@@ -55,16 +63,59 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
       }
     }
 
-    const state = worstOf(checks);
+    if (dbCheck.state !== "down") {
+      try {
+        const heartbeats = await readWorkerHeartbeats(deps.db);
+        const now = new Date();
+        if (deps.config.indexer.enabled) {
+          const expectedChains = [
+            ...(deps.config.indexer.stellar ? [deps.config.indexer.stellar.chain] : []),
+            ...deps.config.indexer.evm.map((chain) => chain.chain),
+          ];
+          const missing = expectedChains.filter(
+            (chain) => !heartbeats.some((hb) => hb.workerKind === "chain" && hb.chainKey === chain),
+          );
+          if (missing.length > 0 || heartbeats.every((hb) => hb.workerKind !== "chain")) {
+            checks.push({
+              name: "indexer-heartbeat",
+              state: "degraded",
+              detail: `enabled indexer has no persisted chain-worker heartbeat${missing.length ? ` for ${missing.join(", ")}` : ""}`,
+            });
+          }
+        }
+        for (const hb of heartbeats) {
+          const { report } = evaluateHeartbeatFreshness(hb, now);
+          const existing = checks.findIndex((check) => check.name === hb.workerName);
+          const current = checks[existing];
+          if (existing < 0) checks.push(report);
+          else if (current !== undefined && worstOf([current, report]) === report.state) {
+            checks[existing] = report;
+          }
+        }
+      } catch (error) {
+        // Minimal unit-test mocks or unmigrated DBs may not have indexer_worker_heartbeat.
+        if (deps.config.indexer.enabled || !isMissingHeartbeatTable(error)) {
+          checks.push({
+            name: "indexer-heartbeat",
+            state: "degraded",
+            detail: `failed to read worker heartbeats: ${messageOf(error)}`,
+          });
+        }
+      }
+    }
+
+    const evaluated = evaluateReadiness(checks, deps.config.readinessPolicy);
     // Degraded still serves. One stalled chain watcher is a reason to alert, not a reason to stop
     // answering questions about the three chains that are fine.
-    const status = state === "down" ? 503 : 200;
+    const status = evaluated.state === "down" ? 503 : 200;
     return reply.code(status).send({
-      status: state,
+      status: evaluated.state,
       meaning: READINESS_MEANING,
       network: deps.config.network,
+      deploymentMode: deps.config.deploymentMode,
+      policy: deps.config.readinessPolicy,
       indexer: deps.config.indexer.enabled ? "enabled" : "disabled",
-      checks,
+      checks: evaluated.checks,
     });
   });
 }
@@ -90,5 +141,12 @@ async function checkRedis(deps: ServerDeps): Promise<ReadinessReport> {
 }
 
 function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return sanitizeDiagnosticText(error instanceof Error ? error.message : String(error));
+}
+
+function isMissingHeartbeatTable(error: unknown): boolean {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    return (error as { code?: unknown }).code === "42P01";
+  }
+  return false;
 }

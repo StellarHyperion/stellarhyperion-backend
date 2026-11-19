@@ -29,6 +29,8 @@ export function encodeCursor(id: string, scope: CursorScope): string {
 }
 
 export function decodeCursor(value: string, expected: CursorScope): string {
+  if (value.length === 0 || value.length > 2048 || !/^[A-Za-z0-9_-]+$/.test(value))
+    throw new CursorError("cursor is not valid");
   let payload: unknown;
   try {
     payload = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
@@ -48,7 +50,8 @@ function isPayload(value: unknown): value is CursorPayload {
     candidate.version === 1 &&
     candidate.order === "id-desc" &&
     typeof candidate.id === "string" &&
-    /^\d+$/.test(candidate.id) &&
+    /^[1-9]\d{0,18}$/.test(candidate.id) &&
+    BigInt(candidate.id) <= 9_223_372_036_854_775_807n &&
     candidate.scope !== undefined
   );
 }

@@ -149,8 +149,7 @@ export class FakeEvmClient implements EvmClient {
             entry.blockNumber >= query.fromBlock &&
             entry.blockNumber <= query.toBlock,
         )
-        // Ascending by block then log index, which is the order a node returns them in and the
-        // order the claim pairing depends on.
+        // Ascending by block then log index, which is the canonical order the watcher validates.
         .sort((a, b) =>
           a.blockNumber === b.blockNumber
             ? a.logIndex - b.logIndex
