@@ -3,7 +3,7 @@
 import copy
 import unittest
 
-from approve_pr_ci import Approval, matches
+from approve_pr_ci import Approval, event_number, matches, timestamp
 
 REPO = "StellarHyperion/example"
 HEAD = "a" * 40
@@ -46,6 +46,7 @@ class GitHub:
         self.fetches = 0
         self.before_recheck = None
         self.failure = False
+        self.registration_delay = 0
 
     def request(self, path, method="GET", data=None):
         if self.failure:
@@ -59,6 +60,9 @@ class GitHub:
                 self.before_recheck(self)
             return copy.deepcopy(self.pr)
         if "?" in path:
+            if self.registration_delay:
+                self.registration_delay -= 1
+                return {"workflow_runs": []}
             return {"workflow_runs": [copy.deepcopy(self.run)]}
         return copy.deepcopy(self.run)
 
@@ -162,6 +166,64 @@ class ApprovalTests(unittest.TestCase):
         with self.assertRaises(OSError):
             self.approval.approve(42)
         self.assertEqual(self.github.approvals, [])
+
+    def test_pr_event_retries_run_registration_and_starts_ci(self):
+        self.github.registration_delay = 2
+        sleeps = []
+        self.assertIn("APPROVE", self.approval.approve(42, registration_attempts=3, sleep=sleeps.append)[0])
+        self.assertEqual(sleeps, [5, 5])
+        self.assertEqual(len(self.github.approvals), 1)
+
+    def test_registration_wait_is_bounded_and_does_not_approve_missing_ci(self):
+        self.github.registration_delay = 10
+        sleeps = []
+        self.assertIn("WAIT", self.approval.approve(42, registration_attempts=3, sleep=sleeps.append)[0])
+        self.assertEqual(sleeps, [5, 5])
+        self.assertEqual(self.github.approvals, [])
+
+    def test_unassigned_author_is_not_polled_or_approved(self):
+        self.github.registration_delay = 10
+        self.policy.allowed = False
+        sleeps = []
+        self.assertIn("WAIT", self.approval.approve(42, registration_attempts=3, sleep=sleeps.append)[0])
+        self.assertEqual(sleeps, [])
+        self.assertEqual(self.github.approvals, [])
+
+    def test_new_head_or_issue_text_during_final_policy_read_is_rejected(self):
+        for field, value in [("head", {"sha": "b" * 40}), ("body", "Fixes #99"), ("state", "closed")]:
+            with self.subTest(field=field):
+                self.setUp()
+                def change(_policy):
+                    if field == "head":
+                        self.github.pr["head"].update(value)
+                    else:
+                        self.github.pr[field] = value
+                self.policy.before_recheck = change
+                self.assertIn("SKIP", self.approval.approve(42)[0])
+                self.assertEqual(self.github.approvals, [])
+
+    def test_trusted_event_selects_one_numeric_pr_only(self):
+        self.assertEqual(event_number("pull_request_target", {"number": 42}), 42)
+        self.assertIsNone(event_number("schedule", {"number": "unsafe"}))
+        for value in [None, True, -1, 0, "42", "42/merge"]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                event_number("pull_request_target", {"number": value})
+
+    def test_description_edit_does_not_reuse_an_older_successful_run(self):
+        self.github.run["conclusion"] = "success"
+        self.github.run["created_at"] = "2026-11-19T00:00:00Z"
+        def register(_seconds):
+            self.github.run["conclusion"] = "action_required"
+            self.github.run["created_at"] = "2026-11-19T01:00:01Z"
+        rows = self.approval.approve(42, registration_attempts=2, sleep=register,
+                                     not_before=timestamp("2026-11-19T01:00:00Z"))
+        self.assertIn("APPROVE", rows[0])
+        self.assertEqual(len(self.github.approvals), 1)
+
+    def test_missing_or_unzoned_event_timestamp_is_rejected(self):
+        for value in [None, "invalid", "2026-11-19T01:00:00"]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                timestamp(value)
 
 
 if __name__ == "__main__":

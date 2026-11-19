@@ -43,6 +43,12 @@ jobs:
       - name: Test automatic PR CI authorization
         run: python3 -B .github/scripts/test_approve_pr_ci.py
 
+      - name: Test privileged workflow isolation and source security gating
+        run: |
+          python3 -B .github/scripts/test_scan_workflow_security.py
+          python3 -B .github/scripts/test_check_source_security.py
+          python3 -B .github/scripts/test_check_pr_description.py
+
       - name: Test dependency advisory verification
         run: python3 -B .github/scripts/test_audit_npm_dependencies.py
 
@@ -62,7 +68,7 @@ jobs:
           echo "$RUNNER_TEMP/security-tools" >> "$GITHUB_PATH"
 
       - name: Analyze every workflow for unsafe trust boundaries
-        run: zizmor --offline --no-config --no-ignores --strict-collection --min-severity medium .github/workflows
+        run: python3 -B .github/scripts/scan_workflow_security.py
 
       - name: Scan contributed Git history for secrets
         env:

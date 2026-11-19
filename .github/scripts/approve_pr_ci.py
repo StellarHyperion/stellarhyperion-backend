@@ -6,8 +6,11 @@ it never approves a code review, merges a PR, or changes a check result.
 """
 
 import os
+import json
+from datetime import datetime
 import re
 import sys
+import time
 from pathlib import Path
 
 from enforce_pr_assignments import Enforcement, GitHub
@@ -16,8 +19,25 @@ CI_PATH = ".github/workflows/ci.yml"
 SHA = re.compile(r"[0-9a-f]{40}")
 
 
+def timestamp(value):
+    if not isinstance(value, str):
+        raise ValueError("Invalid workflow event timestamp")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("Workflow event timestamp must have a timezone")
+    return parsed
+
+
 def waiting(run):
     return run.get("conclusion") == "action_required" or run.get("status") == "action_required"
+
+
+def authorization_state(pr):
+    head, base, user = pr.get("head", {}), pr.get("base", {}), pr.get("user", {})
+    fork, target = head.get("repo") or {}, base.get("repo") or {}
+    return (pr.get("state"), pr.get("title"), pr.get("body"), pr.get("author_association"),
+            user.get("login"), user.get("type"), head.get("sha"), head.get("ref"),
+            fork.get("id"), fork.get("full_name"), base.get("ref"), target.get("full_name"))
 
 
 def matches(pr, run, repository, default_branch):
@@ -72,17 +92,32 @@ class Approval:
                 return runs
         raise RuntimeError("CI run pagination exceeded its limit")
 
-    def approve(self, number):
+    def approve(self, number, registration_attempts=1, sleep=time.sleep, not_before=None):
         if type(number) is not int or number <= 0:
             raise ValueError("Invalid PR number")
         endpoint = f"repos/{self.github.repository}/pulls/{number}"
         pr = self.github.request(endpoint)
         if pr["state"] != "open":
             return ["SKIP: pull request is closed"]
-        candidates = [run for run in self.runs(pr["head"]["sha"])
-                      if waiting(run) and matches(pr, run, self.github.repository, self.github.policy_ref)]
+        # The trusted PR event can arrive before GitHub registers the ordinary CI run.
+        # Retry only registration, always fetching fresh PR state and assignments.
+        for attempt in range(registration_attempts):
+            runs = [run for run in self.runs(pr["head"]["sha"])
+                    if matches(pr, run, self.github.repository, self.github.policy_ref)
+                    and (not_before is None or timestamp(run.get("created_at")) >= not_before)]
+            candidates = [run for run in runs if waiting(run)]
+            if runs or attempt == registration_attempts - 1:
+                break
+            allowed, reason = self.policy.decision(pr)
+            if not allowed:
+                return ["WAIT: " + reason]
+            sleep(5)
+            pr = self.github.request(endpoint)
+            if pr["state"] != "open":
+                return ["SKIP: pull request is closed"]
         if not candidates:
-            return ["SKIP: no current CI run requires approval"]
+            return ["SKIP: current CI already started" if runs else
+                    "WAIT: current CI has not registered; the recovery sweep will retry"]
         allowed, reason = self.policy.decision(pr)
         if not allowed:
             return ["WAIT: " + reason]
@@ -96,26 +131,46 @@ class Approval:
             if not waiting(run) or not matches(current, run, self.github.repository, self.github.policy_ref):
                 rows.append(f"SKIP run {run_id}: run or PR head changed")
                 continue
-            # Recheck every issue assignment immediately before approval.
+            # Recheck every issue assignment immediately before approval, then the PR head
+            # again: assignments and PR text/head can change while issue APIs are read.
             allowed, reason = self.policy.decision(current)
             if not allowed:
                 rows.append(f"WAIT run {run_id}: " + reason)
+                continue
+            latest = self.github.request(endpoint)
+            if (authorization_state(latest) != authorization_state(current)
+                    or not matches(latest, run, self.github.repository, self.github.policy_ref)):
+                rows.append(f"SKIP run {run_id}: PR changed during assignment verification")
                 continue
             self.github.request(f"repos/{self.github.repository}/actions/runs/{run_id}/approve", "POST")
             rows.append(f"APPROVE run {run_id}: " + reason)
         return rows
 
 
+def event_number(event_name, event):
+    if event_name != "pull_request_target":
+        return None
+    number = event.get("number")
+    if type(number) is not int or number <= 0:
+        raise ValueError("Invalid trusted PR event number")
+    return number
+
+
 def main():
     github = GitHub(os.environ["GITHUB_TOKEN"], os.environ["GITHUB_REPOSITORY"], os.environ["POLICY_REF"])
     policy = Enforcement(github, os.environ.get("PR_ASSIGNMENT_HELPER_BOTS", ""))
     approval = Approval(github, policy)
-    numbers = [pr["number"] for pr in github.pages(f"repos/{github.repository}/pulls?state=open")]
+    event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+    event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text()) if event_name == "pull_request_target" else {}
+    number = event_number(event_name, event)
+    not_before = timestamp(event.get("pull_request", {}).get("updated_at")) if number is not None else None
+    numbers = [number] if number is not None else [pr["number"] for pr in github.pages(f"repos/{github.repository}/pulls?state=open")]
     rows = []
     errors = 0
     for number in numbers:
         try:
-            results = approval.approve(number)
+            results = approval.approve(number, registration_attempts=12 if event_name == "pull_request_target" else 1,
+                                       not_before=not_before)
         except Exception as error:
             results = ["ERROR: " + type(error).__name__ + "; CI was not approved"]
             errors += 1
