@@ -10,7 +10,7 @@
 import { describe, expect, it } from "vitest";
 
 import { EvmWatcher } from "../../src/chains/evm/watcher.js";
-import { viemClient, type EvmClient } from "../../src/chains/evm/client.js";
+import { viemClient, type EvmClient, type RawEvmLog } from "../../src/chains/evm/client.js";
 import {
   ANVIL_HISTORY,
   ANVIL_CHAIN_ID,
@@ -416,7 +416,7 @@ describe("what the watcher says about itself", () => {
 
 describe("unknown router logs", () => {
   it("quarantines the raw payload instead of materializing a transfer", async () => {
-    const unknown = {
+    const unknown: RawEvmLog = {
       address: ANVIL_ROUTER,
       blockNumber: 20n,
       transactionHash: `0x${"12".repeat(32)}`,
@@ -437,7 +437,7 @@ describe("unknown router logs", () => {
     expect(db.matching("INSERT INTO inbound_delivery")).toHaveLength(0);
     expect(db.matching("DELETE FROM evm_log_quarantine")).toHaveLength(1);
     expect(db.matching("INSERT INTO evm_log_quarantine")[0]?.params).toEqual(
-      expect.arrayContaining(["unknown event signature", unknown.data]),
+      expect.arrayContaining(["unsupported_signature_or_payload", unknown.data]),
     );
   });
 });

@@ -44,8 +44,10 @@ async function main(): Promise<void> {
       startBlock: network.startBlock,
       confirmations: network.confirmations,
       reorgDepth: network.reorgDepth,
-      finalityMode: network.finalityMode,
-      allowFinalityFallback: network.allowFinalityFallback,
+      ...(network.finalityMode === undefined ? {} : { finalityMode: network.finalityMode }),
+      ...(network.allowFinalityFallback === undefined
+        ? {}
+        : { allowFinalityFallback: network.allowFinalityFallback }),
       logRange: network.logRange,
       client: viemClient(network.rpcUrls, { logger }),
       db,

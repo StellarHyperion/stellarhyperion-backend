@@ -172,8 +172,54 @@ export class EvmWatcher {
       [...new Set(evidence.map((entry) => entry.log.blockNumber))],
       signal,
     );
+    // A quarantined BridgeIn may be replayed after its ClaimParked already succeeded, or
+    // after the bounded evidence page split their transaction. Reconstruct the canonical
+    // transaction context rather than interpreting the delivery as successful in isolation.
+    const context = new Map<string, readonly RawEvmLog[]>();
+    const contextsByBlock = new Map<bigint, readonly RawEvmLog[]>();
+    let contextLogCount = 0;
+    for (const entry of evidence) {
+      if (decodeRouterLog(entry.log)?.name !== "BridgeIn") continue;
+      let logs = contextsByBlock.get(entry.log.blockNumber);
+      if (logs === undefined) {
+        logs = await client.logs(
+          {
+            address: router,
+            fromBlock: entry.log.blockNumber,
+            toBlock: entry.log.blockNumber,
+          },
+          signal,
+        );
+        contextLogCount += logs.length;
+        if (contextLogCount > 1000)
+          throw new Error("Canonical replay context exceeds its log budget.");
+        contextsByBlock.set(entry.log.blockNumber, logs);
+      }
+      const transaction = logs.filter(
+        (log) =>
+          !log.removed &&
+          log.address.toLowerCase() === router.toLowerCase() &&
+          log.blockNumber === entry.log.blockNumber &&
+          log.transactionHash.toLowerCase() === entry.log.transactionHash.toLowerCase(),
+      );
+      const retained = transaction.find((log) => log.logIndex === entry.log.logIndex);
+      if (
+        retained?.data !== entry.log.data ||
+        retained.topics.join("|") !== entry.log.topics.join("|") ||
+        transaction.some((log) => decodeRouterLog(log) === null)
+      )
+        throw new Error("Canonical replay transaction context is missing or unsupported.");
+      context.set(logKey(entry.log), transaction);
+    }
     const pairing = new ClaimPairing();
-    const conflicts = this.findOrderingConflicts(evidence.map((entry) => entry.log));
+    const conflicts = this.findOrderingConflicts(
+      [
+        ...evidence.map((entry) => entry.log).filter((log) => !context.has(logKey(log))),
+        ...[...context.values()].flat(),
+      ].filter(
+        (log, index, logs) => logs.findIndex((other) => logKey(other) === logKey(log)) === index,
+      ),
+    );
     let written = 0;
     let ignored = 0;
     await db.transaction(async (tx) => {
@@ -193,6 +239,13 @@ export class EvmWatcher {
         if (conflicts.has(logKey(entry.log))) {
           ignored++;
           continue;
+        }
+        for (const support of context.get(logKey(entry.log)) ?? []) {
+          if (
+            support.logIndex < entry.log.logIndex &&
+            decodeRouterLog(support)?.name === "ClaimParked"
+          )
+            await this.apply(tx, support, stamp.timestamp, pairing, stamp.hash);
         }
         if (await this.apply(tx, entry.log, stamp.timestamp, pairing, stamp.hash)) written++;
         else ignored++;

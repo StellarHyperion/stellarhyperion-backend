@@ -210,6 +210,17 @@ reviewing a failed job.
 
 EVM watcher ownership is scoped to the chain and router. An expired owner may be replaced after a crash, and each cursor commit verifies ownership and its previous revision in the same transaction as event writes. Concurrent replay keeps the existing canonical event serialization and quarantine checks.
 
+Unsupported EVM signatures and malformed payloads retain canonical block hashes, signature,
+router and up to 64 KiB of raw data in the existing quarantine (at most 1000 records per chain).
+Oversized bodies retain metadata and topics without a raw body. After deploying a decoder that
+supports the event, use `npm run evm:quarantine -- replay <configured-chain> [limit 1..100]`
+with a configured router and database writer credential. Legacy diagnostics without raw data
+are preserved but cannot be replayed. Replay verifies the chain, deployment start, confirmed
+boundary and retained block hash, and uses the normal idempotent writers without advancing
+the live cursor. A replayed BridgeIn reconstructs its canonical transaction's ClaimParked
+context within a total 1000-log budget; missing or unsupported context requires operator review.
+No Hyperion EVM router is configured in the active deployment; the command does not infer one.
+
 `EVM_FINALITY_MODE=confirmations` preserves the chain registry's confirmation depth. Set `EVM_FINALITY_MODE=finalized` to require the RPC's finalized-block number and hash as additional evidence; scans never exceed either that block or the configured confirmation boundary. Unsupported tags fail the pass unless `EVM_FINALITY_ALLOW_FALLBACK=true` explicitly permits depth fallback. Invalid finalized evidence fails even with fallback enabled. `evm_scan_provenance` retains the configured policy, actual evidence, hashes and policy transitions for each committed range; weaker policies never rewrite earlier evidence.
 
 Scheduled route-health compaction removes bounded batches of old interior duplicates and skips rows locked by ingestion. It retains the first and last samples of each configuration run, every transition, and all samples in the recent retention window. Historical `route_health` queries therefore represent state transitions after compaction; they must not treat old row counts as raw sampling frequency or uptime percentages. Recent raw samples remain available within the configured retention window.

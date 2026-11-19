@@ -68,12 +68,15 @@ export async function quarantineEvmLog(
   observedAt: Date,
 ): Promise<void> {
   const raw = entry.raw;
-  const bounded =
+  const validTopics =
     raw !== undefined &&
-    raw.data.length <= 131074 &&
-    /^0x([0-9a-fA-F]{2})*$/.test(raw.data) &&
     raw.topics.length <= 4 &&
     raw.topics.every((topic) => /^0x[0-9a-fA-F]{64}$/.test(topic));
+  const bounded =
+    raw !== undefined &&
+    validTopics &&
+    raw.data.length <= 131074 &&
+    /^0x([0-9a-fA-F]{2})*$/.test(raw.data);
   // Serialize retention with insertion so concurrent replicas keep the same database bound.
   await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
     "evm-quarantine:" + entry.chainKey,
@@ -98,9 +101,9 @@ export async function quarantineEvmLog(
       observedAt,
       raw?.address ?? null,
       entry.blockHash ?? null,
-      bounded ? (raw.topics[0] ?? null) : null,
+      validTopics ? (raw.topics[0] ?? null) : null,
       bounded ? raw.data : null,
-      bounded ? JSON.stringify(raw.topics) : null,
+      validTopics ? JSON.stringify(raw.topics) : null,
     ],
   );
   await db.query(
