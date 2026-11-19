@@ -985,7 +985,7 @@ export async function inspectEventConflict(
     );
     const { rows } = await db.query(
       `SELECT evidence FROM stellar_event_identity
-      WHERE chain_key = $1 AND identity = $3 AND (contract = $2 OR identity NOT LIKE 'event:%') FOR UPDATE`,
+      WHERE chain_key = $1 AND identity = $3 AND (contract = $2 OR (identity NOT LIKE 'event:%' AND identity NOT LIKE 'bridgeOut:%')) FOR UPDATE`,
       [chainKey, raw.contractId, identity],
     );
     const existing = rows[0]?.evidence as EventEvidenceSnapshot | undefined;

@@ -43,7 +43,10 @@ beforeAll(async () => {
     "1790900000000_initial-schema.sql",
     "1791000000000_cursor-block-hash.sql",
     "1791100000000_cursor-autovacuum-tuning.sql",
+    "1791300000000_stellar-durable-scan-evidence.sql",
     "1791400000000_stellar-cursor-cas-leases-gaps.sql",
+    "1791500000000_stellar-revisions-and-quarantine.sql",
+    "1791800000000_outbound-router-identity.sql",
   ]) {
     const sql = readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8").split(
       "-- Down Migration",

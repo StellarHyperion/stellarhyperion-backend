@@ -12,7 +12,11 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, integerOrNull, text, textOrNull, timestampOrNull } from "../../db/rows.js";
-import { LIST_CACHE_CONTROL, computeCanonicalETag, sendConditionalDetailResponse } from "../etag.js";
+import {
+  LIST_CACHE_CONTROL,
+  computeCanonicalETag,
+  sendConditionalDetailResponse,
+} from "../etag.js";
 import type { ServerDeps } from "../server.js";
 
 export type TransferLifecycleStage =
@@ -31,6 +35,7 @@ export interface FormattedTransfer {
   readonly route: number;
   readonly origin: {
     readonly chain: string;
+    readonly router: string | null;
     readonly nonce: string;
     readonly sender: string;
     readonly token: string;
@@ -131,6 +136,7 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
   const railStatus = textOrNull(row, "attestation_status");
 
   const stage = deriveStage(delivered, hasClaim, claimSettled, railStatus);
+  const originRouter = textOrNull(row, "origin_router");
 
   return {
     id: text(row, "id"),
@@ -138,6 +144,7 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
     route: integer(row, "route"),
     origin: {
       chain: text(row, "origin_chain"),
+      router: originRouter === "" ? null : originRouter,
       nonce: text(row, "nonce"),
       sender: text(row, "sender"),
       token,
@@ -188,6 +195,7 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
 const TRANSFER_QUERY = `
   SELECT t.id,
          t.origin_chain,
+         t.origin_router,
          t.route,
          t.nonce,
          t.sender,
@@ -227,11 +235,21 @@ const TRANSFER_QUERY = `
      AND d.route = t.route
      AND d.source_chain = t.origin_chain
      AND d.source_nonce = t.nonce
+      AND (d.source_transfer_id = t.id OR (d.source_transfer_id IS NULL AND NOT EXISTS (
+        SELECT 1 FROM outbound_transfer other
+         WHERE other.origin_chain = t.origin_chain AND other.nonce = t.nonce
+           AND other.id <> t.id
+      )))
     LEFT JOIN pending_claim c
       ON c.chain = t.destination_chain
      AND c.route = t.route
      AND c.source_chain = t.origin_chain
      AND c.source_nonce = t.nonce
+      AND (c.source_transfer_id = t.id OR (c.source_transfer_id IS NULL AND NOT EXISTS (
+        SELECT 1 FROM outbound_transfer other
+         WHERE other.origin_chain = t.origin_chain AND other.nonce = t.nonce
+           AND other.id <> t.id
+      )))
 `;
 
 function isDeliveryFinalized(transfer: FormattedTransfer): boolean {
@@ -283,10 +301,17 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     ) => {
       const { originChain, nonce } = request.params;
       const { rows } = await db.query(
-        `${TRANSFER_QUERY} WHERE t.origin_chain = $1 AND t.nonce = $2 LIMIT 1`,
+        `${TRANSFER_QUERY} WHERE t.origin_chain = $1 AND t.nonce = $2 ORDER BY t.id LIMIT 2`,
         [originChain, nonce],
       );
 
+      if (rows.length > 1) {
+        return reply.code(409).send({
+          error: "ambiguous_transfer",
+          message:
+            "Multiple router deployments used this nonce. Look up the transfer by its source transaction or id.",
+        });
+      }
       const row = rows[0];
       if (row === undefined) {
         return reply.code(404).send({

@@ -48,12 +48,9 @@ COMMENT ON COLUMN indexer_cursor.last_processed_at IS
 CREATE TABLE outbound_transfer (
   id                 bigserial PRIMARY KEY,
   origin_chain       text NOT NULL,
-  -- The router deployment that owns the nonce. A redeployment resets the router's counter, so
-  -- origin_chain and nonce alone are not a durable identity.
-  origin_router      text NOT NULL DEFAULT '',
   -- RouteKind as the integer both chains encode. 0 cctp, 1 axelar its, 2 axelar gmp, 3 allbridge.
   route              smallint NOT NULL CHECK (route BETWEEN 0 AND 3),
-  -- The router's own counter, monotonic per router and therefore unique per origin_router. Not
+  -- The router's own counter, monotonic per router and therefore unique per origin chain. Not
   -- unique per route: one counter serves all four rails.
   nonce              numeric(20, 0) NOT NULL,
   sender             text NOT NULL,
@@ -77,14 +74,12 @@ CREATE TABLE outbound_transfer (
   origin_log_index   integer,
   observed_at        timestamptz NOT NULL DEFAULT now(),
 
-  CONSTRAINT outbound_transfer_identity UNIQUE (origin_chain, origin_router, nonce),
+  CONSTRAINT outbound_transfer_identity UNIQUE (origin_chain, nonce),
   CONSTRAINT outbound_transfer_amounts CHECK (gross_amount = fee + net_amount)
 );
 
 COMMENT ON TABLE outbound_transfer IS
   'One row per departure, from either family. The chain is the source of truth; this is the copy that outlives a seven day RPC history window.';
-COMMENT ON COLUMN outbound_transfer.origin_router IS
-  'The exact router deployment that emitted the departure. Nonces are only unique within this deployment.';
 COMMENT ON CONSTRAINT outbound_transfer_amounts ON outbound_transfer IS
   'The router guarantees gross equals fee plus net. Asserting it here turns a decoder that reads a field off the wrong offset into a failed insert rather than a plausible row.';
 

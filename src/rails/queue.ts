@@ -67,6 +67,11 @@ export async function pendingForRail(
                  AND d.route = t.route
                  AND d.source_chain = t.origin_chain
                  AND d.source_nonce = t.nonce
+      AND (d.source_transfer_id = t.id OR (d.source_transfer_id IS NULL AND NOT EXISTS (
+        SELECT 1 FROM outbound_transfer other
+         WHERE other.origin_chain = t.origin_chain AND other.nonce = t.nonce
+           AND other.id <> t.id
+      )))
                  AND d.recipient = CASE
                    WHEN t.destination ~ '^0x0{24}[0-9a-fA-F]{40}$'
                      THEN lower('0x' || right(t.destination, 40))

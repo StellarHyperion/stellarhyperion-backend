@@ -110,12 +110,22 @@ const CLASSIFIED = `
                   AND d.route = t.route
                   AND d.source_chain = t.origin_chain
                   AND d.source_nonce = t.nonce
+      AND (d.source_transfer_id = t.id OR (d.source_transfer_id IS NULL AND NOT EXISTS (
+        SELECT 1 FROM outbound_transfer other
+         WHERE other.origin_chain = t.origin_chain AND other.nonce = t.nonce
+           AND other.id <> t.id
+      )))
              ) OR EXISTS (
                SELECT 1 FROM pending_claim c
                 WHERE c.chain = t.destination_chain
                   AND c.route = t.route
                   AND c.source_chain = t.origin_chain
                   AND c.source_nonce = t.nonce
+      AND (c.source_transfer_id = t.id OR (c.source_transfer_id IS NULL AND NOT EXISTS (
+        SELECT 1 FROM outbound_transfer other
+         WHERE other.origin_chain = t.origin_chain AND other.nonce = t.nonce
+           AND other.id <> t.id
+      )))
              ) THEN 'attestation_reconciliation'
              WHEN a.status = 'attested' OR a.attested_at IS NOT NULL
                THEN 'destination_receipt_verification'

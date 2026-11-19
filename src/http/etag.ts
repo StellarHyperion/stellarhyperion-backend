@@ -3,7 +3,7 @@ import type { FastifyReply, FastifyRequest } from "fastify";
 
 function canonicalize(value: unknown): string {
   if (value === null || typeof value !== "object") {
-    return JSON.stringify(value) ?? "null";
+    return JSON.stringify(value);
   }
   if (Array.isArray(value)) {
     return `[${value.map(canonicalize).join(",")}]`;
@@ -26,12 +26,9 @@ export function computeCanonicalETag(namespace: string, revision: unknown): stri
   return `"${namespace}-${hash}"`;
 }
 
-function matchesIfNoneMatch(
-  header: string | readonly string[] | undefined,
-  etag: string,
-): boolean {
+function matchesIfNoneMatch(header: string | readonly string[] | undefined, etag: string): boolean {
   if (header === undefined) return false;
-  const value = Array.isArray(header) ? header.join(",") : header;
+  const value = typeof header === "string" ? header : header.join(",");
   const expectedTag = etag.startsWith("W/") ? etag.slice(2) : etag;
   let token = "";
   let quoted = false;

@@ -91,6 +91,7 @@ export async function verifyCctpDelivery(
       observedAt: new Date(Number(block.timestamp) * 1000),
     },
     row: {
+      sourceTransferId: transfer.transferId,
       route: transfer.route,
       sourceChain: transfer.originChain,
       sourceNonce: transfer.nonce,

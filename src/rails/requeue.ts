@@ -43,6 +43,11 @@ export async function requeueTerminalTransfer(
                    AND d.route = t.route
                    AND d.source_chain = t.origin_chain
                    AND d.source_nonce = t.nonce
+      AND (d.source_transfer_id = t.id OR (d.source_transfer_id IS NULL AND NOT EXISTS (
+        SELECT 1 FROM outbound_transfer other
+         WHERE other.origin_chain = t.origin_chain AND other.nonce = t.nonce
+           AND other.id <> t.id
+      )))
               ) AS has_inbound
          FROM outbound_transfer t
          JOIN rail_attestation a ON a.transfer_id = t.id
