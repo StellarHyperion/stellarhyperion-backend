@@ -40,6 +40,7 @@ const { logger } = capturingLogger();
 const config = loadConfig({
   env: completeEnv({ KEEPER_ENABLED: "false", RAILS_ENABLED: "false" }),
 });
+const CURSOR_WALLET = config.deployments.networks["stellar-testnet"]!.treasury;
 const app = buildServer({
   config,
   logger,
@@ -589,15 +590,15 @@ describe("public response differential runner", () => {
     const insert = async (nonce: number) =>
       pg.query(
         `INSERT INTO outbound_transfer(origin_chain,route,nonce,sender,token,gross_amount,fee,net_amount,destination_chain,destination,origin_block,origin_tx)
-       VALUES ('stellar-testnet',1,$1,'cursor-wallet','USDC',100,0,100,'sepolia','recipient',123,$2) RETURNING id`,
-        [nonce, `cursor-source-${String(nonce)}`],
+       VALUES ('stellar-testnet',1,$1,$3,'USDC',100,0,100,'sepolia','recipient',123,$2) RETURNING id`,
+        [nonce, `cursor-source-${String(nonce)}`, CURSOR_WALLET],
       );
     const ids: string[] = [];
     for (let nonce = 9201; nonce <= 9205; nonce += 1) {
       const result = await insert(nonce);
       ids.unshift(String((result.rows[0] as { id: unknown }).id));
     }
-    const first = await app.inject("/v1/transfers?sender=cursor-wallet&limit=2");
+    const first = await app.inject(`/v1/transfers?sender=${CURSOR_WALLET}&limit=2`);
     expect(first.statusCode).toBe(200);
     const seen = first.json().transfers.map((row: { id: string }) => row.id) as string[];
     expect(seen).toEqual(ids.slice(0, 2));
@@ -605,7 +606,7 @@ describe("public response differential runner", () => {
     let cursor = first.json().nextCursor as string | null;
     while (cursor !== null) {
       const next = await app.inject(
-        `/v1/transfers?sender=cursor-wallet&limit=2&cursor=${encodeURIComponent(cursor)}`,
+        `/v1/transfers?sender=${CURSOR_WALLET}&limit=2&cursor=${encodeURIComponent(cursor)}`,
       );
       expect(next.statusCode).toBe(200);
       expect(next.json().offset).toBeUndefined();
@@ -613,14 +614,14 @@ describe("public response differential runner", () => {
       cursor = next.json().nextCursor as string | null;
     }
     expect(seen).toEqual(ids);
-    const offset = await app.inject("/v1/transfers?sender=cursor-wallet&limit=2&offset=1");
+    const offset = await app.inject(`/v1/transfers?sender=${CURSOR_WALLET}&limit=2&offset=1`);
     expect(offset.statusCode).toBe(200);
     expect(offset.json().offset).toBe(1);
     expect(offset.json().transfers.map((row: { id: string }) => row.id)).toEqual(ids.slice(0, 2));
     const mixed = await app.inject(
-      `/v1/transfers?sender=cursor-wallet&offset=1&cursor=${encodeURIComponent(first.json().nextCursor)}`,
+      `/v1/transfers?sender=${CURSOR_WALLET}&offset=1&cursor=${encodeURIComponent(first.json().nextCursor)}`,
     );
     expect(mixed.statusCode).toBe(400);
-    await pg.query("DELETE FROM outbound_transfer WHERE sender='cursor-wallet'");
+    await pg.query("DELETE FROM outbound_transfer WHERE sender=$1", [CURSOR_WALLET]);
   });
 });
