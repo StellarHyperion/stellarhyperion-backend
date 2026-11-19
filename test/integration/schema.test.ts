@@ -423,13 +423,7 @@ suite("destination-proof mutation corpus", () => {
   it("generates the full mutation set covering every protected field", () => {
     const mutations = destinationProofMutations(baseDelivery);
     const fields = mutations.map((m) => m.field);
-    expect(fields).toEqual([
-      "recipient",
-      "amount",
-      "token",
-      "domain",
-      "canonicalHash",
-    ]);
+    expect(fields).toEqual(["recipient", "amount", "token", "domain", "canonicalHash"]);
     for (const mutation of mutations) {
       expect(mutation.mutated).not.toBe(mutation.original);
     }
@@ -503,10 +497,7 @@ suite("API contract differential runner", () => {
       const prevValue = prevBody[key];
       const currValue = currBody[key];
       if (typeof prevValue === "string" && typeof currValue === "string") {
-        if (
-          /^\d{19,}$/.test(currValue) &&
-          !/^\d{19,}$/.test(prevValue)
-        ) {
+        if (/^\d{19,}$/.test(currValue) && !/^\d{19,}$/.test(prevValue)) {
           wideIntegerChanges.push(key);
         }
         if (currValue.includes("USDC") && !prevValue.includes("USDC")) {
