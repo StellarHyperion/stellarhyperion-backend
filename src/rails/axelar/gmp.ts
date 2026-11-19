@@ -182,6 +182,16 @@ export class AxelarGmpClient implements RailClient {
       // The message id, because that is what Axelar's support asks for.
       reference: typeof row.message_id === "string" ? row.message_id : null,
       attestedAt: stampOf(row.approved) ?? stampOf(row.executed),
+      ...(flags.length > 0
+        ? {
+            providerFailure: {
+              kind: FATAL_FLAGS.some((flag) => row[flag] === true)
+                ? ("fatal" as const)
+                : ("recoverable" as const),
+              signals: flags,
+            },
+          }
+        : {}),
       ...(typeof row.executed?.transactionHash === "string" &&
       /^0x[0-9a-fA-F]{64}$/.test(row.executed.transactionHash) &&
       typeof row.command_id === "string" &&

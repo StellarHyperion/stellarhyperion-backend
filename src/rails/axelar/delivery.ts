@@ -30,6 +30,17 @@ export interface VerifiedDelivery {
   readonly row: InboundRow;
 }
 
+export type ItsVerificationState = "receipt_unavailable" | "payout_unverified" | "verified";
+
+/**
+ * A stable explanation for an ITS candidate that did not become a delivery. Provider status is
+ * deliberately not included: callers must not confuse Axelar's opinion with destination proof.
+ */
+export interface ItsVerificationResult {
+  readonly state: ItsVerificationState;
+  readonly delivery: VerifiedDelivery | null;
+}
+
 // The rail API supplies a candidate receipt. Only matching confirmed chain events establish delivery.
 export async function verifyItsDelivery(
   config: AppConfig,

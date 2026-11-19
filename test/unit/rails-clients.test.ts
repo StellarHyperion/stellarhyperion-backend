@@ -448,6 +448,10 @@ describe("Axelar's GMP status", () => {
     if (lookup.kind !== "found") return;
     expect(lookup.report.status).toBe("pending");
     expect(lookup.report.railStatus).toContain("is_insufficient_fee");
+    expect(lookup.report.providerFailure).toEqual({
+      kind: "recoverable",
+      signals: ["is_insufficient_fee"],
+    });
   });
 
   it("lets a fatal flag outrank an optimistic status", async () => {
@@ -467,6 +471,10 @@ describe("Axelar's GMP status", () => {
     expect(lookup.kind).toBe("found");
     if (lookup.kind !== "found") return;
     expect(lookup.report.status).toBe("failed");
+    expect(lookup.report.providerFailure).toEqual({
+      kind: "fatal",
+      signals: ["is_invalid_destination_chain"],
+    });
   });
 
   it("records a status it has never seen without moving ours, and says so once", async () => {

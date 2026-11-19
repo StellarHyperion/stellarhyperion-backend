@@ -46,6 +46,15 @@ export interface RailReport {
   /** The identifier to quote at the rail's support. Circle's event nonce, Axelar's message id. */
   readonly reference: string | null;
   readonly attestedAt: Date | null;
+  /**
+   * A provider-side failure is evidence about the rail, not evidence that the destination
+   * receipt or payout is absent. Keeping the two separate prevents a provider error from being
+   * presented as a failed payment.
+   */
+  readonly providerFailure?: {
+    readonly kind: "recoverable" | "fatal";
+    readonly signals: readonly string[];
+  };
   readonly message?: string | null;
   readonly messageBytes?: string | null;
   readonly attestation?: string | null;

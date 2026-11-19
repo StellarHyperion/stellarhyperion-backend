@@ -20,11 +20,18 @@ export interface ExpectedDelivery {
   recipient: string;
   amount: bigint;
 }
-export function matchingPayment<T extends DeliveryLog>(
+
+export interface DeliveryEvidence<T extends DeliveryLog = DeliveryLog> {
+  readonly received: T | null;
+  readonly payment: T | null;
+}
+
+/** Inspect the two independent destination proofs without collapsing a missing one into failure. */
+export function inspectDeliveryEvidence<T extends DeliveryLog>(
   logs: readonly T[],
   expected: ExpectedDelivery,
-): T | null {
-  let received = false;
+): DeliveryEvidence<T> {
+  let received: T | null = null;
   let payment: T | null = null;
   for (const log of logs) {
     try {
@@ -34,13 +41,15 @@ export function matchingPayment<T extends DeliveryLog>(
         log.address.toLowerCase() === expected.its.toLowerCase()
       ) {
         const args = event.args;
-        received ||=
+        if (
           args.commandId.toLowerCase() === expected.commandId.toLowerCase() &&
           args.tokenId.toLowerCase() === expected.tokenId.toLowerCase() &&
           args.sourceChain === expected.sourceChain &&
           args.sourceAddress.toLowerCase() === expected.sourceAddress.toLowerCase() &&
           args.destinationAddress.toLowerCase() === expected.recipient.toLowerCase() &&
-          args.amount === expected.amount;
+          args.amount === expected.amount
+        )
+          received = log;
       }
       if (
         event.eventName === "Transfer" &&
@@ -53,5 +62,13 @@ export function matchingPayment<T extends DeliveryLog>(
       /* Receipts contain unrelated events; they cannot establish this delivery. */
     }
   }
-  return received ? payment : null;
+  return { received, payment };
+}
+
+export function matchingPayment<T extends DeliveryLog>(
+  logs: readonly T[],
+  expected: ExpectedDelivery,
+): T | null {
+  const evidence = inspectDeliveryEvidence(logs, expected);
+  return evidence.received === null ? null : evidence.payment;
 }
