@@ -10,7 +10,7 @@
 import { describe, expect, it } from "vitest";
 
 import { EvmWatcher } from "../../src/chains/evm/watcher.js";
-import { viemClient, type EvmClient } from "../../src/chains/evm/client.js";
+import { viemClient, type EvmClient, type RawEvmLog } from "../../src/chains/evm/client.js";
 import {
   ANVIL_HISTORY,
   ANVIL_CHAIN_ID,
@@ -411,6 +411,34 @@ describe("what the watcher says about itself", () => {
     const { watcher } = harness({ head: 60n, confirmations: 3 });
     await watcher.tick(AbortSignal.timeout(5_000)).catch(() => undefined);
     expect(watcher.readiness().state).not.toBe("down");
+  });
+});
+
+describe("unknown router logs", () => {
+  it("quarantines the raw payload instead of materializing a transfer", async () => {
+    const unknown: RawEvmLog = {
+      address: ANVIL_ROUTER,
+      blockNumber: 20n,
+      transactionHash: `0x${"12".repeat(32)}`,
+      logIndex: 0,
+      data: "0xdeadbeef",
+      topics: [`0x${"34".repeat(32)}`],
+      removed: false,
+    };
+    const { watcher, db } = harness({
+      client: new FakeEvmClient({ logs: [unknown], head: 60n }),
+      confirmations: 3,
+    });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    expect(db.matching("INSERT INTO evm_log_quarantine")).toHaveLength(1);
+    expect(db.matching("INSERT INTO outbound_transfer")).toHaveLength(0);
+    expect(db.matching("INSERT INTO inbound_delivery")).toHaveLength(0);
+    expect(db.matching("DELETE FROM evm_log_quarantine")).toHaveLength(1);
+    expect(db.matching("INSERT INTO evm_log_quarantine")[0]?.params).toEqual(
+      expect.arrayContaining(["unsupported_signature_or_payload", unknown.data]),
+    );
   });
 });
 

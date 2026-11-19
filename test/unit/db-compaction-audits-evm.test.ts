@@ -45,6 +45,7 @@ const MIGRATIONS = [
   "1792100000000_route-health-compaction-and-audits.sql",
   "1792200000000_evm-scan-provenance.sql",
   "1792800000000_cctp-verification-failure-reasons.sql",
+  "1793000000000_evm-quarantine-raw-replay.sql",
 ] as const;
 
 function makePgliteDb(pg: PGlite): Transactional {
