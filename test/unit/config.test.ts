@@ -39,6 +39,7 @@ describe("loadConfig", () => {
         VERCEL_ENV: "preview",
         HYPERION_DATABASE_ENV: "preview",
         INDEXER_ENABLED: "false",
+        RAILS_ENABLED: "false",
         KEEPER_ENABLED: "false",
       }),
     });
