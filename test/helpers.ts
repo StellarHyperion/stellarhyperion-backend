@@ -36,3 +36,122 @@ export function completeEnv(
     ...overrides,
   };
 }
+
+/** Run workers together and retain every outcome, including rejected transactions. */
+export async function runConcurrent<T>(
+  workers: number,
+  task: (worker: number) => Promise<T>,
+): Promise<PromiseSettledResult<T>[]> {
+  if (!Number.isInteger(workers) || workers < 1 || workers > 32)
+    throw new RangeError("workers must be between 1 and 32");
+  return Promise.allSettled(Array.from({ length: workers }, (_, worker) => task(worker)));
+}
+
+/** Concurrency stress uses TEST_DATABASE_URL only; remote or non-test databases require a separate opt-in. */
+export function validateConcurrencyDatabase(connection: string, allowRemote = false): void {
+  const url = new URL(connection);
+  if (!["postgres:", "postgresql:"].includes(url.protocol))
+    throw new Error("PostgreSQL test URL required");
+  if (
+    !allowRemote &&
+    (!["127.0.0.1", "localhost", "[::1]"].includes(url.hostname) ||
+      !/test|session|concurrency/.test(url.pathname))
+  ) {
+    throw new Error(
+      "concurrency requires a dedicated local test database or explicit HYPERION_ALLOW_REMOTE_CONCURRENCY_TEST_DATABASE=true",
+    );
+  }
+}
+
+/** A start gate for tests that must prove work overlaps rather than merely repeats. */
+export function concurrencyBarrier(parties: number): {
+  readonly wait: () => Promise<void>;
+} {
+  if (!Number.isInteger(parties) || parties < 2) throw new RangeError("parties must be at least 2");
+  let arrived = 0;
+  let release: (() => void) | null = null;
+  const opened = new Promise<void>((resolve) => (release = resolve));
+  return {
+    wait: () => {
+      arrived += 1;
+      if (arrived === parties) release?.();
+      return opened;
+    },
+  };
+}
+
+/**
+ * A single targeted mutation applied to a receipt or message, recording the field that changed,
+ * the original value, and the mutated value so the corpus can report exactly what was altered.
+ */
+export interface Mutation {
+  readonly field: "recipient" | "amount" | "token" | "domain" | "canonicalHash";
+  readonly original: string;
+  readonly mutated: string;
+}
+
+/**
+ * Applies a targeted mutation to a delivery record and returns the mutated copy plus the
+ * mutation descriptor. Harmless unrelated fields are left untouched so only the intended
+ * field change is exercised.
+ */
+export function mutateDelivery(
+  delivery: {
+    readonly recipient: string;
+    readonly amount: string;
+    readonly token: string;
+    readonly domain: string;
+    readonly canonicalHash: string;
+  },
+  mutation: Mutation,
+): { readonly delivery: typeof delivery; readonly mutation: Mutation } {
+  const mutated = { ...delivery };
+  switch (mutation.field) {
+    case "recipient":
+      mutated.recipient = mutation.mutated;
+      break;
+    case "amount":
+      mutated.amount = mutation.mutated;
+      break;
+    case "token":
+      mutated.token = mutation.mutated;
+      break;
+    case "domain":
+      mutated.domain = mutation.mutated;
+      break;
+    case "canonicalHash":
+      mutated.canonicalHash = mutation.mutated;
+      break;
+  }
+  return { delivery: mutated, mutation };
+}
+
+/**
+ * Generates the standard mutation set used by the destination-proof corpus: one mutation
+ * per protected field, each flipping a single character so the verifier must reject it.
+ */
+export function destinationProofMutations(delivery: {
+  readonly recipient: string;
+  readonly amount: string;
+  readonly token: string;
+  readonly domain: string;
+  readonly canonicalHash: string;
+}): readonly Mutation[] {
+  const flip = (value: string): string => {
+    if (value.length === 0) return "x";
+    const chars = Array.from(value);
+    chars[0] = chars[0] === "a" ? "b" : "a";
+    return chars.join("");
+  };
+  return [
+    { field: "recipient", original: delivery.recipient, mutated: flip(delivery.recipient) },
+    { field: "amount", original: delivery.amount, mutated: flip(delivery.amount) },
+    { field: "token", original: delivery.token, mutated: flip(delivery.token) },
+    { field: "domain", original: delivery.domain, mutated: flip(delivery.domain) },
+    {
+      field: "canonicalHash",
+      original: delivery.canonicalHash,
+      mutated: flip(delivery.canonicalHash),
+    },
+  ];
+}

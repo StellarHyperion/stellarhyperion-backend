@@ -10,6 +10,7 @@ import type { AppConfig } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
 import { startKeeperQueue, type KeeperHandle } from "./queue.js";
+import { activateKeeperSigner } from "./signers.js";
 
 export class KeeperWorker implements ReadinessSource {
   readonly name = "keeper";
@@ -35,7 +36,7 @@ export class KeeperWorker implements ReadinessSource {
       return {
         name: this.name,
         state: "degraded",
-        detail: `redis connection failure: ${this.failedError}`,
+        detail: `keeper startup blocked: ${this.failedError}`,
       };
     }
     if (this.handle === null) {
@@ -56,10 +57,20 @@ export class KeeperWorker implements ReadinessSource {
     if (!this.config.keeper.enabled || this.handle !== null || this.starting) return;
     this.starting = true;
 
-    startKeeperQueue(
-      { db: this.db, config: this.config, logger: this.logger },
-      this.config.redisUrl,
-    )
+    Promise.resolve()
+      .then(async () => {
+        if (this.config.keeper.stellarSecrets.length > 0) {
+          const signer = await activateKeeperSigner(this.db, this.config);
+          this.logger.info(
+            { signer: signer.publicKey, balance: signer.balance },
+            "funded keeper signer ownership ready",
+          );
+        }
+        return startKeeperQueue(
+          { db: this.db, config: this.config, logger: this.logger },
+          this.config.redisUrl,
+        );
+      })
       .then((handle) => {
         this.handle = handle;
         this.starting = false;
@@ -67,7 +78,8 @@ export class KeeperWorker implements ReadinessSource {
       })
       .catch((err: unknown) => {
         this.starting = false;
-        this.failedError = err instanceof Error ? err.message : String(err);
+        this.failedError =
+          "signer ownership, balance, network or queue readiness could not be verified";
         this.logger.error({ err }, "failed to start keeper queue");
       });
   }

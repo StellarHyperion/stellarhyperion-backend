@@ -17,6 +17,7 @@ import {
 import { negotiateSchemaVersion, withSchemaMetadata } from "../schema-version.js";
 import type { ServerDeps } from "../server.js";
 import { coverageMetadata } from "./coverage.js";
+import { requestQuery } from "../request-budget.js";
 
 export interface FormattedClaim {
   readonly id: string;
@@ -64,7 +65,9 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       if (version === null) return;
 
       const { chain, claimId } = request.params;
-      const { rows } = await db.query(
+      const { rows } = await requestQuery(
+        request,
+        db,
         `SELECT chain || ':' || claim_id::text AS id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
                 created_at, settled, settled_at, settled_by, settled_tx, observed_at
            FROM pending_claim
@@ -145,7 +148,9 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       params.push(parsedOffset);
       const offsetClause = `OFFSET $${String(params.length)}`;
 
-      const { rows } = await db.query(
+      const { rows } = await requestQuery(
+        request,
+        db,
         `SELECT chain || ':' || claim_id::text AS id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
                 created_at, settled, observed_at
            FROM pending_claim

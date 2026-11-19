@@ -17,6 +17,10 @@ import {
   isIrisMessage,
   isIrisResponsePayload,
   IrisClient,
+  IrisResourceLimitError,
+  MAX_IRIS_ATTESTATION_BYTES,
+  MAX_IRIS_MESSAGE_BYTES,
+  MAX_IRIS_RESPONSE_BYTES,
   reportFor,
 } from "../../src/rails/cctp/iris.js";
 import { RailError, type PendingTransfer } from "../../src/rails/types.js";
@@ -234,7 +238,7 @@ describe("Circle's Iris", () => {
           signature: "0xcafe",
           status: "completed",
           attestationTimestamp: timestampStr,
-          messageId: "msg-999",
+          messageId: `0x${"99".repeat(32)}`,
         },
       ],
     });
@@ -249,7 +253,7 @@ describe("Circle's Iris", () => {
     expect(lookup.report.attestation).toBe("0xcafe");
     expect(lookup.report.attestationTimestamp).toEqual(expectedDate);
     expect(lookup.report.attestedAt).toEqual(expectedDate);
-    expect(lookup.report.reference).toBe("msg-999");
+    expect(lookup.report.reference).toBe(`0x${"99".repeat(32)}`);
   });
 
   it("handles unix epoch timestamp in seconds or milliseconds", async () => {
@@ -373,6 +377,107 @@ describe("Circle's Iris", () => {
     );
   });
 
+  it("rejects an oversized provider envelope before parsing it", async () => {
+    const { fetch } = answering(200, {
+      data: [{ status: "pending_confirmations" }],
+      padding: "x".repeat(MAX_IRIS_RESPONSE_BYTES),
+    });
+    await expect(new IrisClient("testnet", { fetch }).look(TRANSFER)).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof RailError &&
+        error.kind === "permanent" &&
+        error.message.includes("resource limit exceeded"),
+    );
+  });
+
+  it("classifies oversized messages and attestations as resource-limit failures", async () => {
+    for (const [field, size] of [
+      ["message", MAX_IRIS_MESSAGE_BYTES],
+      ["attestation", MAX_IRIS_ATTESTATION_BYTES],
+    ] as const) {
+      const { fetch } = answering(200, {
+        data: [{ status: "complete", [field]: "x".repeat(size + 1) }],
+      });
+      await expect(new IrisClient("testnet", { fetch }).look(TRANSFER)).rejects.toSatisfy(
+        (error: unknown) =>
+          error instanceof RailError &&
+          error.kind === "permanent" &&
+          error.message.includes(`resource limit exceeded: ${field}`),
+      );
+    }
+  });
+
+  it("cancels a chunked oversized response with no declared length before accepting JSON", async () => {
+    let cancelled = false;
+    let reads = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        reads++;
+        controller.enqueue(new Uint8Array(65536));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const fetch = (() => Promise.resolve(new Response(body))) as typeof globalThis.fetch;
+    await expect(new IrisClient("testnet", { fetch }).look(TRANSFER)).rejects.toMatchObject({
+      category: "provider_resource_limit",
+      kind: "permanent",
+    });
+    expect(cancelled).toBe(true);
+    expect(reads).toBeLessThanOrEqual(MAX_IRIS_RESPONSE_BYTES / 65536 + 2);
+  });
+
+  it("rejects a declared oversized body without reading and retains resource classification for error envelopes", async () => {
+    for (const status of [200, 500]) {
+      let cancelled = false;
+      const body = new ReadableStream<Uint8Array>({
+        cancel() {
+          cancelled = true;
+        },
+      });
+      const fetch = (() =>
+        Promise.resolve(
+          new Response(body, {
+            status,
+            headers: { "content-length": String(MAX_IRIS_RESPONSE_BYTES + 1) },
+          }),
+        )) as typeof globalThis.fetch;
+      await expect(new IrisClient("testnet", { fetch }).look(TRANSFER)).rejects.toBeInstanceOf(
+        IrisResourceLimitError,
+      );
+      expect(cancelled).toBe(true);
+    }
+  });
+
+  it("caps nested fast-attestation fields and preserves valid supported v2 responses", async () => {
+    const oversized = answering(200, {
+      messages: [
+        {
+          status: "complete",
+          fastAttestation: { signature: "x".repeat(MAX_IRIS_ATTESTATION_BYTES + 1) },
+        },
+      ],
+    });
+    await expect(
+      new IrisClient("testnet", { fetch: oversized.fetch }).look(TRANSFER),
+    ).rejects.toMatchObject({ category: "provider_resource_limit" });
+    const valid = answering(200, {
+      messages: [
+        {
+          status: "complete",
+          message: "0x1234",
+          attestation: `0x${"ab".repeat(65)}`,
+          eventNonce: "18446744073709551615",
+        },
+      ],
+    });
+    expect(await new IrisClient("testnet", { fetch: valid.fetch }).look(TRANSFER)).toMatchObject({
+      kind: "found",
+      report: { status: "attested", reference: "18446744073709551615" },
+    });
+  });
+
   it("maps various status strings across v1 and v2 formats", () => {
     for (const status of [
       "complete",
@@ -431,7 +536,7 @@ describe("Axelar's GMP status", () => {
   });
 
   it("keeps a recoverable transfer pending and names the reason", async () => {
-    // Insufficient gas is exactly what the keeper exists to fix, so it must stay in the queue.
+    // Provider gas uncertainty remains retryable; this command never performs a gas top-up.
     const { fetch } = answering(200, {
       data: [
         {
@@ -448,6 +553,26 @@ describe("Axelar's GMP status", () => {
     if (lookup.kind !== "found") return;
     expect(lookup.report.status).toBe("pending");
     expect(lookup.report.railStatus).toContain("is_insufficient_fee");
+    expect(lookup.report.providerFailure).toEqual({
+      kind: "recoverable",
+      signals: ["is_insufficient_fee"],
+    });
+  });
+
+  it("keeps a provider error with recoverable gas flags retryable", async () => {
+    const { fetch } = answering(200, {
+      data: [
+        { call: { transactionHash: TRANSFER.originTx }, status: "error", is_not_enough_gas: true },
+      ],
+    });
+    const lookup = await new AxelarGmpClient(BASE, { fetch }).look(TRANSFER);
+    expect(lookup.kind).toBe("found");
+    if (lookup.kind !== "found") return;
+    expect(lookup.report.status).toBe("pending");
+    expect(lookup.report.providerFailure).toEqual({
+      kind: "recoverable",
+      signals: ["is_not_enough_gas"],
+    });
   });
 
   it("lets a fatal flag outrank an optimistic status", async () => {
@@ -467,6 +592,10 @@ describe("Axelar's GMP status", () => {
     expect(lookup.kind).toBe("found");
     if (lookup.kind !== "found") return;
     expect(lookup.report.status).toBe("failed");
+    expect(lookup.report.providerFailure).toEqual({
+      kind: "fatal",
+      signals: ["is_invalid_destination_chain"],
+    });
   });
 
   it("records a status it has never seen without moving ours, and says so once", async () => {

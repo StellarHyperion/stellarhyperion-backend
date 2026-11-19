@@ -1,6 +1,7 @@
 import { Address, BASE_FEE, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 import { bigintOf } from "../../db/rows.js";
 import { submitStellar } from "../stellar.js";
+import { recordKeeperSubmission } from "../outcomes.js";
 import type { AdapterCoverage, KeeperContext, TtlBumpPayload, TtlBumpResult } from "../types.js";
 const MAX_FEE = 10_000;
 export async function processTtlBump(
@@ -32,8 +33,13 @@ export async function processTtlBump(
   );
   const claims = claimRows.rows.map((row) => bigintOf(row, "claim_id"));
   const transfers = transferRows.rows.map((row) => bigintOf(row, "nonce"));
-  const dryRun = ctx.config.keeper.stellarSecret === null;
-  if (dryRun)
+  const dryRun = ctx.config.keeper.stellarSecrets.length === 0;
+  if (dryRun) {
+    await recordKeeperSubmission(ctx.db, {
+      jobName: "ttl-bump",
+      signerPublicKey: "dry-run",
+      stage: "simulated",
+    });
     return {
       bumpedTokens: 0,
       bumpedClaims: 0,
@@ -41,6 +47,7 @@ export async function processTtlBump(
       dryRun: true,
       detail: `No signer: ${tokens.length} tokens, ${claims.length} claims, ${transfers.length} transfers need maintenance.`,
     };
+  }
   const totalFees = tokens.length * BASE_FEE + claims.length * 100 + transfers.length * 50;
   if (totalFees > MAX_FEE) {
     return {
@@ -66,12 +73,21 @@ export async function processTtlBump(
   };
   ctx.logger.info({ adapterCoverage }, "adapter coverage reported");
   const vector = (values: xdr.ScVal[]) => xdr.ScVal.scvVec(values);
-  const hash = await submitStellar(ctx.config, chain.routerContractId, "keep_alive", () => [
-    vector(tokens.map((token) => new Address(token).toScVal())),
-    vector([0, 1, 2, 3].map((route) => nativeToScVal(route, { type: "u32" }))),
-    vector(claims.map((id) => nativeToScVal(id, { type: "u64" }))),
-    vector(transfers.map((id) => nativeToScVal(id, { type: "u64" }))),
-  ]);
+  const hash = await submitStellar(
+    ctx.config,
+    ctx.db,
+    chain.chain,
+    chain.routerContractId,
+    "keep_alive",
+    "keep_alive",
+    () => [
+      vector(tokens.map((token) => new Address(token).toScVal())),
+      vector([0, 1, 2, 3].map((route) => nativeToScVal(route, { type: "u32" }))),
+      vector(claims.map((id) => nativeToScVal(id, { type: "u64" }))),
+      vector(transfers.map((id) => nativeToScVal(id, { type: "u64" }))),
+    ],
+    { db: ctx.db, jobName: "ttl-bump" },
+  );
   ctx.logger.info({ hash }, "router keep_alive confirmed");
   return {
     bumpedTokens: tokens.length,

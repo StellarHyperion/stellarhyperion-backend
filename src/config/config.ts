@@ -11,6 +11,8 @@
  * cast. That is the point of the shared package: there is one description of where Hyperion is
  * deployed, one validator for it, and the backend is not allowed its own opinion.
  */
+import { hostname } from "node:os";
+import { EXPECTED_SCHEMA_VERSION } from "../db/schema.js";
 import { readFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 
@@ -56,6 +58,8 @@ const AXELARSCAN_API: Readonly<Record<NetworkMode, string>> = {
 };
 
 export type NodeEnv = "development" | "test" | "production";
+export type DeploymentEnvironment = "development" | "preview" | "production";
+export type DatabaseRole = "read-only" | "read-write";
 export type LogLevel = "trace" | "debug" | "info" | "warn" | "error" | "fatal";
 
 /** Everything the Soroban watcher needs. One instance, because there is one Stellar per network. */
@@ -116,10 +120,15 @@ export interface KeeperConfig {
   readonly pollIntervalMs: number;
   readonly concurrency: number;
   readonly stellarSecret: string | null;
+  readonly stellarSecrets: readonly string[];
+  readonly activeSigner: string | null;
 }
 
 export interface AppConfig {
   readonly nodeEnv: NodeEnv;
+  readonly deploymentEnvironment: DeploymentEnvironment;
+  readonly databaseEnvironment: DeploymentEnvironment;
+  readonly databaseRole: DatabaseRole;
   readonly logLevel: LogLevel;
   readonly http: { readonly host: string; readonly port: number };
   readonly databaseUrl: string;
@@ -134,6 +143,11 @@ export interface AppConfig {
   readonly readinessPolicy: ReadinessDependencyPolicies;
   readonly freshnessSlo: FreshnessSloConfig;
   readonly shutdownTimeoutMs: number;
+  readonly schemaVersion: string;
+  readonly catchUpBudgetMs: number;
+  readonly catchUpEnabled: boolean;
+  readonly indexerLeaseTtlMs: number;
+  readonly indexerLeaseOwnerId: string;
 }
 
 /** Injected so the unit suite can hand over a record without touching a disk or a process. */
@@ -152,6 +166,37 @@ const NODE_ENV: EnumSpec<NodeEnv> = {
   choices: ["development", "production", "test"],
   printable: true,
   purpose: "Changes log formatting and nothing else. Behaviour is identical across all three.",
+};
+
+const VERCEL_ENV: EnumSpec<DeploymentEnvironment> = {
+  name: "VERCEL_ENV",
+  kind: "enum",
+  required: false,
+  fallback: "development",
+  choices: ["development", "preview", "production"],
+  printable: true,
+  purpose:
+    "Identifies the hosting environment. A preview must use a preview database, never the production database.",
+};
+
+const DATABASE_ENVIRONMENT: EnumSpec<DeploymentEnvironment> = {
+  name: "HYPERION_DATABASE_ENV",
+  kind: "enum",
+  required: false,
+  printable: true,
+  choices: ["development", "preview", "production"],
+  purpose:
+    "Identifies which isolated database this credential belongs to. Required outside local development.",
+};
+
+const DATABASE_ROLE: EnumSpec<DatabaseRole> = {
+  name: "HYPERION_DATABASE_ROLE",
+  kind: "enum",
+  required: false,
+  printable: true,
+  choices: ["read-only", "read-write"],
+  purpose:
+    "Declares whether this process may write. API-only deployments must use read-only credentials.",
 };
 
 const LOG_LEVEL: EnumSpec<LogLevel> = {
@@ -344,6 +389,22 @@ const KEEPER_STELLAR_SECRET: VarSpec = {
     "Secret key for submitting Stellar keep_alive and claim transactions. Optional; runs dry-run when absent.",
 };
 
+const KEEPER_STELLAR_SECRETS: VarSpec = {
+  name: "KEEPER_STELLAR_SECRETS",
+  kind: "string",
+  required: false,
+  printable: false,
+  purpose: "Comma-separated Stellar signer secrets used for safe signer rotation.",
+};
+
+const KEEPER_STELLAR_ACTIVE_SIGNER: VarSpec = {
+  name: "KEEPER_STELLAR_ACTIVE_SIGNER",
+  kind: "string",
+  required: false,
+  printable: true,
+  purpose: "Public key of the funded signer to use after pending submissions are reconciled.",
+};
+
 const SHUTDOWN_TIMEOUT_MS: VarSpec = {
   name: "SHUTDOWN_TIMEOUT_MS",
   kind: "integer",
@@ -352,6 +413,53 @@ const SHUTDOWN_TIMEOUT_MS: VarSpec = {
   min: 100,
   printable: true,
   purpose: "How long shutdown waits for in-flight work before it stops waiting.",
+};
+
+const SCHEMA_VERSION: VarSpec = {
+  name: "SCHEMA_VERSION",
+  kind: "string",
+  required: false,
+  fallback: EXPECTED_SCHEMA_VERSION,
+  printable: true,
+  purpose: "Expected shipped migration version; an override cannot weaken schema admission.",
+};
+const CATCH_UP_BUDGET_MS: VarSpec = {
+  name: "CATCH_UP_BUDGET_MS",
+  kind: "integer",
+  required: false,
+  fallback: "120000",
+  min: 1000,
+  max: 3600000,
+  printable: true,
+  purpose:
+    "Total budget for explicit scheduled catch-up mode; continuous servers have no lifetime limit.",
+};
+const CATCH_UP_ENABLED: VarSpec = {
+  name: "CATCH_UP_ENABLED",
+  kind: "boolean",
+  required: false,
+  fallback: "false",
+  printable: true,
+  purpose:
+    "Run bounded source-scan and proof-polling stages then drain instead of serving continuously.",
+};
+const INDEXER_LEASE_TTL_MS: VarSpec = {
+  name: "INDEXER_LEASE_TTL_MS",
+  kind: "integer",
+  required: false,
+  fallback: "30000",
+  min: 5000,
+  max: 300000,
+  printable: true,
+  purpose: "TTL for the existing cursor ownership lease, fenced inside each write transaction.",
+};
+const INDEXER_LEASE_OWNER_ID: VarSpec = {
+  name: "INDEXER_LEASE_OWNER_ID",
+  kind: "string",
+  required: false,
+  fallback: "",
+  printable: true,
+  purpose: "Replica ownership prefix; each worker also has a unique identity.",
 };
 
 const DEPLOYMENT_MODE: EnumSpec<DeploymentMode> = {
@@ -583,6 +691,10 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const reader = new EnvReader(env);
 
   const nodeEnv = reader.choice(NODE_ENV);
+  const deploymentEnvironment = reader.choice({
+    ...VERCEL_ENV,
+    fallback: nodeEnv === "production" ? "production" : "development",
+  });
   const logLevel = reader.choice(LOG_LEVEL);
   const host = reader.string(HTTP_HOST);
   const port = reader.integer(HTTP_PORT);
@@ -592,9 +704,37 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const network = reader.choice(HYPERION_NETWORK);
   const deploymentsPath = reader.string(DEPLOYMENTS_FILE);
   const indexerEnabled = reader.boolean(INDEXER_ENABLED);
-  const shutdownTimeoutMs = reader.integer(SHUTDOWN_TIMEOUT_MS);
-
+  const databaseEnvironment = reader.choice({
+    ...DATABASE_ENVIRONMENT,
+    required: deploymentEnvironment !== "development",
+    fallback: deploymentEnvironment,
+  });
   const railsEnabled = reader.boolean(RAILS_ENABLED);
+  const expectedDatabaseRole: DatabaseRole =
+    indexerEnabled || keeperEnabled || railsEnabled ? "read-write" : "read-only";
+  const databaseRole = reader.choice({ ...DATABASE_ROLE, fallback: expectedDatabaseRole });
+  if (deploymentEnvironment !== "development" && databaseEnvironment !== deploymentEnvironment) {
+    reader.reject(
+      DATABASE_ENVIRONMENT,
+      `is ${databaseEnvironment}, but VERCEL_ENV is ${deploymentEnvironment}; use a separate database credential for each environment`,
+    );
+  }
+  if (databaseRole !== expectedDatabaseRole) {
+    reader.reject(
+      DATABASE_ROLE,
+      `is ${databaseRole}, but this process requires ${expectedDatabaseRole} access because ${indexerEnabled || keeperEnabled || railsEnabled ? "indexer, rail or keeper writes are enabled" : "it is API-only"}`,
+    );
+  }
+  const shutdownTimeoutMs = reader.integer(SHUTDOWN_TIMEOUT_MS);
+  const schemaVersion = reader.string(SCHEMA_VERSION);
+  if (schemaVersion !== EXPECTED_SCHEMA_VERSION)
+    reader.reject(SCHEMA_VERSION, "must match this build's shipped migration version");
+  const catchUpBudgetMs = reader.integer(CATCH_UP_BUDGET_MS);
+  const catchUpEnabled = reader.boolean(CATCH_UP_ENABLED);
+  const indexerLeaseTtlMs = reader.integer(INDEXER_LEASE_TTL_MS);
+  const indexerLeaseOwnerId =
+    reader.string(INDEXER_LEASE_OWNER_ID) || `${hostname()}:${process.pid}`;
+
   const irisOverride = reader.url(IRIS_API_URL);
   const axelarOverride = reader.url(AXELAR_API_URL);
   const railPollIntervalMs = reader.integer(RAIL_POLL_INTERVAL_MS);
@@ -606,6 +746,18 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const keeperConcurrency = reader.integer(KEEPER_CONCURRENCY);
   const keeperStellarSecret = reader.has(KEEPER_STELLAR_SECRET.name)
     ? reader.string(KEEPER_STELLAR_SECRET)
+    : null;
+  const keeperStellarSecrets = reader.has(KEEPER_STELLAR_SECRETS.name)
+    ? reader
+        .string(KEEPER_STELLAR_SECRETS)
+        .split(",")
+        .map((secret) => secret.trim())
+        .filter((secret) => secret.length > 0)
+    : keeperStellarSecret === null
+      ? []
+      : [keeperStellarSecret];
+  const keeperActiveSigner = reader.has(KEEPER_STELLAR_ACTIVE_SIGNER.name)
+    ? reader.string(KEEPER_STELLAR_ACTIVE_SIGNER)
     : null;
   const stellarRpcOverride = reader.url(STELLAR_RPC_URL);
   const stellarHistoricalRpcUrl = reader.has(STELLAR_HISTORICAL_RPC_URL.name)
@@ -684,6 +836,9 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
 
   return {
     nodeEnv,
+    deploymentEnvironment,
+    databaseEnvironment,
+    databaseRole,
     logLevel,
     http: { host, port },
     databaseUrl,
@@ -706,6 +861,8 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       pollIntervalMs: keeperPollIntervalMs,
       concurrency: keeperConcurrency,
       stellarSecret: keeperStellarSecret,
+      stellarSecrets: keeperStellarSecrets,
+      activeSigner: keeperActiveSigner,
     },
     deploymentMode,
     readinessPolicy,
@@ -718,6 +875,11 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       lanes: freshnessLanes,
     },
     shutdownTimeoutMs,
+    schemaVersion,
+    catchUpBudgetMs,
+    catchUpEnabled,
+    indexerLeaseTtlMs,
+    indexerLeaseOwnerId,
   };
 }
 
