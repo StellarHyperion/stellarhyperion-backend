@@ -6,6 +6,7 @@ import {
   TransactionBuilder,
   nativeToScVal,
   rpc,
+  xdr,
 } from "@stellar/stellar-sdk";
 import type { AppConfig } from "../config/config.js";
 
@@ -79,9 +80,9 @@ export async function submitRestore(
         networkPassphrase: chain.networkPassphrase,
       })
         .addOperation(
-          new Contract(contract).call("restore_archived", () => [
-            claimIds.map((id) => nativeToScVal(id, { type: "u64" })),
-            transferNonces.map((nonce) => nativeToScVal(nonce, { type: "u64" })),
+          new Contract(contract).call("restore_archived", [
+            xdr.ScVal.scvVec(claimIds.map((id) => nativeToScVal(id, { type: "u64" }))),
+            xdr.ScVal.scvVec(transferNonces.map((nonce) => nativeToScVal(nonce, { type: "u64" }))),
           ]),
         )
         .setTimeout(120)
