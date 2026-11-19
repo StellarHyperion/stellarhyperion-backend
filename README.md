@@ -330,3 +330,20 @@ with the same origin/destination/route/sender/recipient/search filters; changing
 a cursor with a nonzero offset returns HTTP400 `invalid_cursor`. New inserts sort before the cursor
 and cannot duplicate an already read transfer. Existing offset reads remain available and keep
 their response offset field. A full page can return a cursor whose next page is empty.
+
+### Keeper outcomes and signer rotation
+
+Keeper maintenance records separate simulated, submitted, pending, confirmed and failed outcomes
+in `keeper_submission`. `/v1/metrics` returns aggregate counts without transaction-hash labels;
+public hashes are retained for recovery. API readers require SELECT on `keeper_submission`
+and `keeper_checkpoint` after migration179310. Dry runs never count as confirmed maintenance.
+
+Configure `KEEPER_STELLAR_SECRETS` as the comma-separated local signer secret sources and
+`KEEPER_STELLAR_ACTIVE_SIGNER` as one configured public key. Startup verifies the account's
+Stellar network and positive balance, then reconciles up to100 old pending public hashes before
+changing persistent signer ownership. Unknown outcomes block rotation. The same chain ownership
+lock protects submission, and old replicas refuse preparation after ownership changes. Every
+maintenance signing attempt rechecks funding/network and current ownership. Signer rotation
+changes the fee payer; router claim payout recipients remain fixed by the contract. Public
+readiness exposes the funded public key and integer-string balance in logs; private provider
+errors are replaced by bounded readiness reasons.

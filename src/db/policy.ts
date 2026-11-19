@@ -8,6 +8,8 @@ export const API_READ_TABLES = [
   "pending_claim",
   "rail_attestation",
   "rail_attestation_history",
+  "keeper_submission",
+  "keeper_checkpoint",
   "route_health",
   "indexer_cursor",
   "indexer_worker_heartbeat",
