@@ -1095,7 +1095,7 @@ suite("database load and bounded-latency benchmarks", () => {
     let db: Database;
 
     beforeAll(async () => {
-      db = await Database.open(CONNECTION ?? "", {
+      db = Database.open(CONNECTION ?? "", {
         applicationName: "hyperion-benchmark",
       });
     });
