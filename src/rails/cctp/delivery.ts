@@ -102,14 +102,5 @@ export async function verifyCctpDelivery(
       delivered: true,
       claimId: null,
     },
-    evidence: {
-      sourceIndexed: true,
-      providerDiscovered: true,
-      destinationReceiptVerified: true,
-      paymentMatched: true,
-      tokenMatched: true,
-      amountMatched: true,
-      networkMatched: true,
-    },
   };
 }
