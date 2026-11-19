@@ -104,6 +104,7 @@ export interface FormattedTransfer {
     readonly provenance: DestinationProvenance;
   };
   readonly rail: {
+    readonly provenance: { readonly status: "candidate"; readonly reference: string | null };
     readonly status: string | null;
     readonly railStatus: string | null;
     readonly verificationFailure: CctpVerificationFailure | null;
@@ -233,6 +234,10 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
       railStatus === null
         ? null
         : {
+            provenance: {
+              status: "candidate",
+              reference: sanitizeRailDiagnostic(textOrNull(row, "rail_reference")),
+            },
             status: railStatus,
             railStatus: sanitizeRailDiagnostic(textOrNull(row, "rail_status")),
             verificationFailure: cctpFailureValue(textOrNull(row, "verification_failure")),
