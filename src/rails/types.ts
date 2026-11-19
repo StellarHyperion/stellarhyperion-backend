@@ -23,6 +23,30 @@
  */
 export type AttestationStatus = "pending" | "attested" | "delivered" | "failed" | "expired";
 
+export const CCTP_VERIFICATION_FAILURES = [
+  "forward_tx_missing",
+  "message_missing",
+  "invalid_message",
+  "configuration_unavailable",
+  "source_transfer_missing",
+  "source_domain_mismatch",
+  "destination_domain_mismatch",
+  "messenger_mismatch",
+  "source_adapter_mismatch",
+  "token_mismatch",
+  "recipient_mismatch",
+  "amount_mismatch",
+  "fee_mismatch",
+  "finality_mismatch",
+  "receipt_missing",
+  "receipt_mismatch",
+  "mint_missing",
+  "receipt_reverted",
+  "confirmations_pending",
+  "non_canonical_receipt",
+] as const;
+export type CctpVerificationFailure = (typeof CCTP_VERIFICATION_FAILURES)[number];
+
 /** Terminal states. Nothing polls a transfer again once it reaches one. */
 export const TERMINAL: readonly AttestationStatus[] = ["delivered", "failed", "expired"];
 
@@ -157,6 +181,7 @@ export interface BacklogCandidate {
   readonly observedAt: string;
   readonly attestationStatus: AttestationStatus | null;
   readonly railStatus: string | null;
+  readonly verificationFailure: CctpVerificationFailure | null;
   readonly railReference: string | null;
   readonly attestedAt: string | null;
   readonly lastCheckedAt: string | null;

@@ -234,7 +234,7 @@ describe("Circle's Iris", () => {
           signature: "0xcafe",
           status: "completed",
           attestationTimestamp: timestampStr,
-          messageId: "msg-999",
+          messageId: `0x${"99".repeat(32)}`,
         },
       ],
     });
@@ -249,7 +249,7 @@ describe("Circle's Iris", () => {
     expect(lookup.report.attestation).toBe("0xcafe");
     expect(lookup.report.attestationTimestamp).toEqual(expectedDate);
     expect(lookup.report.attestedAt).toEqual(expectedDate);
-    expect(lookup.report.reference).toBe("msg-999");
+    expect(lookup.report.reference).toBe(`0x${"99".repeat(32)}`);
   });
 
   it("handles unix epoch timestamp in seconds or milliseconds", async () => {

@@ -62,7 +62,8 @@ describe("REST API endpoints", () => {
           origin_tx: "0xabc",
           observed_at: new Date("2026-10-07T12:00:00Z"),
           attestation_status: "attested",
-          rail_status: "complete",
+          rail_status: "complete token=provider-secret",
+          verification_failure: "recipient_mismatch",
           rail_reference: "iris-42",
           attested_at: new Date("2026-10-07T12:01:00Z"),
           last_error: null,
@@ -95,6 +96,8 @@ describe("REST API endpoints", () => {
     expect(body.origin.chain).toBe("sepolia");
     expect(body.origin.nonce).toBe("42");
     expect(body.rail.status).toBe("attested");
+    expect(body.rail.verificationFailure).toBe("recipient_mismatch");
+    expect(body.rail.railStatus).not.toContain("provider-secret");
     expect(body.rail.reference).toBe("iris-42");
   });
 

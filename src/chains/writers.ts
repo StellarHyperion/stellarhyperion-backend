@@ -1,3 +1,4 @@
+import type { CctpVerificationFailure } from "../rails/types.js";
 import { bounded, safeString } from "../rails/axelar/gmp.js";
 /**
  * Every statement that writes an indexed row, in one file, for both chain families.
@@ -396,6 +397,7 @@ export interface AttestationRow {
   readonly retryAttempts: number;
   readonly nextAttemptAt: Date | null;
   readonly retryClass: RailRetryClass | null;
+  readonly verificationFailure?: CctpVerificationFailure | null;
 }
 
 export interface AxelarQuarantineRow {
@@ -538,8 +540,8 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
   await db.query(
     `INSERT INTO rail_attestation
        (transfer_id, route, status, rail_status, rail_reference, attested_at, last_checked_at,
-        check_failures, last_error, next_attempt_at, retry_class, retry_attempts)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        check_failures, last_error, next_attempt_at, retry_class, retry_attempts, verification_failure)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
      ON CONFLICT (transfer_id) DO UPDATE
        SET status = EXCLUDED.status,
            rail_status = COALESCE(EXCLUDED.rail_status, rail_attestation.rail_status),
@@ -554,6 +556,7 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
            retry_attempts = EXCLUDED.retry_attempts,
            next_attempt_at = EXCLUDED.next_attempt_at,
            retry_class = EXCLUDED.retry_class,
+           verification_failure = EXCLUDED.verification_failure,
            updated_at = now()`,
     [
       row.transferId.toString(),
@@ -568,6 +571,7 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
       row.nextAttemptAt,
       row.retryClass,
       row.retryAttempts,
+      row.verificationFailure ?? null,
     ],
   );
 }
