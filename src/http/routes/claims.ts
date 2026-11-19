@@ -16,6 +16,7 @@ import {
 } from "../etag.js";
 import { negotiateSchemaVersion, withSchemaMetadata } from "../schema-version.js";
 import type { ServerDeps } from "../server.js";
+import { requestQuery } from "../request-budget.js";
 import type { DestinationProvenance, SourceProvenance } from "./transfers.js";
 
 export interface FormattedClaim {
@@ -79,7 +80,10 @@ const CLAIM_SELECT = `
          t.origin_tx AS source_tx, t.origin_block AS source_block, t.origin_log_index AS source_log_index
     FROM pending_claim c
     LEFT JOIN outbound_transfer t
-      ON t.origin_chain = c.source_chain AND t.nonce = c.source_nonce
+      ON t.origin_chain = c.source_chain AND t.nonce = c.source_nonce AND t.route=c.route AND t.destination_chain=c.chain
+      AND (t.id=c.source_transfer_id OR (c.source_transfer_id IS NULL AND NOT EXISTS (
+        SELECT 1 FROM outbound_transfer other WHERE other.origin_chain=c.source_chain AND other.nonce=c.source_nonce AND other.id<>t.id
+      )))
 `;
 
 export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): void {
@@ -96,7 +100,9 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       if (version === null) return;
 
       const { chain, claimId } = request.params;
-      const { rows } = await db.query(
+      const { rows } = await requestQuery(
+        request,
+        db,
         `${CLAIM_SELECT}
           WHERE c.chain = $1 AND c.claim_id = $2
           LIMIT 1`,
@@ -175,7 +181,9 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       params.push(parsedOffset);
       const offsetClause = `OFFSET $${String(params.length)}`;
 
-      const { rows } = await db.query(
+      const { rows } = await requestQuery(
+        request,
+        db,
         `${CLAIM_SELECT}
           ${whereClause}
           ORDER BY c.chain ASC, c.claim_id DESC
