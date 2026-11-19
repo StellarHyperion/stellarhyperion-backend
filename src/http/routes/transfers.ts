@@ -1,6 +1,8 @@
 import { StrKey } from "@stellar/stellar-sdk";
 import {
   CHAINS,
+  type EvmTokenDeployment,
+  type StellarTokenDeployment,
   isRouteKind,
   adapterFor,
   RAIL_CONTRACTS,
@@ -307,7 +309,7 @@ export function validateTransferFilters(
     if (!/^[0-3]$/.test(route)) throw invalidFilter("route must be an integer from 0 to 3");
     const numericRoute = Number(route);
     if (!isRouteKind(numericRoute)) throw invalidFilter("unsupported route");
-    const routeName = ROUTE_NAMES[numericRoute]!;
+    const routeName = ROUTE_NAMES[numericRoute];
     const sources =
       originChain !== undefined && isChainKey(originChain)
         ? [deployments[originChain]]
@@ -316,7 +318,9 @@ export function validateTransferFilters(
       (deployment) =>
         deployment !== undefined &&
         adapterFor(config.deployments, deployment.chain, numericRoute) !== null &&
-        Object.values(deployment.tokens).some((token) => token.routes.includes(numericRoute)),
+        Object.values<EvmTokenDeployment | StellarTokenDeployment>(deployment.tokens).some(
+          (token) => token.routes.includes(numericRoute),
+        ),
     );
     if (!sourceSupported)
       throw invalidFilter("route has no configured source deployment and asset");
@@ -325,7 +329,9 @@ export function validateTransferFilters(
       const registry = RAIL_CONTRACTS[destinationChain];
       const supported =
         deployment !== undefined &&
-        Object.values(deployment.tokens).some((token) => token.routes.includes(numericRoute));
+        Object.values<EvmTokenDeployment | StellarTokenDeployment>(deployment.tokens).some(
+          (token) => token.routes.includes(numericRoute),
+        );
       if (
         !supported &&
         !(routeName === "cctp"
