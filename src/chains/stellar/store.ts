@@ -15,7 +15,16 @@ import { createHash } from "node:crypto";
 import { ROUTE_KINDS } from "@hyperion/protocol";
 
 import type { Queryable } from "../../db/pool.js";
-import { bigintOf, maybeOne, text, textOrNull, timestampOrNull } from "../../db/rows.js";
+import {
+  bigintOf,
+  bigintOrNull,
+  integer,
+  maybeOne,
+  text,
+  textOrNull,
+  timestamp,
+  timestampOrNull,
+} from "../../db/rows.js";
 import type { Position } from "../writers.js";
 import {
   settleAction,
@@ -49,21 +58,39 @@ export interface ChainCursor {
   readonly observedAt: Date | null;
   /** EVM only. Null on Stellar, where a closed ledger cannot change. */
   readonly hash: string | null;
+  /** Monotonic revision for compare-and-swap cursor updates. */
+  readonly revision: bigint;
+  readonly deploymentRevision: number;
+}
+
+export class StaleCursorError extends Error {
+  constructor(
+    readonly chainKey: string,
+    readonly expectedRevision: bigint | null,
+  ) {
+    super(
+      `stale cursor write for ${chainKey}: expected revision ${expectedRevision === null ? "none" : expectedRevision.toString()}`,
+    );
+    this.name = "StaleCursorError";
+  }
 }
 
 export async function readCursor(db: Queryable, chainKey: string): Promise<ChainCursor | null> {
   const { rows } = await db.query(
-    `SELECT last_processed, contract, last_processed_at, last_processed_hash
+    `SELECT last_processed, contract, last_processed_at, last_processed_hash, revision, deployment_revision
        FROM indexer_cursor WHERE chain_key = $1`,
     [chainKey],
   );
   const row = maybeOne(rows, `cursor for ${chainKey}`);
   if (row === null) return null;
+  const revision = bigintOrNull(row, "revision") ?? 1n;
   return {
     position: bigintOf(row, "last_processed"),
     contract: text(row, "contract"),
     observedAt: timestampOrNull(row, "last_processed_at"),
     hash: textOrNull(row, "last_processed_hash"),
+    revision,
+    deploymentRevision: Number(row.deployment_revision ?? 1),
   };
 }
 
@@ -73,6 +100,10 @@ export async function readCursor(db: Queryable, chainKey: string): Promise<Chain
  * The contract is part of the write rather than just the read. A redeployed router at a new address
  * shares no history with the old one, so a cursor carried across would skip everything the new one
  * has ever done, silently. Storing it means the watcher can notice.
+ *
+ * When `expectedRevision` is provided (`null` for initial insert, `bigint` for an existing row),
+ * the update is compare-and-swap guarded and throws `StaleCursorError` if a concurrent writer
+ * modified the cursor first.
  */
 export async function writeCursor(
   db: Queryable,
@@ -83,28 +114,505 @@ export async function writeCursor(
     readonly position: bigint;
     readonly observedAt: Date | null;
     readonly hash: string | null;
+    readonly expectedRevision?: bigint | null;
+    readonly deploymentRevision?: number;
+    readonly expectedContract?: string;
+    readonly expectedDeploymentRevision?: number;
+  },
+): Promise<void> {
+  const baseParams = [
+    entry.chainKey,
+    entry.family,
+    entry.contract,
+    entry.position.toString(),
+    entry.observedAt,
+    entry.hash,
+  ];
+
+  if (entry.expectedRevision === undefined) {
+    await db.query(
+      `INSERT INTO indexer_cursor
+         (chain_key, family, contract, last_processed, last_processed_at, last_processed_hash, revision, deployment_revision)
+       VALUES ($1, $2, $3, $4, $5, $6, 1, $7)
+       ON CONFLICT (chain_key) DO UPDATE
+         SET contract = EXCLUDED.contract,
+             family = EXCLUDED.family,
+             last_processed = EXCLUDED.last_processed,
+             last_processed_at = EXCLUDED.last_processed_at,
+             last_processed_hash = EXCLUDED.last_processed_hash,
+             revision = indexer_cursor.revision + 1,
+             deployment_revision = EXCLUDED.deployment_revision,
+             updated_at = now()`,
+      [...baseParams, entry.deploymentRevision ?? 1],
+    );
+    return;
+  }
+
+  if (entry.expectedRevision === null) {
+    const result = await db.query(
+      `INSERT INTO indexer_cursor
+         (chain_key, family, contract, last_processed, last_processed_at, last_processed_hash, revision, deployment_revision)
+       VALUES ($1, $2, $3, $4, $5, $6, 1, $7)
+       ON CONFLICT (chain_key) DO NOTHING
+       RETURNING revision`,
+      [...baseParams, entry.deploymentRevision ?? 1],
+    );
+    if (result.rowCount === 0) {
+      throw new StaleCursorError(entry.chainKey, null);
+    }
+    return;
+  }
+
+  const result = await db.query(
+    `UPDATE indexer_cursor
+       SET family = $2, contract = $3, last_processed = $4,
+           last_processed_at = $5, last_processed_hash = $6,
+           revision = revision + 1, deployment_revision = $8, updated_at = now()
+     WHERE chain_key = $1 AND revision = $7 AND contract = $9
+       AND deployment_revision = $10
+       AND (($8 = deployment_revision AND contract = $3 AND last_processed <= $4)
+            OR $8 > deployment_revision)
+     RETURNING revision`,
+    [
+      ...baseParams,
+      entry.expectedRevision.toString(),
+      entry.deploymentRevision ?? 1,
+      entry.expectedContract ?? entry.contract,
+      entry.expectedDeploymentRevision ?? entry.deploymentRevision ?? 1,
+    ],
+  );
+  if (result.rowCount === 0) {
+    throw new StaleCursorError(entry.chainKey, entry.expectedRevision);
+  }
+}
+
+const MAX_QUARANTINE_RAW_BYTES = 16_384;
+
+/** Record a watched Stellar deployment revision transition for auditability. */
+export async function recordDeploymentRevision(
+  db: Queryable,
+  entry: {
+    readonly chainKey: string;
+    readonly deploymentRevision: number;
+    readonly contract: string;
+    readonly startLedger: bigint;
+    readonly previousContract: string | null;
+    readonly previousCursor: bigint | null;
   },
 ): Promise<void> {
   await db.query(
-    `INSERT INTO indexer_cursor
-       (chain_key, family, contract, last_processed, last_processed_at, last_processed_hash)
+    `INSERT INTO stellar_deployment_revision
+       (chain_key, deployment_revision, contract, start_ledger, previous_contract, previous_cursor)
      VALUES ($1, $2, $3, $4, $5, $6)
-     ON CONFLICT (chain_key) DO UPDATE
+     ON CONFLICT (chain_key, deployment_revision) DO NOTHING`,
+    [
+      entry.chainKey,
+      entry.deploymentRevision,
+      entry.contract,
+      entry.startLedger.toString(),
+      entry.previousContract,
+      entry.previousCursor === null ? null : entry.previousCursor.toString(),
+    ],
+  );
+}
+
+function boundRawEventJson(raw: RawStellarEvent): string {
+  const serialized = JSON.stringify(raw, (_key, value: unknown) => {
+    if (/secret|password|authorization|credential|private.?key|access.?token/i.test(_key))
+      return "[redacted]";
+    return typeof value === "bigint" ? value.toString() : value;
+  });
+  if (Buffer.byteLength(serialized, "utf8") <= MAX_QUARANTINE_RAW_BYTES) return serialized;
+  // Oversized payloads must be fetched again from their source position; a partial preview
+  // cannot be replayed and can expose arbitrary attacker-controlled data.
+  return JSON.stringify({
+    truncated: true,
+    byteLength: Buffer.byteLength(serialized, "utf8"),
+    id: raw.id,
+    type: raw.type,
+    ledger: raw.ledger,
+    ledgerClosedAt: raw.ledgerClosedAt,
+    contractId: raw.contractId,
+    txHash: raw.txHash,
+    transactionIndex: raw.transactionIndex,
+    operationIndex: raw.operationIndex,
+  });
+}
+export function boundDecodeError(error: string | null): string | null {
+  if (error === null) return null;
+  // Decoder errors may embed raw ScVal content. Keep a diagnostic category only.
+  return (
+    error
+      .split(":", 1)[0]
+      ?.replace(/[^a-zA-Z0-9 _.-]/g, "?")
+      .slice(0, 128) ?? "decode failed"
+  );
+}
+
+/**
+ * Persist an unknown or undecodable raw Soroban event with its exact source position so offline
+ * decoder replay can reprocess it without losing ledger position.
+ */
+export async function recordQuarantinedEvent(
+  db: Queryable,
+  entry: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly deploymentRevision: number;
+    readonly raw: RawStellarEvent;
+    readonly reason: "unknown_tag" | "decode_error";
+    readonly tag: string | null;
+    readonly decodeError: string | null;
+  },
+): Promise<void> {
+  await db.query(
+    `INSERT INTO stellar_event_quarantine
+       (chain_key, contract, deployment_revision, event_id, ledger, tx_hash, tx_index, op_index,
+        ledger_closed_at, reason, tag, decode_error, raw_event)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb)
+     ON CONFLICT (chain_key, contract, deployment_revision, event_id) DO UPDATE
        SET contract = EXCLUDED.contract,
-           family = EXCLUDED.family,
-           last_processed = EXCLUDED.last_processed,
-           last_processed_at = EXCLUDED.last_processed_at,
-           last_processed_hash = EXCLUDED.last_processed_hash,
+           deployment_revision = EXCLUDED.deployment_revision,
+           reason = EXCLUDED.reason,
+           tag = EXCLUDED.tag,
+           decode_error = EXCLUDED.decode_error,
+           raw_event = EXCLUDED.raw_event,
            updated_at = now()`,
     [
       entry.chainKey,
-      entry.family,
       entry.contract,
-      entry.position.toString(),
-      entry.observedAt,
-      entry.hash,
+      entry.deploymentRevision,
+      entry.raw.id,
+      String(entry.raw.ledger),
+      entry.raw.txHash,
+      entry.raw.transactionIndex,
+      entry.raw.operationIndex,
+      new Date(entry.raw.ledgerClosedAt),
+      entry.reason,
+      entry.tag,
+      boundDecodeError(entry.decodeError),
+      boundRawEventJson(entry.raw),
     ],
   );
+}
+
+// --------------------------------------------------------------------------------------------
+// Expiring database leases (#31)
+// --------------------------------------------------------------------------------------------
+
+export class LeaseLostError extends Error {
+  constructor(
+    readonly chainKey: string,
+    readonly contract: string,
+    readonly ownerId: string,
+  ) {
+    super(`watcher lease lost for ${chainKey} (${contract}) held by ${ownerId}`);
+    this.name = "LeaseLostError";
+  }
+}
+
+export interface WatcherLease {
+  readonly chainKey: string;
+  readonly contract: string;
+  readonly ownerId: string;
+  readonly leaseUntil: Date;
+}
+
+export async function acquireLease(
+  db: Queryable,
+  params: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly ownerId: string;
+    readonly ttlMs: number;
+  },
+): Promise<WatcherLease | null> {
+  const { rows, rowCount } = await db.query(
+    `INSERT INTO indexer_lease (chain_key, contract, owner_id, lease_until, updated_at)
+     VALUES ($1, $2, $3, now() + ($4 * interval '1 millisecond'), now())
+     ON CONFLICT (chain_key, contract) DO UPDATE
+       SET owner_id = EXCLUDED.owner_id,
+           lease_until = EXCLUDED.lease_until,
+           updated_at = now()
+       WHERE indexer_lease.lease_until <= now()
+          OR indexer_lease.owner_id = EXCLUDED.owner_id
+     RETURNING owner_id, lease_until`,
+    [params.chainKey, params.contract, params.ownerId, params.ttlMs],
+  );
+  const row = rows[0];
+  if (rowCount === 0 || row === undefined) return null;
+  return {
+    chainKey: params.chainKey,
+    contract: params.contract,
+    ownerId: text(row, "owner_id"),
+    leaseUntil: timestamp(row, "lease_until"),
+  };
+}
+
+export async function assertLeaseHeld(
+  db: Queryable,
+  params: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly ownerId: string;
+    readonly ttlMs?: number;
+  },
+): Promise<void> {
+  const { rowCount } = await db.query(
+    `UPDATE indexer_lease
+        SET lease_until = CASE
+              WHEN $4::bigint IS NULL THEN lease_until
+              ELSE clock_timestamp() + ($4 * interval '1 millisecond')
+            END,
+            updated_at = clock_timestamp()
+      WHERE chain_key = $1
+        AND contract = $2
+        AND owner_id = $3
+        AND lease_until > clock_timestamp()
+     RETURNING owner_id`,
+    [params.chainKey, params.contract, params.ownerId, params.ttlMs ?? null],
+  );
+  if (rowCount === 0) {
+    throw new LeaseLostError(params.chainKey, params.contract, params.ownerId);
+  }
+}
+
+export async function releaseLease(
+  db: Queryable,
+  params: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly ownerId: string;
+  },
+): Promise<boolean> {
+  const { rowCount } = await db.query(
+    `DELETE FROM indexer_lease
+      WHERE chain_key = $1 AND contract = $2 AND owner_id = $3`,
+    [params.chainKey, params.contract, params.ownerId],
+  );
+  return rowCount > 0;
+}
+
+// --------------------------------------------------------------------------------------------
+// Durable Stellar history-gap tracking (#29)
+// --------------------------------------------------------------------------------------------
+
+export type HistoryGapStatus = "open" | "reconciling" | "reconciled";
+
+export interface HistoryGap {
+  readonly id: bigint;
+  readonly chainKey: string;
+  readonly contract: string;
+  readonly startLedger: bigint;
+  readonly endLedger: bigint;
+  readonly status: HistoryGapStatus;
+  readonly replayedThrough: bigint | null;
+  readonly reason: string;
+  readonly detectedAt: Date;
+  readonly reconciledAt: Date | null;
+}
+
+export async function recordHistoryGap(
+  db: Queryable,
+  gap: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly startLedger: number;
+    readonly endLedger: number;
+    readonly reason: string;
+  },
+): Promise<void> {
+  if (gap.endLedger < gap.startLedger) return;
+  await db.query(
+    `INSERT INTO stellar_history_gap
+       (chain_key, contract, start_ledger, end_ledger, status, reason)
+     VALUES ($1, $2, $3, $4, 'open', $5)
+     ON CONFLICT (chain_key, contract, start_ledger, end_ledger) DO UPDATE
+       SET updated_at = now()`,
+    [gap.chainKey, gap.contract, String(gap.startLedger), String(gap.endLedger), gap.reason],
+  );
+}
+
+export async function listHistoryGaps(
+  db: Queryable,
+  params: {
+    readonly chainKey: string;
+    readonly contract?: string;
+    readonly statuses?: readonly HistoryGapStatus[];
+  },
+): Promise<readonly HistoryGap[]> {
+  const conditions = ["chain_key = $1"];
+  const values: unknown[] = [params.chainKey];
+  if (params.contract !== undefined) {
+    values.push(params.contract);
+    conditions.push(`contract = $${String(values.length)}`);
+  }
+  if (params.statuses !== undefined && params.statuses.length > 0) {
+    values.push(params.statuses);
+    conditions.push(`status = ANY($${String(values.length)}::text[])`);
+  }
+  const { rows } = await db.query(
+    `SELECT id, chain_key, contract, start_ledger, end_ledger, status,
+            replayed_through, reason, detected_at, reconciled_at
+       FROM stellar_history_gap
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY start_ledger ASC`,
+    values,
+  );
+  return rows.map((row) => ({
+    id: bigintOf(row, "id"),
+    chainKey: text(row, "chain_key"),
+    contract: text(row, "contract"),
+    startLedger: bigintOf(row, "start_ledger"),
+    endLedger: bigintOf(row, "end_ledger"),
+    status: text(row, "status") as HistoryGapStatus,
+    replayedThrough: bigintOrNull(row, "replayed_through"),
+    reason: text(row, "reason"),
+    detectedAt: timestamp(row, "detected_at"),
+    reconciledAt: timestampOrNull(row, "reconciled_at"),
+  }));
+}
+
+export async function countUnreconciledGaps(
+  db: Queryable,
+  chainKey: string,
+  contract?: string,
+): Promise<number> {
+  const values: unknown[] = [chainKey];
+  const contractFilter = contract === undefined ? "" : " AND contract = $2";
+  if (contract !== undefined) values.push(contract);
+  const { rows } = await db.query(
+    `SELECT count(*)::int AS count
+       FROM stellar_history_gap
+      WHERE chain_key = $1${contractFilter}
+        AND status <> 'reconciled'`,
+    values,
+  );
+  const row = rows[0];
+  return row === undefined ? 0 : integer(row, "count");
+}
+
+export async function advanceGapReplay(
+  db: Queryable,
+  params: {
+    readonly id: bigint;
+    readonly replayedThrough: number;
+    readonly reconciled: boolean;
+  },
+): Promise<void> {
+  await db.query(
+    `UPDATE stellar_history_gap
+        SET replayed_through = $2,
+            status = CASE WHEN $3 THEN 'reconciled' ELSE 'reconciling' END,
+            reconciled_at = CASE WHEN $3 THEN now() ELSE NULL END,
+            updated_at = now()
+      WHERE id = $1`,
+    [params.id.toString(), String(params.replayedThrough), params.reconciled],
+  );
+}
+
+// --------------------------------------------------------------------------------------------
+// Separate historical-provider backfill progress (#30)
+// --------------------------------------------------------------------------------------------
+
+export type BackfillStatus = "running" | "completed" | "failed";
+
+export interface BackfillCursor {
+  readonly chainKey: string;
+  readonly contract: string;
+  readonly jobKey: string;
+  readonly startLedger: bigint;
+  readonly endLedger: bigint;
+  readonly nextLedger: bigint;
+  readonly status: BackfillStatus;
+  readonly revision: bigint;
+}
+
+export async function readBackfillCursor(
+  db: Queryable,
+  chainKey: string,
+  contract: string,
+  jobKey: string,
+): Promise<BackfillCursor | null> {
+  const { rows } = await db.query(
+    `SELECT chain_key, contract, job_key, start_ledger, end_ledger, next_ledger, status, revision
+       FROM stellar_backfill_cursor
+      WHERE chain_key = $1 AND contract = $2 AND job_key = $3`,
+    [chainKey, contract, jobKey],
+  );
+  const row = maybeOne(rows, `backfill cursor for ${chainKey}/${jobKey}`);
+  if (row === null) return null;
+  return {
+    chainKey: text(row, "chain_key"),
+    contract: text(row, "contract"),
+    jobKey: text(row, "job_key"),
+    startLedger: bigintOf(row, "start_ledger"),
+    endLedger: bigintOf(row, "end_ledger"),
+    nextLedger: bigintOf(row, "next_ledger"),
+    status: text(row, "status") as BackfillStatus,
+    revision: bigintOrNull(row, "revision") ?? 1n,
+  };
+}
+
+export async function writeBackfillCursor(
+  db: Queryable,
+  entry: {
+    readonly chainKey: string;
+    readonly contract: string;
+    readonly jobKey: string;
+    readonly startLedger: number;
+    readonly endLedger: number;
+    readonly nextLedger: number;
+    readonly status: BackfillStatus;
+    readonly expectedRevision: bigint | null;
+  },
+): Promise<void> {
+  const baseParams = [
+    entry.chainKey,
+    entry.contract,
+    entry.jobKey,
+    String(entry.startLedger),
+    String(entry.endLedger),
+    String(entry.nextLedger),
+    entry.status,
+  ];
+
+  if (entry.expectedRevision === null) {
+    const result = await db.query(
+      `INSERT INTO stellar_backfill_cursor
+         (chain_key, contract, job_key, start_ledger, end_ledger, next_ledger, status, revision)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 1)
+       ON CONFLICT (chain_key, contract, job_key) DO NOTHING
+       RETURNING revision`,
+      baseParams,
+    );
+    if (result.rowCount === 0) {
+      throw new StaleCursorError(`${entry.chainKey}:backfill:${entry.jobKey}`, null);
+    }
+    return;
+  }
+
+  const result = await db.query(
+    `UPDATE stellar_backfill_cursor
+        SET start_ledger = $4,
+            end_ledger = $5,
+            next_ledger = $6,
+            status = $7,
+            revision = revision + 1,
+            updated_at = now()
+      WHERE chain_key = $1
+        AND contract = $2
+        AND job_key = $3
+        AND revision = $8
+     RETURNING revision`,
+    [...baseParams, entry.expectedRevision.toString()],
+  );
+  if (result.rowCount === 0) {
+    throw new StaleCursorError(
+      `${entry.chainKey}:backfill:${entry.jobKey}`,
+      entry.expectedRevision,
+    );
+  }
 }
 
 /** Context for one Soroban event, in the shape the shared writers take. */
@@ -477,7 +985,7 @@ export async function inspectEventConflict(
     );
     const { rows } = await db.query(
       `SELECT evidence FROM stellar_event_identity
-      WHERE chain_key = $1 AND contract = $2 AND identity = $3 FOR UPDATE`,
+      WHERE chain_key = $1 AND identity = $3 AND (contract = $2 OR identity NOT LIKE 'event:%') FOR UPDATE`,
       [chainKey, raw.contractId, identity],
     );
     const existing = rows[0]?.evidence as EventEvidenceSnapshot | undefined;
@@ -618,8 +1126,14 @@ export function planCursorRepair(input: CursorRepairPlanInput): CursorRepairProp
       blockedByConflicts,
       conflictCount: conflicts.length,
       gap: null,
-      sql: "DELETE FROM indexer_cursor WHERE chain_key = $1 AND contract = $2 AND last_processed = $3",
-      params: [chainKey, currentCursor.contract, currentCursor.position.toString()],
+      sql: "DELETE FROM indexer_cursor WHERE chain_key = $1 AND contract = $2 AND last_processed = $3 AND revision = $4 AND deployment_revision = $5",
+      params: [
+        chainKey,
+        currentCursor.contract,
+        currentCursor.position.toString(),
+        currentCursor.revision.toString(),
+        currentCursor.deploymentRevision,
+      ],
       rationale: `stored cursor belongs to contract ${currentCursor.contract}, not expected router ${expectedContract}`,
       warnings,
       evidence: baseEvidence,
@@ -702,13 +1216,15 @@ ON CONFLICT (chain_key) DO NOTHING`,
         conflictCount: conflicts.length,
         gap: null,
         sql: `UPDATE indexer_cursor
-   SET last_processed = $1, updated_at = now()
- WHERE chain_key = $2 AND contract = $3 AND last_processed = $4`,
+   SET last_processed = $1, revision = revision + 1, updated_at = now()
+ WHERE chain_key = $2 AND contract = $3 AND last_processed = $4 AND revision = $5 AND deployment_revision = $6`,
         params: [
           String(highestVerified),
           chainKey,
           expectedContract,
           currentCursor.position.toString(),
+          currentCursor.revision.toString(),
+          currentCursor.deploymentRevision,
         ],
         rationale: `cursor ${currentCursor.position.toString()} exceeds latest retained ledger ${String(retainedHistory.latestLedger)}; rewind to verified boundary ${String(highestVerified)}`,
         warnings,
@@ -752,13 +1268,15 @@ ON CONFLICT (chain_key) DO NOTHING`,
         conflictCount: conflicts.length,
         gap: null,
         sql: `UPDATE indexer_cursor
-   SET last_processed = $1, updated_at = now()
- WHERE chain_key = $2 AND contract = $3 AND last_processed = $4`,
+   SET last_processed = $1, revision = revision + 1, updated_at = now()
+ WHERE chain_key = $2 AND contract = $3 AND last_processed = $4 AND revision = $5 AND deployment_revision = $6`,
         params: [
           String(highestVerified),
           chainKey,
           expectedContract,
           currentCursor.position.toString(),
+          currentCursor.revision.toString(),
+          currentCursor.deploymentRevision,
         ],
         rationale: `cursor ${currentCursor.position.toString()} fell behind retention (${String(retainedHistory.oldestLedger)}), but verified boundary ${String(highestVerified)} bridges the gap`,
         warnings,
@@ -800,13 +1318,15 @@ ON CONFLICT (chain_key) DO NOTHING`,
       conflictCount: conflicts.length,
       gap: null,
       sql: `UPDATE indexer_cursor
-   SET last_processed = $1, updated_at = now()
- WHERE chain_key = $2 AND contract = $3 AND last_processed = $4`,
+   SET last_processed = $1, revision = revision + 1, updated_at = now()
+ WHERE chain_key = $2 AND contract = $3 AND last_processed = $4 AND revision = $5 AND deployment_revision = $6`,
       params: [
         String(highestVerified),
         chainKey,
         expectedContract,
         currentCursor.position.toString(),
+        currentCursor.revision.toString(),
+        currentCursor.deploymentRevision,
       ],
       rationale: `verified completed ledger boundary ${String(highestVerified)} is ahead of stored cursor ${currentCursor.position.toString()}`,
       warnings,
