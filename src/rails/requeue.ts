@@ -1,16 +1,12 @@
 import { RouteKind } from "@hyperion/protocol";
 import type { Transactional } from "../db/pool.js";
-import { bigintOf, integer, text } from "../db/rows.js";
+import { bigintOf, integer, text, textOrNull } from "../db/rows.js";
 import type { RailRequeueRequest, RailRequeueResult } from "./types.js";
 
 export class RailRequeueError extends Error {
   constructor(
     readonly kind:
-      | "not_found"
-      | "not_terminal"
-      | "already_delivered"
-      | "unsupported_rail"
-      | "invalid_review",
+      "not_found" | "not_terminal" | "already_delivered" | "unsupported_rail" | "invalid_review",
     message: string,
   ) {
     super(message);
@@ -23,6 +19,12 @@ export async function requeueTerminalTransfer(
   db: Transactional,
   request: RailRequeueRequest,
 ): Promise<RailRequeueResult> {
+  if (request.transferId <= 0n || request.transferId > 9_223_372_036_854_775_807n) {
+    throw new RailRequeueError(
+      "invalid_review",
+      "transfer identifier is outside the database range",
+    );
+  }
   const reviewedBy = request.reviewedBy.trim();
   const reason = request.reason.trim();
   if (reviewedBy.length === 0 || reviewedBy.length > 200) {
@@ -34,7 +36,7 @@ export async function requeueTerminalTransfer(
 
   return db.transaction(async (tx) => {
     const { rows } = await tx.query(
-      `SELECT t.id, t.route, t.origin_chain, t.nonce, a.status,
+      `SELECT t.id, t.route, t.origin_chain, t.nonce, a.status, a.retry_class,
               EXISTS (
                 SELECT 1 FROM inbound_delivery d
                  WHERE d.destination_chain = t.destination_chain
@@ -54,10 +56,16 @@ export async function requeueTerminalTransfer(
     }
 
     const priorStatus = text(row, "status");
-    if (priorStatus !== "failed" && priorStatus !== "expired") {
+    const priorRetryClass = textOrNull(row, "retry_class");
+    const held = priorRetryClass === "permanent" || priorRetryClass === "exhausted";
+    if (
+      priorStatus !== "failed" &&
+      priorStatus !== "expired" &&
+      !((priorStatus === "pending" || priorStatus === "attested") && held)
+    ) {
       throw new RailRequeueError(
         "not_terminal",
-        `transfer status ${priorStatus} is not eligible; only failed or expired transfers may be requeued`,
+        `transfer status ${priorStatus} is not eligible; only failed, expired or explicitly held evidence failures may be requeued`,
       );
     }
     if (row.has_inbound === true) {
@@ -85,13 +93,15 @@ export async function requeueTerminalTransfer(
               attested_at = NULL,
               last_checked_at = now(),
               check_failures = 0,
+              retry_attempts = 0,
               last_error = NULL,
               next_attempt_at = now(),
               retry_class = NULL,
               updated_at = now()
         WHERE transfer_id = $1
-          AND status = $2`,
-      [transferId.toString(), priorStatus],
+          AND status = $2
+          AND retry_class IS NOT DISTINCT FROM $3`,
+      [transferId.toString(), priorStatus, priorRetryClass],
     );
     if (updated.rowCount !== 1) {
       throw new RailRequeueError("not_terminal", "transfer status changed during requeue");
@@ -100,8 +110,8 @@ export async function requeueTerminalTransfer(
     await tx.query(
       `INSERT INTO rail_requeue_audit
          (transfer_id, route, origin_chain, nonce, prior_status, new_status,
-          reviewed_by, reviewed_reason)
-       VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)`,
+          reviewed_by, reviewed_reason, prior_retry_class)
+       VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8)`,
       [
         transferId.toString(),
         route,
@@ -110,6 +120,7 @@ export async function requeueTerminalTransfer(
         priorStatus,
         reviewedBy,
         reason,
+        priorRetryClass,
       ],
     );
 

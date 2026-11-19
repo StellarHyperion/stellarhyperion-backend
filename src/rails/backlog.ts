@@ -4,14 +4,7 @@
 import { createHash } from "node:crypto";
 
 import type { Transactional } from "../db/pool.js";
-import {
-  bigintOf,
-  integer,
-  text,
-  textOrNull,
-  timestamp,
-  timestampOrNull,
-} from "../db/rows.js";
+import { bigintOf, integer, text, textOrNull, timestamp, timestampOrNull } from "../db/rows.js";
 import type {
   AttestationStatus,
   BacklogCandidate,
@@ -106,6 +99,7 @@ const CLASSIFIED = `
            a.last_checked_at,
            a.updated_at AS attestation_updated_at,
            COALESCE(a.check_failures, 0) AS check_failures,
+           COALESCE(a.retry_attempts, 0) AS retry_attempts,
            a.retry_class,
            a.next_attempt_at,
            a.last_error,
@@ -132,9 +126,6 @@ const CLASSIFIED = `
                OR COALESCE(a.check_failures, 0) >= $3::int THEN 'held'
              WHEN a.next_attempt_at > $4::timestamptz THEN 'cooling_down'
              WHEN a.next_attempt_at IS NOT NULL THEN 'overdue'
-             WHEN a.last_checked_at IS NULL
-               AND t.observed_at + ($5::double precision * INTERVAL '1 millisecond') <= $4::timestamptz
-               THEN 'overdue'
              WHEN a.last_checked_at IS NULL THEN 'never_checked'
              WHEN a.last_checked_at + ($5::double precision * INTERVAL '1 millisecond') <= $4::timestamptz
                THEN 'overdue'
@@ -147,14 +138,15 @@ const CLASSIFIED = `
                (a.next_attempt_at IS NOT NULL AND a.next_attempt_at <= $4::timestamptz)
                OR (
                  a.next_attempt_at IS NULL
-                 AND COALESCE(a.last_checked_at, t.observed_at) +
-                     ($5::double precision * INTERVAL '1 millisecond') <= $4::timestamptz
+                 AND (a.last_checked_at IS NULL OR
+                   a.last_checked_at + ($5::double precision * INTERVAL '1 millisecond') <= $4::timestamptz)
                )
              )
            ) AS overdue
       FROM outbound_transfer t
       LEFT JOIN rail_attestation a ON a.transfer_id = t.id
      WHERE t.route = ANY($1::smallint[])
+       AND t.observed_at <= $4::timestamptz
        AND (a.transfer_id IS NULL OR a.status IN ('pending', 'attested'))
        AND ($2::text IS NULL OR t.destination_chain = $2::text)
   ),
@@ -196,11 +188,12 @@ export async function inspectRailBacklog(
     );
   }
   const maxCheckFailures = options.maxCheckFailures ?? 10;
-  if (!Number.isSafeInteger(maxCheckFailures) || maxCheckFailures < 1) {
-    throw new BacklogValidationError(
-      "invalid_max_failures",
-      "maxCheckFailures must be positive",
-    );
+  if (
+    !Number.isSafeInteger(maxCheckFailures) ||
+    maxCheckFailures < 1 ||
+    maxCheckFailures > 2_147_483_647
+  ) {
+    throw new BacklogValidationError("invalid_max_failures", "maxCheckFailures must be positive");
   }
   const limit = options.limit ?? DEFAULT_LIMIT;
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) {
@@ -210,11 +203,12 @@ export async function inspectRailBacklog(
     );
   }
   const sort = options.sort ?? "asc";
-  if (sort !== "asc" && sort !== "desc") {
+  if (!["asc", "desc"].includes(sort)) {
     throw new BacklogValidationError("invalid_sort", "sort must be 'asc' or 'desc'");
   }
 
-  const destinationChain = options.destinationChain?.trim() || null;
+  const destinationValue = options.destinationChain?.trim();
+  const destinationChain = destinationValue === "" ? null : (destinationValue ?? null);
   const stage = options.stage ?? null;
   const retryClass = options.retryClass ?? null;
   const overdueOnly = options.overdueOnly === true;
@@ -347,7 +341,7 @@ export async function inspectRailBacklog(
        SELECT id::text AS id_text, route, origin_chain, destination_chain, nonce_text,
               gross_amount_text, fee_text, net_amount_text, origin_block_text, origin_tx,
               observed_at, observed_at_cursor, attestation_status, rail_status, rail_reference,
-              attested_at, last_checked_at, attestation_updated_at, check_failures, retry_class,
+              attested_at, last_checked_at, attestation_updated_at, check_failures, retry_attempts, retry_class,
               next_attempt_at, retry_state, last_error, missing_proof_stage, overdue
          FROM filtered
          ${cursorClause}
@@ -411,16 +405,14 @@ function mapCandidate(
   const overdue = row.overdue === true;
   const nextAttemptAt = timestampOrNull(row, "next_attempt_at");
   const dueAt =
-    nextAttemptAt ?? new Date((lastCheckedAt ?? observedAt).getTime() + recheckAfterMs);
+    nextAttemptAt ??
+    (lastCheckedAt === null ? observedAt : new Date(lastCheckedAt.getTime() + recheckAfterMs));
   const delays: BacklogDelayBreakdown = {
     totalAgeMs: Math.max(0, nowMs - observedAt.getTime()),
     providerDiscoveryDelayMs:
       proofStage === "provider_discovery"
         ? Math.max(0, nowMs - observedAt.getTime())
-        : Math.max(
-            0,
-            (attestedAt ?? updatedAt ?? observedAt).getTime() - observedAt.getTime(),
-          ),
+        : Math.max(0, (attestedAt ?? updatedAt ?? observedAt).getTime() - observedAt.getTime()),
     receiptVerificationDelayMs:
       proofStage === "destination_receipt_verification"
         ? Math.max(0, nowMs - (attestedAt ?? updatedAt ?? observedAt).getTime())
@@ -448,6 +440,7 @@ function mapCandidate(
     attestedAt: attestedAt?.toISOString() ?? null,
     lastCheckedAt: lastCheckedAt?.toISOString() ?? null,
     checkFailures: integer(row, "check_failures"),
+    retryAttempts: integer(row, "retry_attempts"),
     retryClass: retryClassValue(textOrNull(row, "retry_class")),
     retryState,
     lastError: lastError === null ? null : sanitizeRailDiagnostic(lastError),
@@ -496,11 +489,7 @@ function encodeCursor(
   return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
 }
 
-function decodeCursor(
-  raw: string,
-  sort: "asc" | "desc",
-  filters: string,
-): BacklogCursor {
+function decodeCursor(raw: string, sort: "asc" | "desc", filters: string): BacklogCursor {
   if (!raw || raw.length > MAX_CURSOR_LENGTH || !/^[A-Za-z0-9_-]+$/.test(raw)) {
     throw new BacklogValidationError("invalid_cursor", "cursor is malformed or too long");
   }
@@ -589,15 +578,19 @@ export function formatBacklogReportText(report: BacklogInspectionReport): string
     `Rail backlog report (${report.generatedAt}) [read-only]`,
     `Matching: ${report.summary.totalMatching}; overdue: ${report.summary.overdueCount}; held: ${report.summary.heldCount}`,
     `Missing proof: provider_discovery=${report.summary.byStage.provider_discovery}, destination_receipt_verification=${report.summary.byStage.destination_receipt_verification}, attestation_reconciliation=${report.summary.byStage.attestation_reconciliation}`,
-    `Retry classes: ${Object.entries(report.summary.byRetryClass)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([retryClass, count]) => `${retryClass}=${String(count)}`)
-      .join(", ") || "none"}`,
+    `Retry classes: ${
+      Object.entries(report.summary.byRetryClass)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([retryClass, count]) => `${retryClass}=${String(count)}`)
+        .join(", ") || "none"
+    }`,
     `Maximum delays (ms): provider discovery=${report.summary.maxProviderDiscoveryDelayMs ?? "-"}, destination receipt verification=${report.summary.maxReceiptVerificationDelayMs ?? "-"}`,
-    `Destinations: ${Object.entries(report.summary.byDestination)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([chain, count]) => `${chain}=${String(count)}`)
-      .join(", ") || "none"}`,
+    `Destinations: ${
+      Object.entries(report.summary.byDestination)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([chain, count]) => `${chain}=${String(count)}`)
+        .join(", ") || "none"
+    }`,
     "",
     "ID | Route | Destination | Nonce | Net amount | Proof stage | Retry class/state | Age ms | Discovery ms | Receipt ms",
   ];

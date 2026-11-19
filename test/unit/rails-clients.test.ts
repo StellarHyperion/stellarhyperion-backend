@@ -30,6 +30,7 @@ const TRANSFER: PendingTransfer = {
   originTx: `0x${"ab".repeat(32)}`,
   status: null,
   checkFailures: 0,
+  retryAttempts: 0,
   delivered: false,
 };
 
