@@ -132,6 +132,10 @@ export async function revalidateItsDeliveryProofs(
         String(row.id),
       ]);
       await tx.query(
+        "SELECT set_config('hyperion.rail_reconcile_transfer',$1,true), set_config('hyperion.rail_reconcile_reason','destination_proof_reorg',true)",
+        [String(row.transfer_id)],
+      );
+      await tx.query(
         `UPDATE rail_attestation SET status = 'attested', updated_at = now(),
             next_attempt_at = now(), retry_class = NULL
           WHERE transfer_id = $1 AND status = 'delivered'
@@ -175,7 +179,7 @@ export async function verifyItsDelivery(
   const its = RAIL_CONTRACTS[transfer.destinationChain]?.axelar?.interchainTokenService;
   if (!isEvmChain(destination) || !its?.startsWith("0x")) return null;
   const { rows } = await db.query(
-    "SELECT sender, token, net_amount, destination FROM outbound_transfer WHERE id = $1",
+    "SELECT origin_chain,origin_router,nonce,origin_tx,sender,token,net_amount,destination_chain,destination FROM outbound_transfer WHERE id = $1",
     [String(transfer.transferId)],
   );
   const stored = rows[0];
@@ -272,6 +276,17 @@ export async function verifyItsDelivery(
       claimId: null,
     },
     evidence: {
+      sourceBinding: {
+        chain: text(stored, "origin_chain"),
+        router: text(stored, "origin_router"),
+        nonce: bigintOf(stored, "nonce").toString(),
+        transaction: text(stored, "origin_tx"),
+        sender: text(stored, "sender"),
+        token,
+        amount: amount.toString(),
+        destinationChain: text(stored, "destination_chain"),
+        destination: text(stored, "destination"),
+      },
       transferId: transfer.transferId,
       destinationChain: transfer.destinationChain,
       commandId: execution.commandId,

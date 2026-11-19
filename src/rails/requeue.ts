@@ -90,6 +90,10 @@ export async function requeueTerminalTransfer(
     }
     const originChain = text(row, "origin_chain");
     const nonce = bigintOf(row, "nonce");
+    await tx.query(
+      "SELECT set_config('hyperion.rail_reconcile_transfer',$1,true), set_config('hyperion.rail_reconcile_reason','operator_requeue',true)",
+      [transferId.toString()],
+    );
     const updated = await tx.query(
       `UPDATE rail_attestation
           SET status = 'pending',

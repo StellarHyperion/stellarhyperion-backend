@@ -234,7 +234,7 @@ describe("Circle's Iris", () => {
           signature: "0xcafe",
           status: "completed",
           attestationTimestamp: timestampStr,
-          messageId: "msg-999",
+          messageId: `0x${"99".repeat(32)}`,
         },
       ],
     });
@@ -249,7 +249,7 @@ describe("Circle's Iris", () => {
     expect(lookup.report.attestation).toBe("0xcafe");
     expect(lookup.report.attestationTimestamp).toEqual(expectedDate);
     expect(lookup.report.attestedAt).toEqual(expectedDate);
-    expect(lookup.report.reference).toBe("msg-999");
+    expect(lookup.report.reference).toBe(`0x${"99".repeat(32)}`);
   });
 
   it("handles unix epoch timestamp in seconds or milliseconds", async () => {
@@ -431,7 +431,7 @@ describe("Axelar's GMP status", () => {
   });
 
   it("keeps a recoverable transfer pending and names the reason", async () => {
-    // Insufficient gas is exactly what the keeper exists to fix, so it must stay in the queue.
+    // Provider gas uncertainty remains retryable; this command never performs a gas top-up.
     const { fetch } = answering(200, {
       data: [
         {
@@ -451,6 +451,22 @@ describe("Axelar's GMP status", () => {
     expect(lookup.report.providerFailure).toEqual({
       kind: "recoverable",
       signals: ["is_insufficient_fee"],
+    });
+  });
+
+  it("keeps a provider error with recoverable gas flags retryable", async () => {
+    const { fetch } = answering(200, {
+      data: [
+        { call: { transactionHash: TRANSFER.originTx }, status: "error", is_not_enough_gas: true },
+      ],
+    });
+    const lookup = await new AxelarGmpClient(BASE, { fetch }).look(TRANSFER);
+    expect(lookup.kind).toBe("found");
+    if (lookup.kind !== "found") return;
+    expect(lookup.report.status).toBe("pending");
+    expect(lookup.report.providerFailure).toEqual({
+      kind: "recoverable",
+      signals: ["is_not_enough_gas"],
     });
   });
 
