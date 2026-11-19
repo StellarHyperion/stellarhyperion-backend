@@ -204,6 +204,6 @@ describe("CCTP forwarded destination proof", () => {
       verificationFailure: "recipient_mismatch",
     });
     expect(statement).toContain("verification_failure = EXCLUDED.verification_failure");
-    expect(parameters[12]).toBe("recipient_mismatch");
+    expect(parameters[13]).toBe("recipient_mismatch");
   });
 });
