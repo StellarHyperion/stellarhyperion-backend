@@ -58,6 +58,8 @@ const AXELARSCAN_API: Readonly<Record<NetworkMode, string>> = {
 };
 
 export type NodeEnv = "development" | "test" | "production";
+export type DeploymentEnvironment = "development" | "preview" | "production";
+export type DatabaseRole = "read-only" | "read-write";
 export type LogLevel = "trace" | "debug" | "info" | "warn" | "error" | "fatal";
 
 /** Everything the Soroban watcher needs. One instance, because there is one Stellar per network. */
@@ -118,10 +120,15 @@ export interface KeeperConfig {
   readonly pollIntervalMs: number;
   readonly concurrency: number;
   readonly stellarSecret: string | null;
+  readonly stellarSecrets: readonly string[];
+  readonly activeSigner: string | null;
 }
 
 export interface AppConfig {
   readonly nodeEnv: NodeEnv;
+  readonly deploymentEnvironment: DeploymentEnvironment;
+  readonly databaseEnvironment: DeploymentEnvironment;
+  readonly databaseRole: DatabaseRole;
   readonly logLevel: LogLevel;
   readonly http: { readonly host: string; readonly port: number };
   readonly databaseUrl: string;
@@ -159,6 +166,37 @@ const NODE_ENV: EnumSpec<NodeEnv> = {
   choices: ["development", "production", "test"],
   printable: true,
   purpose: "Changes log formatting and nothing else. Behaviour is identical across all three.",
+};
+
+const VERCEL_ENV: EnumSpec<DeploymentEnvironment> = {
+  name: "VERCEL_ENV",
+  kind: "enum",
+  required: false,
+  fallback: "development",
+  choices: ["development", "preview", "production"],
+  printable: true,
+  purpose:
+    "Identifies the hosting environment. A preview must use a preview database, never the production database.",
+};
+
+const DATABASE_ENVIRONMENT: EnumSpec<DeploymentEnvironment> = {
+  name: "HYPERION_DATABASE_ENV",
+  kind: "enum",
+  required: false,
+  printable: true,
+  choices: ["development", "preview", "production"],
+  purpose:
+    "Identifies which isolated database this credential belongs to. Required outside local development.",
+};
+
+const DATABASE_ROLE: EnumSpec<DatabaseRole> = {
+  name: "HYPERION_DATABASE_ROLE",
+  kind: "enum",
+  required: false,
+  printable: true,
+  choices: ["read-only", "read-write"],
+  purpose:
+    "Declares whether this process may write. API-only deployments must use read-only credentials.",
 };
 
 const LOG_LEVEL: EnumSpec<LogLevel> = {
@@ -349,6 +387,22 @@ const KEEPER_STELLAR_SECRET: VarSpec = {
   printable: false,
   purpose:
     "Secret key for submitting Stellar keep_alive and claim transactions. Optional; runs dry-run when absent.",
+};
+
+const KEEPER_STELLAR_SECRETS: VarSpec = {
+  name: "KEEPER_STELLAR_SECRETS",
+  kind: "string",
+  required: false,
+  printable: false,
+  purpose: "Comma-separated Stellar signer secrets used for safe signer rotation.",
+};
+
+const KEEPER_STELLAR_ACTIVE_SIGNER: VarSpec = {
+  name: "KEEPER_STELLAR_ACTIVE_SIGNER",
+  kind: "string",
+  required: false,
+  printable: true,
+  purpose: "Public key of the funded signer to use after pending submissions are reconciled.",
 };
 
 const SHUTDOWN_TIMEOUT_MS: VarSpec = {
@@ -637,6 +691,10 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const reader = new EnvReader(env);
 
   const nodeEnv = reader.choice(NODE_ENV);
+  const deploymentEnvironment = reader.choice({
+    ...VERCEL_ENV,
+    fallback: nodeEnv === "production" ? "production" : "development",
+  });
   const logLevel = reader.choice(LOG_LEVEL);
   const host = reader.string(HTTP_HOST);
   const port = reader.integer(HTTP_PORT);
@@ -646,6 +704,27 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const network = reader.choice(HYPERION_NETWORK);
   const deploymentsPath = reader.string(DEPLOYMENTS_FILE);
   const indexerEnabled = reader.boolean(INDEXER_ENABLED);
+  const databaseEnvironment = reader.choice({
+    ...DATABASE_ENVIRONMENT,
+    required: deploymentEnvironment !== "development",
+    fallback: deploymentEnvironment,
+  });
+  const railsEnabled = reader.boolean(RAILS_ENABLED);
+  const expectedDatabaseRole: DatabaseRole =
+    indexerEnabled || keeperEnabled || railsEnabled ? "read-write" : "read-only";
+  const databaseRole = reader.choice({ ...DATABASE_ROLE, fallback: expectedDatabaseRole });
+  if (deploymentEnvironment !== "development" && databaseEnvironment !== deploymentEnvironment) {
+    reader.reject(
+      DATABASE_ENVIRONMENT,
+      `is ${databaseEnvironment}, but VERCEL_ENV is ${deploymentEnvironment}; use a separate database credential for each environment`,
+    );
+  }
+  if (databaseRole !== expectedDatabaseRole) {
+    reader.reject(
+      DATABASE_ROLE,
+      `is ${databaseRole}, but this process requires ${expectedDatabaseRole} access because ${indexerEnabled || keeperEnabled || railsEnabled ? "indexer, rail or keeper writes are enabled" : "it is API-only"}`,
+    );
+  }
   const shutdownTimeoutMs = reader.integer(SHUTDOWN_TIMEOUT_MS);
   const schemaVersion = reader.string(SCHEMA_VERSION);
   if (schemaVersion !== EXPECTED_SCHEMA_VERSION)
@@ -656,7 +735,6 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const indexerLeaseOwnerId =
     reader.string(INDEXER_LEASE_OWNER_ID) || `${hostname()}:${process.pid}`;
 
-  const railsEnabled = reader.boolean(RAILS_ENABLED);
   const irisOverride = reader.url(IRIS_API_URL);
   const axelarOverride = reader.url(AXELAR_API_URL);
   const railPollIntervalMs = reader.integer(RAIL_POLL_INTERVAL_MS);
@@ -668,6 +746,18 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const keeperConcurrency = reader.integer(KEEPER_CONCURRENCY);
   const keeperStellarSecret = reader.has(KEEPER_STELLAR_SECRET.name)
     ? reader.string(KEEPER_STELLAR_SECRET)
+    : null;
+  const keeperStellarSecrets = reader.has(KEEPER_STELLAR_SECRETS.name)
+    ? reader
+        .string(KEEPER_STELLAR_SECRETS)
+        .split(",")
+        .map((secret) => secret.trim())
+        .filter((secret) => secret.length > 0)
+    : keeperStellarSecret === null
+      ? []
+      : [keeperStellarSecret];
+  const keeperActiveSigner = reader.has(KEEPER_STELLAR_ACTIVE_SIGNER.name)
+    ? reader.string(KEEPER_STELLAR_ACTIVE_SIGNER)
     : null;
   const stellarRpcOverride = reader.url(STELLAR_RPC_URL);
   const stellarHistoricalRpcUrl = reader.has(STELLAR_HISTORICAL_RPC_URL.name)
@@ -746,6 +836,9 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
 
   return {
     nodeEnv,
+    deploymentEnvironment,
+    databaseEnvironment,
+    databaseRole,
     logLevel,
     http: { host, port },
     databaseUrl,
@@ -768,6 +861,8 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       pollIntervalMs: keeperPollIntervalMs,
       concurrency: keeperConcurrency,
       stellarSecret: keeperStellarSecret,
+      stellarSecrets: keeperStellarSecrets,
+      activeSigner: keeperActiveSigner,
     },
     deploymentMode,
     readinessPolicy,

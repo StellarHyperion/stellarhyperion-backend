@@ -1,3 +1,4 @@
+import { checkDatabasePolicy } from "../src/db/policy.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { resolve as resolvePath } from "node:path";
 import type { FastifyInstance } from "fastify";
@@ -14,22 +15,35 @@ let initializing: Promise<FastifyInstance> | null = null;
 async function initializeApp(): Promise<FastifyInstance> {
   if (app) return app;
 
+  process.env.VERCEL_ENV ??= "production";
   process.env.HYPERION_NETWORK ??= "testnet";
   process.env.HYPERION_DEPLOYMENTS_FILE ??= resolvePath(process.cwd(), "deployments/testnet.json");
   process.env.INDEXER_ENABLED ??= "false";
   process.env.RAILS_ENABLED ??= "false";
   process.env.KEEPER_ENABLED ??= "false";
+  process.env.HYPERION_DATABASE_ROLE ??= "read-only";
 
   const config = loadConfig();
+  if (
+    config.indexer.enabled ||
+    config.rails.enabled ||
+    config.keeper.enabled ||
+    config.databaseRole !== "read-only"
+  )
+    throw new Error(
+      "API entrypoint requires read-only database credentials and disabled background writers.",
+    );
   const logger = createLogger(config);
   const startedAt = new Date();
 
   const db = Database.open(config.databaseUrl, {
     applicationName: "hyperion-vercel-api",
     connectionTimeoutMs: 2000,
+    readOnly: true,
   });
   try {
     await checkSchemaCompatibility(db, config.schemaVersion);
+    await checkDatabasePolicy(db, config);
   } catch (error) {
     await db.close();
     throw error;
