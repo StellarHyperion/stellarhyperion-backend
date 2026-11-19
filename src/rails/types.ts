@@ -100,6 +100,7 @@ export interface PendingTransfer {
   /** Null until the first check. */
   readonly status: AttestationStatus | null;
   readonly checkFailures: number;
+  readonly retryAttempts: number;
   /** True when an inbound delivery already exists, which settles it without asking the rail. */
   readonly delivered: boolean;
 }
@@ -115,7 +116,7 @@ export interface RailRequeueRequest {
 export interface RailRequeueResult {
   readonly transferId: bigint;
   readonly route: number;
-  readonly priorStatus: "failed" | "expired";
+  readonly priorStatus: "pending" | "attested" | "failed" | "expired";
 }
 
 /** What a rail client has to offer the pass that polls it. */
@@ -126,16 +127,9 @@ export interface RailClient {
 }
 
 export type MissingProofStage =
-  | "provider_discovery"
-  | "destination_receipt_verification"
-  | "attestation_reconciliation";
+  "provider_discovery" | "destination_receipt_verification" | "attestation_reconciliation";
 
-export type BacklogRetryState =
-  | "never_checked"
-  | "cooling_down"
-  | "not_due"
-  | "overdue"
-  | "held";
+export type BacklogRetryState = "never_checked" | "cooling_down" | "not_due" | "overdue" | "held";
 
 export interface BacklogDelayBreakdown {
   readonly totalAgeMs: number;
@@ -162,6 +156,7 @@ export interface BacklogCandidate {
   readonly attestedAt: string | null;
   readonly lastCheckedAt: string | null;
   readonly checkFailures: number;
+  readonly retryAttempts: number;
   readonly retryClass: RailRetryClass | null;
   readonly retryState: BacklogRetryState;
   readonly lastError: string | null;

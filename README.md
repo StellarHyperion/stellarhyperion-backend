@@ -51,7 +51,7 @@ Unknown or unreachable APIs produce errors; there are no fabricated deliveries o
 
 ## Rail retry recovery
 
-Rail lookup failures persist a normalized `retry_class` and `next_attempt_at`. Transient failures use capped exponential backoff; rate limits use the provider's retry delay. Permanent failures and transfers that exhaust the configured retry count are held for operator recovery and are not retried automatically. After correcting the underlying issue and reviewing the source transfer, an operator may explicitly re-enable one transfer with:
+Rail lookup failures persist a normalized `retry_class` and `next_attempt_at`. Transient failures use capped exponential backoff; rate limits use the provider's retry delay. Permanent failures and transfers that exhaust the configured evidence-failure count are held for operator recovery and are not retried automatically. After correcting the underlying issue and reviewing the source transfer, an operator may explicitly re-enable one transfer with:
 
 ```bash
 npm run migrate:up
@@ -59,7 +59,7 @@ npm run build
 npm run rail:requeue -- --transfer-id 123 --reviewed-by operator-name --reason "Provider evidence is now available"
 ```
 
-Only transfers in the `failed` or `expired` terminal state can be reopened. Each requeue atomically records the prior state, operator and reason. A matching destination delivery or claim blocks requeue, and the original source transfer is never rewritten. Add `--evaluate-now` to make one immediate rail lookup after requeue; otherwise the regular worker picks it up. Provider error text and credentials are not exposed through the public transfer API or retry logs.
+Transfers in `failed` or `expired`, or pending/attested transfers held for `permanent`/`exhausted` evidence failures, can be reopened. Each requeue atomically records the prior state, operator and reason. A matching destination delivery or claim blocks requeue, and the original source transfer is never rewritten. Add `--evaluate-now` to make one immediate rail lookup after requeue; otherwise the regular worker picks it up. Provider error text and credentials are not exposed through the public transfer API or retry logs.
 
 Inspect active rail backlog without starting workers or changing lifecycle state:
 
@@ -102,3 +102,5 @@ Signed source transactions and independently checked destination payments are pu
 The [October 29 CI run](https://github.com/StellarHyperion/stellarhyperion-backend/actions/runs/40881373948) passed formatting, lint, types, the production build and all 220 tests. `npm audit` reported zero known vulnerabilities after compatible locked HTTP redirect and test-tooling patches. These results cover dependency and regression checks; they are not a formal security audit.
 
 MIT.
+
+Rail workers claim one transfer inside a PostgreSQL transaction using `FOR UPDATE SKIP LOCKED`, so another replica skips active polling. Source identity, verified delivery and the retry schedule commit together. Aborted polling rolls back. Transient and rate-limit attempts have a separate durable counter and do not exhaust the permanent/evidence failure budget; explicit Retry-After delays are respected.

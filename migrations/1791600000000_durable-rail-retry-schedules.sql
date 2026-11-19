@@ -2,6 +2,7 @@
 
 ALTER TABLE rail_attestation
   ADD COLUMN next_attempt_at timestamptz,
+  ADD COLUMN retry_attempts integer NOT NULL DEFAULT 0 CHECK (retry_attempts >= 0),
   ADD COLUMN retry_class text CHECK (
     retry_class IN ('transient', 'rate_limited', 'permanent', 'exhausted')
   );
@@ -24,5 +25,6 @@ CREATE INDEX rail_attestation_outstanding
   WHERE status IN ('pending', 'attested');
 
 ALTER TABLE rail_attestation
+  DROP COLUMN retry_attempts,
   DROP COLUMN retry_class,
   DROP COLUMN next_attempt_at;

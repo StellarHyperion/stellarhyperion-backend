@@ -28,7 +28,7 @@ function parseArguments(argv: readonly string[]): Arguments | null {
       continue;
     }
     if (option !== "--transfer-id" && option !== "--reviewed-by" && option !== "--reason") {
-      throw new Error(`unknown argument: ${option ?? ""}`);
+      throw new Error("unknown argument; use --help for supported options");
     }
     if (values.has(option)) throw new Error(`${option} may only be specified once`);
     const value = argv[index + 1];

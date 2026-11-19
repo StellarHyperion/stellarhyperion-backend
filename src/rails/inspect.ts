@@ -176,7 +176,7 @@ export async function runBacklogCli(
   }
 
   let db = injected?.db;
-  let shouldClose = false;
+  let ownedDb: Database | undefined;
   let recheckAfterMs = injected?.recheckAfterMs;
   let maxCheckFailures = injected?.maxCheckFailures;
   try {
@@ -191,8 +191,8 @@ export async function runBacklogCli(
       });
       recheckAfterMs = config.rails.recheckAfterMs;
       maxCheckFailures = config.rails.maxCheckFailures;
-      db = Database.open(config.databaseUrl, { applicationName: "hyperion-rails-backlog" });
-      shouldClose = true;
+      ownedDb = Database.open(config.databaseUrl, { applicationName: "hyperion-rails-backlog" });
+      db = ownedDb;
     }
 
     const report = await inspectRailBacklog(db, {
@@ -212,7 +212,7 @@ export async function runBacklogCli(
     if (error instanceof ConfigError) return 78;
     return error instanceof BacklogValidationError ? 2 : 1;
   } finally {
-    if (shouldClose && db !== undefined) await db.close();
+    await ownedDb?.close();
   }
 }
 

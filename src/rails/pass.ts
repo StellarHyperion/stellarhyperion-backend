@@ -10,8 +10,8 @@
  * one transfer being unanswerable while the rail is otherwise fine, which happens when a transfer
  * was filed under the wrong rail or its chain has no domain. Those are different situations and
  * conflating them means either one bad transfer backs off the whole rail, or a dead rail is
- * hammered once per transfer per tick. So a per transfer failure is counted on the row and the
- * queue stops offering it after `maxCheckFailures`; only a rail level failure reaches the poller.
+ * hammered once per transfer per tick. Transient provider attempts have a separate durable
+ * counter; only permanent and evidence failures consume `maxCheckFailures`.
  *
  * A rate limit is its own case again. Circle blocks every request for five minutes after one, so
  * the pass records a cooldown and returns without asking anything until it passes. Doubling from a
@@ -96,10 +96,7 @@ export class RailPass {
 
   /** Inspect this rail's backlog without polling providers or mutating pass state. */
   inspectBacklog(
-    options: Omit<
-      InspectRailBacklogOptions,
-      "routes" | "recheckAfterMs" | "maxCheckFailures"
-    > = {},
+    options: Omit<InspectRailBacklogOptions, "routes" | "recheckAfterMs" | "maxCheckFailures"> = {},
   ): Promise<BacklogInspectionReport> {
     return inspectRailBacklog(this.options.db, {
       ...options,
@@ -153,41 +150,50 @@ export class RailPass {
     if (cooldown !== null && cooldown > this.now()) return false;
     this.cooldownUntil = null;
 
-    const queue = await pendingForRail(db, {
-      route: this.options.route,
-      limit: batchSize,
-      now: this.now(),
-      notCheckedSince: new Date(this.now().getTime() - this.options.recheckAfterMs),
-      maxCheckFailures: this.options.maxCheckFailures,
-    });
-
     let checked = 0;
     let settled = 0;
     let failures = 0;
+    let selected = 0;
+    let stoppedForCooldown = false;
+    const seen: bigint[] = [];
 
-    for (const transfer of queue) {
-      if (signal.aborted) break;
-      try {
-        if (await this.handle(transfer)) settled += 1;
-        checked += 1;
-      } catch (error) {
-        if (error instanceof RailError && error.kind === "rateLimited") {
-          // The whole rail, not this transfer. Stop the pass and hold off.
-          const waitMs = error.retryAfterMs ?? 60_000;
-          this.cooldownUntil = new Date(this.now().getTime() + waitMs);
+    // One locked transfer per transaction: replicas skip active work and cannot commit stale
+    // schedules. A crash rolls back the claim; no process-local ownership survives a restart.
+    while (selected < batchSize && !signal.aborted) {
+      const outcome = await db.transaction(async (tx) => {
+        const queue = await pendingForRail(tx, {
+          route: this.options.route,
+          limit: 1,
+          now: this.now(),
+          notCheckedSince: new Date(this.now().getTime() - this.options.recheckAfterMs),
+          maxCheckFailures: this.options.maxCheckFailures,
+          lock: true,
+          excludedTransferIds: seen,
+        });
+        const transfer = queue[0];
+        if (!transfer) return "empty";
+        selected += 1;
+        seen.push(transfer.transferId);
+        try {
+          if (await this.handle(transfer, tx, signal)) settled += 1;
+          checked += 1;
+        } catch (error) {
+          signal.throwIfAborted();
           failures += 1;
-          await this.recordFailure(transfer, error);
-          logger.warn(
-            { rail: client.rail, until: this.cooldownUntil.toISOString() },
-            "the rail rate limited us, holding off rather than retrying",
-          );
-          break;
+          await this.recordFailure(transfer, error, tx);
+          if (error instanceof RailError && error.kind === "rateLimited") {
+            this.cooldownUntil = this.failureRetryAt(this.now(), transfer.retryAttempts + 1, error);
+            logger.warn(
+              { rail: client.rail, until: this.cooldownUntil.toISOString() },
+              "the rail rate limited us, holding off rather than retrying",
+            );
+            return "cooldown";
+          }
         }
-        // Everything else is this transfer's problem, recorded on its own row so one unanswerable
-        // transfer cannot back off the rest of the queue.
-        failures += 1;
-        await this.recordFailure(transfer, error);
-      }
+        return "processed";
+      });
+      if (outcome === "cooldown") stoppedForCooldown = true;
+      if (outcome !== "processed") break;
     }
 
     const outstanding = await outstandingForRail(db, this.options.route);
@@ -201,45 +207,57 @@ export class RailPass {
     }
 
     // A full batch means the queue is longer than one pass, so come straight back.
-    return queue.length >= batchSize;
+    return selected >= batchSize && !stoppedForCooldown;
   }
 
   /** Re-evaluate one reopened transfer immediately, without changing its source identity. */
-  async evaluateTransfer(transferId: bigint, signal?: AbortSignal): Promise<boolean> {
-    if (signal?.aborted === true) return false;
-    const transfer = await pendingTransferById(this.options.db, this.options.route, transferId);
-    if (transfer === null) return false;
-
-    try {
-      return await this.handle(transfer);
-    } catch (error) {
-      if (error instanceof RailError && error.kind === "rateLimited") {
-        const waitMs = error.retryAfterMs ?? 60_000;
-        this.cooldownUntil = new Date(this.now().getTime() + waitMs);
-        this.options.logger.warn(
-          { rail: this.options.client.rail, until: this.cooldownUntil.toISOString() },
-          "the rail rate limited us, holding off rather than retrying",
-        );
+  async evaluateTransfer(
+    transferId: bigint,
+    signal: AbortSignal = new AbortController().signal,
+  ): Promise<boolean> {
+    if (signal.aborted) return false;
+    const cooldown = this.cooldownUntil;
+    if (cooldown !== null && cooldown > this.now()) return false;
+    return this.options.db.transaction(async (tx) => {
+      const transfer = await pendingTransferById(
+        tx,
+        this.options.route,
+        transferId,
+        this.options.maxCheckFailures,
+      );
+      if (transfer === null) return false;
+      try {
+        return await this.handle(transfer, tx, signal);
+      } catch (error) {
+        signal.throwIfAborted();
+        await this.recordFailure(transfer, error, tx);
+        if (error instanceof RailError && error.kind === "rateLimited") {
+          this.cooldownUntil = this.failureRetryAt(this.now(), transfer.retryAttempts + 1, error);
+        }
+        return false;
       }
-      await this.recordFailure(transfer, error);
-      return false;
-    }
+    });
   }
 
   /** Returns true when the transfer reached a terminal state on this pass. */
-  private async handle(transfer: PendingTransfer): Promise<boolean> {
+  private async handle(
+    transfer: PendingTransfer,
+    db: Queryable,
+    signal: AbortSignal,
+  ): Promise<boolean> {
     const at = this.now();
 
     if (transfer.delivered) {
       // Our own inbound index already says the money arrived, which outranks anything the rail
       // would tell us. No request, and the transfer leaves the queue for good.
-      await this.write(transfer, {
+      await this.write(db, transfer, {
         status: "delivered",
         railStatus: null,
         reference: null,
         attestedAt: null,
         checkedAt: at,
         failures: 0,
+        retryAttempts: 0,
         error: null,
         nextAttemptAt: null,
         retryClass: null,
@@ -247,16 +265,18 @@ export class RailPass {
       return true;
     }
 
-    const lookup = await this.options.client.look(transfer);
+    const lookup = await this.options.client.look(transfer, signal);
+    signal.throwIfAborted();
     if (lookup.kind === "missing") {
       // Normal. The rail has not indexed the burn yet, which is where every transfer starts.
-      await this.write(transfer, {
+      await this.write(db, transfer, {
         status: transfer.status ?? "pending",
         railStatus: null,
         reference: null,
         attestedAt: null,
         checkedAt: at,
         failures: 0,
+        retryAttempts: 0,
         error: null,
         nextAttemptAt: this.nextCheckAt(at),
         retryClass: null,
@@ -267,19 +287,19 @@ export class RailPass {
     const { report } = lookup;
     if (this.options.config && (report.execution || report.forwardTxHash)) {
       const verified =
-        (await verifyItsDelivery(this.options.config, this.options.db, transfer, report)) ??
-        (await verifyCctpDelivery(this.options.config, this.options.db, transfer, report));
+        (await verifyItsDelivery(this.options.config, db, transfer, report)) ??
+        (await verifyCctpDelivery(this.options.config, db, transfer, report));
       if (verified) {
-        await this.options.db.transaction(async (tx) => {
-          await writeInbound(tx, verified.at, verified.row);
-        });
-        await this.write(transfer, {
+        signal.throwIfAborted();
+        await writeInbound(db, verified.at, verified.row);
+        await this.write(db, transfer, {
           status: "delivered",
           railStatus: report.railStatus,
           reference: report.reference,
           attestedAt: report.attestedAt,
           checkedAt: at,
           failures: 0,
+          retryAttempts: 0,
           error: null,
           nextAttemptAt: null,
           retryClass: null,
@@ -288,13 +308,14 @@ export class RailPass {
       }
     }
     const status = report.status === "delivered" ? "pending" : report.status;
-    await this.write(transfer, {
+    await this.write(db, transfer, {
       status,
       railStatus: report.railStatus,
       reference: report.reference,
       attestedAt: report.attestedAt,
       checkedAt: at,
       failures: 0,
+      retryAttempts: 0,
       error: null,
       nextAttemptAt: isTerminal(status) ? null : this.nextCheckAt(at),
       retryClass: null,
@@ -302,10 +323,16 @@ export class RailPass {
     return isTerminal(status);
   }
 
-  private async recordFailure(transfer: PendingTransfer, error: unknown): Promise<void> {
-    const failures = transfer.checkFailures + 1;
+  private async recordFailure(
+    transfer: PendingTransfer,
+    error: unknown,
+    db: Queryable,
+  ): Promise<void> {
+    const retryable = error instanceof RailError && error.kind !== "permanent";
+    const failures = retryable ? transfer.checkFailures : transfer.checkFailures + 1;
+    const attempts = Math.min(transfer.retryAttempts + 1, 30);
     const permanent = error instanceof RailError && error.kind === "permanent";
-    const exhausted = !permanent && failures >= this.options.maxCheckFailures;
+    const exhausted = !permanent && !retryable && failures >= this.options.maxCheckFailures;
     const retryClass: RailRetryClass = permanent
       ? "permanent"
       : exhausted
@@ -331,7 +358,7 @@ export class RailPass {
       );
     }
 
-    await this.write(transfer, {
+    await this.write(db, transfer, {
       // Still pending, not failed. A transfer we cannot ask about is not a transfer that failed,
       // and writing `failed` here would claim the money did not move on the strength of our own
       // inability to get an answer.
@@ -341,16 +368,18 @@ export class RailPass {
       attestedAt: null,
       checkedAt: this.now(),
       failures,
+      retryAttempts: attempts,
       error: reason,
       nextAttemptAt:
         retryClass === "permanent" || retryClass === "exhausted"
           ? null
-          : this.failureRetryAt(this.now(), failures, error),
+          : this.failureRetryAt(this.now(), attempts, error),
       retryClass,
     });
   }
 
   private async write(
+    db: Queryable,
     transfer: PendingTransfer,
     fields: {
       readonly status: string;
@@ -359,25 +388,25 @@ export class RailPass {
       readonly attestedAt: Date | null;
       readonly checkedAt: Date;
       readonly failures: number;
+      readonly retryAttempts: number;
       readonly error: string | null;
       readonly nextAttemptAt: Date | null;
       readonly retryClass: RailRetryClass | null;
     },
   ): Promise<void> {
-    await this.options.db.transaction(async (tx: Queryable) => {
-      await writeAttestation(tx, {
-        transferId: transfer.transferId,
-        route: transfer.route,
-        status: fields.status,
-        railStatus: fields.railStatus,
-        railReference: fields.reference,
-        attestedAt: fields.attestedAt,
-        checkedAt: fields.checkedAt,
-        checkFailures: fields.failures,
-        lastError: fields.error,
-        nextAttemptAt: fields.nextAttemptAt,
-        retryClass: fields.retryClass,
-      });
+    await writeAttestation(db, {
+      transferId: transfer.transferId,
+      route: transfer.route,
+      status: fields.status,
+      railStatus: fields.railStatus,
+      railReference: fields.reference,
+      attestedAt: fields.attestedAt,
+      checkedAt: fields.checkedAt,
+      checkFailures: fields.failures,
+      retryAttempts: fields.retryAttempts,
+      lastError: fields.error,
+      nextAttemptAt: fields.nextAttemptAt,
+      retryClass: fields.retryClass,
     });
   }
 
@@ -390,7 +419,12 @@ export class RailPass {
       error instanceof RailError && error.kind === "rateLimited"
         ? (error.retryAfterMs ?? 60_000)
         : this.options.recheckAfterMs * 2 ** Math.min(failures - 1, 30);
-    const delay = Math.min(Math.max(1_000, requestedDelay), MAX_RETRY_DELAY_MS);
+    const finiteDelay =
+      Number.isFinite(requestedDelay) && requestedDelay >= 0 ? requestedDelay : 60_000;
+    const delay =
+      error instanceof RailError && error.kind === "rateLimited"
+        ? Math.min(Math.max(1_000, finiteDelay), 8_640_000_000_000_000 - at.getTime())
+        : Math.min(Math.max(1_000, finiteDelay), MAX_RETRY_DELAY_MS);
     return new Date(at.getTime() + delay);
   }
 
