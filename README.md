@@ -164,11 +164,15 @@ for a seeded history.
 - `GET /v1/routes/health`, `GET /v1/metrics`
 
 Public reads have a ten-second request budget. A client disconnect cancels the in-flight
-PostgreSQL query through its `AbortSignal`; the pool's statement timeout remains the final
-server-side safeguard. The transfer stream sends a numeric `id` with each `transfer_update`.
-Clients may reconnect with `Last-Event-ID` to replay retained updates. Replay history is bounded
-to the most recent 100 events per transfer and expires after 15 minutes. A `409 cursor_expired`
-response includes a `resync` URL when the client must reconnect without a cursor.
+PostgreSQL query through its `AbortSignal`. The database adapter uses a separate connection with
+the same role to cancel the exact active backend, and holds its borrowed connection until cancellation
+finishes so a delayed cancellation cannot affect a later request. The statement timeout remains the
+server-side safeguard. SSE uses opaque, transfer-scoped full-width history cursors. Reconnection with
+`Last-Event-ID` replays committed `rail_transition` events from PostgreSQL, including changes made while
+the client was disconnected, then emits the current `transfer_update` snapshot. Replay is bounded to
+100 transitions and cursors expire after 15 minutes. Invalid, expired or oversized replay windows return
+`409 cursor_expired` with `resync=true`; reconnect without the cursor. Slow clients wait for socket drain
+within a bounded budget, and disconnected clients stop polling.
 
 `npm run check` runs formatting, lint, type checking and tests. Schema/API regressions execute repository migrations in embedded PostgreSQL (PGlite). The full PostgreSQL integration suite requires `TEST_DATABASE_URL`; it is skipped when unset. Use `npm run build` for emitted production code.
 

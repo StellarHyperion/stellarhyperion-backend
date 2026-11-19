@@ -401,7 +401,7 @@ describe("REST API endpoints", () => {
     expect(res.statusCode).toBe(200);
     expect(res.headers["content-type"]).toBe("text/event-stream");
     expect(res.headers["cache-control"]).toBe("no-cache");
-    expect(res.payload).toContain("id: 1\nevent: transfer_update");
+    expect(res.payload).toMatch(/^id: [A-Za-z0-9_-]+\nevent: transfer_update/);
     expect(res.payload).toContain("event: transfer_update\ndata: ");
     expect(res.payload).toContain("event: complete\ndata: ");
     expect(res.payload).toContain('"stage":"delivered"');
@@ -444,15 +444,16 @@ describe("REST API endpoints", () => {
 
     const first = await app.inject("/v1/transfers/resume-1/stream");
     expect(first.statusCode).toBe(200);
-    expect(first.payload).toContain("id: 1\n");
+    const cursor = first.payload.split("\n")[0]?.slice(4) ?? "";
+    expect(cursor).toMatch(/^[A-Za-z0-9_-]+$/);
 
     const resumed = await app.inject({
       method: "GET",
       url: "/v1/transfers/resume-1/stream",
-      headers: { "last-event-id": "0" },
+      headers: { "last-event-id": cursor },
     });
     expect(resumed.statusCode).toBe(200);
-    expect(resumed.payload).toContain("id: 1\nevent: transfer_update");
+    expect(resumed.payload).toMatch(/^id: [A-Za-z0-9_-]+\nevent: transfer_update/);
   });
 
   it("rejects malformed SSE cursors with a client error", async () => {
@@ -494,8 +495,8 @@ describe("REST API endpoints", () => {
       url: "/v1/transfers/resume-invalid/stream",
       headers: { "last-event-id": "not-a-cursor" },
     });
-    expect(response.statusCode).toBe(400);
-    expect(response.json().error).toBe("invalid_cursor");
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ error: "cursor_expired", resync: true });
   });
 
   it("emits transfer_update on status change and sends periodic ping comments", async () => {

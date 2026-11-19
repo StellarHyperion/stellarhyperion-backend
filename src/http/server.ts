@@ -15,6 +15,7 @@ import { registerHealthRoutes } from "./routes/health.js";
 import { registerMetricsRoutes } from "./routes/metrics.js";
 import { registerRouteHealthRoutes } from "./routes/routes.js";
 import { registerTransferRoutes } from "./routes/transfers.js";
+import { RequestBudgetExceededError } from "./request-budget.js";
 
 export const DEFAULT_RATE_LIMIT_MAX = 120;
 export const DEFAULT_STREAM_RATE_LIMIT_MAX = 20;
@@ -167,6 +168,14 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   app.setErrorHandler((error: FastifyError, request, reply) => {
+    if (error instanceof RequestBudgetExceededError) {
+      void reply.code(504).send({
+        error: "request_budget_exceeded",
+        message: "The public read exceeded its request budget.",
+        requestId: request.id,
+      });
+      return;
+    }
     const status = error.statusCode ?? 500;
     if (status === 429) {
       const seconds = Number(reply.getHeader("retry-after"));
