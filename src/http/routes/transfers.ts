@@ -11,7 +11,12 @@ import type { AppConfig } from "../../config/config.js";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
-import { integer, text, textOrNull } from "../../db/rows.js";
+import { integer, integerOrNull, text, textOrNull, timestampOrNull } from "../../db/rows.js";
+import {
+  LIST_CACHE_CONTROL,
+  computeCanonicalETag,
+  sendConditionalDetailResponse,
+} from "../etag.js";
 import type { ServerDeps } from "../server.js";
 
 export type TransferLifecycleStage =
@@ -199,6 +204,7 @@ const TRANSFER_QUERY = `
          t.rail_ref,
          t.origin_block,
          t.origin_tx,
+         t.origin_log_index,
          t.observed_at,
          a.status AS attestation_status,
          a.rail_status,
@@ -208,11 +214,16 @@ const TRANSFER_QUERY = `
          d.delivered AS inbound_delivered,
          d.destination_block,
          d.destination_tx,
+         d.rail_message_id,
+         d.destination_log_index,
          d.token AS received_token,
          d.amount AS received_amount,
          d.observed_at AS delivered_at,
          c.claim_id,
-         c.settled AS claim_settled
+         c.settled AS claim_settled,
+         c.settled_at AS claim_settled_at,
+         c.settled_by AS claim_settled_by,
+         c.settled_tx AS claim_settled_tx
     FROM outbound_transfer t
     LEFT JOIN rail_attestation a ON a.transfer_id = t.id
     LEFT JOIN inbound_delivery d
@@ -233,13 +244,38 @@ function isDeliveryFinalized(transfer: FormattedTransfer): boolean {
   );
 }
 
+function buildTransferRevision(row: Record<string, unknown>, config: AppConfig) {
+  const transfer = formatRow(row, config);
+  const settledAt = timestampOrNull(row, "claim_settled_at");
+  return {
+    transfer,
+    etag: computeCanonicalETag("transfer-v1", {
+      transfer,
+      proof: {
+        originLogIndex: integerOrNull(row, "origin_log_index"),
+        originRailReference: textOrNull(row, "rail_ref"),
+        destinationLogIndex: integerOrNull(row, "destination_log_index"),
+        railMessageId: textOrNull(row, "rail_message_id"),
+        claimSettledAt: settledAt?.toISOString() ?? null,
+        claimSettledBy: textOrNull(row, "claim_settled_by"),
+        claimSettledTx: textOrNull(row, "claim_settled_tx"),
+      },
+    }),
+  };
+}
+
 export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
 
-  const queryTransferById = async (id: string): Promise<FormattedTransfer | null> => {
+  const queryTransferRevisionById = async (id: string) => {
     const { rows } = await db.query(`${TRANSFER_QUERY} WHERE t.id = $1 LIMIT 1`, [id]);
     const row = rows[0];
-    return row !== undefined ? formatRow(row, deps.config) : null;
+    return row !== undefined ? buildTransferRevision(row, deps.config) : null;
+  };
+
+  const queryTransferById = async (id: string): Promise<FormattedTransfer | null> => {
+    const revision = await queryTransferRevisionById(id);
+    return revision?.transfer ?? null;
   };
 
   // 1. Look up by originChain and nonce
@@ -263,7 +299,8 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         });
       }
 
-      return reply.send(formatRow(row, deps.config));
+      const revision = buildTransferRevision(row, deps.config);
+      return sendConditionalDetailResponse(request, reply, revision.transfer, revision.etag);
     },
   );
 
@@ -285,7 +322,8 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         });
       }
 
-      return reply.send(formatRow(row, deps.config));
+      const revision = buildTransferRevision(row, deps.config);
+      return sendConditionalDetailResponse(request, reply, revision.transfer, revision.etag);
     },
   );
 
@@ -405,14 +443,14 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     reply: FastifyReply,
   ) => {
     const { id } = request.params;
-    const transfer = await queryTransferById(id);
-    if (transfer === null) {
+    const revision = await queryTransferRevisionById(id);
+    if (revision === null) {
       return reply.code(404).send({
         error: "not_found",
         message: `no transfer found with id ${id}`,
       });
     }
-    return reply.send(transfer);
+    return sendConditionalDetailResponse(request, reply, revision.transfer, revision.etag);
   };
 
   app.get("/v1/transfers/:id", getTransferById);
@@ -485,6 +523,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         params,
       );
 
+      reply.header("Cache-Control", LIST_CACHE_CONTROL);
       return reply.send({
         transfers: rows.map((row) => formatRow(row, deps.config)),
         limit: parsedLimit,
