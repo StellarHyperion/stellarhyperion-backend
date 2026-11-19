@@ -11,7 +11,7 @@ import { loadConfig } from "./config/config.js";
 import { ConfigError } from "./config/env.js";
 import { Database } from "./db/pool.js";
 import { buildServer } from "./http/server.js";
-import { createKeeperRedis } from "./keeper/queue.js";
+import { createApiRedis } from "./http/rate-limit-redis.js";
 import { createLogger } from "./logging/logger.js";
 import { Shutdown, installSignalHandlers } from "./runtime/shutdown.js";
 
@@ -34,10 +34,14 @@ async function main(): Promise<void> {
   const shutdown = new Shutdown(logger, config.shutdownTimeoutMs);
   installSignalHandlers(shutdown, logger);
 
-  const db = Database.open(config.databaseUrl, { applicationName: "hyperion-backend" });
+  const db = Database.open(config.databaseUrl, {
+    applicationName: "hyperion-backend",
+    logger,
+    slowQueryThresholdMs: 1_000,
+  });
   shutdown.add("postgres", () => db.close());
 
-  const redis = config.keeper.enabled ? createKeeperRedis(config.redisUrl) : undefined;
+  const redis = config.redisUrl.length > 0 ? createApiRedis(config.redisUrl) : undefined;
   if (redis)
     shutdown.add("redis", async () => {
       await redis.quit();

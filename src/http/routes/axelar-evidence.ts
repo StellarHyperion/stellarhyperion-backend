@@ -1,3 +1,4 @@
+import { bounded, safeString } from "../../rails/axelar/gmp.js";
 import { RouteKind } from "@hyperion/protocol";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
@@ -31,6 +32,11 @@ export function registerAxelarEvidenceRoutes(app: FastifyInstance, deps: ServerD
     reply: FastifyReply,
   ) => {
     const transferId = request.params.id;
+    if (!/^[1-9][0-9]{0,18}$/.test(transferId) || BigInt(transferId) > 9223372036854775807n)
+      return reply.code(400).send({
+        error: "invalid_transfer_id",
+        message: "transfer id must be a positive database identifier",
+      });
     const { rows: transfers } = await db.query(
       `SELECT id, route, origin_chain, nonce, destination_chain
          FROM outbound_transfer WHERE id = $1 LIMIT 1`,
@@ -96,7 +102,7 @@ export function registerAxelarEvidenceRoutes(app: FastifyInstance, deps: ServerD
               tokenManager: text(latest, "token_manager"),
               proofBlockNumber: bigintOf(latest, "token_manager_block").toString(),
               proofBlockHash: text(latest, "token_manager_block_hash"),
-              verified: true,
+              verified,
             },
       tokenPayment:
         latest === undefined
@@ -107,7 +113,7 @@ export function registerAxelarEvidenceRoutes(app: FastifyInstance, deps: ServerD
               amount: bigintOf(latest, "payment_amount").toString(),
               transactionHash: text(latest, "execution_tx_hash"),
               logIndex: integer(latest, "payment_log_index"),
-              exactMatch: true,
+              exactMatch: verified,
             },
       history: evidenceRows.slice(1).map((row) => ({
         status: text(row, "status"),
@@ -119,9 +125,12 @@ export function registerAxelarEvidenceRoutes(app: FastifyInstance, deps: ServerD
         lastRevalidatedAt: timestampOrNull(row, "last_revalidated_at"),
       })),
       quarantined: quarantineRows.map((row) => ({
-        providerReference: textOrNull(row, "provider_reference"),
-        schema: text(row, "schema"),
-        payload: row.payload,
+        providerReference:
+          textOrNull(row, "provider_reference") === null
+            ? null
+            : safeString(text(row, "provider_reference")),
+        schema: safeString(text(row, "schema")),
+        payload: bounded(row.payload),
         firstSeenAt: timestamp(row, "first_seen_at"),
         lastSeenAt: timestamp(row, "last_seen_at"),
         replayCount: integer(row, "replay_count"),

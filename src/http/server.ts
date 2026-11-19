@@ -3,16 +3,32 @@ import type { FastifyBaseLogger, FastifyError, FastifyInstance } from "fastify";
 import type { Logger } from "pino";
 
 import rateLimit from "@fastify/rate-limit";
+import type { Redis } from "ioredis";
 
 import type { AppConfig } from "../config/config.js";
 import type { Database } from "../db/pool.js";
 import type { BullMQWorkerState, RedisPingable, ReadinessSource } from "../runtime/readiness.js";
 import { registerClaimRoutes } from "./routes/claims.js";
 import { registerAxelarEvidenceRoutes } from "./routes/axelar-evidence.js";
+import { registerBackfillRoutes } from "./routes/backfills.js";
 import { registerHealthRoutes } from "./routes/health.js";
 import { registerMetricsRoutes } from "./routes/metrics.js";
 import { registerRouteHealthRoutes } from "./routes/routes.js";
 import { registerTransferRoutes } from "./routes/transfers.js";
+
+export const DEFAULT_RATE_LIMIT_MAX = 120;
+export const DEFAULT_STREAM_RATE_LIMIT_MAX = 20;
+export const DEFAULT_RATE_LIMIT_WINDOW_MS = 60_000;
+export const DEFAULT_RATE_LIMIT_CACHE_SIZE = 10_000;
+
+export interface RateLimitPolicyOptions {
+  readonly enabled?: boolean;
+  readonly max?: number;
+  readonly streamMax?: number;
+  readonly timeWindowMs?: number;
+  readonly cacheSize?: number;
+  readonly keyPrefix?: string;
+}
 
 export interface ServerDeps {
   readonly config: AppConfig;
@@ -24,6 +40,18 @@ export interface ServerDeps {
   readonly readiness: readonly ReadinessSource[];
   /** Set at boot so `/health` can report how long the process has been up. */
   readonly startedAt?: Date;
+  /** Explicit proxy trust policy; defaults to `false` so unvalidated forwarded headers are ignored. */
+  readonly trustProxy?: boolean | string | string[];
+  /** Bounded public API rate-limit policy with optional shared Redis store. */
+  readonly rateLimit?: RateLimitPolicyOptions;
+}
+
+function isIoredisStore(redis: RedisPingable | undefined): redis is Redis {
+  return (
+    redis !== undefined &&
+    typeof (redis as Partial<Redis>).defineCommand === "function" &&
+    typeof (redis as Partial<Redis>).pttl === "function"
+  );
 }
 
 export function buildServer(deps: ServerDeps): FastifyInstance {
@@ -39,9 +67,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // Fastify gets the same instance the watchers use, so a request line and a watcher line carry
     // the same service fields and the same redaction rules.
     loggerInstance,
-    // Behind a load balancer the client address is in the header, and rate limiting in B7 needs
-    // the real one. Only trustworthy because this never faces the internet directly.
-    trustProxy: true,
+    // Explicit proxy handling: only trust forwarded client IP headers when configured by the
+    // deployment, preventing clients from spoofing X-Forwarded-For to bypass rate limits.
+    trustProxy: deps.trustProxy ?? false,
     // A request id that survives into every log line for that request. Fastify generates one;
     // naming the header means a caller can supply theirs and have it show up in our logs.
     requestIdHeader: "x-request-id",
@@ -53,27 +81,83 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   app.addHook("onRequest", async (_request, reply) => {
     reply.header("Access-Control-Allow-Origin", "*");
     reply.header("Access-Control-Allow-Methods", "GET, OPTIONS");
-    reply.header("Access-Control-Allow-Headers", "Accept, Content-Type");
+    reply.header(
+      "Access-Control-Allow-Headers",
+      "Accept, Content-Type, If-None-Match, X-API-Schema-Version",
+    );
+    reply.header(
+      "Access-Control-Expose-Headers",
+      "ETag, Cache-Control, X-API-Schema-Version, Retry-After",
+    );
   });
   app.options("/*", async (_request, reply) => reply.code(204).send());
 
+  const rateLimitEnabled = deps.rateLimit?.enabled ?? deps.config.nodeEnv !== "test";
+  const max = deps.rateLimit?.max ?? DEFAULT_RATE_LIMIT_MAX;
+  const streamMax = deps.rateLimit?.streamMax ?? DEFAULT_STREAM_RATE_LIMIT_MAX;
+  const timeWindow = deps.rateLimit?.timeWindowMs ?? DEFAULT_RATE_LIMIT_WINDOW_MS;
+  const cacheSize = deps.rateLimit?.cacheSize ?? DEFAULT_RATE_LIMIT_CACHE_SIZE;
+  if (
+    !Number.isSafeInteger(max) ||
+    max < 1 ||
+    max > 1_000_000 ||
+    !Number.isSafeInteger(streamMax) ||
+    streamMax < 1 ||
+    streamMax > 1_000_000 ||
+    !Number.isSafeInteger(timeWindow) ||
+    timeWindow < 1 ||
+    timeWindow > 86_400_000 ||
+    !Number.isSafeInteger(cacheSize) ||
+    cacheSize < 1 ||
+    cacheSize > DEFAULT_RATE_LIMIT_CACHE_SIZE
+  ) {
+    throw new RangeError("rate-limit policy exceeds supported request, time or storage bounds");
+  }
+  const sharedRedis = isIoredisStore(deps.redis) ? deps.redis : undefined;
+
   void app.register(rateLimit, {
-    max: 120,
-    timeWindow: "1 minute",
-    allowList: (req) => deps.config.nodeEnv === "test" || req.url.includes("/stream"),
-    errorResponseBuilder: () => ({
+    max,
+    timeWindow,
+    cache: cacheSize,
+    skipOnError: false,
+    ...(sharedRedis !== undefined
+      ? {
+          redis: sharedRedis,
+          nameSpace: deps.rateLimit?.keyPrefix ?? "hyperion:rl:",
+        }
+      : {}),
+    keyGenerator: (req) => req.ip,
+    allowList: (req) =>
+      !rateLimitEnabled || ["/health", "/ready"].includes(req.url.split("?")[0] ?? ""),
+    addHeadersOnExceeding: {
+      "x-ratelimit-limit": true,
+      "x-ratelimit-remaining": true,
+      "x-ratelimit-reset": true,
+    },
+    addHeaders: {
+      "x-ratelimit-limit": true,
+      "x-ratelimit-remaining": true,
+      "x-ratelimit-reset": true,
+      "retry-after": true,
+    },
+    errorResponseBuilder: (_req, context) => ({
+      statusCode: context.statusCode,
       error: "too_many_requests",
       message:
-        "rate limit exceeded; status endpoints must not be polled faster than twice a second",
+        "rate limit exceeded; status endpoints must not be polled faster than the deployment budget",
+      retryAfterMs: context.ttl,
     }),
   });
 
-  registerHealthRoutes(app, deps);
-  registerTransferRoutes(app, deps);
-  registerAxelarEvidenceRoutes(app, deps);
-  registerClaimRoutes(app, deps);
-  registerRouteHealthRoutes(app, deps);
-  registerMetricsRoutes(app, deps);
+  app.after(() => {
+    registerHealthRoutes(app, deps);
+    registerTransferRoutes(app, deps);
+    registerAxelarEvidenceRoutes(app, deps);
+    registerClaimRoutes(app, deps);
+    registerBackfillRoutes(app, deps);
+    registerRouteHealthRoutes(app, deps);
+    registerMetricsRoutes(app, deps);
+  });
 
   app.setNotFoundHandler((request, reply) => {
     void reply.code(404).send({
@@ -84,6 +168,16 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
   app.setErrorHandler((error: FastifyError, request, reply) => {
     const status = error.statusCode ?? 500;
+    if (status === 429) {
+      const seconds = Number(reply.getHeader("retry-after"));
+      void reply.code(429).send({
+        error: "too_many_requests",
+        message: "rate limit exceeded; retry after the deployment request budget resets",
+        retryAfterMs: Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : timeWindow,
+        requestId: request.id,
+      });
+      return;
+    }
     // The log gets the error, the response does not. An internal error message is the kind of
     // thing that carries a table name, a file path or, on a bad day, a connection string.
     request.log.error({ err: error, status }, "request failed");

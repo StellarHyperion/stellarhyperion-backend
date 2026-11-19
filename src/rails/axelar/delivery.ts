@@ -20,7 +20,7 @@ import {
 import { createPublicClient, http, stringToHex } from "viem";
 import type { PublicClient } from "viem";
 import type { AppConfig } from "../../config/config.js";
-import type { Transactional } from "../../db/pool.js";
+import type { Queryable, Transactional } from "../../db/pool.js";
 import { bigintOf, text } from "../../db/rows.js";
 import type { InboundRow, Position } from "../../chains/writers.js";
 import type { PendingTransfer, RailReport } from "../types.js";
@@ -48,6 +48,7 @@ export interface AxelarCanonicalityClient {
 }
 
 export interface RevalidationOptions {
+  readonly signal?: AbortSignal;
   readonly clientForChain?: (chainKey: string) => AxelarCanonicalityClient;
 }
 
@@ -57,72 +58,84 @@ export async function revalidateItsDeliveryProofs(
   limit: number,
   options: RevalidationOptions = {},
 ): Promise<number> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000)
+    throw new Error("Axelar revalidation batch must be between 1 and 1000.");
   const { rows } = await db.query(
-    `SELECT id, transfer_id, destination_chain, execution_tx_hash, receipt_block,
-            receipt_block_hash
-       FROM axelar_delivery_evidence
-      WHERE status = 'canonical'
-      ORDER BY last_revalidated_at NULLS FIRST, receipt_block
-      LIMIT $1`,
+    `SELECT id, transfer_id, destination_chain, execution_tx_hash, receipt_block, receipt_block_hash
+       FROM axelar_delivery_evidence WHERE status = 'canonical'
+      ORDER BY last_revalidated_at NULLS FIRST, receipt_block, id LIMIT $1`,
     [limit],
   );
   const clients = new Map<string, AxelarCanonicalityClient>();
   let orphaned = 0;
   for (const row of rows) {
+    options.signal?.throwIfAborted();
     const chain = text(row, "destination_chain");
     const chainConfig = isChainKey(chain) && isEvmChain(CHAINS[chain]) ? CHAINS[chain] : null;
-    if (chainConfig === null) throw new Error(`Axelar proof names a non-EVM chain: ${chain}`);
+    if (chainConfig?.network !== config.network)
+      throw new Error("Axelar proof names an unsupported destination chain.");
     let client = clients.get(chain);
     if (!client) {
-      client = options.clientForChain?.(chain) ?? canonicalityClient(chainConfig.defaultRpcUrl);
+      const configured = config.indexer.evm.find((item) => item.chain === chain);
+      client =
+        options.clientForChain?.(chain) ??
+        canonicalityClient(configured?.rpcUrl ?? chainConfig.defaultRpcUrl);
       if ((await client.getChainId()) !== chainConfig.chainId)
-        throw new Error(
-          `Destination RPC chain mismatch during Axelar proof revalidation: ${chain}`,
-        );
+        throw new Error("Destination RPC chain mismatch during Axelar proof revalidation.");
       clients.set(chain, client);
     }
-
     const blockNumber = bigintOf(row, "receipt_block");
     const blockHash = text(row, "receipt_block_hash");
     const txHash = text(row, "execution_tx_hash") as `0x${string}`;
     const block = await client.getBlock({ blockNumber });
-    const canonical = block.hash.toLowerCase() === blockHash.toLowerCase();
+    let canonical = block.hash.toLowerCase() === blockHash.toLowerCase();
     if (canonical) {
       const receipt = await client.getTransactionReceipt({ hash: txHash });
-      if (
-        receipt.status !== "success" ||
-        receipt.blockNumber !== blockNumber ||
-        receipt.blockHash.toLowerCase() !== blockHash.toLowerCase() ||
-        receipt.transactionHash.toLowerCase() !== txHash.toLowerCase()
-      )
-        throw new Error("Canonical Axelar receipt no longer matches its stored delivery proof.");
-      await db.query(
-        "UPDATE axelar_delivery_evidence SET last_revalidated_at = now() WHERE id = $1",
-        [bigintOf(row, "id").toString()],
-      );
-      continue;
+      canonical =
+        receipt.status === "success" &&
+        receipt.blockNumber === blockNumber &&
+        receipt.blockHash.toLowerCase() === blockHash.toLowerCase() &&
+        receipt.transactionHash.toLowerCase() === txHash.toLowerCase();
     }
-
-    await db.transaction(async (tx) => {
-      const evidenceId = bigintOf(row, "id");
-      const transferId = bigintOf(row, "transfer_id");
-      await tx.query(
-        `UPDATE axelar_delivery_evidence
-            SET status = 'orphaned', last_revalidated_at = now()
-          WHERE id = $1 AND status = 'canonical'`,
-        [evidenceId.toString()],
+    options.signal?.throwIfAborted();
+    const changed = await db.transaction(async (tx) => {
+      // Serialize with the rail pass and re-check the exact proof after remote reads. A newer
+      // replacement or same-id re-mined receipt must never be invalidated by a stale result.
+      const locked = await tx.query(
+        "SELECT id FROM outbound_transfer WHERE id = $1 FOR UPDATE SKIP LOCKED",
+        [String(row.transfer_id)],
       );
+      if (locked.rowCount !== 1) return false;
+      const result = await tx.query(
+        `UPDATE axelar_delivery_evidence SET status = $6, last_revalidated_at = now()
+          WHERE id = $1 AND transfer_id = $2 AND status = 'canonical'
+            AND execution_tx_hash = $3 AND receipt_block = $4 AND receipt_block_hash = $5
+          RETURNING id`,
+        [
+          String(row.id),
+          String(row.transfer_id),
+          txHash,
+          blockNumber.toString(),
+          blockHash,
+          canonical ? "canonical" : "orphaned",
+        ],
+      );
+      if (canonical || result.rowCount !== 1) return false;
       await tx.query("DELETE FROM inbound_delivery WHERE axelar_evidence_id = $1", [
-        evidenceId.toString(),
+        String(row.id),
       ]);
       await tx.query(
-        `UPDATE rail_attestation
-            SET status = 'attested', updated_at = now()
-          WHERE transfer_id = $1 AND status = 'delivered'`,
-        [transferId.toString()],
+        `UPDATE rail_attestation SET status = 'attested', updated_at = now(),
+            next_attempt_at = now(), retry_class = NULL
+          WHERE transfer_id = $1 AND status = 'delivered'
+            AND NOT EXISTS (SELECT 1 FROM inbound_delivery d JOIN outbound_transfer t
+              ON (t.origin_chain, t.nonce) = (d.source_chain, d.source_nonce)
+              WHERE t.id = $1 AND d.delivered = true)`,
+        [String(row.transfer_id)],
       );
+      return true;
     });
-    orphaned += 1;
+    if (changed) orphaned += 1;
   }
   return orphaned;
 }
@@ -137,7 +150,7 @@ function canonicalityClient(url: string): AxelarCanonicalityClient {
 // The rail API supplies a candidate receipt. Only matching confirmed chain events establish delivery.
 export async function verifyItsDelivery(
   config: AppConfig,
-  db: Transactional,
+  db: Queryable,
   transfer: PendingTransfer,
   report: RailReport,
 ): Promise<VerifiedItsDelivery | null> {
@@ -240,6 +253,7 @@ export async function verifyItsDelivery(
       observedAt: new Date(Number(block.timestamp) * 1000),
     },
     row: {
+      sourceTransferId: transfer.transferId,
       route: transfer.route,
       sourceChain: transfer.originChain,
       sourceNonce: transfer.nonce,

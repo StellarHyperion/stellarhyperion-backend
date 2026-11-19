@@ -54,7 +54,7 @@ export interface GmpOptions {
   readonly onUnknownStatus?: (status: string) => void;
 }
 const SECRET_KEY =
-  /(?:authorization|password|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|credential|private[_-]?key|cookie)/i;
+  /(?:authorization|password|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|credential|signer|seed|mnemonic|private[_-]?key|cookie)/i;
 const MAX_STATUS_ROWS = 100;
 const MAX_QUARANTINE_BYTES = 16_384;
 const MAX_STRING = 512;
@@ -110,9 +110,10 @@ export class AxelarGmpClient implements RailClient {
       }
     }
     if (selected) return { kind: "found", report: this.reportFor(selected) };
-    const unsupported = rows.find((item) => !isSupportedRow(item));
-    if (unsupported !== undefined) {
-      const row = unsupported as Record<string, unknown>;
+    const unsupportedIndex = rows.findIndex((item) => !isSupportedRow(item));
+    if (unsupportedIndex !== -1) {
+      const unsupported = rows[unsupportedIndex];
+      const row = isObject(unsupported) ? unsupported : {};
       return {
         kind: "found",
         report: {
@@ -128,7 +129,7 @@ export class AxelarGmpClient implements RailClient {
                 : typeof row.id === "string"
                   ? safeString(row.id)
                   : null,
-            payload: bounded(row),
+            payload: bounded(unsupported),
           },
         },
       };
@@ -145,13 +146,13 @@ export class AxelarGmpClient implements RailClient {
         response.status >= 500 ? "transient" : "permanent",
         `http ${String(response.status)}`,
       );
-    let body: { readonly data?: unknown };
+    let body: unknown;
     try {
-      body = (await response.json()) as { readonly data?: unknown };
+      body = await response.json();
     } catch (cause) {
       throw new RailError(this.rail, "transient", `response was not json: ${describe(cause)}`);
     }
-    if (!Array.isArray(body.data))
+    if (!isObject(body) || !Array.isArray(body.data))
       throw new RailError(this.rail, "transient", "status API returned an invalid data field");
     if (body.data.length > MAX_STATUS_ROWS)
       throw new RailError(this.rail, "transient", "status API returned too many data rows");
@@ -163,7 +164,7 @@ export class AxelarGmpClient implements RailClient {
     const flags = [...RECOVERABLE_FLAGS, ...FATAL_FLAGS].filter((flag) => row[flag] === true);
     let mapped = MAPPING[status];
     if (mapped === undefined) {
-      if (!this.reported.has(status)) {
+      if (!this.reported.has(status) && this.reported.size < 64) {
         this.reported.add(status);
         this.options.onUnknownStatus?.(safeString(status));
       }
@@ -234,7 +235,13 @@ export class AxelarGmpClient implements RailClient {
 }
 function stampOf(stage: { readonly block_timestamp?: unknown } | null | undefined): Date | null {
   const seconds = stage?.block_timestamp;
-  if (typeof seconds !== "number" || seconds <= 0) return null;
+  if (
+    typeof seconds !== "number" ||
+    !Number.isFinite(seconds) ||
+    seconds <= 0 ||
+    seconds > 8_640_000_000_000
+  )
+    return null;
   return new Date(seconds * 1000);
 }
 function describe(cause: unknown): string {
@@ -250,7 +257,22 @@ function callOf(row: Record<string, unknown>): GmpRow["call"] {
   return row.call as GmpRow["call"];
 }
 function isSupportedRow(value: unknown): boolean {
-  if (!isObject(value)) return false;
+  if (!isObject(value) || typeof value.status !== "string" || value.status.length === 0)
+    return false;
+  for (const stage of ["executed", "approved"]) {
+    const item = value[stage];
+    if (
+      item !== undefined &&
+      item !== null &&
+      (!isObject(item) ||
+        (item.block_timestamp !== undefined &&
+          (typeof item.block_timestamp !== "number" || !Number.isFinite(item.block_timestamp))) ||
+        (item.transactionHash !== undefined && typeof item.transactionHash !== "string"))
+    )
+      return false;
+  }
+  for (const flag of [...RECOVERABLE_FLAGS, ...FATAL_FLAGS])
+    if (value[flag] !== undefined && typeof value[flag] !== "boolean") return false;
   for (const key of ["status", "simplified_status", "message_id", "id", "command_id"]) {
     if (value[key] !== undefined && typeof value[key] !== "string") return false;
   }
@@ -263,7 +285,7 @@ function isSupportedRow(value: unknown): boolean {
   }
   return true;
 }
-function bounded(value: unknown): unknown {
+export function bounded(value: unknown): unknown {
   const sanitized = sanitize(value, 0);
   const serialized = JSON.stringify(sanitized);
   if (serialized.length <= MAX_QUARANTINE_BYTES) return sanitized;
@@ -287,9 +309,13 @@ function sanitize(value: unknown, depth: number): unknown {
       ]),
   );
 }
-function safeString(value: string): string {
+export function safeString(value: string): string {
   return value
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [redacted]")
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/-]+=*/gi, "$1 [redacted]")
+    .replace(
+      /\b(?:authorization|password|secret|api[_-]?key|access[_-]?token|private[_-]?key)\s*[:=]\s*[^,;\s]+/gi,
+      "[redacted]",
+    )
     .replace(
       /([?&](?:api[_-]?key|access[_-]?token|token|password|secret)=)[^&#\s]*/gi,
       "$1[redacted]",
