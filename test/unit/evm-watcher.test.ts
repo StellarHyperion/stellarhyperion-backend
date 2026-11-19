@@ -421,7 +421,7 @@ describe("unknown router logs", () => {
       blockNumber: 20n,
       transactionHash: `0x${"12".repeat(32)}`,
       logIndex: 0,
-      data: "0xdeadbeef" as `0x${string}`,
+      data: "0xdeadbeef",
       topics: [`0x${"34".repeat(32)}`],
       removed: false,
     };

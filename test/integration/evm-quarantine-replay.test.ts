@@ -71,7 +71,7 @@ const connection = process.env.TEST_DATABASE_URL;
       ),
     );
   };
-  beforeAll(async () => {
+  beforeAll(() => {
     db = Database.open(connection ?? "");
   });
   beforeEach(clean);

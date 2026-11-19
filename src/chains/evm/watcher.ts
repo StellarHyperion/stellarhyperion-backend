@@ -232,8 +232,7 @@ export class EvmWatcher {
         if (
           entry.log.blockNumber < this.options.startBlock ||
           entry.log.blockNumber > boundary ||
-          stamp === undefined ||
-          stamp.hash.toLowerCase() !== entry.blockHash.toLowerCase()
+          stamp?.hash.toLowerCase() !== entry.blockHash.toLowerCase()
         )
           throw new Error("Quarantined evidence is outside the confirmed canonical deployment.");
         if (conflicts.has(logKey(entry.log))) {
@@ -336,12 +335,11 @@ export class EvmWatcher {
           ignored += 1;
           continue;
         }
-        const timestamp = blocks.get(log.blockNumber)?.timestamp;
-        if (timestamp === undefined) {
+        const stamp = blocks.get(log.blockNumber);
+        if (stamp === undefined) {
           throw new Error(`no timestamp for block ${log.blockNumber.toString()} on ${chainKey}`);
         }
-        if (await this.apply(tx, log, timestamp, pairing, blocks.get(log.blockNumber)!.hash))
-          written += 1;
+        if (await this.apply(tx, log, stamp.timestamp, pairing, stamp.hash)) written += 1;
         else ignored += 1;
       }
     });
@@ -552,14 +550,13 @@ export class EvmWatcher {
             ignored += 1;
             continue;
           }
-          const timestamp = blocks.get(log.blockNumber)?.timestamp;
-          if (timestamp === undefined) {
+          const stamp = blocks.get(log.blockNumber);
+          if (stamp === undefined) {
             throw new Error(
               `no timestamp for block ${log.blockNumber.toString()} on ${chainKey}, which three columns need`,
             );
           }
-          if (await this.apply(tx, log, timestamp, pairing, blocks.get(log.blockNumber)!.hash))
-            written += 1;
+          if (await this.apply(tx, log, stamp.timestamp, pairing, stamp.hash)) written += 1;
           else ignored += 1;
         }
         await writeCursor(tx, {
