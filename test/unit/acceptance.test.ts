@@ -17,8 +17,8 @@ const policy = {
   token: "USDC",
   representation: "ITS-Stellar-USDC",
   decimals: 7,
-  sourcePublicKey: source.publicKey.export({ type: "spki", format: "pem" }).toString(),
-  destinationPublicKey: destination.publicKey.export({ type: "spki", format: "pem" }).toString(),
+  sourcePublicKey: source.publicKey.export({ type: "spki", format: "pem" }),
+  destinationPublicKey: destination.publicKey.export({ type: "spki", format: "pem" }),
 };
 const proof: SignedLaneAcceptance = {
   network: policy.network,
@@ -129,19 +129,21 @@ describe("lane acceptance", () => {
 
 describe("isolated concurrency configuration", () => {
   it("requires explicit separate configuration before targeting a remote or production database", () => {
-    expect(() => validateConcurrencyDatabase("postgres://localhost/hyperion_test")).not.toThrow();
-    expect(() =>
-      validateConcurrencyDatabase("postgres://localhost/hyperion_session_305"),
-    ).not.toThrow();
-    expect(() => validateConcurrencyDatabase("postgres://localhost/production")).toThrow(
-      "dedicated local test",
-    );
-    expect(() => validateConcurrencyDatabase("postgres://remote.example/hyperion_test")).toThrow(
-      "dedicated local test",
-    );
-    expect(() =>
-      validateConcurrencyDatabase("postgres://remote.example/hyperion_test", true),
-    ).not.toThrow();
+    expect(() => {
+      validateConcurrencyDatabase("postgres://localhost/hyperion_test");
+    }).not.toThrow();
+    expect(() => {
+      validateConcurrencyDatabase("postgres://localhost/hyperion_session_305");
+    }).not.toThrow();
+    expect(() => {
+      validateConcurrencyDatabase("postgres://localhost/production");
+    }).toThrow("dedicated local test");
+    expect(() => {
+      validateConcurrencyDatabase("postgres://remote.example/hyperion_test");
+    }).toThrow("dedicated local test");
+    expect(() => {
+      validateConcurrencyDatabase("postgres://remote.example/hyperion_test", true);
+    }).not.toThrow();
   });
   it("retains failed worker results and bounds concurrency", async () => {
     expect(

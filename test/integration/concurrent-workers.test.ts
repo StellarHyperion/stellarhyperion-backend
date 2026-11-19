@@ -6,7 +6,8 @@ import { concurrencyBarrier, runConcurrent, validateConcurrencyDatabase } from "
 
 const connection = process.env.TEST_DATABASE_URL;
 (connection ? describe : describe.skip)("real concurrent worker fault boundaries", () => {
-  let db: Database;
+  const db = Database.open(connection ?? "", { maxConnections: 4 });
+  let prepared = false;
   const chain = `concurrency-${process.pid}`;
   const table = `public.hyperion_worker_stress_${process.pid}`;
   beforeAll(async () => {
@@ -14,12 +15,15 @@ const connection = process.env.TEST_DATABASE_URL;
       connection ?? "",
       process.env.HYPERION_ALLOW_REMOTE_CONCURRENCY_TEST_DATABASE === "true",
     );
-    db = Database.open(connection ?? "", { maxConnections: 4 });
     await db.query(`CREATE TABLE ${table} (id integer PRIMARY KEY, value integer NOT NULL)`);
     await db.query(`INSERT INTO ${table} VALUES (1,0),(2,0)`);
+    prepared = true;
   });
   afterAll(async () => {
-    if (!db) return;
+    if (!prepared) {
+      await db.close();
+      return;
+    }
     await db.query("DELETE FROM indexer_lease WHERE chain_key=$1", [chain]);
     await db.query("DELETE FROM indexer_cursor WHERE chain_key=$1", [chain]);
     await db.query(`DROP TABLE IF EXISTS ${table}`);
