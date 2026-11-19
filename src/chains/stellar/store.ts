@@ -618,6 +618,7 @@ export async function writeBackfillCursor(
 /** Context for one Soroban event, in the shape the shared writers take. */
 export interface EventContext {
   readonly chainKey: string;
+  readonly router: string;
   readonly ledger: number;
   readonly txHash: string;
   readonly closedAt: Date;
@@ -626,6 +627,7 @@ export interface EventContext {
 function positionOf(context: EventContext): Position {
   return {
     chainKey: context.chainKey,
+    router: context.router,
     block: BigInt(context.ledger),
     txHash: context.txHash,
     // Soroban orders events by operation and event index within a transaction rather than by a
@@ -983,7 +985,7 @@ export async function inspectEventConflict(
     );
     const { rows } = await db.query(
       `SELECT evidence FROM stellar_event_identity
-      WHERE chain_key = $1 AND identity = $3 AND (contract = $2 OR identity NOT LIKE 'event:%') FOR UPDATE`,
+      WHERE chain_key = $1 AND identity = $3 AND (contract = $2 OR (identity NOT LIKE 'event:%' AND identity NOT LIKE 'bridgeOut:%')) FOR UPDATE`,
       [chainKey, raw.contractId, identity],
     );
     const existing = rows[0]?.evidence as EventEvidenceSnapshot | undefined;

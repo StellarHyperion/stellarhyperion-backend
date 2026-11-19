@@ -361,7 +361,7 @@ export class EvmWatcher {
     timestamp: bigint,
     pairing: ClaimPairing,
   ): Promise<boolean> {
-    const { chainKey, logger } = this.options;
+    const { chainKey, router, logger } = this.options;
     const decoded = decodeRouterLog(log);
     if (decoded === null) {
       const signature = signatureOf(log);
@@ -377,6 +377,7 @@ export class EvmWatcher {
 
     const at: Position = {
       chainKey,
+      router,
       block: log.blockNumber,
       txHash: log.transactionHash,
       // Unlike Soroban, which orders events within a transaction instead.
