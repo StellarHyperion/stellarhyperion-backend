@@ -21,6 +21,7 @@ import {
   compactRouteHealthSamples,
 } from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
+import { concurrencyBarrier, runConcurrent } from "../helpers.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
 const suite = CONNECTION === undefined ? describe.skip : describe;
@@ -296,6 +297,42 @@ suite("the schema", () => {
     expect(reloptions).toBeDefined();
     expect(reloptions).toContain("autovacuum_vacuum_scale_factor=0.05");
     expect(reloptions).toContain("autovacuum_vacuum_cost_limit=500");
+  });
+
+  it("serializes competing worker transactions without losing an update", async () => {
+    await db.query(
+      "CREATE TABLE IF NOT EXISTS public.hyperion_concurrency_test (id integer PRIMARY KEY, value integer NOT NULL)",
+    );
+    await db.query("DELETE FROM public.hyperion_concurrency_test");
+    await db.query("INSERT INTO public.hyperion_concurrency_test (id, value) VALUES (1, 0)");
+
+    const started = concurrencyBarrier(2);
+    const lockReady = concurrencyBarrier(2);
+    const outcomes = await runConcurrent(2, async (worker) =>
+      db.transaction(async (tx) => {
+        await tx.query("SET LOCAL lock_timeout = '2s'");
+        await started.wait();
+        if (worker === 0) {
+          await tx.query(
+            "UPDATE public.hyperion_concurrency_test SET value = value + 1 WHERE id = 1",
+          );
+          await lockReady.wait();
+        } else {
+          await lockReady.wait();
+          await tx.query(
+            "UPDATE public.hyperion_concurrency_test SET value = value + 1 WHERE id = 1",
+          );
+        }
+        return worker;
+      }),
+    );
+
+    expect(outcomes.every((outcome) => outcome.status === "fulfilled")).toBe(true);
+    const { rows } = await db.query(
+      "SELECT value FROM public.hyperion_concurrency_test WHERE id = 1",
+    );
+    expect(rows[0]?.value).toBe(2);
+    await db.query("DROP TABLE public.hyperion_concurrency_test");
   });
 });
 
