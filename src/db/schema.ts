@@ -1,47 +1,37 @@
-/**
- * Startup schema compatibility check.
- *
- * Verifies the database has been migrated to the expected schema version before the
- * process serves requests or indexes events. It never runs migrations itself: an
- * incompatible schema is a startup failure with an actionable message, not a silent
- * schema drift that corrupts indexed rows.
- *
- * node-pg-migrate records each applied migration in `pgmigrations.name`. The expected
- * version is the newest migration file this build ships, so a database that has not
- * had `npm run migrate:up` applied is refused rather than served against stale tables.
- *
- * Nothing in an error message carries a connection string, host or password: only the
- * variable name and the shape of the failure.
- */
-
-import type { Queryable } from "../db/pool.js";
-
-/** The newest migration this build ships. Kept in step with `migrations/`. */
-export const EXPECTED_SCHEMA_VERSION = "1792000000000_evm-backfill-jobs";
-
-/** Thrown when the database schema is not at the expected version. */
+import { readdirSync } from "node:fs";
+import type { Queryable } from "./pool.js";
+const REQUIRED_MIGRATIONS = readdirSync(new URL("../../migrations/", import.meta.url))
+  .filter((name) => /^\d{13}_[a-z0-9-]+\.sql$/.test(name))
+  .map((name) => name.slice(0, -4))
+  .sort();
+export const EXPECTED_SCHEMA_VERSION = REQUIRED_MIGRATIONS.at(-1) ?? "unavailable";
 export class SchemaIncompatibleError extends Error {
-  constructor(readonly expected: string, readonly applied: string | null) {
+  constructor(
+    readonly expected: string,
+    readonly applied: string | null,
+  ) {
     super(
-      applied === null
-        ? `Database schema is uninitialised: expected ${expected}, found no applied migrations. Run \`npm run migrate:up\` before starting.`
-        : `Database schema is incompatible: expected ${expected}, found ${applied}. Run \`npm run migrate:up\` to apply pending migrations before starting.`,
+      `Database schema admission failed: this build requires ${expected}. Apply the shipped migrations with npm run migrate:up before startup; schema checks never run migrations.`,
     );
     this.name = "SchemaIncompatibleError";
   }
 }
-
-/** Query the migration table and throw if the expected version has not been applied. */
 export async function checkSchemaCompatibility(
   db: Queryable,
-  expectedVersion: string,
+  expectedVersion = EXPECTED_SCHEMA_VERSION,
 ): Promise<void> {
-  const { rows } = await db.query(
-    "SELECT name FROM pgmigrations WHERE name = $1 ORDER BY name DESC LIMIT 1",
-    [expectedVersion],
-  );
-  const applied = rows.length > 0 ? String(rows[0].name) : null;
-  if (applied !== expectedVersion) {
-    throw new SchemaIncompatibleError(expectedVersion, applied);
+  if (expectedVersion !== EXPECTED_SCHEMA_VERSION || REQUIRED_MIGRATIONS.length === 0)
+    throw new SchemaIncompatibleError(EXPECTED_SCHEMA_VERSION, null);
+  let rows;
+  try {
+    rows = (await db.query("SELECT name FROM pgmigrations ORDER BY name")).rows;
+  } catch {
+    throw new SchemaIncompatibleError(expectedVersion, null);
   }
+  const applied = rows.map((row) => String(row.name));
+  if (
+    applied.length !== REQUIRED_MIGRATIONS.length ||
+    REQUIRED_MIGRATIONS.some((name, index) => name !== applied[index])
+  )
+    throw new SchemaIncompatibleError(expectedVersion, null);
 }
