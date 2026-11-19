@@ -10,6 +10,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { writeOutbound, writeInbound } from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
 import { outstandingForRail, pendingForRail } from "../../src/rails/queue.js";
+import { requeueTerminalTransfer } from "../../src/rails/requeue.js";
 import { RailPass } from "../../src/rails/pass.js";
 import {
   RailError,
@@ -29,6 +30,7 @@ suite("rail pollers against real Postgres", () => {
   let db: Database;
 
   const clean = async (): Promise<void> => {
+    await db.query("DELETE FROM rail_requeue_audit WHERE route IN (0, 1)");
     await db.query("DELETE FROM rail_attestation WHERE route IN (0, 1)");
     await db.query("DELETE FROM inbound_delivery WHERE route IN (0, 1)");
     await db.query("DELETE FROM outbound_transfer WHERE route IN (0, 1)");
@@ -613,5 +615,283 @@ suite("rail pollers against real Postgres", () => {
       ["0x4444444444444444444444444444444444444444"],
     );
     expect((await pendingForRail(db, query))[0]?.delivered).toBe(false);
+  });
+  it("requeues an expired transfer with its original identity and records the review", async () => {
+    const { logger } = capturingLogger();
+    const nonce = 18446744073709551615n;
+    const amount = 100000000000000000000000000000000000000n;
+    const transfer = {
+      chainKey: ORIGIN_CHAIN,
+      block: 1009n,
+      txHash: "0xaaa606",
+      logIndex: 0,
+      observedAt: new Date(),
+    };
+    const outbound = {
+      route: 0,
+      nonce,
+      sender: "0x1111111111111111111111111111111111111111",
+      token: "0x3333333333333333333333333333333333333333",
+      grossAmount: amount + 1_000n,
+      fee: 1_000n,
+      netAmount: amount,
+      destinationChain: DESTINATION_CHAIN,
+      destination: "0x2222222222222222222222222222222222222222",
+      railRef: "0xrail-reference",
+    };
+    await db.transaction(async (tx) => {
+      await writeOutbound(tx, transfer, outbound);
+    });
+
+    const seeded = await db.query(
+      "SELECT id FROM outbound_transfer WHERE origin_chain = $1 AND nonce = $2",
+      [ORIGIN_CHAIN, nonce.toString()],
+    );
+    const transferId = BigInt(String(seeded.rows[0]?.id));
+    await db.query(
+      `INSERT INTO rail_attestation
+         (transfer_id, route, status, rail_status, rail_reference, check_failures,
+          last_error, retry_class, next_attempt_at)
+       VALUES ($1, 0, 'expired', 'timeout', 'old-rail-ref', 5,
+               'generic lookup failure', 'exhausted', NULL)`,
+      [transferId.toString()],
+    );
+
+    const result = await requeueTerminalTransfer(db, {
+      transferId,
+      reviewedBy: "rail-operator",
+      reason: "Provider evidence became available",
+    });
+    expect(result).toEqual({ transferId, route: 0, priorStatus: "expired" });
+
+    const identity = await db.query(
+      `SELECT origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
+              destination_chain, destination, origin_tx
+         FROM outbound_transfer WHERE id = $1`,
+      [transferId.toString()],
+    );
+    expect(identity.rows[0]).toMatchObject({
+      origin_chain: ORIGIN_CHAIN,
+      route: 0,
+      nonce: nonce.toString(),
+      sender: outbound.sender,
+      token: outbound.token,
+      gross_amount: outbound.grossAmount.toString(),
+      fee: outbound.fee.toString(),
+      net_amount: amount.toString(),
+      destination_chain: DESTINATION_CHAIN,
+      destination: outbound.destination,
+      origin_tx: transfer.txHash,
+    });
+
+    const audit = await db.query(
+      `SELECT origin_chain, nonce, prior_status, new_status, reviewed_by, reviewed_reason
+         FROM rail_requeue_audit WHERE transfer_id = $1`,
+      [transferId.toString()],
+    );
+    expect(audit.rows).toEqual([
+      {
+        origin_chain: ORIGIN_CHAIN,
+        nonce: nonce.toString(),
+        prior_status: "expired",
+        new_status: "pending",
+        reviewed_by: "rail-operator",
+        reviewed_reason: "Provider evidence became available",
+      },
+    ]);
+
+    const client: RailClient = {
+      rail: "cctp",
+      look: (candidate): Promise<RailLookup> => {
+        expect(candidate.transferId).toBe(transferId);
+        expect(candidate.nonce).toBe(nonce);
+        expect(candidate.originChain).toBe(ORIGIN_CHAIN);
+        expect(candidate.originTx).toBe(transfer.txHash);
+        return Promise.resolve({
+          kind: "found",
+          report: {
+            status: "attested",
+            railStatus: "complete",
+            reference: "new-rail-ref",
+            attestedAt: new Date(),
+          },
+        });
+      },
+    };
+    const pass = new RailPass({
+      route: 0,
+      client,
+      db,
+      logger,
+      batchSize: 10,
+      recheckAfterMs: 1_000,
+      maxCheckFailures: 5,
+    });
+    await pass.evaluateTransfer(transferId);
+    const status = await db.query(
+      "SELECT status, rail_reference FROM rail_attestation WHERE transfer_id = $1",
+      [transferId.toString()],
+    );
+    expect(status.rows[0]).toMatchObject({ status: "attested", rail_reference: "new-rail-ref" });
+    await expect(
+      requeueTerminalTransfer(db, {
+        transferId,
+        reviewedBy: "rail-operator",
+        reason: "Repeated requeue must not reopen an active transfer",
+      }),
+    ).rejects.toMatchObject({ kind: "not_terminal" });
+  });
+
+  it("refuses to requeue a failed transfer after destination evidence is indexed", async () => {
+    const transferId = 607n;
+    await db.transaction(async (tx) => {
+      await writeOutbound(
+        tx,
+        {
+          chainKey: ORIGIN_CHAIN,
+          block: 1010n,
+          txHash: "0xaaa607",
+          logIndex: 0,
+          observedAt: new Date(),
+        },
+        {
+          route: 0,
+          nonce: transferId,
+          sender: "0x1111111111111111111111111111111111111111",
+          token: "0x3333333333333333333333333333333333333333",
+          grossAmount: 1001000n,
+          fee: 1000n,
+          netAmount: 1000000n,
+          destinationChain: DESTINATION_CHAIN,
+          destination: "0x2222222222222222222222222222222222222222",
+          railRef: "0xrail-607",
+        },
+      );
+      await writeInbound(
+        tx,
+        {
+          chainKey: DESTINATION_CHAIN,
+          block: 2010n,
+          txHash: "0xdest607",
+          logIndex: 0,
+          observedAt: new Date(),
+        },
+        {
+          route: 0,
+          sourceChain: ORIGIN_CHAIN,
+          sourceNonce: transferId,
+          recipient: "0x2222222222222222222222222222222222222222",
+          token: "0x3333333333333333333333333333333333333333",
+          amount: 1000000n,
+          delivered: true,
+          claimId: null,
+          railMessageId: "0xmsg607",
+        },
+      );
+    });
+    const seeded = await db.query(
+      "SELECT id FROM outbound_transfer WHERE origin_chain = $1 AND nonce = $2",
+      [ORIGIN_CHAIN, transferId.toString()],
+    );
+    const id = BigInt(String(seeded.rows[0]?.id));
+    await db.query(
+      "INSERT INTO rail_attestation (transfer_id, route, status) VALUES ($1, 0, 'failed')",
+      [id.toString()],
+    );
+
+    await expect(
+      requeueTerminalTransfer(db, {
+        transferId: id,
+        reviewedBy: "rail-operator",
+        reason: "Do not repeat a confirmed payout",
+      }),
+    ).rejects.toMatchObject({ kind: "already_delivered" });
+    const status = await db.query("SELECT status FROM rail_attestation WHERE transfer_id = $1", [
+      id.toString(),
+    ]);
+    expect(status.rows[0]?.status).toBe("failed");
+    const audit = await db.query("SELECT id FROM rail_requeue_audit WHERE transfer_id = $1", [
+      id.toString(),
+    ]);
+    expect(audit.rows).toHaveLength(0);
+  });
+  it("audits held evidence recovery exactly once under concurrent operator requests", async () => {
+    await seedRetry(1001n);
+    const id = String(
+      (await db.query("SELECT id FROM outbound_transfer WHERE nonce = 1001")).rows[0]?.id,
+    );
+    await db.query(
+      `INSERT INTO rail_attestation
+      (transfer_id, route, status, check_failures, retry_attempts, retry_class)
+      VALUES ($1, 0, 'pending', 5, 30, 'exhausted')`,
+      [id],
+    );
+    const request = {
+      transferId: BigInt(id),
+      reviewedBy: "operator",
+      reason: "Source evidence corrected",
+    };
+    const results = await Promise.allSettled([
+      requeueTerminalTransfer(db, request),
+      requeueTerminalTransfer(db, request),
+    ]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    const row = (await db.query("SELECT * FROM rail_attestation WHERE transfer_id = $1", [id]))
+      .rows[0];
+    expect(row).toMatchObject({
+      status: "pending",
+      check_failures: 0,
+      retry_attempts: 0,
+      retry_class: null,
+    });
+    const audit = (await db.query("SELECT * FROM rail_requeue_audit WHERE transfer_id = $1", [id]))
+      .rows;
+    expect(audit).toHaveLength(1);
+    expect(audit[0]).toMatchObject({
+      prior_status: "pending",
+      prior_retry_class: "exhausted",
+      reviewed_by: "operator",
+    });
+  });
+
+  it("immediate evaluation respects future schedules and replica ownership", async () => {
+    await seedRetry(1002n);
+    const id = BigInt(
+      String((await db.query("SELECT id FROM outbound_transfer WHERE nonce = 1002")).rows[0]?.id),
+    );
+    await db.query(
+      `INSERT INTO rail_attestation (transfer_id, route, status, next_attempt_at)
+      VALUES ($1, 0, 'pending', now() + interval '1 hour')`,
+      [id.toString()],
+    );
+    const { logger } = capturingLogger();
+    let calls = 0;
+    const options = {
+      route: 0,
+      db,
+      logger,
+      batchSize: 1,
+      recheckAfterMs: 60_000,
+      maxCheckFailures: 5,
+      client: {
+        rail: "cctp",
+        look: (): Promise<RailLookup> => {
+          calls += 1;
+          return Promise.resolve({ kind: "missing" });
+        },
+      },
+    };
+    expect(await new RailPass(options).evaluateTransfer(id)).toBe(false);
+    expect(calls).toBe(0);
+    await db.query("UPDATE rail_attestation SET next_attempt_at = now() WHERE transfer_id = $1", [
+      id.toString(),
+    ]);
+    await db.transaction(async (tx) => {
+      await tx.query("SELECT id FROM outbound_transfer WHERE id = $1 FOR UPDATE", [id.toString()]);
+      expect(await new RailPass(options).evaluateTransfer(id)).toBe(false);
+      expect(calls).toBe(0);
+    });
+    await new RailPass(options).evaluateTransfer(id);
+    expect(calls).toBe(1);
   });
 });

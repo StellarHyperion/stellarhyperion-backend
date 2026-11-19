@@ -105,6 +105,20 @@ export interface PendingTransfer {
   readonly delivered: boolean;
 }
 
+/** An operator's review, required before a terminal transfer can re-enter the rail queue. */
+export interface RailRequeueRequest {
+  readonly transferId: bigint;
+  readonly reviewedBy: string;
+  readonly reason: string;
+}
+
+/** The prior terminal state recorded alongside the requeue audit entry. */
+export interface RailRequeueResult {
+  readonly transferId: bigint;
+  readonly route: number;
+  readonly priorStatus: "pending" | "attested" | "failed" | "expired";
+}
+
 /** What a rail client has to offer the pass that polls it. */
 export interface RailClient {
   readonly rail: string;

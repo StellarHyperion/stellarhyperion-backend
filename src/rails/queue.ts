@@ -16,6 +16,8 @@ import type { Queryable } from "../db/pool.js";
 import { bigintOf, integer, text, textOrNull } from "../db/rows.js";
 import type { AttestationStatus, PendingTransfer } from "./types.js";
 
+export { requeueTerminalTransfer } from "./requeue.js";
+
 const STATUSES: readonly string[] = ["pending", "attested", "delivered", "failed", "expired"];
 
 export interface QueueQuery {
@@ -25,6 +27,7 @@ export interface QueueQuery {
   /** Only inside the transaction that processes and writes this transfer. */
   readonly lock?: boolean;
   readonly excludedTransferIds?: readonly bigint[];
+  readonly onlyTransferId?: bigint;
   /**
    * Skip transfers checked more recently than this.
    *
@@ -67,6 +70,7 @@ export async function pendingForRail(
        LEFT JOIN rail_attestation a ON a.transfer_id = t.id
       WHERE t.route = $1
         AND NOT (t.id = ANY($6::bigint[]))
+        AND ($7::bigint IS NULL OR t.id = $7)
         AND (a.transfer_id IS NULL OR a.status IN ('pending', 'attested'))
         AND COALESCE(a.check_failures, 0) < $2
         AND a.retry_class IS DISTINCT FROM 'permanent'
@@ -87,10 +91,35 @@ export async function pendingForRail(
       query.notCheckedSince,
       query.limit,
       (query.excludedTransferIds ?? []).map(String),
+      query.onlyTransferId?.toString() ?? null,
     ],
   );
 
-  return rows.map((row) => ({
+  return rows.map((row) => mapPendingRow(row));
+}
+
+/** Fetch one active transfer for an operator-requested immediate re-evaluation. */
+export async function pendingTransferById(
+  db: Queryable,
+  route: number,
+  transferId: bigint,
+  maxCheckFailures = 5,
+): Promise<PendingTransfer | null> {
+  const now = new Date();
+  const rows = await pendingForRail(db, {
+    route,
+    limit: 1,
+    now,
+    notCheckedSince: now,
+    maxCheckFailures,
+    onlyTransferId: transferId,
+    lock: true,
+  });
+  return rows[0] ?? null;
+}
+
+function mapPendingRow(row: Record<string, unknown>): PendingTransfer {
+  return {
     transferId: bigintOf(row, "id"),
     route: integer(row, "route"),
     originChain: text(row, "origin_chain"),
@@ -101,7 +130,7 @@ export async function pendingForRail(
     checkFailures: integer(row, "check_failures"),
     retryAttempts: integer(row, "retry_attempts"),
     delivered: row.delivered === true,
-  }));
+  };
 }
 
 /**

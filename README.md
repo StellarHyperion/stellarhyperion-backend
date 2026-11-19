@@ -53,18 +53,13 @@ Unknown or unreachable APIs produce errors; there are no fabricated deliveries o
 
 Rail lookup failures persist a normalized `retry_class` and `next_attempt_at`. Transient failures use capped exponential backoff; rate limits use the provider's retry delay. Permanent failures and transfers that exhaust the configured evidence-failure count are held for operator recovery and are not retried automatically. After correcting the underlying issue and reviewing the source transfer, an operator may explicitly re-enable one transfer with:
 
-```sql
-UPDATE rail_attestation
-   SET check_failures = 0,
-       retry_attempts = 0,
-       retry_class = NULL,
-       next_attempt_at = now(),
-       last_error = NULL
- WHERE transfer_id = '<transfer-id>'
-   AND retry_class IN ('permanent', 'exhausted');
+```bash
+npm run migrate:up
+npm run build
+npm run rail:requeue -- --transfer-id 123 --reviewed-by operator-name --reason "Provider evidence is now available"
 ```
 
-The worker stores only a generic failure category in `last_error`; provider error text and credentials are not exposed through the public transfer API or retry logs.
+Transfers in `failed` or `expired`, or pending/attested transfers held for `permanent`/`exhausted` evidence failures, can be reopened. Each requeue atomically records the prior state, operator and reason. A matching destination delivery or claim blocks requeue, and the original source transfer is never rewritten. Add `--evaluate-now` to make one immediate rail lookup after requeue; otherwise the regular worker picks it up. Provider error text and credentials are not exposed through the public transfer API or retry logs.
 
 ## Protocol fees and claims
 

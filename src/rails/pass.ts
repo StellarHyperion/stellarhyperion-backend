@@ -25,7 +25,7 @@ import type { Logger } from "pino";
 import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
 import { writeInbound, writeAttestation } from "../chains/writers.js";
-import { outstandingForRail, pendingForRail } from "./queue.js";
+import { outstandingForRail, pendingForRail, pendingTransferById } from "./queue.js";
 import {
   RailError,
   isTerminal,
@@ -73,6 +73,14 @@ export class RailPass {
 
   get name(): string {
     return `rail:${this.options.client.rail}`;
+  }
+
+  get rail(): string {
+    return this.options.client.rail;
+  }
+
+  get route(): number {
+    return this.options.route;
   }
 
   get progress(): RailProgress | null {
@@ -180,6 +188,35 @@ export class RailPass {
 
     // A full batch means the queue is longer than one pass, so come straight back.
     return selected >= batchSize && !stoppedForCooldown;
+  }
+
+  /** Re-evaluate one reopened transfer immediately, without changing its source identity. */
+  async evaluateTransfer(
+    transferId: bigint,
+    signal: AbortSignal = new AbortController().signal,
+  ): Promise<boolean> {
+    if (signal.aborted) return false;
+    const cooldown = this.cooldownUntil;
+    if (cooldown !== null && cooldown > this.now()) return false;
+    return this.options.db.transaction(async (tx) => {
+      const transfer = await pendingTransferById(
+        tx,
+        this.options.route,
+        transferId,
+        this.options.maxCheckFailures,
+      );
+      if (transfer === null) return false;
+      try {
+        return await this.handle(transfer, tx, signal);
+      } catch (error) {
+        signal.throwIfAborted();
+        await this.recordFailure(transfer, error, tx);
+        if (error instanceof RailError && error.kind === "rateLimited") {
+          this.cooldownUntil = this.failureRetryAt(this.now(), transfer.retryAttempts + 1, error);
+        }
+        return false;
+      }
+    });
   }
 
   /** Returns true when the transfer reached a terminal state on this pass. */
