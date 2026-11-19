@@ -28,6 +28,7 @@ const connection = process.env.TEST_DATABASE_URL;
   const fixture = cctpProofFixture();
   const base = loadConfig({ env: completeEnv() });
   const source = base.deployments.networks["stellar-testnet"]!;
+  if (source.family !== "stellar") throw new Error("Expected Stellar source deployment.");
   const config = {
     ...base,
     deployments: {
@@ -137,14 +138,15 @@ const connection = process.env.TEST_DATABASE_URL;
     forwardTxHash: hash,
     messageBytes: fixture.raw,
   };
-  it.each([
-    ["forward_tx_missing", { forwardTxHash: undefined }],
-    ["message_missing", { messageBytes: null }],
-  ] as const)(
+  it.each(["forward_tx_missing", "message_missing"] as const)(
     "keeps %s retryable across new pass instances without consuming failures",
-    async (failure, override) => {
+    async (failure) => {
+      const { forwardTxHash, ...withoutForwardTx } = report;
+      expect(forwardTxHash).toBe(hash);
+      const missingReport =
+        failure === "forward_tx_missing" ? withoutForwardTx : { ...report, messageBytes: null };
       for (let attempt = 0; attempt < 3; attempt++) {
-        const row = await tick({ ...report, ...override });
+        const row = await tick(missingReport);
         expect(row?.status).toBe("pending");
         expect(row?.verification_failure).toBe(failure);
         expect(row?.check_failures).toBe(0);
