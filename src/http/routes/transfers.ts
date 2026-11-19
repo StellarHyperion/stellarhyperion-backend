@@ -18,6 +18,7 @@ import {
   sendConditionalDetailResponse,
 } from "../etag.js";
 import type { ServerDeps } from "../server.js";
+import { transferStreamIntervals } from "../stream-intervals.js";
 
 export type TransferLifecycleStage =
   | "initiated"
@@ -397,8 +398,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     let lastSerialized = JSON.stringify(initial);
     let closed = false;
 
-    const pollInterval = Math.max(Number(request.query.pollIntervalMs) || 1000, 1000);
-    const heartbeatInterval = Math.max(Number(request.query.heartbeatIntervalMs) || 15000, 5000);
+    const intervals = transferStreamIntervals(request.query);
 
     let pollTimer: ReturnType<typeof setInterval> | null = null;
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -444,7 +444,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
           request.log.warn({ err: error, id }, "transfer stream poll failed");
         }
       })();
-    }, pollInterval);
+    }, intervals.poll);
 
     heartbeatTimer = setInterval(() => {
       if (closed || reply.raw.writableEnded || reply.raw.destroyed) {
@@ -452,7 +452,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         return;
       }
       safeWrite(": ping\n\n");
-    }, heartbeatInterval);
+    }, intervals.heartbeat);
   };
 
   app.get("/v1/transfers/:id/stream", handleStream);

@@ -46,7 +46,8 @@ jobs:
       - name: Analyze source and write local findings
         uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066
         with:
-          upload: false
+          upload: never
+          upload-database: false
           output: source-security-results
           category: source-security/${{ matrix.language }}
 
