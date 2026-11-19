@@ -52,7 +52,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   app.addHook("onRequest", async (_request, reply) => {
     reply.header("Access-Control-Allow-Origin", "*");
     reply.header("Access-Control-Allow-Methods", "GET, OPTIONS");
-    reply.header("Access-Control-Allow-Headers", "Accept, Content-Type");
+    reply.header("Access-Control-Allow-Headers", "Accept, Content-Type, If-None-Match");
+    reply.header("Access-Control-Expose-Headers", "ETag, Cache-Control");
   });
   app.options("/*", async (_request, reply) => reply.code(204).send());
 
