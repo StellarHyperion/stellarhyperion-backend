@@ -27,6 +27,7 @@
 import type { Logger } from "pino";
 import type { Hex } from "viem";
 
+import { createHash } from "node:crypto";
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
@@ -106,11 +107,35 @@ export class EvmWatcher {
     to: bigint,
     signal: AbortSignal,
   ): Promise<{ readonly written: number; readonly ignored: number }> {
-    if (from > to) throw new Error("backfill range must start at or before its end");
+    if (
+      from < this.options.startBlock ||
+      from > to ||
+      to - from + 1n > BigInt(this.options.logRange)
+    )
+      throw new Error("backfill range exceeds the configured deployment or page bound");
     throwIfAborted(signal);
     const { router, client, db, chainKey } = this.options;
     await this.confirmChain(signal);
-    const logs = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
+    const head = await client.blockNumber(signal);
+    if (to > head - BigInt(this.options.confirmations))
+      throw new Error("backfill range is not confirmed");
+    const fetched = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
+    if (
+      fetched.some(
+        (log) =>
+          log.address.toLowerCase() !== router.toLowerCase() ||
+          log.blockNumber < from ||
+          log.blockNumber > to,
+      )
+    )
+      throw new Error("provider returned logs outside the requested range");
+    const logs = [...fetched].sort((a, b) =>
+      a.blockNumber < b.blockNumber
+        ? -1
+        : a.blockNumber > b.blockNumber
+          ? 1
+          : a.logIndex - b.logIndex,
+    );
     const wanted = new Set<bigint>(logs.map((log) => log.blockNumber));
     wanted.add(to);
     const blocks = await client.blocks([...wanted], signal);
@@ -120,10 +145,35 @@ export class EvmWatcher {
     let written = 0;
     let ignored = 0;
     const pairing = new ClaimPairing();
+    const conflicts = this.findOrderingConflicts(logs);
+    let diagnosticCount = 0;
     await db.transaction(async (tx) => {
+      await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        "evm-events:" + chainKey,
+      ]);
       for (const log of logs) {
         if (signal.aborted) throw new DOMException("backfill cancelled", "AbortError");
         if (log.removed) {
+          ignored += 1;
+          continue;
+        }
+        const conflict = conflicts.get(logKey(log));
+        if (conflict) {
+          const timestamp = blocks.get(log.blockNumber)?.timestamp;
+          if (timestamp === undefined) throw new Error("missing canonical quarantine timestamp");
+          if (diagnosticCount++ < MAX_QUARANTINED_LOGS_PER_PASS)
+            await quarantineEvmLog(
+              tx,
+              {
+                chainKey,
+                block: log.blockNumber,
+                txHash: log.transactionHash,
+                logIndex: log.logIndex,
+                eventName: conflict.eventName,
+                reason: conflict.reason,
+              },
+              new Date(Number(timestamp) * 1000),
+            );
           ignored += 1;
           continue;
         }
@@ -262,6 +312,9 @@ export class EvmWatcher {
     // One transaction for the range and the cursor advance past it. This is the restart guarantee,
     // and splitting it would turn every crash into either a lost range or a duplicated one.
     await db.transaction(async (tx: Queryable) => {
+      await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        "evm-events:" + chainKey,
+      ]);
       for (const log of logs) {
         if (log.removed) {
           // viem marks a log from an orphaned block. Indexing one would record a transfer that is
@@ -432,6 +485,39 @@ export class EvmWatcher {
       return false;
     }
 
+    const digest = createHash("sha256").update(log.data).update(log.topics.join("|")).digest("hex");
+    const key = [chainKey, router, log.blockNumber.toString(), log.transactionHash, log.logIndex];
+    const evidence = await tx.query(
+      `SELECT digest FROM evm_applied_event
+      WHERE chain_key=$1 AND contract=$2 AND block_number=$3 AND tx_hash=$4 AND log_index=$5`,
+      key,
+    );
+    // A duplicate parked event still establishes pairing context for a newly decoded BridgeIn.
+    if (decoded.name === "ClaimParked") {
+      const args = decoded.args;
+      if (
+        typeof args.route !== "number" ||
+        typeof args.sourceChain !== "string" ||
+        typeof args.sourceNonce !== "bigint" ||
+        typeof args.id !== "bigint"
+      )
+        throw new Error("invalid parked claim identity");
+      pairing.note(
+        ClaimPairing.key(
+          log.blockNumber,
+          log.transactionHash,
+          args.route,
+          args.sourceChain,
+          args.sourceNonce,
+        ),
+        args.id,
+      );
+    }
+    if (evidence.rows[0]) {
+      if (evidence.rows[0].digest !== digest)
+        throw new Error("conflicting canonical EVM event identity");
+      return false;
+    }
     const at: Position = {
       chainKey,
       router,
@@ -453,6 +539,12 @@ export class EvmWatcher {
       );
       return false;
     }
+    if (applied.kind === "written")
+      await tx.query(
+        `INSERT INTO evm_applied_event
+      (chain_key,contract,block_number,tx_hash,log_index,digest) VALUES($1,$2,$3,$4,$5,$6)`,
+        [...key, digest],
+      );
     return applied.kind === "written";
   }
 
