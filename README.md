@@ -70,7 +70,9 @@ require this hosting marker.
 
 The API requires a dedicated nonprivileged login with `USAGE` on the `public` schema and `SELECT`
 on the tables listed by `API_READ_TABLES` in `src/db/policy.ts` (including `pgmigrations` and the
-identity marker). Grant no public-table write privileges or privileged role memberships. API
+identity marker and `rail_attestation_history` for durable SSE replay). Existing API reader
+roles must receive this additional SELECT grant before enabling resumable streams. Grant no
+public-table write privileges or privileged role memberships. API
 connections also use `default_transaction_read_only`; startup verifies the actual role and grants,
 not only the `HYPERION_DATABASE_ROLE=read-only` label. The serverless entrypoint refuses enabled
 background writers. Indexer, rail or keeper processes require `HYPERION_DATABASE_ROLE=read-write`
