@@ -48,6 +48,51 @@ export type Applied =
   /** A settlement for a row this indexer never saw created. */
   | { readonly kind: "unmatched"; readonly what: string };
 
+export interface EvmLogQuarantine {
+  readonly chainKey: string;
+  readonly block: bigint;
+  readonly txHash: string;
+  readonly logIndex: number;
+  readonly eventName: string;
+  readonly reason: string;
+}
+
+/** Keep malformed ranges visible without allowing one bad provider response to fill the database. */
+export async function quarantineEvmLog(
+  db: Queryable,
+  entry: EvmLogQuarantine,
+  observedAt: Date,
+): Promise<void> {
+  // Serialize retention with insertion so concurrent replicas keep the same database bound.
+  await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+    "evm-quarantine:" + entry.chainKey,
+  ]);
+  await db.query(
+    `INSERT INTO evm_log_quarantine
+       (chain_key, block_number, transaction_hash, log_index, event_name, reason, observed_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (chain_key, block_number, transaction_hash, log_index, reason) DO NOTHING`,
+    [
+      entry.chainKey,
+      entry.block.toString(),
+      entry.txHash,
+      entry.logIndex,
+      entry.eventName,
+      entry.reason,
+      observedAt,
+    ],
+  );
+  await db.query(
+    `DELETE FROM evm_log_quarantine
+      WHERE chain_key = $1 AND (block_number, transaction_hash, log_index, reason) IN (
+        SELECT block_number, transaction_hash, log_index, reason FROM evm_log_quarantine
+         WHERE chain_key = $1
+         ORDER BY block_number DESC, transaction_hash, log_index, reason OFFSET 1000
+      )`,
+    [entry.chainKey],
+  );
+}
+
 /**
  * Claims parked earlier in the same transaction, keyed by the hop they belong to.
  *
@@ -57,8 +102,14 @@ export type Applied =
 export class ClaimPairing {
   private readonly parked = new Map<string, bigint>();
 
-  static key(txHash: string, route: number, sourceChain: string, sourceNonce: bigint): string {
-    return `${txHash}|${String(route)}|${sourceChain}|${sourceNonce.toString()}`;
+  static key(
+    block: bigint,
+    txHash: string,
+    route: number,
+    sourceChain: string,
+    sourceNonce: bigint,
+  ): string {
+    return `${block.toString()}|${txHash}|${String(route)}|${sourceChain}|${sourceNonce.toString()}`;
   }
 
   note(key: string, claimId: bigint): void {
@@ -113,7 +164,7 @@ export async function applyRouterLog(
         // stored rather than an approximation of it.
         createdAt: at.observedAt,
       });
-      pairing.note(ClaimPairing.key(at.txHash, route, sourceChain, sourceNonce), claimId);
+      pairing.note(ClaimPairing.key(at.block, at.txHash, route, sourceChain, sourceNonce), claimId);
       return { kind: "written" };
     }
 
@@ -124,7 +175,7 @@ export async function applyRouterLog(
       // A claim parked in this same transaction means the delivery did not land. Nothing in the
       // BridgeIn log itself says so.
       const claimId = pairing.claimFor(
-        ClaimPairing.key(at.txHash, route, sourceChain, sourceNonce),
+        ClaimPairing.key(at.block, at.txHash, route, sourceChain, sourceNonce),
       );
       await writeInbound(db, at, {
         route,
@@ -266,6 +317,8 @@ export async function applyRouterLog(
 export interface EvmFinalityPolicy {
   readonly confirmations: number;
   readonly reorgDepth: number;
+  readonly finalityMode?: "confirmations" | "finalized";
+  readonly allowFinalityFallback?: boolean;
 }
 
 export interface EvmScanProvenanceEntry {
@@ -281,6 +334,9 @@ export interface EvmScanProvenanceEntry {
   readonly logsIgnored: number;
   readonly reorgDetected: boolean;
   readonly ownerId: string | null;
+  readonly evidenceKind?: "confirmations" | "finalized";
+  readonly finalizedBlock?: bigint | null;
+  readonly finalizedHash?: string | null;
 }
 
 export interface EvmFinalityPolicyChange {
@@ -294,6 +350,10 @@ export interface EvmFinalityPolicyChange {
   readonly reorgDepth: number;
   readonly previousConfirmations: number;
   readonly previousReorgDepth: number;
+  readonly finalityMode: string;
+  readonly previousFinalityMode: string;
+  readonly allowFinalityFallback: boolean;
+  readonly previousAllowFinalityFallback: boolean;
   readonly committedAt: Date;
 }
 
@@ -316,6 +376,10 @@ export interface EvmScanProvenanceRecord {
   readonly previousReorgDepth: number | null;
   readonly ownerId: string | null;
   readonly committedAt: Date;
+  readonly finalityMode: string;
+  readonly evidenceKind: string;
+  readonly finalizedBlock: bigint | null;
+  readonly finalizedHash: string | null;
 }
 
 /**
@@ -329,7 +393,7 @@ export async function recordEvmScanProvenance(
 ): Promise<EvmFinalityPolicyChange | null> {
   const { rows } = await db.query(
     `WITH prev AS (
-       SELECT confirmations, reorg_depth
+       SELECT confirmations, reorg_depth, finality_mode, allow_finality_fallback
          FROM evm_scan_provenance
         WHERE chain_key = $1 AND lower(contract) = lower($2)
         ORDER BY id DESC
@@ -339,21 +403,24 @@ export async function recordEvmScanProvenance(
        INSERT INTO evm_scan_provenance (
          chain_key, contract, chain_id, from_block, to_block, end_block_hash, head_block,
          confirmations, reorg_depth, logs_written, logs_ignored, reorg_detected,
-         policy_changed, previous_confirmations, previous_reorg_depth, owner_id
+         policy_changed, previous_confirmations, previous_reorg_depth, previous_finality_mode, previous_allow_finality_fallback, owner_id,
+         finality_mode, allow_finality_fallback, evidence_kind, finalized_block, finalized_hash
        )
        SELECT
          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-         COALESCE((SELECT confirmations <> $8 OR reorg_depth <> $9 FROM prev), false),
-         CASE WHEN COALESCE((SELECT confirmations <> $8 OR reorg_depth <> $9 FROM prev), false)
+         COALESCE((SELECT confirmations <> $8 OR reorg_depth <> $9 OR finality_mode <> $14 OR allow_finality_fallback <> $15 FROM prev), false),
+         CASE WHEN COALESCE((SELECT confirmations <> $8 OR reorg_depth <> $9 OR finality_mode <> $14 OR allow_finality_fallback <> $15 FROM prev), false)
               THEN (SELECT confirmations FROM prev)
               ELSE NULL END,
-         CASE WHEN COALESCE((SELECT confirmations <> $8 OR reorg_depth <> $9 FROM prev), false)
+         CASE WHEN COALESCE((SELECT confirmations <> $8 OR reorg_depth <> $9 OR finality_mode <> $14 OR allow_finality_fallback <> $15 FROM prev), false)
               THEN (SELECT reorg_depth FROM prev)
               ELSE NULL END,
-         $13
+         CASE WHEN COALESCE((SELECT confirmations <> $8 OR reorg_depth <> $9 OR finality_mode <> $14 OR allow_finality_fallback <> $15 FROM prev), false) THEN (SELECT finality_mode FROM prev) ELSE NULL END,
+         CASE WHEN COALESCE((SELECT confirmations <> $8 OR reorg_depth <> $9 OR finality_mode <> $14 OR allow_finality_fallback <> $15 FROM prev), false) THEN (SELECT allow_finality_fallback FROM prev) ELSE NULL END,
+         $13, $14, $15, $16, $17, $18
        RETURNING id, chain_key, contract, chain_id, from_block, to_block,
                  confirmations, reorg_depth, policy_changed,
-                 previous_confirmations, previous_reorg_depth, committed_at
+                 previous_confirmations, previous_reorg_depth, finality_mode, previous_finality_mode, allow_finality_fallback, previous_allow_finality_fallback, committed_at
      )
      SELECT * FROM ins`,
     [
@@ -370,6 +437,11 @@ export async function recordEvmScanProvenance(
       entry.logsIgnored,
       entry.reorgDetected,
       entry.ownerId,
+      entry.policy.finalityMode ?? "confirmations",
+      entry.policy.allowFinalityFallback ?? false,
+      entry.evidenceKind ?? "confirmations",
+      entry.finalizedBlock?.toString() ?? null,
+      entry.finalizedHash ?? null,
     ],
   );
 
@@ -389,6 +461,10 @@ export async function recordEvmScanProvenance(
     reorgDepth: integer(row, "reorg_depth"),
     previousConfirmations: integer(row, "previous_confirmations"),
     previousReorgDepth: integer(row, "previous_reorg_depth"),
+    finalityMode: text(row, "finality_mode"),
+    previousFinalityMode: text(row, "previous_finality_mode"),
+    allowFinalityFallback: boolean(row, "allow_finality_fallback"),
+    previousAllowFinalityFallback: boolean(row, "previous_allow_finality_fallback"),
     committedAt: timestamp(row, "committed_at"),
   };
 }
@@ -407,7 +483,7 @@ export async function readEvmFinalityPolicyChanges(
 
   const { rows } = await db.query(
     `SELECT id, chain_key, contract, chain_id, from_block, to_block,
-            confirmations, reorg_depth, previous_confirmations, previous_reorg_depth, committed_at
+            confirmations, reorg_depth, previous_confirmations, previous_reorg_depth, finality_mode, previous_finality_mode, allow_finality_fallback, previous_allow_finality_fallback, committed_at
        FROM evm_scan_provenance
       WHERE chain_key = $1${contractFilter}
         AND policy_changed
@@ -427,6 +503,10 @@ export async function readEvmFinalityPolicyChanges(
     reorgDepth: integer(row, "reorg_depth"),
     previousConfirmations: integer(row, "previous_confirmations"),
     previousReorgDepth: integer(row, "previous_reorg_depth"),
+    finalityMode: text(row, "finality_mode"),
+    previousFinalityMode: text(row, "previous_finality_mode"),
+    allowFinalityFallback: boolean(row, "allow_finality_fallback"),
+    previousAllowFinalityFallback: boolean(row, "previous_allow_finality_fallback"),
     committedAt: timestamp(row, "committed_at"),
   }));
 }
@@ -444,7 +524,8 @@ export async function readLatestEvmScanProvenance(
   const { rows } = await db.query(
     `SELECT id, chain_key, contract, chain_id, from_block, to_block, end_block_hash, head_block,
             confirmations, reorg_depth, logs_written, logs_ignored, reorg_detected,
-            policy_changed, previous_confirmations, previous_reorg_depth, owner_id, committed_at
+            policy_changed, previous_confirmations, previous_reorg_depth, owner_id, committed_at,
+            finality_mode, evidence_kind, finalized_block, finalized_hash
        FROM evm_scan_provenance
       WHERE chain_key = $1${contractFilter}
       ORDER BY id DESC
@@ -476,5 +557,9 @@ export async function readLatestEvmScanProvenance(
       row.previous_reorg_depth === null ? null : integer(row, "previous_reorg_depth"),
     ownerId: textOrNull(row, "owner_id"),
     committedAt: timestamp(row, "committed_at"),
+    finalityMode: text(row, "finality_mode"),
+    evidenceKind: text(row, "evidence_kind"),
+    finalizedBlock: row.finalized_block === null ? null : bigintOf(row, "finalized_block"),
+    finalizedHash: textOrNull(row, "finalized_hash"),
   };
 }

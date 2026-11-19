@@ -28,6 +28,7 @@ import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 import type { Hex } from "viem";
 
+import { createHash } from "node:crypto";
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
@@ -38,6 +39,7 @@ import {
   assertLeaseHeld,
   ClaimPairing,
   recordEvmScanProvenance,
+  quarantineEvmLog,
   releaseLease,
   type EvmFinalityPolicy,
   type EvmFinalityPolicyChange,
@@ -56,6 +58,7 @@ import type { EvmClient, RawEvmLog } from "./client.js";
 const CURRENT_WITHIN_BLOCKS = 2;
 const DEFAULT_LEASE_TTL_MS = 30_000;
 const MAX_POLICY_CHANGES_CACHED = 50;
+const MAX_QUARANTINED_LOGS_PER_PASS = 100;
 
 export interface EvmWatcherOptions {
   readonly chainKey: string;
@@ -66,6 +69,9 @@ export interface EvmWatcherOptions {
   readonly startBlock: bigint;
   /** How many blocks behind the head this chain's own finality needs. */
   readonly confirmations: number;
+  readonly finalityMode?: "confirmations" | "finalized";
+  /** Only this explicit configuration permits falling back from finalized evidence to depth. */
+  readonly allowFinalityFallback?: boolean;
   /** How far back to wind the cursor when a reorg is found below that depth. */
   readonly reorgDepth: number;
   /** Blocks per `getLogs` call. Public endpoints reject wide ranges. */
@@ -108,6 +114,17 @@ export class EvmWatcher {
   constructor(private readonly options: EvmWatcherOptions) {
     this.ownerId = options.ownerId ?? randomUUID();
     this.leaseTtlMs = options.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS;
+    if (!Number.isSafeInteger(this.leaseTtlMs) || this.leaseTtlMs < 1)
+      throw new RangeError("invalid EVM lease TTL");
+    if (
+      !Number.isSafeInteger(options.confirmations) ||
+      options.confirmations < 0 ||
+      !Number.isSafeInteger(options.reorgDepth) ||
+      options.reorgDepth < 1 ||
+      !Number.isSafeInteger(options.logRange) ||
+      options.logRange < 1
+    )
+      throw new RangeError("invalid EVM scan policy");
   }
 
   get name(): string {
@@ -122,6 +139,8 @@ export class EvmWatcher {
     return {
       confirmations: this.options.confirmations,
       reorgDepth: this.options.reorgDepth,
+      finalityMode: this.options.finalityMode ?? "confirmations",
+      allowFinalityFallback: this.options.allowFinalityFallback ?? false,
     };
   }
 
@@ -135,6 +154,99 @@ export class EvmWatcher {
       contract: this.options.router.toLowerCase(),
       ownerId: this.ownerId,
     });
+  }
+
+  /**
+   * Apply one historical range without reading or advancing the live cursor.
+   *
+   * A backfill deliberately shares the decoder and writers with live polling, but not its
+   * cursor. Each bounded page commits its rows before the returned next block is exposed, so a
+   * cancelled job can resume from that boundary without replaying a partial transaction.
+   */
+  async backfillRange(
+    from: bigint,
+    to: bigint,
+    signal: AbortSignal,
+  ): Promise<{ readonly written: number; readonly ignored: number }> {
+    if (
+      from < this.options.startBlock ||
+      from > to ||
+      to - from + 1n > BigInt(this.options.logRange)
+    )
+      throw new Error("backfill range exceeds the configured deployment or page bound");
+    throwIfAborted(signal);
+    const { router, client, db, chainKey } = this.options;
+    await this.confirmChain(signal);
+    const head = await client.blockNumber(signal);
+    if (to > (await this.scanLimit(head, signal)).boundary)
+      throw new Error("backfill range is not confirmed");
+    const fetched = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
+    if (
+      fetched.some(
+        (log) =>
+          log.address.toLowerCase() !== router.toLowerCase() ||
+          log.blockNumber < from ||
+          log.blockNumber > to,
+      )
+    )
+      throw new Error("provider returned logs outside the requested range");
+    const logs = [...fetched].sort((a, b) =>
+      a.blockNumber < b.blockNumber
+        ? -1
+        : a.blockNumber > b.blockNumber
+          ? 1
+          : a.logIndex - b.logIndex,
+    );
+    const wanted = new Set<bigint>(logs.map((log) => log.blockNumber));
+    wanted.add(to);
+    const blocks = await client.blocks([...wanted], signal);
+    if (!blocks.has(to)) throw new Error(`backfill end block ${to.toString()} is unavailable`);
+    throwIfAborted(signal);
+
+    let written = 0;
+    let ignored = 0;
+    const pairing = new ClaimPairing();
+    const conflicts = this.findOrderingConflicts(logs);
+    let diagnosticCount = 0;
+    await db.transaction(async (tx) => {
+      await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        "evm-events:" + chainKey,
+      ]);
+      for (const log of logs) {
+        if (signal.aborted) throw new DOMException("backfill cancelled", "AbortError");
+        if (log.removed) {
+          ignored += 1;
+          continue;
+        }
+        const conflict = conflicts.get(logKey(log));
+        if (conflict) {
+          const timestamp = blocks.get(log.blockNumber)?.timestamp;
+          if (timestamp === undefined) throw new Error("missing canonical quarantine timestamp");
+          if (diagnosticCount++ < MAX_QUARANTINED_LOGS_PER_PASS)
+            await quarantineEvmLog(
+              tx,
+              {
+                chainKey,
+                block: log.blockNumber,
+                txHash: log.transactionHash,
+                logIndex: log.logIndex,
+                eventName: conflict.eventName,
+                reason: conflict.reason,
+              },
+              new Date(Number(timestamp) * 1000),
+            );
+          ignored += 1;
+          continue;
+        }
+        const timestamp = blocks.get(log.blockNumber)?.timestamp;
+        if (timestamp === undefined) {
+          throw new Error(`no timestamp for block ${log.blockNumber.toString()} on ${chainKey}`);
+        }
+        if (await this.apply(tx, log, timestamp, pairing)) written += 1;
+        else ignored += 1;
+      }
+    });
+    return { written, ignored };
   }
 
   /**
@@ -211,7 +323,8 @@ export class EvmWatcher {
       const head = await client.blockNumber(signal);
       // The deepest block this chain considers settled. Nothing past it is read, so nothing past it
       // can be written and then taken back.
-      const confirmed = head - BigInt(confirmations);
+      const finality = await this.scanLimit(head, signal);
+      const confirmed = finality.boundary;
 
       let from = stored === null ? this.options.startBlock : stored.position + 1n;
       let reorgDetected = false;
@@ -239,7 +352,23 @@ export class EvmWatcher {
       }
 
       const to = min(from + BigInt(this.options.logRange) - 1n, confirmed);
-      const logs = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
+      const fetched = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
+      if (
+        fetched.some(
+          (log) =>
+            log.address.toLowerCase() !== router.toLowerCase() ||
+            log.blockNumber < from ||
+            log.blockNumber > to,
+        )
+      )
+        throw new Error("provider returned logs outside the requested router or block range");
+      const logs = [...fetched].sort((a, b) =>
+        a.blockNumber < b.blockNumber
+          ? -1
+          : a.blockNumber > b.blockNumber
+            ? 1
+            : a.logIndex - b.logIndex,
+      );
 
       // Block timestamps, which `getLogs` does not return and three columns need. One call per block
       // that actually has logs, plus the range end for its hash, rather than one per block in range.
@@ -261,11 +390,16 @@ export class EvmWatcher {
       let written = 0;
       let ignored = 0;
       const pairing = new ClaimPairing();
+      const quarantined = this.findOrderingConflicts(logs);
+      let recordedQuarantines = 0;
 
       // One transaction for the range, the cursor advance, and the finality-policy provenance.
       // Asserting the lease inside the transaction ensures a worker whose lease expired during RPC
       // calls cannot commit stale state.
       const policyChange = await db.transaction(async (tx: Queryable) => {
+        await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+          "evm-events:" + chainKey,
+        ]);
         await assertLeaseHeld(tx, {
           chainKey,
           contract: leaseContract,
@@ -274,9 +408,48 @@ export class EvmWatcher {
         });
 
         for (const log of logs) {
+          throwIfAborted(signal);
           if (log.removed) {
             // viem marks a log from an orphaned block. Indexing one would record a transfer that is
             // no longer on the chain.
+            ignored += 1;
+            continue;
+          }
+          const conflict = quarantined.get(logKey(log));
+          if (conflict !== undefined) {
+            const timestamp = blocks.get(log.blockNumber)?.timestamp;
+            if (timestamp === undefined) {
+              throw new Error(
+                `no timestamp for quarantined block ${log.blockNumber.toString()} on ${chainKey}`,
+              );
+            }
+            if (recordedQuarantines < MAX_QUARANTINED_LOGS_PER_PASS) {
+              recordedQuarantines += 1;
+              await quarantineEvmLog(
+                tx,
+                {
+                  chainKey,
+                  block: log.blockNumber,
+                  txHash: log.transactionHash,
+                  logIndex: log.logIndex,
+                  eventName: conflict.eventName,
+                  reason: conflict.reason,
+                },
+                new Date(Number(timestamp) * 1000),
+              );
+            }
+            if (recordedQuarantines < MAX_QUARANTINED_LOGS_PER_PASS)
+              logger.warn(
+                {
+                  chain: chainKey,
+                  block: log.blockNumber.toString(),
+                  txHash: log.transactionHash,
+                  logIndex: log.logIndex,
+                  event: conflict.eventName,
+                  reason: conflict.reason,
+                },
+                "quarantined EVM log with invalid lifecycle ordering",
+              );
             ignored += 1;
             continue;
           }
@@ -289,12 +462,12 @@ export class EvmWatcher {
           if (await this.apply(tx, log, timestamp, pairing)) written += 1;
           else ignored += 1;
         }
-
         await writeCursor(tx, {
           chainKey,
           family: "evm",
           contract: router,
           position: to,
+          expectedRevision: stored?.revision ?? null,
           observedAt: timestampOf(blocks.get(to)?.timestamp ?? null),
           // The whole reason the column exists. Without it the next pass cannot tell advancing from
           // being handed a different history.
@@ -309,7 +482,10 @@ export class EvmWatcher {
           toBlock: to,
           endBlockHash: endHash,
           headBlock: head,
-          policy: { confirmations, reorgDepth },
+          policy: this.policy,
+          evidenceKind: finality.kind,
+          finalizedBlock: finality.finalized?.number ?? null,
+          finalizedHash: finality.finalized?.hash ?? null,
           logsWritten: written,
           logsIgnored: ignored,
           reorgDetected,
@@ -368,6 +544,42 @@ export class EvmWatcher {
         await this.release().catch(() => undefined);
       }
     }
+  }
+
+  private async scanLimit(
+    head: bigint,
+    signal: AbortSignal,
+  ): Promise<{
+    boundary: bigint;
+    kind: "confirmations" | "finalized";
+    finalized: { number: bigint; hash: Hex } | null;
+  }> {
+    const depth = head - BigInt(this.options.confirmations);
+    if (this.options.finalityMode !== "finalized")
+      return { boundary: depth, kind: "confirmations", finalized: null };
+    let finalized: { number: bigint; hash: Hex };
+    try {
+      if (!this.options.client.finalizedBlock)
+        throw new Error("finalized block tags are unsupported");
+      finalized = await this.options.client.finalizedBlock(signal);
+    } catch {
+      throwIfAborted(signal);
+      if (!this.options.allowFinalityFallback)
+        throw new Error("finalized block evidence unavailable; depth fallback is disabled");
+      this.options.logger.warn(
+        { chain: this.options.chainKey },
+        "using explicitly configured confirmation-depth finality fallback",
+      );
+      return { boundary: depth, kind: "confirmations", finalized: null };
+    }
+    if (
+      finalized.number < 0n ||
+      finalized.number > head ||
+      !/^0x[0-9a-fA-F]{64}$/.test(finalized.hash)
+    ) {
+      throw new Error("invalid finalized block evidence");
+    }
+    return { boundary: min(depth, finalized.number), kind: "finalized", finalized };
   }
 
   /**
@@ -434,7 +646,7 @@ export class EvmWatcher {
     timestamp: bigint,
     pairing: ClaimPairing,
   ): Promise<boolean> {
-    const { chainKey, logger } = this.options;
+    const { chainKey, router, logger } = this.options;
     const decoded = decodeRouterLog(log);
     if (decoded === null) {
       const signature = signatureOf(log);
@@ -448,8 +660,42 @@ export class EvmWatcher {
       return false;
     }
 
+    const digest = createHash("sha256").update(log.data).update(log.topics.join("|")).digest("hex");
+    const key = [chainKey, router, log.blockNumber.toString(), log.transactionHash, log.logIndex];
+    const evidence = await tx.query(
+      `SELECT digest FROM evm_applied_event
+      WHERE chain_key=$1 AND contract=$2 AND block_number=$3 AND tx_hash=$4 AND log_index=$5`,
+      key,
+    );
+    // A duplicate parked event still establishes pairing context for a newly decoded BridgeIn.
+    if (decoded.name === "ClaimParked") {
+      const args = decoded.args;
+      if (
+        typeof args.route !== "number" ||
+        typeof args.sourceChain !== "string" ||
+        typeof args.sourceNonce !== "bigint" ||
+        typeof args.id !== "bigint"
+      )
+        throw new Error("invalid parked claim identity");
+      pairing.note(
+        ClaimPairing.key(
+          log.blockNumber,
+          log.transactionHash,
+          args.route,
+          args.sourceChain,
+          args.sourceNonce,
+        ),
+        args.id,
+      );
+    }
+    if (evidence.rows[0]) {
+      if (evidence.rows[0].digest !== digest)
+        throw new Error("conflicting canonical EVM event identity");
+      return false;
+    }
     const at: Position = {
       chainKey,
+      router,
       block: log.blockNumber,
       txHash: log.transactionHash,
       // Unlike Soroban, which orders events within a transaction instead.
@@ -468,8 +714,58 @@ export class EvmWatcher {
       );
       return false;
     }
+    if (applied.kind === "written")
+      await tx.query(
+        `INSERT INTO evm_applied_event
+      (chain_key,contract,block_number,tx_hash,log_index,digest) VALUES($1,$2,$3,$4,$5,$6)`,
+        [...key, digest],
+      );
     return applied.kind === "written";
   }
+
+  private findOrderingConflicts(logs: readonly RawEvmLog[]): Map<string, OrderingConflict> {
+    const groups = new Map<string, { log: RawEvmLog; name: string }[]>();
+    const conflicts = new Map<string, OrderingConflict>();
+    for (const log of logs) {
+      if (log.removed) continue;
+      const decoded = decodeRouterLog(log);
+      if (decoded?.name !== "ClaimParked" && decoded?.name !== "BridgeIn") continue;
+      const route = decoded.args.route;
+      const sourceChain = decoded.args.sourceChain;
+      const sourceNonce = decoded.args.sourceNonce;
+      const key = `${log.blockNumber}|${log.transactionHash}|${String(route)}|${String(sourceChain)}|${String(sourceNonce)}`;
+      const group = groups.get(key) ?? [];
+      group.push({ log, name: decoded.name });
+      groups.set(key, group);
+    }
+    for (const group of groups.values()) {
+      const parked = group.filter((entry) => entry.name === "ClaimParked");
+      const inbound = group.filter((entry) => entry.name === "BridgeIn");
+      if (
+        parked.length > 1 ||
+        inbound.length > 1 ||
+        (parked[0] && inbound[0] && parked[0].log.logIndex >= inbound[0].log.logIndex)
+      ) {
+        for (const entry of group)
+          conflicts.set(logKey(entry.log), {
+            eventName: entry.name,
+            reason: "duplicate or reversed claim/delivery lifecycle ordering",
+          });
+      }
+    }
+
+    // Every conflicting log is excluded even after the diagnostic recording budget is exhausted.
+    return conflicts;
+  }
+}
+
+interface OrderingConflict {
+  readonly eventName: string;
+  readonly reason: string;
+}
+
+function logKey(log: Pick<RawEvmLog, "blockNumber" | "transactionHash" | "logIndex">): string {
+  return `${log.blockNumber.toString()}|${log.transactionHash}|${String(log.logIndex)}`;
 }
 
 function min(a: bigint, b: bigint): bigint {
@@ -478,4 +774,8 @@ function min(a: bigint, b: bigint): bigint {
 
 function timestampOf(seconds: bigint | null): Date | null {
   return seconds === null ? null : new Date(Number(seconds) * 1000);
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw new DOMException("backfill cancelled", "AbortError");
 }

@@ -142,11 +142,11 @@ suite("outbound_transfer", () => {
     nonce += 1;
     await db.query(
       `INSERT INTO public.outbound_transfer
-         (origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
+         (origin_chain, origin_router, route, nonce, sender, token, gross_amount, fee, net_amount,
           destination_chain, destination, origin_block, origin_tx)
-       VALUES ('base-sepolia', 0, $1, '0xsender', '0xtoken', $2, $3, $4,
-               'stellar-testnet', 'GA5ZYIIV', 1, $5)`,
-      [String(nonce), gross, fee, net, `0xtx-${String(nonce)}`],
+       VALUES ('base-sepolia', $1, 0, $2, '0xsender', '0xtoken', $3, $4, $5,
+               'stellar-testnet', 'GA5ZYIIV', 1, $6)`,
+      [`router-${String(nonce)}`, String(nonce), gross, fee, net, `0xtx-${String(nonce)}`],
     );
   };
 
@@ -176,23 +176,38 @@ suite("outbound_transfer", () => {
     await expect(insert("1000", "0", "1000")).resolves.toBeUndefined();
   });
 
-  it("refuses two departures with the same nonce from one chain", async () => {
-    // The router's counter is monotonic per router, so this is the identity of a departure. A
-    // duplicate means the watcher re-read a page, and it should be a no-op rather than a second row.
+  it("allows the same nonce across router deployments", async () => {
     nonce += 1;
-    const values = [String(nonce), "1000", "3", "997", `0xtx-${String(nonce)}`];
-    const run = async (): Promise<void> => {
+    const insertFor = async (router: string, tx: string): Promise<void> => {
       await db.query(
         `INSERT INTO public.outbound_transfer
-           (origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
+           (origin_chain, origin_router, route, nonce, sender, token, gross_amount, fee, net_amount,
             destination_chain, destination, origin_block, origin_tx)
-         VALUES ('base-sepolia', 0, $1, '0xsender', '0xtoken', $2, $3, $4,
-                 'stellar-testnet', 'GA5ZYIIV', 1, $5)`,
-        values,
+         VALUES ('base-sepolia', $1, 0, $2, '0xsender', '0xtoken', 1000, 3, 997,
+                 'stellar-testnet', 'GA5ZYIIV', 1, $3)`,
+        [router, String(nonce), tx],
       );
     };
-    await run();
-    await expect(run()).rejects.toSatisfy((error: unknown) => codeOf(error) === UNIQUE_VIOLATION);
+    await insertFor("router-a", `0xtx-${String(nonce)}-a`);
+    await expect(insertFor("router-b", `0xtx-${String(nonce)}-b`)).resolves.toBeUndefined();
+  });
+
+  it("refuses two departures with the same nonce from one router deployment", async () => {
+    nonce += 1;
+    const insertFor = async (tx: string): Promise<void> => {
+      await db.query(
+        `INSERT INTO public.outbound_transfer
+           (origin_chain, origin_router, route, nonce, sender, token, gross_amount, fee, net_amount,
+            destination_chain, destination, origin_block, origin_tx)
+         VALUES ('base-sepolia', 'router-single', 0, $1, '0xsender', '0xtoken', 1000, 3, 997,
+                 'stellar-testnet', 'GA5ZYIIV', 1, $2)`,
+        [String(nonce), tx],
+      );
+    };
+    await insertFor(`0xtx-${String(nonce)}-a`);
+    await expect(insertFor(`0xtx-${String(nonce)}-b`)).rejects.toSatisfy(
+      (error: unknown) => codeOf(error) === UNIQUE_VIOLATION,
+    );
   });
 });
 
@@ -304,7 +319,7 @@ suite("maintenance and pruning", () => {
                'stellar-testnet', 'GA5ZYIIV', 1, '0xtx-2'),
               (999993, 'prune-test-3', 0, 999993, '0xsender', '0xtoken', 100, 0, 100,
                'stellar-testnet', 'GA5ZYIIV', 1, '0xtx-3')
-       ON CONFLICT (origin_chain, nonce) DO NOTHING`,
+       ON CONFLICT (origin_chain, origin_router, nonce) DO NOTHING`,
     );
 
     // Old completed attestation (40 days old)

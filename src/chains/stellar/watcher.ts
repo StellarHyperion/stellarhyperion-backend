@@ -1042,6 +1042,7 @@ export class StellarWatcher {
       }
       const context: EventContext = {
         chainKey,
+        router: this.options.router,
         ledger: raw.ledger,
         txHash: raw.txHash,
         closedAt: new Date(raw.ledgerClosedAt),

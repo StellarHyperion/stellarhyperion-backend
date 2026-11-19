@@ -70,6 +70,8 @@ export interface EvmWatchConfig {
   readonly startBlock: bigint;
   /** From the chain registry. How many blocks before a log is believed. */
   readonly confirmations: number;
+  readonly finalityMode?: "confirmations" | "finalized";
+  readonly allowFinalityFallback?: boolean;
   /** How far back to wind the cursor when a reorg is found below the confirmation depth. */
   readonly reorgDepth: number;
   readonly logRange: number;
@@ -396,6 +398,25 @@ const EVM_POLL_INTERVAL_MS: VarSpec = {
   purpose: "How often each EVM chain is polled for new logs.",
 };
 
+const EVM_FINALITY_MODE: EnumSpec<"confirmations" | "finalized"> = {
+  name: "EVM_FINALITY_MODE",
+  kind: "enum",
+  required: false,
+  fallback: "confirmations",
+  printable: true,
+  choices: ["confirmations", "finalized"],
+  purpose: "Use configured confirmation depth or explicit finalized-block evidence for EVM scans.",
+};
+const EVM_FINALITY_ALLOW_FALLBACK: VarSpec = {
+  name: "EVM_FINALITY_ALLOW_FALLBACK",
+  kind: "boolean",
+  required: false,
+  fallback: "false",
+  printable: true,
+  purpose:
+    "Explicitly permit confirmation-depth fallback when finalized-block tags are unavailable. Defaults to false.",
+};
+
 const EVM_LOG_RANGE: VarSpec = {
   name: "EVM_LOG_RANGE",
   kind: "integer",
@@ -493,6 +514,8 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const pageSize = reader.integer(STELLAR_EVENT_PAGE_SIZE);
   const stellarPollIntervalMs = reader.integer(STELLAR_POLL_INTERVAL_MS);
   const evmPollIntervalMs = reader.integer(EVM_POLL_INTERVAL_MS);
+  const evmFinalityMode = reader.choice(EVM_FINALITY_MODE);
+  const evmFinalityAllowFallback = reader.boolean(EVM_FINALITY_ALLOW_FALLBACK);
   const logRange = reader.integer(EVM_LOG_RANGE);
   const reorgDepthOverride = reader.has(EVM_REORG_DEPTH.name)
     ? reader.integer(EVM_REORG_DEPTH)
@@ -510,6 +533,8 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     pageSize,
     stellarPollIntervalMs,
     evmPollIntervalMs,
+    evmFinalityMode,
+    evmFinalityAllowFallback,
     logRange,
     reorgDepthOverride,
     env,
@@ -599,6 +624,8 @@ interface PlanInput {
   readonly pageSize: number;
   readonly stellarPollIntervalMs: number;
   readonly evmPollIntervalMs: number;
+  readonly evmFinalityMode: "confirmations" | "finalized";
+  readonly evmFinalityAllowFallback: boolean;
   readonly logRange: number;
   readonly reorgDepthOverride: number | null;
   readonly env: Readonly<Record<string, string | undefined>>;
@@ -696,6 +723,8 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
         routerAddress: deployment.router,
         startBlock: BigInt(deployment.deployedAt.blockNumber),
         confirmations: chain.confirmations,
+        finalityMode: input.evmFinalityMode,
+        allowFinalityFallback: input.evmFinalityAllowFallback,
         // The chain's own confirmations is the right default per chain: one on Arc, where
         // Malachite finality is genuinely final, and twelve on Ethereum, where it is not.
         reorgDepth: input.reorgDepthOverride ?? chain.confirmations,

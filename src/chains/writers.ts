@@ -21,10 +21,13 @@
  */
 import type { Queryable } from "../db/pool.js";
 import { integer, numericString, one, text, textOrNull, timestamp } from "../db/rows.js";
+import type { RailRetryClass } from "../rails/types.js";
 
 /** Where on a chain a row was observed. One shape for a ledger and for a block. */
 export interface Position {
   readonly chainKey: string;
+  /** Present for rows emitted by a watched router; rail evidence has no local router context. */
+  readonly router?: string;
   /** Ledger sequence on Stellar, block number on an EVM chain. */
   readonly block: bigint;
   readonly txHash: string;
@@ -56,6 +59,8 @@ export interface OutboundRow {
 }
 
 export interface InboundRow {
+  /** Exact source row established by a receipt verifier, never by provider status alone. */
+  readonly sourceTransferId?: bigint;
   readonly route: number;
   readonly sourceChain: string;
   readonly sourceNonce: bigint;
@@ -107,13 +112,44 @@ export interface HealthSample {
 }
 
 export async function writeOutbound(db: Queryable, at: Position, row: OutboundRow): Promise<void> {
+  const router = at.router ?? "";
+  if (router) {
+    // Preserve IDs, attestations and delivery links when replay proves a legacy row's deployment.
+    await db.query(
+      `UPDATE outbound_transfer SET origin_router = $1
+        WHERE origin_chain = $2 AND nonce = $3 AND origin_router = ''
+          AND origin_tx = $4 AND origin_block = $5
+          AND origin_log_index IS NOT DISTINCT FROM $6
+          AND sender = $7 AND token = $8 AND gross_amount = $9
+          AND fee = $10 AND net_amount = $11 AND route = $12
+          AND destination_chain = $13 AND destination = $14
+          AND NOT EXISTS (SELECT 1 FROM outbound_transfer known
+            WHERE known.origin_chain = $2 AND known.origin_router = $1 AND known.nonce = $3)`,
+      [
+        router,
+        at.chainKey,
+        row.nonce.toString(),
+        at.txHash,
+        at.block.toString(),
+        at.logIndex,
+        row.sender,
+        row.token,
+        row.grossAmount.toString(),
+        row.fee.toString(),
+        row.netAmount.toString(),
+        row.route,
+        row.destinationChain,
+        row.destination,
+      ],
+    );
+  }
   await db.query(
     `INSERT INTO outbound_transfer
-       (origin_chain, route, nonce, sender, token, gross_amount, fee, net_amount,
+       (origin_chain, origin_router, route, nonce, sender, token, gross_amount, fee, net_amount,
         destination_chain, destination, rail_ref, origin_block, origin_tx, origin_log_index,
         observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-     ON CONFLICT (origin_chain, nonce) DO UPDATE
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+     ON CONFLICT (origin_chain, origin_router, nonce) DO UPDATE
        SET route = EXCLUDED.route,
            sender = EXCLUDED.sender,
            token = EXCLUDED.token,
@@ -128,6 +164,7 @@ export async function writeOutbound(db: Queryable, at: Position, row: OutboundRo
            origin_log_index = EXCLUDED.origin_log_index`,
     [
       at.chainKey,
+      router,
       row.route,
       row.nonce.toString(),
       row.sender,
@@ -151,9 +188,9 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
     `INSERT INTO inbound_delivery
        (destination_chain, route, source_chain, source_nonce, rail_message_id, recipient, token,
         amount, delivered, claim_id, destination_block, destination_tx, destination_log_index,
-        observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-     ON CONFLICT (destination_chain, route, source_chain, source_nonce) DO UPDATE
+        observed_at, source_transfer_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+     ON CONFLICT (destination_chain, route, source_chain, source_nonce, source_transfer_id) DO UPDATE
        SET rail_message_id = COALESCE(EXCLUDED.rail_message_id, inbound_delivery.rail_message_id),
            recipient = EXCLUDED.recipient,
            token = EXCLUDED.token,
@@ -178,6 +215,7 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
       at.txHash,
       at.logIndex,
       at.observedAt,
+      row.sourceTransferId?.toString() ?? null,
     ],
   );
 }
@@ -340,14 +378,17 @@ export interface AttestationRow {
   /** Consecutive failures for this transfer, distinct from the poller's own backoff. */
   readonly checkFailures: number;
   readonly lastError: string | null;
+  readonly retryAttempts: number;
+  readonly nextAttemptAt: Date | null;
+  readonly retryClass: RailRetryClass | null;
 }
 
 export async function writeAttestation(db: Queryable, row: AttestationRow): Promise<void> {
   await db.query(
     `INSERT INTO rail_attestation
        (transfer_id, route, status, rail_status, rail_reference, attested_at, last_checked_at,
-        check_failures, last_error)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        check_failures, last_error, next_attempt_at, retry_class, retry_attempts)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
      ON CONFLICT (transfer_id) DO UPDATE
        SET status = EXCLUDED.status,
            rail_status = COALESCE(EXCLUDED.rail_status, rail_attestation.rail_status),
@@ -359,6 +400,9 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
            last_checked_at = EXCLUDED.last_checked_at,
            check_failures = EXCLUDED.check_failures,
            last_error = EXCLUDED.last_error,
+           retry_attempts = EXCLUDED.retry_attempts,
+           next_attempt_at = EXCLUDED.next_attempt_at,
+           retry_class = EXCLUDED.retry_class,
            updated_at = now()`,
     [
       row.transferId.toString(),
@@ -370,6 +414,9 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
       row.checkedAt,
       row.checkFailures,
       row.lastError,
+      row.nextAttemptAt,
+      row.retryClass,
+      row.retryAttempts,
     ],
   );
 }
@@ -440,20 +487,22 @@ export async function compactRouteHealthSamples(
        )
      ),
      candidates AS (
-       SELECT id
+       SELECT r.id
        FROM ordered
-       WHERE sampled_at < now() - ($1 * INTERVAL '1 hour')
+       JOIN route_health r USING (id)
+       WHERE ordered.sampled_at < now() - ($1 * INTERVAL '1 hour')
          AND rn > 1
-         AND prev_available IS NOT DISTINCT FROM available
-         AND prev_blocker IS NOT DISTINCT FROM blocker
-         AND prev_flow_available IS NOT DISTINCT FROM flow_available
-         AND prev_median_seconds IS NOT DISTINCT FROM median_seconds
-         AND next_available IS NOT DISTINCT FROM available
-         AND next_blocker IS NOT DISTINCT FROM blocker
-         AND next_flow_available IS NOT DISTINCT FROM flow_available
-         AND next_median_seconds IS NOT DISTINCT FROM median_seconds
-       ORDER BY sampled_at ASC, id ASC
+         AND prev_available IS NOT DISTINCT FROM ordered.available
+         AND prev_blocker IS NOT DISTINCT FROM ordered.blocker
+         AND prev_flow_available IS NOT DISTINCT FROM ordered.flow_available
+         AND prev_median_seconds IS NOT DISTINCT FROM ordered.median_seconds
+         AND next_available IS NOT DISTINCT FROM ordered.available
+         AND next_blocker IS NOT DISTINCT FROM ordered.blocker
+         AND next_flow_available IS NOT DISTINCT FROM ordered.flow_available
+         AND next_median_seconds IS NOT DISTINCT FROM ordered.median_seconds
+       ORDER BY ordered.sampled_at ASC, r.id ASC
        LIMIT $2
+       FOR UPDATE OF r SKIP LOCKED
      ),
      deleted AS (
        DELETE FROM route_health
@@ -475,6 +524,9 @@ export async function compactRouteHealthSamples(
 export interface SourceAmountViolation {
   readonly kind: "outbound_amount_equation_mismatch" | "inbound_amount_mismatch";
   readonly chainKey: string;
+  readonly rowId: string;
+  readonly router: string;
+  readonly inboundId?: string;
   readonly route: number;
   readonly nonce: string;
   readonly expectedAmount: string;
@@ -531,7 +583,7 @@ export async function auditTransferAndClaimInvariants(
   db: Queryable,
 ): Promise<TransferClaimAuditReport> {
   const sourceOutboundRes = await db.query(
-    `SELECT origin_chain, route, nonce, gross_amount, fee, net_amount
+    `SELECT id, origin_router, origin_chain, route, nonce, gross_amount, fee, net_amount
        FROM outbound_transfer
       WHERE gross_amount <> fee + net_amount
          OR gross_amount < 0
@@ -541,13 +593,17 @@ export async function auditTransferAndClaimInvariants(
   );
 
   const sourcePairRes = await db.query(
-    `SELECT o.origin_chain, o.route, o.nonce, o.net_amount, i.amount AS inbound_amount
+    `SELECT o.id, o.origin_router, i.id AS inbound_id, o.origin_chain, o.route, o.nonce, o.net_amount, i.amount AS inbound_amount
        FROM outbound_transfer o
        JOIN inbound_delivery i
          ON i.destination_chain = o.destination_chain
         AND i.route = o.route
         AND i.source_chain = o.origin_chain
         AND i.source_nonce = o.nonce
+        AND (i.source_transfer_id = o.id OR (i.source_transfer_id IS NULL AND
+             (SELECT count(*) FROM outbound_transfer legacy WHERE legacy.origin_chain = o.origin_chain
+              AND legacy.route = o.route AND legacy.nonce = o.nonce
+              AND legacy.destination_chain = o.destination_chain) = 1))
       WHERE i.amount <> o.net_amount
       ORDER BY o.origin_chain, o.nonce`,
   );
@@ -556,6 +612,8 @@ export async function auditTransferAndClaimInvariants(
     ...sourceOutboundRes.rows.map((row) => ({
       kind: "outbound_amount_equation_mismatch" as const,
       chainKey: text(row, "origin_chain"),
+      rowId: numericString(row, "id"),
+      router: text(row, "origin_router"),
       route: integer(row, "route"),
       nonce: numericString(row, "nonce"),
       expectedAmount: numericString(row, "gross_amount"),
@@ -564,7 +622,10 @@ export async function auditTransferAndClaimInvariants(
     })),
     ...sourcePairRes.rows.map((row) => ({
       kind: "inbound_amount_mismatch" as const,
+      inboundId: numericString(row, "inbound_id"),
       chainKey: text(row, "origin_chain"),
+      rowId: numericString(row, "id"),
+      router: text(row, "origin_router"),
       route: integer(row, "route"),
       nonce: numericString(row, "nonce"),
       expectedAmount: numericString(row, "net_amount"),
@@ -649,7 +710,7 @@ export async function auditTransferAndClaimInvariants(
   ];
 
   const unsettledRes = await db.query(
-    `SELECT chain, token, count(*)::int AS open_count, COALESCE(sum(amount), 0)::numeric(78, 0) AS total_amount
+    `SELECT chain, token, count(*)::int AS open_count, COALESCE(sum(amount), 0)::numeric AS total_amount
        FROM pending_claim
       WHERE NOT settled
       GROUP BY chain, token
@@ -672,6 +733,11 @@ export async function auditTransferAndClaimInvariants(
         AND i.route = o.route
         AND i.source_chain = o.origin_chain
         AND i.source_nonce = o.nonce
+        AND i.delivered
+        AND (i.source_transfer_id = o.id OR (i.source_transfer_id IS NULL AND
+             (SELECT count(*) FROM outbound_transfer legacy WHERE legacy.origin_chain = o.origin_chain
+              AND legacy.route = o.route AND legacy.nonce = o.nonce
+              AND legacy.destination_chain = o.destination_chain) = 1))
       WHERE a.status = 'delivered'
         AND i.id IS NULL
       ORDER BY a.transfer_id`,

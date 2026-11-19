@@ -55,6 +55,7 @@ suite("replaying the anvil deployment's logs", () => {
     await db.query("DELETE FROM indexer_cursor WHERE chain_key = $1", [CHAIN]);
     await db.query("DELETE FROM indexer_lease WHERE chain_key = $1", [CHAIN]);
     await db.query("DELETE FROM evm_scan_provenance WHERE chain_key = $1", [CHAIN]);
+    await db.query("DELETE FROM evm_applied_event WHERE chain_key = $1", [CHAIN]);
   };
 
   /** Run the watcher to the confirmation line, the way the poller would. */

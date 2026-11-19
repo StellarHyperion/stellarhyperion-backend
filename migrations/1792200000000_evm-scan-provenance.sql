@@ -21,10 +21,21 @@ CREATE TABLE evm_scan_provenance (
   policy_changed         boolean NOT NULL DEFAULT false,
   previous_confirmations integer,
   previous_reorg_depth   integer,
+  previous_finality_mode text,
+  previous_allow_finality_fallback boolean,
   owner_id               text,
+  finality_mode          text NOT NULL DEFAULT 'confirmations' CHECK (finality_mode IN ('confirmations', 'finalized')),
+  allow_finality_fallback boolean NOT NULL DEFAULT false,
+  evidence_kind          text NOT NULL DEFAULT 'confirmations' CHECK (evidence_kind IN ('confirmations', 'finalized')),
+  finalized_block        numeric(20, 0),
+  finalized_hash         text,
   committed_at           timestamptz NOT NULL DEFAULT now(),
 
   CONSTRAINT evm_scan_provenance_range_chk CHECK (from_block <= to_block),
+  CONSTRAINT evm_scan_provenance_evidence_chk CHECK (
+    (evidence_kind = 'confirmations' AND finalized_block IS NULL AND finalized_hash IS NULL)
+    OR (evidence_kind = 'finalized' AND finalized_block >= to_block AND finalized_hash IS NOT NULL)
+  ),
   CONSTRAINT evm_scan_provenance_policy_change_chk CHECK (
     (NOT policy_changed AND previous_confirmations IS NULL AND previous_reorg_depth IS NULL)
     OR (policy_changed AND previous_confirmations IS NOT NULL AND previous_reorg_depth IS NOT NULL)

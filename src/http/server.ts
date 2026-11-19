@@ -8,6 +8,7 @@ import type { AppConfig } from "../config/config.js";
 import type { Database } from "../db/pool.js";
 import type { BullMQWorkerState, RedisPingable, ReadinessSource } from "../runtime/readiness.js";
 import { registerClaimRoutes } from "./routes/claims.js";
+import { registerBackfillRoutes } from "./routes/backfills.js";
 import { registerHealthRoutes } from "./routes/health.js";
 import { registerMetricsRoutes } from "./routes/metrics.js";
 import { registerRouteHealthRoutes } from "./routes/routes.js";
@@ -52,7 +53,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   app.addHook("onRequest", async (_request, reply) => {
     reply.header("Access-Control-Allow-Origin", "*");
     reply.header("Access-Control-Allow-Methods", "GET, OPTIONS");
-    reply.header("Access-Control-Allow-Headers", "Accept, Content-Type");
+    reply.header("Access-Control-Allow-Headers", "Accept, Content-Type, If-None-Match");
+    reply.header("Access-Control-Expose-Headers", "ETag, Cache-Control");
   });
   app.options("/*", async (_request, reply) => reply.code(204).send());
 
@@ -70,6 +72,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   registerHealthRoutes(app, deps);
   registerTransferRoutes(app, deps);
   registerClaimRoutes(app, deps);
+  registerBackfillRoutes(app, deps);
   registerRouteHealthRoutes(app, deps);
   registerMetricsRoutes(app, deps);
 

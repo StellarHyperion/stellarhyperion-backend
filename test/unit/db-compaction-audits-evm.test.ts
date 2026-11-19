@@ -4,11 +4,14 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import {
   readEvmFinalityPolicyChanges,
+  recordEvmScanProvenance,
   readLatestEvmScanProvenance,
 } from "../../src/chains/evm/store.js";
 import { EvmWatcher } from "../../src/chains/evm/watcher.js";
 import {
   auditTransferAndClaimInvariants,
+  acquireLease,
+  assertLeaseHeld,
   compactRouteHealthSamples,
   settleClaim,
   writeAttestation,
@@ -34,8 +37,13 @@ const MIGRATIONS = [
   "1791300000000_stellar-durable-scan-evidence.sql",
   "1791400000000_stellar-cursor-cas-leases-gaps.sql",
   "1791500000000_stellar-revisions-and-quarantine.sql",
-  "1791600000000_route-health-compaction-and-audits.sql",
-  "1791700000000_evm-scan-provenance.sql",
+  "1791600000000_durable-rail-retry-schedules.sql",
+  "1791700000000_rail-requeue-audit.sql",
+  "1791800000000_outbound-router-identity.sql",
+  "1791900000000_evm-log-quarantine.sql",
+  "1792000000000_evm-backfill-jobs.sql",
+  "1792100000000_route-health-compaction-and-audits.sql",
+  "1792200000000_evm-scan-provenance.sql",
 ] as const;
 
 function makePgliteDb(pg: PGlite): Transactional {
@@ -102,6 +110,143 @@ describe("PostgreSQL compaction, invariant audits, EVM leases and finality prove
         evm_scan_provenance
       RESTART IDENTITY CASCADE;
     `);
+  });
+
+  it("records a weaker evidence policy without changing any previous scan", async () => {
+    const entry = {
+      chainKey: "sepolia",
+      contract: ANVIL_ROUTER,
+      chainId: ANVIL_CHAIN_ID,
+      fromBlock: 1n,
+      toBlock: 10n,
+      endBlockHash: "0x" + "1".repeat(64),
+      headBlock: 100n,
+      logsWritten: 0,
+      logsIgnored: 0,
+      reorgDetected: false,
+      ownerId: "worker",
+    };
+    await recordEvmScanProvenance(db, {
+      ...entry,
+      policy: { confirmations: 3, reorgDepth: 5, finalityMode: "finalized" },
+      evidenceKind: "finalized",
+      finalizedBlock: 10n,
+      finalizedHash: entry.endBlockHash,
+    });
+    await recordEvmScanProvenance(db, {
+      ...entry,
+      fromBlock: 11n,
+      toBlock: 20n,
+      policy: { confirmations: 3, reorgDepth: 5, finalityMode: "confirmations" },
+    });
+    const changes = await readEvmFinalityPolicyChanges(db, "sepolia", ANVIL_ROUTER);
+    expect(changes).toHaveLength(1);
+    expect(changes[0]).toMatchObject({
+      previousFinalityMode: "finalized",
+      finalityMode: "confirmations",
+    });
+    const { rows } = await db.query(
+      "SELECT evidence_kind, finalized_block FROM evm_scan_provenance ORDER BY id",
+    );
+    expect(rows).toEqual([
+      { evidence_kind: "finalized", finalized_block: "10" },
+      { evidence_kind: "confirmations", finalized_block: null },
+    ]);
+  });
+
+  it("allows a crashed owner's expired lease to be replaced and rejects its old ownership", async () => {
+    const deployment = { chainKey: "sepolia", contract: ANVIL_ROUTER, ttlMs: 30_000 };
+    expect(await acquireLease(db, { ...deployment, ownerId: "crashed-owner" })).not.toBeNull();
+    expect(await acquireLease(db, { ...deployment, ownerId: "replacement" })).toBeNull();
+    await db.query(
+      "UPDATE indexer_lease SET lease_until = clock_timestamp() - interval '1 second'",
+    );
+    expect(await acquireLease(db, { ...deployment, ownerId: "replacement" })).not.toBeNull();
+    await expect(assertLeaseHeld(db, { ...deployment, ownerId: "crashed-owner" })).rejects.toThrow(
+      "watcher lease lost",
+    );
+    await expect(
+      assertLeaseHeld(db, { ...deployment, ownerId: "replacement" }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("audits exact source identities when different deployments reuse a nonce", async () => {
+    const at = {
+      chainKey: "sepolia",
+      block: 1n,
+      txHash: "source-one",
+      logIndex: 0,
+      observedAt: new Date(),
+    };
+    const row = {
+      route: 0,
+      nonce: 7n,
+      sender: "sender",
+      token: "USDC",
+      grossAmount: 100n,
+      fee: 0n,
+      netAmount: 100n,
+      destinationChain: "stellar-testnet",
+      destination: "recipient",
+      railRef: null,
+    };
+    await writeOutbound(db, { ...at, router: "router-one" }, row);
+    await writeOutbound(
+      db,
+      { ...at, router: "router-two", txHash: "source-two" },
+      { ...row, grossAmount: 200n, netAmount: 200n },
+    );
+    const { rows } = await db.query("SELECT id FROM outbound_transfer ORDER BY id");
+    const first = BigInt(String(rows[0]?.id));
+    const second = BigInt(String(rows[1]?.id));
+    await writeInbound(
+      db,
+      { ...at, chainKey: "stellar-testnet", txHash: "destination-proof" },
+      {
+        sourceTransferId: first,
+        route: 0,
+        sourceChain: "sepolia",
+        sourceNonce: 7n,
+        railMessageId: null,
+        recipient: "recipient",
+        token: "USDC",
+        amount: 90n,
+        delivered: true,
+        claimId: null,
+      },
+    );
+    for (const transferId of [first, second]) {
+      await writeAttestation(db, {
+        transferId,
+        route: 0,
+        status: "delivered",
+        railStatus: "delivered",
+        railReference: "provider-reference",
+        attestedAt: new Date(),
+        checkedAt: new Date(),
+        checkFailures: 0,
+        lastError: null,
+        retryAttempts: 0,
+        nextAttemptAt: null,
+        retryClass: null,
+      });
+    }
+    const report = await auditTransferAndClaimInvariants(db);
+    expect(report.sourceAmountViolations).toHaveLength(1);
+    expect(report.sourceAmountViolations[0]).toMatchObject({
+      rowId: first.toString(),
+      router: "router-one",
+      expectedAmount: "100",
+      actualAmount: "90",
+    });
+    expect(report.deliverySettlementViolations).toEqual([
+      {
+        kind: "delivered_attestation_without_inbound",
+        chainKey: "sepolia",
+        referenceId: second.toString(),
+        detail: "rail_attestation status is delivered without a corresponding inbound_delivery",
+      },
+    ]);
   });
 
   it("#61 compacts old identical route_health samples in bounded batches while preserving change boundaries and recent samples", async () => {
@@ -254,6 +399,9 @@ describe("PostgreSQL compaction, invariant audits, EVM leases and finality prove
       attestedAt: t0,
       checkedAt: t0,
       checkFailures: 0,
+      retryAttempts: 0,
+      nextAttemptAt: null,
+      retryClass: null,
       lastError: null,
     });
 
@@ -351,7 +499,7 @@ describe("PostgreSQL compaction, invariant audits, EVM leases and finality prove
     await db.query("DELETE FROM indexer_cursor WHERE chain_key = 'sepolia'");
 
     await watcherB.tick(AbortSignal.timeout(5_000));
-    expect(watcherB.progress?.policy).toEqual({ confirmations: 1, reorgDepth: 8 });
+    expect(watcherB.progress?.policy).toMatchObject({ confirmations: 1, reorgDepth: 8 });
     expect(watcherB.policyChanges).toHaveLength(1);
 
     const changes = await readEvmFinalityPolicyChanges(db, "sepolia", ANVIL_ROUTER);

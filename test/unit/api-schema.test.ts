@@ -43,7 +43,10 @@ beforeAll(async () => {
     "1790900000000_initial-schema.sql",
     "1791000000000_cursor-block-hash.sql",
     "1791100000000_cursor-autovacuum-tuning.sql",
+    "1791300000000_stellar-durable-scan-evidence.sql",
     "1791400000000_stellar-cursor-cas-leases-gaps.sql",
+    "1791500000000_stellar-revisions-and-quarantine.sql",
+    "1791800000000_outbound-router-identity.sql",
   ]) {
     const sql = readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8").split(
       "-- Down Migration",
@@ -75,6 +78,37 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     const list = await app.inject("/v1/claims?chain=stellar-testnet");
     expect(list.statusCode).toBe(200);
     expect(list.json().claims).toHaveLength(1);
+  });
+  it("supports revalidation for detail claims and updates their revision after settlement", async () => {
+    const detailUrl = "/v1/claims/stellar-testnet/7";
+    const pending = await app.inject(detailUrl);
+    expect(pending.statusCode).toBe(200);
+    expect(pending.headers["cache-control"]).toBe("private, no-cache, max-age=0, must-revalidate");
+    const etag = pending.headers.etag;
+    expect(etag).toBeDefined();
+
+    const unchanged = await app.inject({
+      method: "GET",
+      url: detailUrl,
+      headers: { "if-none-match": `W/${etag}` },
+    });
+    expect(unchanged.statusCode).toBe(304);
+    expect(unchanged.payload).toBe("");
+    expect(unchanged.headers.etag).toBe(etag);
+
+    await pg.query(
+      `UPDATE pending_claim
+          SET settled = true, settled_at = now(), settled_by = 'Gsettler', settled_tx = 'settlement-tx'
+        WHERE chain = 'stellar-testnet' AND claim_id = 7`,
+    );
+    const settled = await app.inject({
+      method: "GET",
+      url: detailUrl,
+      headers: { "if-none-match": etag },
+    });
+    expect(settled.statusCode).toBe(200);
+    expect(settled.headers.etag).not.toBe(etag);
+    expect(settled.json().settled).toBe(true);
   });
   it("reads sampled route health using the migration's timestamp", async () => {
     const response = await app.inject("/v1/routes/health");
@@ -124,5 +158,62 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     expect(response.json().destination.decimals).toBe(6);
     expect(response.json().destination.symbol).toBe("USDC");
     expect(response.json().origin.netAmount).toBe("9970000");
+  });
+  it("revalidates equivalent transfer detail routes and invalidates on proof changes", async () => {
+    const initial = await app.inject("/v1/transfers/by-tx/source-hash");
+    expect(initial.statusCode).toBe(200);
+    expect(initial.json().destination.delivered).toBe(false);
+    expect(initial.headers["cache-control"]).toBe("private, no-cache, max-age=0, must-revalidate");
+    expect(initial.headers["access-control-allow-headers"]).toContain("If-None-Match");
+    expect(initial.headers["access-control-expose-headers"]).toContain("ETag");
+    const transferId = initial.json().id as string;
+    const etag = initial.headers.etag;
+    expect(etag).toBeDefined();
+
+    for (const url of [
+      "/v1/transfers/stellar-testnet/42",
+      "/v1/transfers/by-tx/source-hash",
+      `/v1/transfers/${transferId}`,
+      `/api/v1/transfers/${transferId}`,
+    ]) {
+      const unchanged = await app.inject({
+        method: "GET",
+        url,
+        headers: { "if-none-match": etag },
+      });
+      expect(unchanged.statusCode).toBe(304);
+      expect(unchanged.payload).toBe("");
+      expect(unchanged.headers.etag).toBe(etag);
+    }
+
+    await pg.query(
+      `INSERT INTO rail_attestation (transfer_id, route, status, rail_status, rail_reference, attested_at)
+       VALUES ($1, 1, 'attested', 'complete', 'provider-proof', now())`,
+      [transferId],
+    );
+    const providerStatusOnly = await app.inject({
+      method: "GET",
+      url: `/v1/transfers/${transferId}`,
+      headers: { "if-none-match": etag },
+    });
+    expect(providerStatusOnly.statusCode).toBe(200);
+    expect(providerStatusOnly.headers.etag).not.toBe(etag);
+    expect(providerStatusOnly.json().destination.delivered).toBe(false);
+    expect(providerStatusOnly.headers["cache-control"]).toBe(
+      "private, no-cache, max-age=0, must-revalidate",
+    );
+
+    await pg.query(
+      `UPDATE outbound_transfer SET origin_log_index = 3
+        WHERE origin_chain = 'stellar-testnet' AND nonce = 42`,
+    );
+    const updatedProof = await app.inject({
+      method: "GET",
+      url: `/v1/transfers/${transferId}`,
+      headers: { "if-none-match": providerStatusOnly.headers.etag },
+    });
+    expect(updatedProof.statusCode).toBe(200);
+    expect(updatedProof.headers.etag).not.toBe(providerStatusOnly.headers.etag);
+    expect(updatedProof.json().destination.delivered).toBe(false);
   });
 });
