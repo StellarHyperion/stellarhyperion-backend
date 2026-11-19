@@ -10,6 +10,8 @@ import type { AppConfig } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
 import { startKeeperQueue, type KeeperHandle } from "./queue.js";
+import { countPendingKeeperSubmissions } from "./outcomes.js";
+import { activeKeeperSigner, validateKeeperSigner } from "./signers.js";
 
 export class KeeperWorker implements ReadinessSource {
   readonly name = "keeper";
@@ -35,7 +37,7 @@ export class KeeperWorker implements ReadinessSource {
       return {
         name: this.name,
         state: "degraded",
-        detail: `redis connection failure: ${this.failedError}`,
+        detail: `keeper startup blocked: ${this.failedError}`,
       };
     }
     if (this.handle === null) {
@@ -56,10 +58,34 @@ export class KeeperWorker implements ReadinessSource {
     if (!this.config.keeper.enabled || this.handle !== null || this.starting) return;
     this.starting = true;
 
-    startKeeperQueue(
-      { db: this.db, config: this.config, logger: this.logger },
-      this.config.redisUrl,
-    )
+    Promise.resolve()
+      .then(async () => {
+        if (this.config.keeper.stellarSecrets.length > 0) {
+          const signer = activeKeeperSigner(this.config);
+          await validateKeeperSigner(this.config, signer);
+          let pending = 0;
+          try {
+            pending = await countPendingKeeperSubmissions(this.db);
+          } catch (error) {
+            if (!(
+              typeof error === "object" &&
+              error !== null &&
+              "code" in error &&
+              error.code === "42P01"
+            ))
+              throw error;
+          }
+          if (pending > 0) {
+            throw new Error(
+              `${String(pending)} pending Stellar submission(s) require reconciliation before signer rotation`,
+            );
+          }
+        }
+        return startKeeperQueue(
+          { db: this.db, config: this.config, logger: this.logger },
+          this.config.redisUrl,
+        );
+      })
       .then((handle) => {
         this.handle = handle;
         this.starting = false;

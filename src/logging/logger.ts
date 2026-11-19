@@ -42,6 +42,8 @@ const REDACTED_PATHS = [
   "fallbackRpc",
   "*.stellarSecret",
   "config.keeper.stellarSecret",
+  "stellarSecrets",
+  "config.keeper.stellarSecrets",
   "*.databaseUrl",
   "*.redisUrl",
   "*.connectionString",
