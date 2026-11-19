@@ -12,6 +12,7 @@
  * them apart is why the watcher tests do not sleep, and why the retry policy is one file rather
  * than one per chain.
  */
+import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 
 import type {
@@ -22,14 +23,14 @@ import type {
 } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
 import { Poller } from "../runtime/poller.js";
-import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
-import { fixedReadiness } from "../runtime/readiness.js";
+import type { ReadinessReport, ReadinessSource, WorkerKind } from "../runtime/readiness.js";
+import { fixedReadiness, recordWorkerHeartbeat } from "../runtime/readiness.js";
 import { RouteKind } from "@hyperion/protocol";
 
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
 import { inspectRailBacklog, type InspectRailBacklogOptions } from "../rails/backlog.js";
 import { IrisClient } from "../rails/cctp/iris.js";
-import { RailPass } from "../rails/pass.js";
+import { RailPass, type RailProgress } from "../rails/pass.js";
 import { requeueTerminalTransfer } from "../rails/requeue.js";
 import type {
   BacklogInspectionReport,
@@ -78,6 +79,13 @@ interface Pass extends ReadinessSource {
   readonly name: string;
   tick(signal: AbortSignal): Promise<boolean>;
   release?(): Promise<unknown>;
+  readonly progress?: { readonly block?: bigint; readonly ledger?: number } | RailProgress | null;
+}
+
+export interface PolledWorkerOptions {
+  readonly db?: Transactional;
+  readonly workerKind?: WorkerKind;
+  readonly chainKey?: string | null;
 }
 
 /**
@@ -89,17 +97,69 @@ interface Pass extends ReadinessSource {
  */
 export class PolledWorker implements Worker {
   private readonly poller: Poller;
+  private readonly db: Transactional | undefined;
+  private readonly workerKind: WorkerKind;
+  private readonly chainKey: string | null;
 
   constructor(
     private readonly pass: Pass,
     intervalMs: number,
     logger: Logger,
+    options: PolledWorkerOptions = {},
   ) {
+    this.db = options.db;
+    this.workerKind = options.workerKind ?? "other";
+    this.chainKey = options.chainKey ?? null;
     this.poller = new Poller({
       name: pass.name,
       intervalMs,
       logger,
-      tick: (signal) => pass.tick(signal),
+      tick: async (signal) => {
+        let error: unknown;
+        let completed = false;
+        try {
+          const result = await pass.tick(signal);
+          completed = true;
+          return result;
+        } catch (failure) {
+          error = failure;
+          throw failure;
+        } finally {
+          if (this.db !== undefined) {
+            await this.persistHeartbeat(completed, error).catch((err: unknown) => {
+              logger.warn({ err, worker: pass.name }, "failed to persist worker heartbeat");
+            });
+          }
+        }
+      },
+    });
+  }
+
+  private async persistHeartbeat(completed: boolean, error?: unknown): Promise<void> {
+    if (this.db === undefined) return;
+    const stats = this.poller.stats;
+    const report = await (completed ? this.pass.readiness() : this.readiness());
+    const progress = this.pass.progress;
+    const consecutiveFailures = completed ? 0 : stats.consecutiveFailures + 1;
+    await recordWorkerHeartbeat(this.db, {
+      workerName: this.name,
+      workerKind: this.workerKind,
+      chainKey: this.chainKey,
+      state: consecutiveFailures >= FAILURES_BEFORE_DEGRADED ? "degraded" : report.state,
+      detail: report.detail,
+      completed,
+      lastCursorBlock:
+        progress && "block" in progress
+          ? (progress.block ?? null)
+          : progress && "ledger" in progress
+            ? BigInt(progress.ledger)
+            : null,
+      consecutiveFailures,
+      lastError: completed ? null : error instanceof Error ? error.message : String(error),
+      metadata: {
+        ticks: stats.ticks,
+        running: stats.running,
+      },
     });
   }
 
@@ -192,7 +252,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   const extra: ReadinessSource[] = [];
 
   if (config.indexer.stellar !== null) {
-    workers.push(stellarWorker(config.indexer.stellar, db, logger));
+    workers.push(stellarWorker(config.indexer.stellar, db, logger, config));
   } else {
     logger.warn("the deployment record has no Stellar router, so nothing is watching Stellar");
   }
@@ -200,7 +260,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // One per chain in the record. Each carries its own confirmations from the registry, which is
   // the honest way to treat one block on Arc and twelve on Ethereum as the same kind of fact.
   for (const chain of config.indexer.evm) {
-    workers.push(evmWorker(chain, db, logger));
+    workers.push(evmWorker(chain, db, logger, config));
   }
 
   // Counted before the rail pollers join the list, because the two questions are different. "Is
@@ -213,7 +273,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // They are not conditional on a router being watched: a transfer indexed by a previous run is
   // still waiting on its rail whether or not this replica is watching the chain it left.
   if (config.rails.enabled) {
-    for (const worker of railWorkersFromPasses(passes, config.rails, logger)) {
+    for (const worker of railWorkersFromPasses(passes, config.rails, db, logger)) {
       workers.push(worker);
     }
   } else {
@@ -323,34 +383,61 @@ export function buildRailPasses(
 function railWorkersFromPasses(
   passes: readonly RailPass[],
   config: RailsConfig,
+  db: Transactional,
   logger: Logger,
 ): readonly Worker[] {
   return passes.map((pass) => {
     const child = logger.child({ rail: pass.rail, route: pass.route });
-    return new PolledWorker(pass, config.pollIntervalMs, child);
+    return new PolledWorker(pass, config.pollIntervalMs, child, {
+      db,
+      workerKind: "rail",
+      chainKey: null,
+    });
   });
 }
 
-function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): Worker {
+function evmWorker(
+  config: EvmWatchConfig,
+  db: Transactional,
+  logger: Logger,
+  app?: AppConfig,
+): Worker {
   const child = logger.child({ chain: config.chain, chainId: config.chainId });
   const watcher = new EvmWatcher({
+    ...(app
+      ? { ownerId: `${app.indexerLeaseOwnerId}:${randomUUID()}`, leaseTtlMs: app.indexerLeaseTtlMs }
+      : {}),
     chainKey: config.chain,
     router: config.routerAddress,
     chainId: config.chainId,
     startBlock: config.startBlock,
     confirmations: config.confirmations,
+    finalityMode: config.finalityMode ?? "confirmations",
+    allowFinalityFallback: config.allowFinalityFallback ?? false,
     reorgDepth: config.reorgDepth,
     logRange: config.logRange,
     client: viemClient(config.rpcUrls, { logger: child }),
     db,
     logger: child,
   });
-  return new PolledWorker(watcher, config.pollIntervalMs, child);
+  return new PolledWorker(watcher, config.pollIntervalMs, child, {
+    db,
+    workerKind: "chain",
+    chainKey: config.chain,
+  });
 }
 
-function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Logger): Worker {
+function stellarWorker(
+  config: StellarWatchConfig,
+  db: Transactional,
+  logger: Logger,
+  app?: AppConfig,
+): Worker {
   const child = logger.child({ chain: config.chain });
   const watcher = new StellarWatcher({
+    ...(app
+      ? { ownerId: `${app.indexerLeaseOwnerId}:${randomUUID()}`, leaseTtlMs: app.indexerLeaseTtlMs }
+      : {}),
     chainKey: config.chain,
     router: config.routerContractId,
     startLedger: config.startLedger,
@@ -364,5 +451,9 @@ function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Lo
     db,
     logger: child,
   });
-  return new PolledWorker(watcher, config.pollIntervalMs, child);
+  return new PolledWorker(watcher, config.pollIntervalMs, child, {
+    db,
+    workerKind: "chain",
+    chainKey: config.chain,
+  });
 }

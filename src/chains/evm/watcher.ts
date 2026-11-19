@@ -24,6 +24,7 @@
  * deleted money records to tidy up after a reorg deeper than the chain's own stated finality would
  * be a worse failure than the one it was cleaning up. So that case is reported and left.
  */
+import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 import type { Hex } from "viem";
 
@@ -32,7 +33,17 @@ import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
 import type { Position } from "../writers.js";
-import { ClaimPairing, applyRouterLog, quarantineEvmLog } from "./store.js";
+import {
+  acquireLease,
+  applyRouterLog,
+  assertLeaseHeld,
+  ClaimPairing,
+  recordEvmScanProvenance,
+  quarantineEvmLog,
+  releaseLease,
+  type EvmFinalityPolicy,
+  type EvmFinalityPolicyChange,
+} from "./store.js";
 import { decodeRouterLog, signatureOf } from "./logs.js";
 import type { EvmClient, RawEvmLog } from "./client.js";
 
@@ -45,6 +56,8 @@ import type { EvmClient, RawEvmLog } from "./client.js";
  * chain in the registry.
  */
 const CURRENT_WITHIN_BLOCKS = 2;
+const DEFAULT_LEASE_TTL_MS = 30_000;
+const MAX_POLICY_CHANGES_CACHED = 50;
 const MAX_QUARANTINED_LOGS_PER_PASS = 100;
 
 export interface EvmWatcherOptions {
@@ -56,6 +69,9 @@ export interface EvmWatcherOptions {
   readonly startBlock: bigint;
   /** How many blocks behind the head this chain's own finality needs. */
   readonly confirmations: number;
+  readonly finalityMode?: "confirmations" | "finalized";
+  /** Only this explicit configuration permits falling back from finalized evidence to depth. */
+  readonly allowFinalityFallback?: boolean;
   /** How far back to wind the cursor when a reorg is found below that depth. */
   readonly reorgDepth: number;
   /** Blocks per `getLogs` call. Public endpoints reject wide ranges. */
@@ -63,6 +79,12 @@ export interface EvmWatcherOptions {
   readonly client: EvmClient;
   readonly db: Transactional;
   readonly logger: Logger;
+  /** Unique worker identity for expiring database lease ownership (#46). */
+  readonly ownerId?: string;
+  /** Lease TTL in milliseconds (#46). Defaults to 30_000. */
+  readonly leaseTtlMs?: number;
+  /** Release the lease at the end of each tick (useful for scheduled/one-shot workers). */
+  readonly releaseLeaseOnTick?: boolean;
 }
 
 export interface EvmProgress {
@@ -74,6 +96,7 @@ export interface EvmProgress {
   /** Blocks between the cursor and the deepest block this watcher will read. */
   readonly behind: number;
   readonly reorgs: number;
+  readonly policy: EvmFinalityPolicy;
   readonly at: Date;
 }
 
@@ -84,8 +107,25 @@ export class EvmWatcher {
   private chainConfirmed = false;
   /** Signatures seen once and logged once. A router ahead of this build is not a log flood. */
   private readonly reportedUnknown = new Set<string>();
+  private readonly ownerId: string;
+  private readonly leaseTtlMs: number;
+  private readonly recentPolicyChanges: EvmFinalityPolicyChange[] = [];
 
-  constructor(private readonly options: EvmWatcherOptions) {}
+  constructor(private readonly options: EvmWatcherOptions) {
+    this.ownerId = options.ownerId ?? randomUUID();
+    this.leaseTtlMs = options.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS;
+    if (!Number.isSafeInteger(this.leaseTtlMs) || this.leaseTtlMs < 1)
+      throw new RangeError("invalid EVM lease TTL");
+    if (
+      !Number.isSafeInteger(options.confirmations) ||
+      options.confirmations < 0 ||
+      !Number.isSafeInteger(options.reorgDepth) ||
+      options.reorgDepth < 1 ||
+      !Number.isSafeInteger(options.logRange) ||
+      options.logRange < 1
+    )
+      throw new RangeError("invalid EVM scan policy");
+  }
 
   get name(): string {
     return this.options.chainKey;
@@ -93,6 +133,27 @@ export class EvmWatcher {
 
   get progress(): EvmProgress | null {
     return this.lastProgress;
+  }
+
+  get policy(): EvmFinalityPolicy {
+    return {
+      confirmations: this.options.confirmations,
+      reorgDepth: this.options.reorgDepth,
+      finalityMode: this.options.finalityMode ?? "confirmations",
+      allowFinalityFallback: this.options.allowFinalityFallback ?? false,
+    };
+  }
+
+  get policyChanges(): readonly EvmFinalityPolicyChange[] {
+    return [...this.recentPolicyChanges];
+  }
+
+  async release(): Promise<boolean> {
+    return releaseLease(this.options.db, {
+      chainKey: this.options.chainKey,
+      contract: this.options.router.toLowerCase(),
+      ownerId: this.ownerId,
+    });
   }
 
   /**
@@ -117,7 +178,7 @@ export class EvmWatcher {
     const { router, client, db, chainKey } = this.options;
     await this.confirmChain(signal);
     const head = await client.blockNumber(signal);
-    if (to > head - BigInt(this.options.confirmations))
+    if (to > (await this.scanLimit(head, signal)).boundary)
       throw new Error("backfill range is not confirmed");
     const fetched = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
     if (
@@ -228,183 +289,297 @@ export class EvmWatcher {
    * a watcher starting from a deployment block months back catches up without sleeping per range.
    */
   async tick(signal: AbortSignal): Promise<boolean> {
-    const { chainKey, router, db, logger, client, confirmations } = this.options;
+    const { chainKey, chainId, router, db, logger, client, confirmations, reorgDepth } =
+      this.options;
+    const leaseContract = router.toLowerCase();
 
-    const stored = await readCursor(db, chainKey);
-    if (stored !== null && stored.contract.toLowerCase() !== router.toLowerCase()) {
-      // A different router at a different address shares no history with this cursor. Carrying it
-      // over would skip everything the new deployment has ever done, silently.
-      throw new Error(
-        `the cursor for ${chainKey} was written for router ${stored.contract} and this process is watching ${router}. ` +
-          "A redeployed router needs its cursor reset rather than reused.",
-      );
-    }
-
-    await this.confirmChain(signal);
-
-    const head = await client.blockNumber(signal);
-    // The deepest block this chain considers settled. Nothing past it is read, so nothing past it
-    // can be written and then taken back.
-    const confirmed = head - BigInt(confirmations);
-
-    let from = stored === null ? this.options.startBlock : stored.position + 1n;
-    if (stored !== null && stored.hash !== null) {
-      const rewound = await this.checkForReorg(stored.position, stored.hash, signal);
-      if (rewound !== null) from = rewound;
-    }
-
-    if (from > confirmed) {
-      // Caught up to the confirmation line. Normal, and the common case on a fast chain.
-      this.lastProgress = {
-        block: stored?.position ?? this.options.startBlock - 1n,
-        written: 0,
-        ignored: 0,
-        head,
-        behind: Number(confirmed - (stored?.position ?? this.options.startBlock - 1n)),
-        reorgs: this.reorgs,
-        at: new Date(),
-      };
-      return false;
-    }
-
-    const to = min(from + BigInt(this.options.logRange) - 1n, confirmed);
-    const fetched = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
-    if (
-      fetched.some(
-        (log) =>
-          log.address.toLowerCase() !== router.toLowerCase() ||
-          log.blockNumber < from ||
-          log.blockNumber > to,
-      )
-    )
-      throw new Error("provider returned logs outside the requested router or block range");
-    const logs = [...fetched].sort((a, b) =>
-      a.blockNumber < b.blockNumber
-        ? -1
-        : a.blockNumber > b.blockNumber
-          ? 1
-          : a.logIndex - b.logIndex,
-    );
-
-    // Block timestamps, which `getLogs` does not return and three columns need. One call per block
-    // that actually has logs, plus the range end for its hash, rather than one per block in range.
-    const wanted = new Set<bigint>(logs.map((log) => log.blockNumber));
-    wanted.add(to);
-    const blocks = await client.blocks([...wanted], signal);
-
-    const endHash = blocks.get(to)?.hash ?? null;
-    if (endHash === null) {
-      // The range end vanished between the log read and the block read, which is a reorg landing
-      // mid pass. Nothing is written and the next pass finds it through the cursor hash.
-      logger.warn(
-        { chain: chainKey, block: to.toString() },
-        "the block at the end of this range disappeared mid pass, so nothing was committed",
+    const lease = await acquireLease(db, {
+      chainKey,
+      contract: leaseContract,
+      ownerId: this.ownerId,
+      ttlMs: this.leaseTtlMs,
+    });
+    if (lease === null) {
+      logger.debug(
+        { chain: chainKey, router, ownerId: this.ownerId },
+        "skipping evm tick; lease held by another worker",
       );
       return false;
     }
 
-    let written = 0;
-    let ignored = 0;
-    const pairing = new ClaimPairing();
-    const quarantined = this.findOrderingConflicts(logs);
-    let recordedQuarantines = 0;
+    try {
+      const stored = await readCursor(db, chainKey);
+      if (stored !== null && stored.contract.toLowerCase() !== leaseContract) {
+        // A different router at a different address shares no history with this cursor. Carrying it
+        // over would skip everything the new deployment has ever done, silently.
+        throw new Error(
+          `the cursor for ${chainKey} was written for router ${stored.contract} and this process is watching ${router}. ` +
+            "A redeployed router needs its cursor reset rather than reused.",
+        );
+      }
 
-    // One transaction for the range and the cursor advance past it. This is the restart guarantee,
-    // and splitting it would turn every crash into either a lost range or a duplicated one.
-    await db.transaction(async (tx: Queryable) => {
-      await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
-        "evm-events:" + chainKey,
-      ]);
-      for (const log of logs) {
-        if (log.removed) {
-          // viem marks a log from an orphaned block. Indexing one would record a transfer that is
-          // no longer on the chain.
-          ignored += 1;
-          continue;
+      await this.confirmChain(signal);
+
+      const head = await client.blockNumber(signal);
+      // The deepest block this chain considers settled. Nothing past it is read, so nothing past it
+      // can be written and then taken back.
+      const finality = await this.scanLimit(head, signal);
+      const confirmed = finality.boundary;
+
+      let from = stored === null ? this.options.startBlock : stored.position + 1n;
+      let reorgDetected = false;
+      if (stored !== null && stored.hash !== null) {
+        const rewound = await this.checkForReorg(stored.position, stored.hash, signal);
+        if (rewound !== null) {
+          from = rewound;
+          reorgDetected = true;
         }
-        const conflict = quarantined.get(logKey(log));
-        if (conflict !== undefined) {
+      }
+
+      if (from > confirmed) {
+        // Caught up to the confirmation line. Normal, and the common case on a fast chain.
+        this.lastProgress = {
+          block: stored?.position ?? this.options.startBlock - 1n,
+          written: 0,
+          ignored: 0,
+          head,
+          behind: Number(confirmed - (stored?.position ?? this.options.startBlock - 1n)),
+          reorgs: this.reorgs,
+          policy: this.policy,
+          at: new Date(),
+        };
+        return false;
+      }
+
+      const to = min(from + BigInt(this.options.logRange) - 1n, confirmed);
+      const fetched = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
+      if (
+        fetched.some(
+          (log) =>
+            log.address.toLowerCase() !== router.toLowerCase() ||
+            log.blockNumber < from ||
+            log.blockNumber > to,
+        )
+      )
+        throw new Error("provider returned logs outside the requested router or block range");
+      const logs = [...fetched].sort((a, b) =>
+        a.blockNumber < b.blockNumber
+          ? -1
+          : a.blockNumber > b.blockNumber
+            ? 1
+            : a.logIndex - b.logIndex,
+      );
+
+      // Block timestamps, which `getLogs` does not return and three columns need. One call per block
+      // that actually has logs, plus the range end for its hash, rather than one per block in range.
+      const wanted = new Set<bigint>(logs.map((log) => log.blockNumber));
+      wanted.add(to);
+      const blocks = await client.blocks([...wanted], signal);
+
+      const endHash = blocks.get(to)?.hash ?? null;
+      if (endHash === null) {
+        // The range end vanished between the log read and the block read, which is a reorg landing
+        // mid pass. Nothing is written and the next pass finds it through the cursor hash.
+        logger.warn(
+          { chain: chainKey, block: to.toString() },
+          "the block at the end of this range disappeared mid pass, so nothing was committed",
+        );
+        return false;
+      }
+
+      let written = 0;
+      let ignored = 0;
+      const pairing = new ClaimPairing();
+      const quarantined = this.findOrderingConflicts(logs);
+      let recordedQuarantines = 0;
+
+      // One transaction for the range, the cursor advance, and the finality-policy provenance.
+      // Asserting the lease inside the transaction ensures a worker whose lease expired during RPC
+      // calls cannot commit stale state.
+      const policyChange = await db.transaction(async (tx: Queryable) => {
+        await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+          "evm-events:" + chainKey,
+        ]);
+        await assertLeaseHeld(tx, {
+          chainKey,
+          contract: leaseContract,
+          ownerId: this.ownerId,
+          ttlMs: this.leaseTtlMs,
+        });
+
+        for (const log of logs) {
+          throwIfAborted(signal);
+          if (log.removed) {
+            // viem marks a log from an orphaned block. Indexing one would record a transfer that is
+            // no longer on the chain.
+            ignored += 1;
+            continue;
+          }
+          const conflict = quarantined.get(logKey(log));
+          if (conflict !== undefined) {
+            const timestamp = blocks.get(log.blockNumber)?.timestamp;
+            if (timestamp === undefined) {
+              throw new Error(
+                `no timestamp for quarantined block ${log.blockNumber.toString()} on ${chainKey}`,
+              );
+            }
+            if (recordedQuarantines < MAX_QUARANTINED_LOGS_PER_PASS) {
+              recordedQuarantines += 1;
+              await quarantineEvmLog(
+                tx,
+                {
+                  chainKey,
+                  block: log.blockNumber,
+                  txHash: log.transactionHash,
+                  logIndex: log.logIndex,
+                  eventName: conflict.eventName,
+                  reason: conflict.reason,
+                },
+                new Date(Number(timestamp) * 1000),
+              );
+            }
+            if (recordedQuarantines < MAX_QUARANTINED_LOGS_PER_PASS)
+              logger.warn(
+                {
+                  chain: chainKey,
+                  block: log.blockNumber.toString(),
+                  txHash: log.transactionHash,
+                  logIndex: log.logIndex,
+                  event: conflict.eventName,
+                  reason: conflict.reason,
+                },
+                "quarantined EVM log with invalid lifecycle ordering",
+              );
+            ignored += 1;
+            continue;
+          }
           const timestamp = blocks.get(log.blockNumber)?.timestamp;
           if (timestamp === undefined) {
             throw new Error(
-              `no timestamp for quarantined block ${log.blockNumber.toString()} on ${chainKey}`,
+              `no timestamp for block ${log.blockNumber.toString()} on ${chainKey}, which three columns need`,
             );
           }
-          if (recordedQuarantines < MAX_QUARANTINED_LOGS_PER_PASS) {
-            recordedQuarantines += 1;
-            await quarantineEvmLog(
-              tx,
-              {
-                chainKey,
-                block: log.blockNumber,
-                txHash: log.transactionHash,
-                logIndex: log.logIndex,
-                eventName: conflict.eventName,
-                reason: conflict.reason,
-              },
-              new Date(Number(timestamp) * 1000),
-            );
-          }
-          if (recordedQuarantines < MAX_QUARANTINED_LOGS_PER_PASS)
-            logger.warn(
-              {
-                chain: chainKey,
-                block: log.blockNumber.toString(),
-                txHash: log.transactionHash,
-                logIndex: log.logIndex,
-                event: conflict.eventName,
-                reason: conflict.reason,
-              },
-              "quarantined EVM log with invalid lifecycle ordering",
-            );
-          ignored += 1;
-          continue;
+          if (await this.apply(tx, log, timestamp, pairing)) written += 1;
+          else ignored += 1;
         }
-        const timestamp = blocks.get(log.blockNumber)?.timestamp;
-        if (timestamp === undefined) {
-          throw new Error(
-            `no timestamp for block ${log.blockNumber.toString()} on ${chainKey}, which three columns need`,
-          );
+        await writeCursor(tx, {
+          chainKey,
+          family: "evm",
+          contract: router,
+          position: to,
+          expectedRevision: stored?.revision ?? null,
+          observedAt: timestampOf(blocks.get(to)?.timestamp ?? null),
+          // The whole reason the column exists. Without it the next pass cannot tell advancing from
+          // being handed a different history.
+          hash: endHash,
+        });
+
+        return recordEvmScanProvenance(tx, {
+          chainKey,
+          contract: router,
+          chainId,
+          fromBlock: from,
+          toBlock: to,
+          endBlockHash: endHash,
+          headBlock: head,
+          policy: this.policy,
+          evidenceKind: finality.kind,
+          finalizedBlock: finality.finalized?.number ?? null,
+          finalizedHash: finality.finalized?.hash ?? null,
+          logsWritten: written,
+          logsIgnored: ignored,
+          reorgDetected,
+          ownerId: this.ownerId,
+        });
+      });
+
+      if (policyChange !== null) {
+        this.recentPolicyChanges.push(policyChange);
+        if (this.recentPolicyChanges.length > MAX_POLICY_CHANGES_CACHED) {
+          this.recentPolicyChanges.shift();
         }
-        if (await this.apply(tx, log, timestamp, pairing)) written += 1;
-        else ignored += 1;
+        logger.warn(
+          {
+            chain: chainKey,
+            contract: router,
+            from: from.toString(),
+            to: to.toString(),
+            previousConfirmations: policyChange.previousConfirmations,
+            confirmations: policyChange.confirmations,
+            previousReorgDepth: policyChange.previousReorgDepth,
+            reorgDepth: policyChange.reorgDepth,
+          },
+          "evm finality policy changed across committed scans",
+        );
       }
 
-      await writeCursor(tx, {
-        chainKey,
-        family: "evm",
-        contract: router,
-        position: to,
-        observedAt: timestampOf(blocks.get(to)?.timestamp ?? null),
-        // The whole reason the column exists. Without it the next pass cannot tell advancing from
-        // being handed a different history.
-        hash: endHash,
-      });
-    });
-
-    const behind = Number(confirmed - to);
-    this.lastProgress = {
-      block: to,
-      written,
-      ignored,
-      head,
-      behind,
-      reorgs: this.reorgs,
-      at: new Date(),
-    };
-    logger.info(
-      {
-        chain: chainKey,
-        from: from.toString(),
-        to: to.toString(),
+      const behind = Number(confirmed - to);
+      this.lastProgress = {
+        block: to,
         written,
         ignored,
+        head,
         behind,
-      },
-      "evm range indexed",
-    );
+        reorgs: this.reorgs,
+        policy: this.policy,
+        at: new Date(),
+      };
+      logger.info(
+        {
+          chain: chainKey,
+          from: from.toString(),
+          to: to.toString(),
+          written,
+          ignored,
+          behind,
+          confirmations,
+          reorgDepth,
+        },
+        "evm range indexed",
+      );
 
-    return behind > 0;
+      return behind > 0;
+    } finally {
+      if (this.options.releaseLeaseOnTick) {
+        await this.release().catch(() => undefined);
+      }
+    }
+  }
+
+  private async scanLimit(
+    head: bigint,
+    signal: AbortSignal,
+  ): Promise<{
+    boundary: bigint;
+    kind: "confirmations" | "finalized";
+    finalized: { number: bigint; hash: Hex } | null;
+  }> {
+    const depth = head - BigInt(this.options.confirmations);
+    if (this.options.finalityMode !== "finalized")
+      return { boundary: depth, kind: "confirmations", finalized: null };
+    let finalized: { number: bigint; hash: Hex };
+    try {
+      if (!this.options.client.finalizedBlock)
+        throw new Error("finalized block tags are unsupported");
+      finalized = await this.options.client.finalizedBlock(signal);
+    } catch {
+      throwIfAborted(signal);
+      if (!this.options.allowFinalityFallback)
+        throw new Error("finalized block evidence unavailable; depth fallback is disabled");
+      this.options.logger.warn(
+        { chain: this.options.chainKey },
+        "using explicitly configured confirmation-depth finality fallback",
+      );
+      return { boundary: depth, kind: "confirmations", finalized: null };
+    }
+    if (
+      finalized.number < 0n ||
+      finalized.number > head ||
+      !/^0x[0-9a-fA-F]{64}$/.test(finalized.hash)
+    ) {
+      throw new Error("invalid finalized block evidence");
+    }
+    return { boundary: min(depth, finalized.number), kind: "finalized", finalized };
   }
 
   /**

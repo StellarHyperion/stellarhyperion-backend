@@ -29,6 +29,20 @@ finishes or its database connection closes. API instances do not run migrations 
 
 The SDK is installed from the committed protocol tarball. `npm run dev` does not load `.env` automatically; export the variables first or run `node --env-file=.env --watch --experimental-strip-types src/main.ts`.
 
+### Startup schema compatibility check
+
+Before the server accepts requests or the indexer reads a cursor, the process verifies that the database has been migrated to the schema version this build expects (`SCHEMA_VERSION`, defaulting to the newest migration file). The check reads `pgmigrations` and refuses to start unless the complete shipped migration manifest matches the applied schema (including the newest step). It never runs migrations itself: apply them with `npm run migrate:up` first. The failure message names only the variable and the expected shape, never the database connection string.
+
+### Bounded catch-up runtime budget
+
+Enable `CATCH_UP_ENABLED=true` for scheduled runs; continuous containers have no lifetime limit. Apply migrations explicitly before startup. The scheduled process divides its wall-clock budget (`CATCH_UP_BUDGET_MS`, default 120000ms) among migrations, source scans, proof polling and graceful drain. A slow stage cannot consume the entire shutdown safety margin: source scans and proof polling receive bounded stage allocations with a reserved drain window and the run moves on when its slice is spent. Work already committed to the database survives budget expiration, and the shutdown log reports why the run stopped and which stage remains eligible for the next run.
+
+### Continuous-container readiness and graceful rollout
+
+Before indexing shared cursors, a replica acquires an expiring lease per chain/router in the existing cursor lease storage so two active replicas never advance the same cursor. The lease TTL (`INDEXER_LEASE_TTL_MS`, default 30000ms) is renewed while the replica is healthy and released during graceful shutdown. A replica that loses its lease stops indexing until it can re-acquire ownership.
+
+`INDEXER_LEASE_OWNER_ID` names this replica; it defaults to hostname plus process id, with an independently unique worker suffix. Health probes (`GET /ready`) report lease ownership together with Postgres, Redis and watcher state, so a load balancer takes a replica out of rotation when it cannot do its job and puts it back when it recovers. The Dockerfile exposes `/ready` as a HEALTHCHECK endpoint.
+
 Run the watchers and rail pollers in a continuous process or in regular scheduled catch-up windows. Deploying only `api/index.ts` provides reads from an existing database; it does not run indexing in the background. Set the frontend's `NEXT_PUBLIC_HYPERION_API_URL` to this service's origin. Public API reads support cross-origin GET requests.
 
 ## Deploy on Vercel
@@ -83,7 +97,11 @@ A claim number identifies funds parked by a destination router after an unsucces
 
 `KEEPER_ENABLED=true` enables BullMQ jobs for router `keep_alive` and Stellar `settle_claim`. Supply a funded testnet `KEEPER_STELLAR_SECRET` from your secret store to submit them. With no signer, jobs report zero confirmed changes and dry-run status. Secrets are redacted from structured logs.
 
-One process serializes its Stellar submissions to avoid sequence conflicts. Run only one active keeper signer process, or give replicas separate accounts. The keeper counts confirmations and leaves database claim/delivery changes to indexed events. It does not perform rail second-step delivery or gas top-ups. TTL maintenance covers configured router tokens/routes and recent indexed transfer/claim entries; it is not a guarantee that every adapter or upstream storage entry remains live.
+### Signed transaction checkpoints
+
+Before a signed keeper transaction is broadcast, its hash, intended operation, chain and contract are durably written to `keeper_checkpoint` with state `submitted`. Only a definitive terminal outcome changes the row to `confirmed` or `failed`; ambiguous responses and timeouts remain `submitted` and block new envelopes, so an unknown broadcast outcome can be reconciled by the saved hash before retrying. Recovery never generates a second claim payment attempt blindly, and no secret key or signed credential material appears in logs.
+
+PostgreSQL serializes submissions across replicas sharing a signer. Keep at least two pool connections available: one holds the signer lock while independent journal writes commit before broadcast. The keeper counts confirmations and leaves database claim/delivery changes to indexed events. It does not perform rail second-step delivery or gas top-ups. TTL maintenance covers configured router tokens/routes and recent indexed transfer/claim entries; it is not a guarantee that every adapter or upstream storage entry remains live.
 
 ## API and checks
 
@@ -135,3 +153,90 @@ Live and historical ingestion share durable event identity and serialized
 materialization, including route-health observations. Provider errors are
 reported with fixed public messages; inspect secure local provider logs when
 reviewing a failed job.
+
+## EVM scan finality and historical audits
+
+EVM watcher ownership is scoped to the chain and router. An expired owner may be replaced after a crash, and each cursor commit verifies ownership and its previous revision in the same transaction as event writes. Concurrent replay keeps the existing canonical event serialization and quarantine checks.
+
+`EVM_FINALITY_MODE=confirmations` preserves the chain registry's confirmation depth. Set `EVM_FINALITY_MODE=finalized` to require the RPC's finalized-block number and hash as additional evidence; scans never exceed either that block or the configured confirmation boundary. Unsupported tags fail the pass unless `EVM_FINALITY_ALLOW_FALLBACK=true` explicitly permits depth fallback. Invalid finalized evidence fails even with fallback enabled. `evm_scan_provenance` retains the configured policy, actual evidence, hashes and policy transitions for each committed range; weaker policies never rewrite earlier evidence.
+
+Scheduled route-health compaction removes bounded batches of old interior duplicates and skips rows locked by ingestion. It retains the first and last samples of each configuration run, every transition, and all samples in the recent retention window. Historical `route_health` queries therefore represent state transitions after compaction; they must not treat old row counts as raw sampling frequency or uptime percentages. Recent raw samples remain available within the configured retention window.
+
+`Database.auditTransferAndClaimInvariants()` reads source amount equations, claim liabilities and actual destination-delivery evidence. Its monetary values remain integer strings, and violations identify source row IDs and routers. Delivery joins use the bound source transfer or an unambiguous legacy hop; a reused deployment nonce cannot prove delivery for another source row.
+
+## Metadata versions, request budgets and durable freshness
+
+Public transfer, claim and route responses default to schema `1.0` and retain their legacy shape.
+Request `X-API-Schema-Version: 1.1` (or `schemaVersion=1.1` for EventSource) to receive the
+`schemaVersion` and `metadata.source=indexed_postgres` envelope. Monetary and token identity
+fields are identical in both versions. Unsupported versions return 400 with the supported list.
+Versioned responses carry distinct ETags and vary on `X-API-Schema-Version`.
+
+Production API requests default to 120 requests per client per minute, with 20 SSE connections
+per minute. `/health` and `/ready` probes, including query-bearing probes, are exempt;
+operational metrics and backfill inspection use the ordinary budget. `buildServer` accepts a
+bounded `rateLimit` policy and explicit `trustProxy` configuration. Forwarded client headers
+are ignored by default; production proxy trust should name the validated proxy addresses.
+When `REDIS_URL` is configured, both continuous and serverless API entry points connect
+with bounded command/connect timeouts; an injected ioredis client shares counters across replicas using the same key prefix; without
+one the bounded cache is local to that process. Redis errors fail requests closed and expose
+only the generic internal error. 429 responses include `Retry-After` and `retryAfterMs`.
+
+Background chain and rail workers persist heartbeats after every completed or failed poll,
+including the actual cursor and consecutive failures. Worker IDs are limited to 128 safe
+characters; diagnostic text and nested metadata are bounded and redact credentials. Older
+writes cannot overwrite newer activity. `/ready` degrades missing configured chain-worker
+heartbeats and timestamps older than 120 seconds, invalid timestamps, or timestamps over 30 seconds
+in the future. A healthy database or a local ready report cannot mask stale persisted activity.
+API replicas with indexing disabled still report the durable heartbeats present in PostgreSQL.
+
+`Database.computeHistoryDigest`/`recordHistoryDigest`/`verifyHistoryDigest` cover indexed
+outbound transfers, inbound deliveries and claims linked to a delivery within the requested
+inclusive block range. Exact integer strings and deployment/source identities contribute to
+the SHA-256 digest; surrogate row IDs, observation times and API presentation do not.
+Rows are read in deterministic pages of 1,000 under a repeatable-read snapshot. A plain
+`Queryable` must already provide snapshot isolation when used concurrently with ingestion.
+Unlinked claims are outside a block-range digest because they have no delivery block evidence.
+
+## Freshness targets and deployment readiness
+
+`/v1/metrics` now reports `freshnessSlo` using persisted source cursors/history gaps and
+source-bound destination delivery or settled-claim evidence. A parked delivery or provider
+status alone cannot settle a backlog entry. Ambiguous legacy hops remain pending.
+Every report identifies the source-scan or destination-proof stage, its chain/lane and target.
+Missing or invalid/future cursor timestamps produce `unknown` with `met=false`; open and
+reconciling history gaps breach source progress. API-only processes evaluate remote durable
+history. Other deployment modes with indexing explicitly disabled label source monitoring
+`disabled` rather than presenting an absent watcher as healthy.
+
+Defaults are 120 seconds for source scan lag, 100 pending proofs per lane and 15 minutes for
+oldest proof age. Set `FRESHNESS_MAX_SCAN_LAG_MS`, `FRESHNESS_MAX_PROOF_BACKLOG_COUNT`,
+`FRESHNESS_MAX_PROOF_BACKLOG_AGE_MS` and optional JSON `FRESHNESS_LANE_TARGETS` to override them.
+Lane keys use `origin->destination`, with `maxSourceScanLagMs`, `maxProofBacklogCount` and
+`maxProofBacklogAgeMs`. The strictest configured lane scan target applies to its origin.
+
+`DEPLOYMENT_MODE` accepts `all-in-one`, `api-only`, `indexer-only`, `keeper-only` or `custom`;
+component flags determine the default mode. `READINESS_DB_POLICY`, `READINESS_INDEXER_POLICY`,
+`READINESS_RAILS_POLICY` and `READINESS_KEEPER_POLICY` accept `required`, `optional` or
+`disabled`. Required dependencies without readiness evidence are down. Required down
+returns 503; stale/degraded evidence remains visible as degraded. Optional down degrades
+without returning 503. Disabled checks explicitly carry `effectiveState=disabled` and do not
+certify absent workers. `/ready` includes the resolved mode and dependency policy.
+
+## Database telemetry and diagnostics
+
+`/v1/metrics.database` reports pool active/idle/queued connections, saturation and latency/error
+counts by a fixed set of workload labels. Ingestion writes and API reads have separate labels.
+Each workload retains at most 256 recent latency samples by default (configurable 1–4096 via
+`Database.open`); SQL text, parameters and wallet identifiers are never retained in telemetry
+or slow-query messages. Saturation is visible while requests queue, before a timeout.
+
+Run `npm run diagnostics -- --output diagnostics.json` to collect configuration presence,
+migrations/table counts, persisted worker freshness, source revisions, proof backlog and local
+pool telemetry. `--compact` emits compact JSON; without `--output`, the bundle goes to stdout.
+Every database connection enforces read-only statements. Failed probes retain normalized
+codes and actionable descriptions, so unavailable data is distinguishable from empty history.
+The bundle records its generation time and the code revision (`HYPERION_REVISION`, `GITHUB_SHA`
+or the local Git HEAD when available). URLs, nested authorization/signers and other sensitive
+values are redacted. Output files are created exclusively with mode 0600; choose a new filename
+for each capture. No RPC polling, transactions or wallet operations are performed.

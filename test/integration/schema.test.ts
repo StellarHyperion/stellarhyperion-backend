@@ -10,8 +10,15 @@
  * runs the unit suite rather than failing in a way somebody learns to ignore.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { runner } from "node-pg-migrate";
 
+import {
+  auditTransferAndClaimInvariants,
+  compactRouteHealthSamples,
+} from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
@@ -58,7 +65,9 @@ suite("the schema", () => {
     for (const table of [
       "admin_action",
       "inbound_delivery",
+      "indexed_history_digest",
       "indexer_cursor",
+      "indexer_worker_heartbeat",
       "outbound_transfer",
       "pending_claim",
       "rail_attestation",
@@ -68,67 +77,87 @@ suite("the schema", () => {
     }
   });
 
-  it("serializes concurrent migration runners and applies a migration once", async () => {
-    let executionCount = 0;
-    let markStarted!: () => void;
-    const started = new Promise<void>((resolve) => {
-      markStarted = resolve;
-    });
-    let releaseMigration!: () => void;
-    const migrationGate = new Promise<void>((resolve) => {
-      releaseMigration = resolve;
-    });
-
-    const migration = {
-      up: async (): Promise<void> => {
-        executionCount += 1;
-        markStarted();
-        await migrationGate;
-      },
-    };
-
+  it("serializes real SQL migration runners and applies each step once", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "hyperion-migration-lock-"));
+    const file = join(directory, "1790900000000_lock-test.sql");
+    await writeFile(
+      file,
+      "-- Up Migration\nSELECT pg_sleep(1); CREATE TABLE lock_once (id integer PRIMARY KEY); INSERT INTO lock_once VALUES (1);\n-- Down Migration\nDROP TABLE lock_once;",
+    );
     const run = (applicationName: string) =>
       runner({
-        databaseUrl: {
-          connectionString: CONNECTION ?? "",
-          application_name: applicationName,
-        },
-        migrations: { "1790900000000_lock-test": migration },
+        databaseUrl: { connectionString: CONNECTION ?? "", application_name: applicationName },
+        dir: directory,
         migrationsTable: "pgmigrations",
         schema: MIGRATION_TEST_SCHEMA,
         createSchema: true,
         direction: "up",
         advisoryLockMode: "wait",
+        log: () => undefined,
       });
-
     const first = run("hyperion-migration-lock-first");
-    await started;
-    const second = run("hyperion-migration-lock-second");
-
+    let second: Promise<unknown> | undefined;
     let secondRunnerWaiting = false;
-    let outcomes: PromiseSettledResult<unknown>[] = [];
     try {
-      for (let attempt = 0; attempt < 100; attempt += 1) {
+      for (let attempt = 0; attempt < 100; attempt++) {
         const { rows } = await db.query(
-          `SELECT 1 FROM pg_stat_activity
-            WHERE application_name = 'hyperion-migration-lock-second'
-              AND wait_event_type = 'Lock' AND wait_event = 'advisory'`,
+          "SELECT 1 FROM pg_stat_activity WHERE application_name='hyperion-migration-lock-first' AND wait_event='PgSleep'",
         );
-        if (rows.length > 0) {
+        if (rows.length) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      second = run("hyperion-migration-lock-second");
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const { rows } = await db.query(
+          "SELECT 1 FROM pg_stat_activity WHERE application_name='hyperion-migration-lock-second' AND wait_event_type='Lock' AND wait_event='advisory'",
+        );
+        if (rows.length) {
           secondRunnerWaiting = true;
           break;
         }
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
+      const outcomes = await Promise.allSettled([first, second]);
+      expect(outcomes.map((value) => value.status)).toEqual(["fulfilled", "fulfilled"]);
+      expect(secondRunnerWaiting).toBe(true);
+      const { rows } = await db.query(
+        `SELECT count(*)::integer AS count FROM "${MIGRATION_TEST_SCHEMA}".lock_once`,
+      );
+      expect(rows[0]?.count).toBe(1);
     } finally {
-      releaseMigration();
-      outcomes = await Promise.allSettled([first, second]);
+      await Promise.allSettled([first, ...(second ? [second] : [])]);
       await db.query(`DROP SCHEMA IF EXISTS "${MIGRATION_TEST_SCHEMA}" CASCADE`);
+      await rm(directory, { recursive: true, force: true });
     }
+  });
 
-    expect(secondRunnerWaiting).toBe(true);
-    expect(outcomes.map(({ status }) => status)).toEqual(["fulfilled", "fulfilled"]);
-    expect(executionCount).toBe(1);
+  it("releases advisory ownership after a failed SQL migration and permits a clean retry", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "hyperion-migration-failure-"));
+    const file = join(directory, "1790900000000_failure-test.sql");
+    const schema = MIGRATION_TEST_SCHEMA + "_failed";
+    const run = () =>
+      runner({
+        databaseUrl: CONNECTION ?? "",
+        dir: directory,
+        migrationsTable: "pgmigrations",
+        schema,
+        createSchema: true,
+        direction: "up",
+        advisoryLockMode: "wait",
+        log: () => undefined,
+      });
+    try {
+      await writeFile(file, "-- Up Migration\nSELECT 1/0;\n-- Down Migration\nSELECT 1;");
+      await expect(run()).rejects.toThrow();
+      await writeFile(
+        file,
+        "-- Up Migration\nCREATE TABLE retry_once(id integer PRIMARY KEY); INSERT INTO retry_once VALUES (1);\n-- Down Migration\nDROP TABLE retry_once;",
+      );
+      await expect(run()).resolves.toHaveLength(1);
+    } finally {
+      await db.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("holds a u64 that bigint cannot", async () => {
@@ -414,5 +443,50 @@ suite("maintenance and pruning", () => {
     expect(ids).not.toContain(999991);
     expect(ids).toContain(999992);
     expect(ids).toContain(999993);
+  });
+
+  it("compacts old identical route_health samples in bounded batches while preserving change boundaries", async () => {
+    await db.query("DELETE FROM public.route_health WHERE origin_chain = 'compact-test'");
+    // 5 identical old samples (t-10d .. t-6d), then a state change (t-5d), then 2 recent samples (t-2h, t-1h)
+    await db.query(
+      `INSERT INTO public.route_health
+         (sampled_at, origin_chain, destination_chain, route, token, available, blocker, flow_available)
+       VALUES
+         (now() - INTERVAL '10 days', 'compact-test', 'stellar-testnet', 0, 'USDC', true, 0, 1000),
+         (now() - INTERVAL '9 days',  'compact-test', 'stellar-testnet', 0, 'USDC', true, 0, 1000),
+         (now() - INTERVAL '8 days',  'compact-test', 'stellar-testnet', 0, 'USDC', true, 0, 1000),
+         (now() - INTERVAL '7 days',  'compact-test', 'stellar-testnet', 0, 'USDC', true, 0, 1000),
+         (now() - INTERVAL '6 days',  'compact-test', 'stellar-testnet', 0, 'USDC', true, 0, 1000),
+         (now() - INTERVAL '5 days',  'compact-test', 'stellar-testnet', 0, 'USDC', false, 1, 0),
+         (now() - INTERVAL '2 hours', 'compact-test', 'stellar-testnet', 0, 'USDC', false, 1, 0),
+         (now() - INTERVAL '1 hours', 'compact-test', 'stellar-testnet', 0, 'USDC', false, 1, 0)`,
+    );
+
+    const firstPass = await compactRouteHealthSamples(db, { retainRecentHours: 24, batchSize: 2 });
+    expect(firstPass.deleted).toBe(2);
+
+    const secondPass = await compactRouteHealthSamples(db, {
+      retainRecentHours: 24,
+      batchSize: 10,
+    });
+    expect(secondPass.deleted).toBe(1);
+
+    const thirdPass = await compactRouteHealthSamples(db, { retainRecentHours: 24, batchSize: 10 });
+    expect(thirdPass.deleted).toBe(0);
+
+    const { rows } = await db.query(
+      "SELECT available, blocker FROM public.route_health WHERE origin_chain = 'compact-test' ORDER BY sampled_at ASC, id ASC",
+    );
+    // Kept: first (t-10d), last of first run (t-6d), change boundary (t-5d), and both recent (t-2h, t-1h)
+    expect(rows).toHaveLength(5);
+  });
+
+  it("audits transfer and claim invariants without mutating state", async () => {
+    const report = await auditTransferAndClaimInvariants(db);
+    expect(report).toHaveProperty("ok");
+    expect(Array.isArray(report.sourceAmountViolations)).toBe(true);
+    expect(Array.isArray(report.claimLiabilityViolations)).toBe(true);
+    expect(Array.isArray(report.deliverySettlementViolations)).toBe(true);
+    expect(Array.isArray(report.unsettledLiabilities)).toBe(true);
   });
 });

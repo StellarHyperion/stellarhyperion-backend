@@ -3,17 +3,19 @@ import { resolve as resolvePath } from "node:path";
 import type { FastifyInstance } from "fastify";
 import { loadConfig } from "../src/config/config.js";
 import { Database } from "../src/db/pool.js";
+import { checkSchemaCompatibility } from "../src/db/schema.js";
 import { buildServer } from "../src/http/server.js";
+import { createApiRedis } from "../src/http/rate-limit-redis.js";
 import { createLogger } from "../src/logging/logger.js";
 
 let app: FastifyInstance | null = null;
+let initializing: Promise<FastifyInstance> | null = null;
 
-async function getApp(): Promise<FastifyInstance> {
+async function initializeApp(): Promise<FastifyInstance> {
   if (app) return app;
 
   process.env.HYPERION_NETWORK ??= "testnet";
   process.env.HYPERION_DEPLOYMENTS_FILE ??= resolvePath(process.cwd(), "deployments/testnet.json");
-  process.env.REDIS_URL ??= "redis://127.0.0.1:6379";
   process.env.INDEXER_ENABLED ??= "false";
   process.env.RAILS_ENABLED ??= "false";
   process.env.KEEPER_ENABLED ??= "false";
@@ -26,17 +28,40 @@ async function getApp(): Promise<FastifyInstance> {
     applicationName: "hyperion-vercel-api",
     connectionTimeoutMs: 2000,
   });
+  try {
+    await checkSchemaCompatibility(db, config.schemaVersion);
+  } catch (error) {
+    await db.close();
+    throw error;
+  }
 
-  app = buildServer({
+  const candidate = buildServer({
     config,
     logger,
     db,
+    ...(config.redisUrl.length > 0 ? { redis: createApiRedis(config.redisUrl) } : {}),
     readiness: [],
     startedAt,
   });
 
-  await app.ready();
-  return app;
+  try {
+    await candidate.ready();
+  } catch (error) {
+    await candidate.close();
+    await db.close();
+    throw error;
+  }
+  app = candidate;
+  return candidate;
+}
+
+function getApp(): Promise<FastifyInstance> {
+  if (app) return Promise.resolve(app);
+  initializing ??= initializeApp().catch((error) => {
+    initializing = null;
+    throw error;
+  });
+  return initializing;
 }
 
 export default async function handler(req: IncomingMessage, res: ServerResponse): Promise<void> {
