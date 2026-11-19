@@ -1,4 +1,16 @@
-import { CHAINS, assetOn, isChainKey, isEvmChain, toEvmAddress } from "@hyperion/protocol";
+import { StrKey } from "@stellar/stellar-sdk";
+import {
+  CHAINS,
+  type EvmTokenDeployment,
+  type StellarTokenDeployment,
+  isRouteKind,
+  adapterFor,
+  RAIL_CONTRACTS,
+  assetOn,
+  isChainKey,
+  isEvmChain,
+  toEvmAddress,
+} from "@hyperion/protocol";
 import type { AppConfig } from "../../config/config.js";
 /**
  * Transfer status and lookup REST API endpoints.
@@ -47,6 +59,22 @@ export type TransferLifecycleStage =
   | "settled"
   | "failed";
 
+export interface SourceProvenance {
+  readonly status: "confirmed";
+  readonly chain: string;
+  readonly txHash: string;
+  readonly block: string;
+  readonly logIndex: number | null;
+}
+
+export interface DestinationProvenance {
+  readonly status: "confirmed" | "unverified";
+  readonly chain: string;
+  readonly txHash: string | null;
+  readonly block: string | null;
+  readonly logIndex: number | null;
+}
+
 export interface FormattedTransfer {
   readonly id: string;
   readonly stage: TransferLifecycleStage;
@@ -65,6 +93,7 @@ export interface FormattedTransfer {
     readonly block: string;
     readonly txHash: string;
     readonly observedAt: string;
+    readonly provenance: SourceProvenance;
   };
   readonly destination: {
     readonly token: string | null;
@@ -77,8 +106,10 @@ export interface FormattedTransfer {
     readonly block: string | null;
     readonly txHash: string | null;
     readonly deliveredAt: string | null;
+    readonly provenance: DestinationProvenance;
   };
   readonly rail: {
+    readonly provenance: { readonly status: "candidate"; readonly reference: string | null };
     readonly status: string | null;
     readonly railStatus: string | null;
     readonly verificationFailure: CctpVerificationFailure | null;
@@ -175,6 +206,13 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
       block: text(row, "origin_block"),
       txHash: text(row, "origin_tx"),
       observedAt: new Date(row.observed_at as string | number | Date).toISOString(),
+      provenance: {
+        status: "confirmed",
+        chain,
+        txHash: text(row, "origin_tx"),
+        block: text(row, "origin_block"),
+        logIndex: integerOrNull(row, "origin_log_index"),
+      },
     },
     destination: {
       token: receivedToken,
@@ -189,11 +227,22 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
       deliveredAt: row.delivered_at
         ? new Date(row.delivered_at as string | number | Date).toISOString()
         : null,
+      provenance: {
+        status: delivered ? "confirmed" : "unverified",
+        chain: destinationChain,
+        txHash: textOrNull(row, "destination_tx"),
+        block: textOrNull(row, "destination_block"),
+        logIndex: integerOrNull(row, "destination_log_index"),
+      },
     },
     rail:
       railStatus === null
         ? null
         : {
+            provenance: {
+              status: "candidate",
+              reference: sanitizeRailDiagnostic(textOrNull(row, "rail_reference")),
+            },
             status: railStatus,
             railStatus: sanitizeRailDiagnostic(textOrNull(row, "rail_status")),
             verificationFailure: cctpFailureValue(textOrNull(row, "verification_failure")),
@@ -210,6 +259,96 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
         }
       : null,
   };
+}
+
+const ROUTE_NAMES = ["cctp", "axelar-its", "axelar-gmp", "allbridge"] as const;
+
+function invalidFilter(message: string): Error {
+  const error = new Error(message);
+  (error as Error & { statusCode?: number }).statusCode = 400;
+  return error;
+}
+
+function validateIdentifierFilter(name: string, value: string, chain?: string): void {
+  const evm = /^0x[0-9a-fA-F]{40}$/.test(value) || /^0x0{24}[0-9a-fA-F]{40}$/.test(value);
+  const stellar = StrKey.isValidEd25519PublicKey(value) || StrKey.isValidContract(value);
+  const family = chain !== undefined && isChainKey(chain) ? CHAINS[chain].family : undefined;
+  if (!(family === "stellar" ? stellar : family === "evm" ? evm : evm || stellar)) {
+    throw invalidFilter(`${name} must be a canonical identity for the selected chain`);
+  }
+}
+
+export function validateTransferFilters(
+  config: AppConfig,
+  filters: Readonly<{
+    originChain?: string | undefined;
+    destinationChain?: string | undefined;
+    route?: string | undefined;
+    sender?: string | undefined;
+    recipient?: string | undefined;
+    search?: string | undefined;
+  }>,
+): void {
+  const { originChain, destinationChain, route, sender, recipient, search } = filters;
+  const deployments = config.deployments.networks;
+  for (const [name, chain] of [
+    ["originChain", originChain],
+    ["destinationChain", destinationChain],
+  ] as const) {
+    if (
+      chain !== undefined &&
+      (!isChainKey(chain) ||
+        CHAINS[chain].network !== config.network ||
+        (name === "originChain" && deployments[chain] === undefined))
+    ) {
+      throw invalidFilter(`${name} must name a supported chain on the configured network`);
+    }
+  }
+  if (originChain !== undefined && originChain === destinationChain)
+    throw invalidFilter("originChain and destinationChain must differ");
+  if (route !== undefined) {
+    if (!/^[0-3]$/.test(route)) throw invalidFilter("route must be an integer from 0 to 3");
+    const numericRoute = Number(route);
+    if (!isRouteKind(numericRoute)) throw invalidFilter("unsupported route");
+    const routeName = ROUTE_NAMES[numericRoute];
+    const sources =
+      originChain !== undefined && isChainKey(originChain)
+        ? [deployments[originChain]]
+        : Object.values(deployments);
+    const sourceSupported = sources.some(
+      (deployment) =>
+        deployment !== undefined &&
+        adapterFor(config.deployments, deployment.chain, numericRoute) !== null &&
+        Object.values<EvmTokenDeployment | StellarTokenDeployment>(deployment.tokens).some(
+          (token) => token.routes.includes(numericRoute),
+        ),
+    );
+    if (!sourceSupported)
+      throw invalidFilter("route has no configured source deployment and asset");
+    if (destinationChain !== undefined && isChainKey(destinationChain)) {
+      const deployment = deployments[destinationChain];
+      const registry = RAIL_CONTRACTS[destinationChain];
+      const supported =
+        deployment !== undefined &&
+        Object.values<EvmTokenDeployment | StellarTokenDeployment>(deployment.tokens).some(
+          (token) => token.routes.includes(numericRoute),
+        );
+      if (
+        !supported &&
+        !(routeName === "cctp"
+          ? registry?.cctp
+          : routeName === "axelar-its"
+            ? registry?.axelar
+            : false)
+      ) {
+        throw invalidFilter("route has no supported destination representation");
+      }
+    }
+  }
+  if (sender !== undefined) validateIdentifierFilter("sender", sender, originChain);
+  if (recipient !== undefined) validateIdentifierFilter("recipient", recipient, destinationChain);
+  if (search !== undefined && (search.length > 128 || /[\u0000-\u001f\u007f]/.test(search)))
+    throw invalidFilter("search must be at most 128 printable characters");
 }
 
 const TRANSFER_QUERY = `
@@ -665,6 +804,15 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         });
       }
 
+      validateTransferFilters(deps.config, {
+        originChain,
+        destinationChain,
+        route,
+        sender,
+        recipient,
+        search,
+      });
+
       const conditions: string[] = [];
       const params: unknown[] = [];
 
@@ -682,11 +830,23 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       }
       if (sender) {
         params.push(sender);
-        conditions.push(`t.sender = $${String(params.length)}`);
+        conditions.push(
+          sender.startsWith("0x")
+            ? `lower(t.sender) = lower($${String(params.length)})`
+            : `t.sender = $${String(params.length)}`,
+        );
       }
       if (recipient) {
-        params.push(recipient);
-        conditions.push(`t.destination = $${String(params.length)}`);
+        params.push(
+          recipient.startsWith("0x") && recipient.length === 42
+            ? `0x${recipient.slice(2).padStart(64, "0")}`
+            : recipient,
+        );
+        conditions.push(
+          recipient.startsWith("0x")
+            ? `lower(t.destination) = lower($${String(params.length)})`
+            : `t.destination = $${String(params.length)}`,
+        );
       }
 
       if (search?.trim()) {
