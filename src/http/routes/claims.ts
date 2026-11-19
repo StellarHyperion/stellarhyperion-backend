@@ -9,7 +9,11 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull, timestampOrNull } from "../../db/rows.js";
-import { LIST_CACHE_CONTROL, computeCanonicalETag, sendConditionalDetailResponse } from "../etag.js";
+import {
+  LIST_CACHE_CONTROL,
+  computeCanonicalETag,
+  sendConditionalDetailResponse,
+} from "../etag.js";
 import type { ServerDeps } from "../server.js";
 
 export interface FormattedClaim {
