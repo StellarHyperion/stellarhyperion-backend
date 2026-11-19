@@ -9,7 +9,6 @@ import { Queue, Worker } from "bullmq";
 import { Redis } from "ioredis";
 
 import { processClaimSettlement } from "./jobs/claims.js";
-import { processRestore } from "./jobs/claims.js";
 import { processTtlBump } from "./jobs/ttl.js";
 import type { KeeperContext, KeeperJobName, KeeperJobResult } from "./types.js";
 
@@ -55,10 +54,6 @@ export async function startKeeperQueue(
           const result = await processClaimSettlement(ctx, job.data as object);
           return { kind: "claim-settlement", result };
         }
-        case "restore": {
-          const result = await processRestore(ctx, job.data as object);
-          return { kind: "restore", result };
-        }
         default:
           throw new Error(`unknown keeper job name: ${job.name}`);
       }
@@ -77,7 +72,7 @@ export async function startKeeperQueue(
     logger.error({ jobName: job?.name, jobId: job?.id, err: error }, "keeper job failed");
   });
 
-  // Schedule repeatable jobs for the Stellar upkeep tasks
+  // Schedule repeatable jobs for the two Stellar tasks
   const every = config.keeper.pollIntervalMs;
   await queue.upsertJobScheduler("repeat:ttl-bump", { every }, { name: "ttl-bump" });
   await queue.upsertJobScheduler(
@@ -85,7 +80,6 @@ export async function startKeeperQueue(
     { every },
     { name: "claim-settlement" },
   );
-  await queue.upsertJobScheduler("repeat:restore", { every }, { name: "restore" });
   await queue.removeJobScheduler("repeat:rail-second-step");
   await queue.removeJobScheduler("repeat:gas-topup");
 

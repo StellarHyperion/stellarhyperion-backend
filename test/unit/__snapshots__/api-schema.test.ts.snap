@@ -1,0 +1,80 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`HTTP queries against the migrated PostgreSQL schema > negotiates API schema versions without altering monetary or token fields (#105) > 1.1 transfer response 1`] = `
+{
+  "claim": null,
+  "destination": {
+    "amount": "897000",
+    "block": "400",
+    "chain": "sepolia",
+    "decimals": 6,
+    "delivered": true,
+    "deliveredAt": "<timestamp>",
+    "recipient": "0x6ef8032ffe4943f27388172549f6700f18bb8b38",
+    "symbol": "USDC",
+    "token": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+    "txHash": "cctp-mint",
+  },
+  "id": "2",
+  "metadata": {
+    "schemaVersion": "1.1",
+    "source": "indexed_postgres",
+  },
+  "origin": {
+    "block": "124",
+    "chain": "stellar-testnet",
+    "decimals": 7,
+    "fee": "30000",
+    "grossAmount": "10000000",
+    "netAmount": "9970000",
+    "nonce": "43",
+    "observedAt": "<timestamp>",
+    "router": null,
+    "sender": "Gsender",
+    "symbol": "USDC",
+    "token": "CD5IB466XCQIUDYWV22PUMJTF6EE3KPXBDGLLBSKAPNE6QPXVUZLXJGA",
+    "txHash": "cctp-source",
+  },
+  "rail": null,
+  "route": 0,
+  "schemaVersion": "1.1",
+  "stage": "delivered",
+}
+`;
+
+exports[`HTTP queries against the migrated PostgreSQL schema > negotiates API schema versions without altering monetary or token fields (#105) > legacy transfer response 1`] = `
+{
+  "claim": null,
+  "destination": {
+    "amount": "897000",
+    "block": "400",
+    "chain": "sepolia",
+    "decimals": 6,
+    "delivered": true,
+    "deliveredAt": "<timestamp>",
+    "recipient": "0x6ef8032ffe4943f27388172549f6700f18bb8b38",
+    "symbol": "USDC",
+    "token": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+    "txHash": "cctp-mint",
+  },
+  "id": "2",
+  "origin": {
+    "block": "124",
+    "chain": "stellar-testnet",
+    "decimals": 7,
+    "fee": "30000",
+    "grossAmount": "10000000",
+    "netAmount": "9970000",
+    "nonce": "43",
+    "observedAt": "<timestamp>",
+    "router": null,
+    "sender": "Gsender",
+    "symbol": "USDC",
+    "token": "CD5IB466XCQIUDYWV22PUMJTF6EE3KPXBDGLLBSKAPNE6QPXVUZLXJGA",
+    "txHash": "cctp-source",
+  },
+  "rail": null,
+  "route": 0,
+  "stage": "delivered",
+}
+`;

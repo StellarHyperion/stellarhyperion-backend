@@ -10,8 +10,13 @@
 import { ROUTE_KINDS } from "@hyperion/protocol";
 
 import type { Queryable } from "../../db/pool.js";
+import { bigintOf, boolean, integer, text, textOrNull, timestamp } from "../../db/rows.js";
 import type { Position } from "../writers.js";
 import {
+  acquireLease,
+  assertLeaseHeld,
+  LeaseLostError,
+  releaseLease,
   settleAction,
   settleClaim,
   writeAction,
@@ -19,7 +24,10 @@ import {
   writeHealthSample,
   writeInbound,
   writeOutbound,
+  type WatcherLease,
 } from "../writers.js";
+
+export { acquireLease, assertLeaseHeld, LeaseLostError, releaseLease, type WatcherLease };
 import {
   type DecodedLog,
   requireAddress,
@@ -300,4 +308,258 @@ export async function applyRouterLog(
     default:
       return { kind: "ignored" };
   }
+}
+
+// --------------------------------------------------------------------------------------------
+// Finality-policy provenance (#47)
+// --------------------------------------------------------------------------------------------
+
+export interface EvmFinalityPolicy {
+  readonly confirmations: number;
+  readonly reorgDepth: number;
+  readonly finalityMode?: "confirmations" | "finalized";
+  readonly allowFinalityFallback?: boolean;
+}
+
+export interface EvmScanProvenanceEntry {
+  readonly chainKey: string;
+  readonly contract: string;
+  readonly chainId: number;
+  readonly fromBlock: bigint;
+  readonly toBlock: bigint;
+  readonly endBlockHash: string;
+  readonly headBlock: bigint;
+  readonly policy: EvmFinalityPolicy;
+  readonly logsWritten: number;
+  readonly logsIgnored: number;
+  readonly reorgDetected: boolean;
+  readonly ownerId: string | null;
+  readonly evidenceKind?: "confirmations" | "finalized";
+  readonly finalizedBlock?: bigint | null;
+  readonly finalizedHash?: string | null;
+}
+
+export interface EvmFinalityPolicyChange {
+  readonly id: bigint;
+  readonly chainKey: string;
+  readonly contract: string;
+  readonly chainId: number;
+  readonly fromBlock: bigint;
+  readonly toBlock: bigint;
+  readonly confirmations: number;
+  readonly reorgDepth: number;
+  readonly previousConfirmations: number;
+  readonly previousReorgDepth: number;
+  readonly finalityMode: string;
+  readonly previousFinalityMode: string;
+  readonly allowFinalityFallback: boolean;
+  readonly previousAllowFinalityFallback: boolean;
+  readonly committedAt: Date;
+}
+
+export interface EvmScanProvenanceRecord {
+  readonly id: bigint;
+  readonly chainKey: string;
+  readonly contract: string;
+  readonly chainId: number;
+  readonly fromBlock: bigint;
+  readonly toBlock: bigint;
+  readonly endBlockHash: string;
+  readonly headBlock: bigint;
+  readonly confirmations: number;
+  readonly reorgDepth: number;
+  readonly logsWritten: number;
+  readonly logsIgnored: number;
+  readonly reorgDetected: boolean;
+  readonly policyChanged: boolean;
+  readonly previousConfirmations: number | null;
+  readonly previousReorgDepth: number | null;
+  readonly ownerId: string | null;
+  readonly committedAt: Date;
+  readonly finalityMode: string;
+  readonly evidenceKind: string;
+  readonly finalizedBlock: bigint | null;
+  readonly finalizedHash: string | null;
+}
+
+/**
+ * Record the finality policy used for a committed EVM scan inside the same transaction as the
+ * indexed rows and cursor advance. Returns the policy-change record if the configured policy
+ * differs from the previous committed scan for the same deployment.
+ */
+export async function recordEvmScanProvenance(
+  db: Queryable,
+  entry: EvmScanProvenanceEntry,
+): Promise<EvmFinalityPolicyChange | null> {
+  const { rows } = await db.query(
+    `WITH prev AS (
+       SELECT confirmations, reorg_depth, finality_mode, allow_finality_fallback
+         FROM evm_scan_provenance
+        WHERE chain_key = $1 AND lower(contract) = lower($2)
+        ORDER BY id DESC
+        LIMIT 1
+     ),
+     ins AS (
+       INSERT INTO evm_scan_provenance (
+         chain_key, contract, chain_id, from_block, to_block, end_block_hash, head_block,
+         confirmations, reorg_depth, logs_written, logs_ignored, reorg_detected,
+         policy_changed, previous_confirmations, previous_reorg_depth, previous_finality_mode, previous_allow_finality_fallback, owner_id,
+         finality_mode, allow_finality_fallback, evidence_kind, finalized_block, finalized_hash
+       )
+       SELECT
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+         COALESCE((SELECT confirmations <> $8 OR reorg_depth <> $9 OR finality_mode <> $14 OR allow_finality_fallback <> $15 FROM prev), false),
+         CASE WHEN COALESCE((SELECT confirmations <> $8 OR reorg_depth <> $9 OR finality_mode <> $14 OR allow_finality_fallback <> $15 FROM prev), false)
+              THEN (SELECT confirmations FROM prev)
+              ELSE NULL END,
+         CASE WHEN COALESCE((SELECT confirmations <> $8 OR reorg_depth <> $9 OR finality_mode <> $14 OR allow_finality_fallback <> $15 FROM prev), false)
+              THEN (SELECT reorg_depth FROM prev)
+              ELSE NULL END,
+         CASE WHEN COALESCE((SELECT confirmations <> $8 OR reorg_depth <> $9 OR finality_mode <> $14 OR allow_finality_fallback <> $15 FROM prev), false) THEN (SELECT finality_mode FROM prev) ELSE NULL END,
+         CASE WHEN COALESCE((SELECT confirmations <> $8 OR reorg_depth <> $9 OR finality_mode <> $14 OR allow_finality_fallback <> $15 FROM prev), false) THEN (SELECT allow_finality_fallback FROM prev) ELSE NULL END,
+         $13, $14, $15, $16, $17, $18
+       RETURNING id, chain_key, contract, chain_id, from_block, to_block,
+                 confirmations, reorg_depth, policy_changed,
+                 previous_confirmations, previous_reorg_depth, finality_mode, previous_finality_mode, allow_finality_fallback, previous_allow_finality_fallback, committed_at
+     )
+     SELECT * FROM ins`,
+    [
+      entry.chainKey,
+      entry.contract.toLowerCase(),
+      entry.chainId,
+      entry.fromBlock.toString(),
+      entry.toBlock.toString(),
+      entry.endBlockHash,
+      entry.headBlock.toString(),
+      entry.policy.confirmations,
+      entry.policy.reorgDepth,
+      entry.logsWritten,
+      entry.logsIgnored,
+      entry.reorgDetected,
+      entry.ownerId,
+      entry.policy.finalityMode ?? "confirmations",
+      entry.policy.allowFinalityFallback ?? false,
+      entry.evidenceKind ?? "confirmations",
+      entry.finalizedBlock?.toString() ?? null,
+      entry.finalizedHash ?? null,
+    ],
+  );
+
+  const row = rows[0];
+  if (row === undefined || !boolean(row, "policy_changed")) {
+    return null;
+  }
+
+  return {
+    id: bigintOf(row, "id"),
+    chainKey: text(row, "chain_key"),
+    contract: text(row, "contract"),
+    chainId: integer(row, "chain_id"),
+    fromBlock: bigintOf(row, "from_block"),
+    toBlock: bigintOf(row, "to_block"),
+    confirmations: integer(row, "confirmations"),
+    reorgDepth: integer(row, "reorg_depth"),
+    previousConfirmations: integer(row, "previous_confirmations"),
+    previousReorgDepth: integer(row, "previous_reorg_depth"),
+    finalityMode: text(row, "finality_mode"),
+    previousFinalityMode: text(row, "previous_finality_mode"),
+    allowFinalityFallback: boolean(row, "allow_finality_fallback"),
+    previousAllowFinalityFallback: boolean(row, "previous_allow_finality_fallback"),
+    committedAt: timestamp(row, "committed_at"),
+  };
+}
+
+/** Read finality-policy change events recorded in `evm_scan_provenance` (newest first). */
+export async function readEvmFinalityPolicyChanges(
+  db: Queryable,
+  chainKey: string,
+  contract?: string,
+  limit = 50,
+): Promise<readonly EvmFinalityPolicyChange[]> {
+  const params: unknown[] = [chainKey];
+  const contractFilter =
+    contract === undefined ? "" : ` AND lower(contract) = lower($${params.push(contract)})`;
+  const limitParam = `$${params.push(limit)}`;
+
+  const { rows } = await db.query(
+    `SELECT id, chain_key, contract, chain_id, from_block, to_block,
+            confirmations, reorg_depth, previous_confirmations, previous_reorg_depth, finality_mode, previous_finality_mode, allow_finality_fallback, previous_allow_finality_fallback, committed_at
+       FROM evm_scan_provenance
+      WHERE chain_key = $1${contractFilter}
+        AND policy_changed
+      ORDER BY id DESC
+      LIMIT ${limitParam}`,
+    params,
+  );
+
+  return rows.map((row) => ({
+    id: bigintOf(row, "id"),
+    chainKey: text(row, "chain_key"),
+    contract: text(row, "contract"),
+    chainId: integer(row, "chain_id"),
+    fromBlock: bigintOf(row, "from_block"),
+    toBlock: bigintOf(row, "to_block"),
+    confirmations: integer(row, "confirmations"),
+    reorgDepth: integer(row, "reorg_depth"),
+    previousConfirmations: integer(row, "previous_confirmations"),
+    previousReorgDepth: integer(row, "previous_reorg_depth"),
+    finalityMode: text(row, "finality_mode"),
+    previousFinalityMode: text(row, "previous_finality_mode"),
+    allowFinalityFallback: boolean(row, "allow_finality_fallback"),
+    previousAllowFinalityFallback: boolean(row, "previous_allow_finality_fallback"),
+    committedAt: timestamp(row, "committed_at"),
+  }));
+}
+
+/** Read the latest committed EVM scan provenance record for a chain (and optional router). */
+export async function readLatestEvmScanProvenance(
+  db: Queryable,
+  chainKey: string,
+  contract?: string,
+): Promise<EvmScanProvenanceRecord | null> {
+  const params: unknown[] = [chainKey];
+  const contractFilter =
+    contract === undefined ? "" : ` AND lower(contract) = lower($${params.push(contract)})`;
+
+  const { rows } = await db.query(
+    `SELECT id, chain_key, contract, chain_id, from_block, to_block, end_block_hash, head_block,
+            confirmations, reorg_depth, logs_written, logs_ignored, reorg_detected,
+            policy_changed, previous_confirmations, previous_reorg_depth, owner_id, committed_at,
+            finality_mode, evidence_kind, finalized_block, finalized_hash
+       FROM evm_scan_provenance
+      WHERE chain_key = $1${contractFilter}
+      ORDER BY id DESC
+      LIMIT 1`,
+    params,
+  );
+
+  const row = rows[0];
+  if (row === undefined) return null;
+
+  return {
+    id: bigintOf(row, "id"),
+    chainKey: text(row, "chain_key"),
+    contract: text(row, "contract"),
+    chainId: integer(row, "chain_id"),
+    fromBlock: bigintOf(row, "from_block"),
+    toBlock: bigintOf(row, "to_block"),
+    endBlockHash: text(row, "end_block_hash"),
+    headBlock: bigintOf(row, "head_block"),
+    confirmations: integer(row, "confirmations"),
+    reorgDepth: integer(row, "reorg_depth"),
+    logsWritten: integer(row, "logs_written"),
+    logsIgnored: integer(row, "logs_ignored"),
+    reorgDetected: boolean(row, "reorg_detected"),
+    policyChanged: boolean(row, "policy_changed"),
+    previousConfirmations:
+      row.previous_confirmations === null ? null : integer(row, "previous_confirmations"),
+    previousReorgDepth:
+      row.previous_reorg_depth === null ? null : integer(row, "previous_reorg_depth"),
+    ownerId: textOrNull(row, "owner_id"),
+    committedAt: timestamp(row, "committed_at"),
+    finalityMode: text(row, "finality_mode"),
+    evidenceKind: text(row, "evidence_kind"),
+    finalizedBlock: row.finalized_block === null ? null : bigintOf(row, "finalized_block"),
+    finalizedHash: textOrNull(row, "finalized_hash"),
+  };
 }

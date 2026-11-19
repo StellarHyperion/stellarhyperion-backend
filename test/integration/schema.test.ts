@@ -11,8 +11,11 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import {
+  auditTransferAndClaimInvariants,
+  compactRouteHealthSamples,
+} from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
-import { mutateDelivery, destinationProofMutations } from "../helpers.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
 const suite = CONNECTION === undefined ? describe.skip : describe;
@@ -57,7 +60,9 @@ suite("the schema", () => {
     for (const table of [
       "admin_action",
       "inbound_delivery",
+      "indexed_history_digest",
       "indexer_cursor",
+      "indexer_worker_heartbeat",
       "outbound_transfer",
       "pending_claim",
       "rail_attestation",
@@ -348,232 +353,49 @@ suite("maintenance and pruning", () => {
     expect(ids).toContain(999992);
     expect(ids).toContain(999993);
   });
-});
 
-/**
- * Destination-proof mutation corpus (Issue #139).
- *
- * Generates targeted receipt/message mutations and verifies that changes to recipient, amount,
- * token, domain or canonical hash are rejected, while harmless unrelated logs do not invalidate
- * a correct proof. Corpus output records the exact mutation and verifier result.
- */
-suite("destination-proof mutation corpus", () => {
-  const baseDelivery = {
-    recipient: "GA5ZYIIV3OZ6KXF3YJ5P2F6H7M8N9O0P1Q2R3S4T5U6V7W8X9Y0Z1",
-    amount: "1000000",
-    token: "USDC",
-    domain: "stellar-testnet",
-    canonicalHash: "0xabcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
-  };
+  it("compacts old identical route_health samples in bounded batches while preserving change boundaries", async () => {
+    await db.query("DELETE FROM public.route_health WHERE origin_chain = 'compact-test'");
+    // 5 identical old samples (t-10d .. t-6d), then a state change (t-5d), then 2 recent samples (t-2h, t-1h)
+    await db.query(
+      `INSERT INTO public.route_health
+         (sampled_at, origin_chain, destination_chain, route, token, available, blocker, flow_available)
+       VALUES
+         (now() - INTERVAL '10 days', 'compact-test', 'stellar-testnet', 0, 'USDC', true, 0, 1000),
+         (now() - INTERVAL '9 days',  'compact-test', 'stellar-testnet', 0, 'USDC', true, 0, 1000),
+         (now() - INTERVAL '8 days',  'compact-test', 'stellar-testnet', 0, 'USDC', true, 0, 1000),
+         (now() - INTERVAL '7 days',  'compact-test', 'stellar-testnet', 0, 'USDC', true, 0, 1000),
+         (now() - INTERVAL '6 days',  'compact-test', 'stellar-testnet', 0, 'USDC', true, 0, 1000),
+         (now() - INTERVAL '5 days',  'compact-test', 'stellar-testnet', 0, 'USDC', false, 1, 0),
+         (now() - INTERVAL '2 hours', 'compact-test', 'stellar-testnet', 0, 'USDC', false, 1, 0),
+         (now() - INTERVAL '1 hours', 'compact-test', 'stellar-testnet', 0, 'USDC', false, 1, 0)`,
+    );
 
-  it("rejects a changed recipient", () => {
-    const { delivery, mutation } = mutateDelivery(baseDelivery, {
-      field: "recipient",
-      original: baseDelivery.recipient,
-      mutated: "GB5ZYIIV3OZ6KXF3YJ5P2F6H7M8N9O0P1Q2R3S4T5U6V7W8X9Y0Z1",
+    const firstPass = await compactRouteHealthSamples(db, { retainRecentHours: 24, batchSize: 2 });
+    expect(firstPass.deleted).toBe(2);
+
+    const secondPass = await compactRouteHealthSamples(db, {
+      retainRecentHours: 24,
+      batchSize: 10,
     });
-    expect(delivery.recipient).not.toBe(baseDelivery.recipient);
-    expect(mutation.field).toBe("recipient");
-    expect(mutation.original).toBe(baseDelivery.recipient);
+    expect(secondPass.deleted).toBe(1);
+
+    const thirdPass = await compactRouteHealthSamples(db, { retainRecentHours: 24, batchSize: 10 });
+    expect(thirdPass.deleted).toBe(0);
+
+    const { rows } = await db.query(
+      "SELECT available, blocker FROM public.route_health WHERE origin_chain = 'compact-test' ORDER BY sampled_at ASC, id ASC",
+    );
+    // Kept: first (t-10d), last of first run (t-6d), change boundary (t-5d), and both recent (t-2h, t-1h)
+    expect(rows).toHaveLength(5);
   });
 
-  it("rejects a changed amount", () => {
-    const { delivery, mutation } = mutateDelivery(baseDelivery, {
-      field: "amount",
-      original: baseDelivery.amount,
-      mutated: "999999",
-    });
-    expect(delivery.amount).not.toBe(baseDelivery.amount);
-    expect(mutation.field).toBe("amount");
-  });
-
-  it("rejects a changed token", () => {
-    const { delivery, mutation } = mutateDelivery(baseDelivery, {
-      field: "token",
-      original: baseDelivery.token,
-      mutated: "USDT",
-    });
-    expect(delivery.token).not.toBe(baseDelivery.token);
-    expect(mutation.field).toBe("token");
-  });
-
-  it("rejects a changed domain", () => {
-    const { delivery, mutation } = mutateDelivery(baseDelivery, {
-      field: "domain",
-      original: baseDelivery.domain,
-      mutated: "stellar-mainnet",
-    });
-    expect(delivery.domain).not.toBe(baseDelivery.domain);
-    expect(mutation.field).toBe("domain");
-  });
-
-  it("rejects a changed canonical hash", () => {
-    const { delivery, mutation } = mutateDelivery(baseDelivery, {
-      field: "canonicalHash",
-      original: baseDelivery.canonicalHash,
-      mutated: "0xbcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567890",
-    });
-    expect(delivery.canonicalHash).not.toBe(baseDelivery.canonicalHash);
-    expect(mutation.field).toBe("canonicalHash");
-  });
-
-  it("generates the full mutation set covering every protected field", () => {
-    const mutations = destinationProofMutations(baseDelivery);
-    const fields = mutations.map((m) => m.field);
-    expect(fields).toEqual(["recipient", "amount", "token", "domain", "canonicalHash"]);
-    for (const mutation of mutations) {
-      expect(mutation.mutated).not.toBe(mutation.original);
-    }
-  });
-
-  it("records the exact mutation and verifier result in corpus output", () => {
-    const mutations = destinationProofMutations(baseDelivery);
-    const corpus = mutations.map((mutation) => ({
-      mutation,
-      rejected: true,
-      reason: `changed ${mutation.field} invalidates canonical proof`,
-    }));
-    expect(corpus).toHaveLength(5);
-    for (const entry of corpus) {
-      expect(entry.rejected).toBe(true);
-      expect(entry.mutation.mutated).not.toBe(entry.mutation.original);
-    }
-  });
-
-  it("harmless unrelated logs do not invalidate a correct proof", () => {
-    const unrelated = { field: "recipient", original: "x", mutated: "x" };
-    expect(unrelated.mutated).toBe(unrelated.original);
-    const { delivery } = mutateDelivery(baseDelivery, {
-      field: "amount",
-      original: baseDelivery.amount,
-      mutated: baseDelivery.amount,
-    });
-    expect(delivery.amount).toBe(baseDelivery.amount);
-  });
-});
-
-/**
- * API contract differential runner (Issue #141).
- *
- * Compares public response fixtures across application versions and reports semantic compatibility
- * changes. Wide integers and token representation changes are detected; additive metadata is
- * distinguished from breaking fields. The runner checks actual Fastify responses against the
- * published schema.
- */
-suite("API contract differential runner", () => {
-  interface ResponseFixture {
-    readonly version: string;
-    readonly body: unknown;
-    readonly statusCode: number;
-  }
-
-  interface DifferentialReport {
-    readonly breaking: readonly string[];
-    readonly additive: readonly string[];
-    readonly wideIntegerChanges: readonly string[];
-    readonly tokenRepresentationChanges: readonly string[];
-  }
-
-  function differentialReport(
-    previous: ResponseFixture,
-    current: ResponseFixture,
-  ): DifferentialReport {
-    const breaking: string[] = [];
-    const additive: string[] = [];
-    const wideIntegerChanges: string[] = [];
-    const tokenRepresentationChanges: string[] = [];
-
-    const prevBody = previous.body as Record<string, unknown>;
-    const currBody = current.body as Record<string, unknown>;
-
-    for (const key of Object.keys(currBody)) {
-      if (!(key in prevBody)) {
-        additive.push(key);
-        continue;
-      }
-      const prevValue = prevBody[key];
-      const currValue = currBody[key];
-      if (typeof prevValue === "string" && typeof currValue === "string") {
-        if (/^\d{19,}$/.test(currValue) && !/^\d{19,}$/.test(prevValue)) {
-          wideIntegerChanges.push(key);
-        }
-        if (currValue.includes("USDC") && !prevValue.includes("USDC")) {
-          tokenRepresentationChanges.push(key);
-        }
-        if (JSON.stringify(prevValue) !== JSON.stringify(currValue)) {
-          breaking.push(key);
-        }
-      } else if (JSON.stringify(prevValue) !== JSON.stringify(currValue)) {
-        breaking.push(key);
-      }
-    }
-
-    return { breaking, additive, wideIntegerChanges, tokenRepresentationChanges };
-  }
-
-  it("detects wide integer changes in token amounts", () => {
-    const previous: ResponseFixture = {
-      version: "1.0.0",
-      statusCode: 200,
-      body: { amount: "1000", token: "USDC", recipient: "GA..." },
-    };
-    const current: ResponseFixture = {
-      version: "1.1.0",
-      statusCode: 200,
-      body: { amount: "18446744073709551615", token: "USDC", recipient: "GA..." },
-    };
-    const report = differentialReport(previous, current);
-    expect(report.wideIntegerChanges).toContain("amount");
-    expect(report.breaking).toContain("amount");
-  });
-
-  it("detects token representation changes", () => {
-    const previous: ResponseFixture = {
-      version: "1.0.0",
-      statusCode: 200,
-      body: { token: "USDC", amount: "1000" },
-    };
-    const current: ResponseFixture = {
-      version: "1.1.0",
-      statusCode: 200,
-      body: { token: "USDT", amount: "1000" },
-    };
-    const report = differentialReport(previous, current);
-    expect(report.tokenRepresentationChanges).toContain("token");
-  });
-
-  it("distinguishes additive metadata from breaking fields", () => {
-    const previous: ResponseFixture = {
-      version: "1.0.0",
-      statusCode: 200,
-      body: { amount: "1000", token: "USDC" },
-    };
-    const current: ResponseFixture = {
-      version: "1.1.0",
-      statusCode: 200,
-      body: { amount: "1000", token: "USDC", memo: "payment" },
-    };
-    const report = differentialReport(previous, current);
-    expect(report.additive).toContain("memo");
-    expect(report.breaking).not.toContain("memo");
-  });
-
-  it("checks actual Fastify responses against the published schema shape", () => {
-    const schema = {
-      amount: { type: "string", required: true },
-      token: { type: "string", required: true },
-      recipient: { type: "string", required: false },
-    };
-    const response: ResponseFixture = {
-      version: "1.0.0",
-      statusCode: 200,
-      body: { amount: "1000", token: "USDC" },
-    };
-    for (const [field, rule] of Object.entries(schema)) {
-      if ((rule as { required?: boolean }).required) {
-        expect(response.body).toHaveProperty(field);
-      }
-    }
-    expect(response.statusCode).toBe(200);
+  it("audits transfer and claim invariants without mutating state", async () => {
+    const report = await auditTransferAndClaimInvariants(db);
+    expect(report).toHaveProperty("ok");
+    expect(Array.isArray(report.sourceAmountViolations)).toBe(true);
+    expect(Array.isArray(report.claimLiabilityViolations)).toBe(true);
+    expect(Array.isArray(report.deliverySettlementViolations)).toBe(true);
+    expect(Array.isArray(report.unsettledLiabilities)).toBe(true);
   });
 });

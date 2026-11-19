@@ -48,7 +48,7 @@ export class KeeperWorker implements ReadinessSource {
     return {
       name: this.name,
       state: "ready",
-      detail: "active on BullMQ with 3 scheduled Stellar upkeep jobs",
+      detail: "active on BullMQ with 2 scheduled Stellar upkeep jobs",
     };
   }
 

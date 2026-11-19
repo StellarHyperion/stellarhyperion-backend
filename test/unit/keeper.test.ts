@@ -3,41 +3,20 @@ import { Keypair } from "@stellar/stellar-sdk";
 import { loadConfig } from "../../src/config/config.js";
 import { processTtlBump } from "../../src/keeper/jobs/ttl.js";
 import { processClaimSettlement } from "../../src/keeper/jobs/claims.js";
-import { processRestore } from "../../src/keeper/jobs/claims.js";
-import { submitStellar, submitRestore } from "../../src/keeper/stellar.js";
+import { submitStellar } from "../../src/keeper/stellar.js";
 import { KeeperWorker } from "../../src/keeper/worker.js";
 import { completeEnv } from "../helpers.js";
 import { capturingLogger } from "../stellar-fakes.js";
-vi.mock("../../src/keeper/stellar.js", () => ({ submitStellar: vi.fn(), submitRestore: vi.fn() }));
+vi.mock("../../src/keeper/stellar.js", () => ({ submitStellar: vi.fn() }));
 class Db {
   calls: { sql: string; params: readonly unknown[] }[] = [];
-  claims: { claim_id: string; archived?: boolean }[] = [];
-  transfers: { nonce: string; archived?: boolean }[] = [];
   query(sql: string, params: readonly unknown[] = []) {
     this.calls.push({ sql, params });
-    if (sql.includes("pending_claim") && sql.includes("archived")) {
-      const filtered = this.claims.filter((c) => c.archived === true);
-      return Promise.resolve({
-        rows: filtered.map((c) => ({ claim_id: c.claim_id })),
-        rowCount: filtered.length,
-      });
-    }
-    if (sql.includes("pending_claim")) {
-      return Promise.resolve({
-        rows: this.claims.map((c) => ({ claim_id: c.claim_id })),
-        rowCount: this.claims.length,
-      });
-    }
-    if (sql.includes("outbound_transfer") && sql.includes("archived")) {
-      const filtered = this.transfers.filter((t) => t.archived === true);
-      return Promise.resolve({
-        rows: filtered.map((t) => ({ nonce: t.nonce })),
-        rowCount: filtered.length,
-      });
-    }
     return Promise.resolve({
-      rows: [{ nonce: "3" }],
-      rowCount: 1,
+      rows: sql.includes("pending_claim")
+        ? [{ claim_id: "1" }, { claim_id: "2" }]
+        : [{ nonce: "3" }],
+      rowCount: 2,
     });
   }
   transaction<T>(work: (db: Db) => Promise<T>) {
@@ -47,7 +26,6 @@ class Db {
 const { logger } = capturingLogger();
 beforeEach(() => {
   vi.mocked(submitStellar).mockReset();
-  vi.mocked(submitRestore).mockReset();
 });
 describe("Stellar keeper execution", () => {
   it("reports zero completed maintenance when there is no signer", async () => {
@@ -113,42 +91,5 @@ describe("Stellar keeper execution", () => {
     expect(new KeeperWorker(config, new Db(), logger).readiness().state).toBe("degraded");
     const disabled = loadConfig({ env: completeEnv({ KEEPER_ENABLED: "false" }) });
     expect(new KeeperWorker(disabled, new Db(), logger).readiness().state).toBe("ready");
-  });
-  it("restores archived claims without changing recipient or amount", async () => {
-    const config = loadConfig({
-      env: completeEnv({ KEEPER_STELLAR_SECRET: Keypair.random().secret() }),
-    });
-    vi.mocked(submitRestore).mockResolvedValue("restore-hash");
-    const db = new Db();
-    db.claims = [{ claim_id: "10", archived: true }];
-    db.transfers = [{ nonce: "20", archived: true }];
-    const result = await processRestore({ config, db, logger });
-    expect(result.restoredClaims).toBe(1);
-    expect(result.restoredTransfers).toBe(1);
-    expect(result.dryRun).toBe(false);
-    expect(vi.mocked(submitRestore).mock.calls[0]?.[2]).toEqual([10n]);
-    expect(vi.mocked(submitRestore).mock.calls[0]?.[3]).toEqual([20n]);
-  });
-  it("treats archived entries as present, not absent", async () => {
-    const config = loadConfig({
-      env: completeEnv({ KEEPER_STELLAR_SECRET: Keypair.random().secret() }),
-    });
-    vi.mocked(submitRestore).mockResolvedValue("restore-hash");
-    const db = new Db();
-    db.claims = [{ claim_id: "11", archived: true }];
-    db.transfers = [];
-    const result = await processRestore({ config, db, logger });
-    expect(result.restoredClaims).toBe(1);
-    expect(result.restoredTransfers).toBe(0);
-    expect(result.dryRun).toBe(false);
-  });
-  it("performs dry run restore when no signer", async () => {
-    const config = loadConfig({ env: completeEnv() });
-    const db = new Db();
-    db.claims = [{ claim_id: "12", archived: true }];
-    const result = await processRestore({ config, db, logger });
-    expect(result.dryRun).toBe(true);
-    expect(result.restoredClaims).toBe(1);
-    expect(vi.mocked(submitRestore)).not.toHaveBeenCalled();
   });
 });
