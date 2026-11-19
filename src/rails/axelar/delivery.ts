@@ -323,7 +323,7 @@ export async function verifyItsDelivery(
       tokenManager,
       tokenManagerBlock: receipt.blockNumber,
       tokenManagerBlockHash: block.hash,
-      paymentLogIndex: inspection.payment?.logIndex ?? null,
+      paymentLogIndex: inspection.payment.logIndex,
       paymentRecipient: recipient,
       paymentAmount: amount,
     },
