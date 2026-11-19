@@ -25,6 +25,8 @@ import {
   isStellarChain,
   isStellarDeployment,
   parseDeploymentSet,
+  RAIL_CONTRACTS,
+  RouteKind,
 } from "@hyperion/protocol";
 
 import type { EnumSpec, VarSpec } from "./env.js";
@@ -875,6 +877,30 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
       DEPLOYMENTS_FILE,
       `names ${wrongNetwork.join(", ")}, which is not a ${input.network} chain. Split the record or change HYPERION_NETWORK.`,
     );
+  }
+
+  const stellarDeployment = Object.values(input.deployments.networks).find(
+    (deployment) => isStellarDeployment(deployment) && RouteKind.AxelarIts in deployment.adapters,
+  );
+  if (stellarDeployment !== undefined) {
+    // Direct ITS payouts use the deployed protocol service, not a Hyperion EVM router.
+    // Restrict admission to valid receiver metadata on this network; receipt verification
+    // independently checks the actual destination service, peer, token and payment.
+    const hasReceiver = chainsFor(input.network).some((chain) => {
+      if (!isEvmChain(chain)) return false;
+      const receiver = RAIL_CONTRACTS[chain.key]?.axelar?.interchainTokenService;
+      return (
+        receiver !== undefined &&
+        /^0x[0-9a-fA-F]{40}$/.test(receiver) &&
+        !/^0x0{40}$/.test(receiver)
+      );
+    });
+    if (!hasReceiver) {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        "enables axelar-its without a supported deployed destination receiver; admission is blocked until receiver metadata is present",
+      );
+    }
   }
 
   for (const [key, deployment] of Object.entries(input.deployments.networks)) {
