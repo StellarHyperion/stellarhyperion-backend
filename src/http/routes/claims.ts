@@ -14,6 +14,7 @@ import {
   computeCanonicalETag,
   sendConditionalDetailResponse,
 } from "../etag.js";
+import { negotiateSchemaVersion, withSchemaMetadata } from "../schema-version.js";
 import type { ServerDeps } from "../server.js";
 
 export interface FormattedClaim {
@@ -58,6 +59,9 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       request: FastifyRequest<{ Params: { chain: string; claimId: string } }>,
       reply: FastifyReply,
     ) => {
+      const version = negotiateSchemaVersion(request, reply);
+      if (version === null) return;
+
       const { chain, claimId } = request.params;
       const { rows } = await db.query(
         `SELECT chain || ':' || claim_id::text AS id, chain, claim_id, recipient, token, amount, route, source_chain, source_nonce,
@@ -86,7 +90,12 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
           settledTx: textOrNull(row, "settled_tx"),
         },
       });
-      return sendConditionalDetailResponse(request, reply, claim, etag);
+      return sendConditionalDetailResponse(
+        request,
+        reply,
+        withSchemaMetadata(claim, version),
+        version === "1.0" ? etag : computeCanonicalETag("claim-v1.1", { base: etag }),
+      );
     },
   );
 
@@ -105,6 +114,9 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       }>,
       reply: FastifyReply,
     ) => {
+      const version = negotiateSchemaVersion(request, reply);
+      if (version === null) return;
+
       const { chain, recipient, settled, limit, offset } = request.query;
 
       const conditions: string[] = [];
@@ -144,12 +156,17 @@ export function registerClaimRoutes(app: FastifyInstance, deps: ServerDeps): voi
       );
 
       reply.header("Cache-Control", LIST_CACHE_CONTROL);
-      return reply.send({
-        claims: rows.map(formatClaimRow),
-        limit: parsedLimit,
-        offset: parsedOffset,
-        count: rows.length,
-      });
+      return reply.send(
+        withSchemaMetadata(
+          {
+            claims: rows.map(formatClaimRow),
+            limit: parsedLimit,
+            offset: parsedOffset,
+            count: rows.length,
+          },
+          version,
+        ),
+      );
     },
   );
 }

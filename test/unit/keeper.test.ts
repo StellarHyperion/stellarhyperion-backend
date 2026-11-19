@@ -52,8 +52,9 @@ describe("Stellar keeper execution", () => {
     expect(result.dryRun).toBe(false);
     expect(result.bumpedClaims).toBe(2);
     expect(result.bumpedTransfers).toBe(1);
-    expect(vi.mocked(submitStellar).mock.calls[0]?.[2]).toBe("keep_alive");
-    expect(vi.mocked(submitStellar).mock.calls[0]?.[3]("ignored")).toHaveLength(4);
+    expect(vi.mocked(submitStellar).mock.calls[0]?.[4]).toBe("keep_alive");
+    expect(vi.mocked(submitStellar).mock.calls[0]?.[5]).toBe("keep_alive");
+    expect(vi.mocked(submitStellar).mock.calls[0]?.[6]("ignored")).toHaveLength(4);
   });
   it("does not claim upkeep succeeded if submission fails", async () => {
     const config = loadConfig({

@@ -17,7 +17,7 @@ import type { VerifiedDelivery } from "../axelar/delivery.js";
 import { inspectCctpMessage, inspectCctpPayment, type ExpectedCctpTransfer } from "./events.js";
 import type { CctpVerificationFailure } from "../types.js";
 
-export async function verifyCctpDelivery(
+export async function inspectCctpDelivery(
   config: AppConfig,
   db: Queryable,
   transfer: PendingTransfer,
@@ -110,4 +110,14 @@ export async function verifyCctpDelivery(
       claimId: null,
     },
   });
+}
+
+/** Proof-only callers retain the established nullable verifier contract. */
+export async function verifyCctpDelivery(
+  config: AppConfig,
+  db: Queryable,
+  transfer: PendingTransfer,
+  report: RailReport,
+): Promise<VerifiedDelivery | null> {
+  return (await inspectCctpDelivery(config, db, transfer, report)).delivery;
 }

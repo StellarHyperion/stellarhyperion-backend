@@ -41,12 +41,20 @@ export async function processTtlBump(
       detail: `No signer: ${tokens.length} tokens, ${claims.length} claims, ${transfers.length} transfers need maintenance.`,
     };
   const vector = (values: xdr.ScVal[]) => xdr.ScVal.scvVec(values);
-  const hash = await submitStellar(ctx.config, chain.routerContractId, "keep_alive", () => [
-    vector(tokens.map((token) => new Address(token).toScVal())),
-    vector([0, 1, 2, 3].map((route) => nativeToScVal(route, { type: "u32" }))),
-    vector(claims.map((id) => nativeToScVal(id, { type: "u64" }))),
-    vector(transfers.map((id) => nativeToScVal(id, { type: "u64" }))),
-  ]);
+  const hash = await submitStellar(
+    ctx.config,
+    ctx.db,
+    chain.chain,
+    chain.routerContractId,
+    "keep_alive",
+    "keep_alive",
+    () => [
+      vector(tokens.map((token) => new Address(token).toScVal())),
+      vector([0, 1, 2, 3].map((route) => nativeToScVal(route, { type: "u32" }))),
+      vector(claims.map((id) => nativeToScVal(id, { type: "u64" }))),
+      vector(transfers.map((id) => nativeToScVal(id, { type: "u64" }))),
+    ],
+  );
   ctx.logger.info({ hash }, "router keep_alive confirmed");
   return {
     bumpedTokens: tokens.length,

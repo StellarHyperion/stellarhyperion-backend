@@ -15,11 +15,14 @@ ENV NODE_ENV=production \
     HYPERION_DEPLOYMENTS_FILE=./deployments/testnet.json \
     INDEXER_ENABLED=true \
     RAILS_ENABLED=true \
-    KEEPER_ENABLED=false
+    KEEPER_ENABLED=false \
+    INDEXER_LEASE_TTL_MS=30000
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+  CMD node --eval "import('http').then(h=>{const r=h.get('http://127.0.0.1:8080/ready',s=>process.exit(s.statusCode===200?0:1));r.on('error',()=>process.exit(1));r.setTimeout(5000,()=>{r.destroy();process.exit(1)});})"
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./
 COPY migrations ./migrations
 COPY deployments/testnet.json ./deployments/testnet.json
 USER node
-CMD ["sh", "-c", "npm run migrate:up && exec node dist/main.js"]
+CMD ["node", "dist/main.js"]

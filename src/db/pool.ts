@@ -12,15 +12,33 @@
  * not check the shape it returns against anything, so a generic there is a cast wearing a
  * costume. Narrowing happens once per table, in `rows.ts`, where it is visible.
  */
+import { performance } from "node:perf_hooks";
+
 import { Pool } from "pg";
 import type { PoolClient, PoolConfig } from "pg";
 import {
+  computeHistoryDigest as computeRangeDigest,
+  recordHistoryDigest as storeRangeDigest,
+  verifyHistoryDigest as verifyRangeDigest,
+  type ComputeHistoryDigestOptions,
+  type DigestVerificationResult,
+  type HistoryDigestResult,
+  type StoredHistoryDigest,
   auditTransferAndClaimInvariants,
   compactRouteHealthSamples,
   type CompactRouteHealthOptions,
   type RouteHealthCompactionResult,
   type TransferClaimAuditReport,
 } from "../chains/writers.js";
+
+import {
+  DbTelemetryCollector,
+  classifySqlWorkload,
+  type DbTelemetrySnapshot,
+  type DbWorkload,
+  type PoolSaturationSnapshot,
+  type QueryOptions,
+} from "./telemetry.js";
 
 export interface QueryResultRows {
   readonly rows: readonly Record<string, unknown>[];
@@ -46,22 +64,43 @@ export interface Transactional extends Queryable {
 }
 
 export interface OpenOptions {
+  /** Enforce read-only statements on every connection, including diagnostics probes. */
+  readonly readOnly?: boolean;
   /** Low by default. Two watchers and an HTTP server do not need twenty connections. */
   readonly maxConnections?: number;
   readonly connectionTimeoutMs?: number;
   readonly statementTimeoutMs?: number;
   readonly applicationName?: string;
+  readonly maxLatencySamplesPerWorkload?: number;
+  readonly slowQueryThresholdMs?: number;
+  readonly logger?: {
+    warn?: (obj: unknown, msg: string) => void;
+  };
 }
 
 export class Database implements Transactional {
   private closed = false;
+  private readonly telemetry: DbTelemetryCollector;
+  private readonly maxConnections: number;
+  private readonly slowQueryThresholdMs: number | undefined;
+  private readonly logger: OpenOptions["logger"];
 
-  private constructor(private readonly pool: Pool) {}
+  private constructor(
+    private readonly pool: Pool,
+    options: OpenOptions = {},
+  ) {
+    this.maxConnections = options.maxConnections ?? 10;
+    this.telemetry = new DbTelemetryCollector(options.maxLatencySamplesPerWorkload);
+    this.slowQueryThresholdMs = options.slowQueryThresholdMs;
+    this.logger = options.logger;
+  }
 
   static open(connectionString: string, options: OpenOptions = {}): Database {
+    const maxConnections = options.maxConnections ?? 10;
     const config: PoolConfig = {
       connectionString,
-      max: options.maxConnections ?? 10,
+      max: maxConnections,
+      ...(options.readOnly ? { options: "-c default_transaction_read_only=on" } : {}),
       connectionTimeoutMillis: options.connectionTimeoutMs ?? 10_000,
       // Named so `pg_stat_activity` says which process is holding a connection. During an
       // incident that is the difference between knowing and guessing.
@@ -70,12 +109,16 @@ export class Database implements Transactional {
       // the connection does not help it.
       statement_timeout: options.statementTimeoutMs ?? 30_000,
     };
-    return new Database(new Pool(config));
+    return new Database(new Pool(config), { ...options, maxConnections });
   }
 
-  async query(text: string, params: readonly unknown[] = []): Promise<QueryResultRows> {
-    const result = await this.pool.query(text, params as unknown[]);
-    return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount ?? 0 };
+  async query(
+    text: string,
+    params: readonly unknown[] = [],
+    options?: QueryOptions,
+  ): Promise<QueryResultRows> {
+    const workload = options?.workload ?? classifySqlWorkload(text);
+    return this.measure(workload, () => this.pool.query(text, params as unknown[]));
   }
 
   /**
@@ -88,14 +131,14 @@ export class Database implements Transactional {
   async transaction<T>(work: (tx: Queryable) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
     try {
-      await client.query("BEGIN");
-      const value = await work(wrapClient(client));
-      await client.query("COMMIT");
+      await this.measure("transaction", () => client.query("BEGIN"));
+      const value = await work(this.wrapClient(client));
+      await this.measure("transaction", () => client.query("COMMIT"));
       return value;
     } catch (error) {
       // A rollback that itself fails means the connection is gone, in which case the server has
       // already rolled back and the original error is the one worth reporting.
-      await client.query("ROLLBACK").catch(() => undefined);
+      await this.measure("transaction", () => client.query("ROLLBACK")).catch(() => undefined);
       throw error;
     } finally {
       client.release();
@@ -104,7 +147,76 @@ export class Database implements Transactional {
 
   /** Cheapest possible proof the database is answering, for the ready check. */
   async ping(): Promise<void> {
-    await this.query("SELECT 1");
+    await this.query("SELECT 1", [], { workload: "health" });
+  }
+
+  poolSnapshot(): PoolSaturationSnapshot {
+    return this.telemetry.poolSnapshot({
+      totalCount: this.pool.totalCount,
+      idleCount: this.pool.idleCount,
+      waitingCount: this.pool.waitingCount,
+      maxConnections: this.maxConnections,
+    });
+  }
+
+  telemetrySnapshot(): DbTelemetrySnapshot {
+    return this.telemetry.snapshot({
+      totalCount: this.pool.totalCount,
+      idleCount: this.pool.idleCount,
+      waitingCount: this.pool.waitingCount,
+      maxConnections: this.maxConnections,
+    });
+  }
+
+  private wrapClient(client: PoolClient): Queryable {
+    return {
+      query: (text: string, params: readonly unknown[] = []): Promise<QueryResultRows> => {
+        const workload = classifySqlWorkload(text);
+        return this.measure(workload, () => client.query(text, params as unknown[]));
+      },
+    };
+  }
+
+  private async measure(
+    workload: DbWorkload,
+    exec: () => Promise<{ rows: unknown[]; rowCount: number | null }>,
+  ): Promise<QueryResultRows> {
+    const startedAt = performance.now();
+    try {
+      const result = await exec();
+      const durationMs = performance.now() - startedAt;
+      this.telemetry.record(workload, durationMs, true);
+      const rowCount = result.rowCount ?? 0;
+      if (this.slowQueryThresholdMs !== undefined && durationMs >= this.slowQueryThresholdMs) {
+        // Never log SQL parameters or raw SQL text that might be misinterpreted.
+        this.logger?.warn?.(
+          { workload, durationMs: Math.round(durationMs * 1000) / 1000, rowCount },
+          "slow database query",
+        );
+      }
+      return { rows: result.rows as Record<string, unknown>[], rowCount };
+    } catch (error) {
+      const durationMs = performance.now() - startedAt;
+      this.telemetry.record(workload, durationMs, false);
+      throw error;
+    }
+  }
+
+  /** Compute a deterministic range digest for indexed event and monetary records (#63). */
+  async computeHistoryDigest(options: ComputeHistoryDigestOptions): Promise<HistoryDigestResult> {
+    return computeRangeDigest(this, options);
+  }
+
+  /** Persist a computed range digest for later backfill/restore verification (#63). */
+  async recordHistoryDigest(result: HistoryDigestResult): Promise<StoredHistoryDigest> {
+    return storeRangeDigest(this, result);
+  }
+
+  /** Recompute and verify a range digest against an expected or stored digest (#63). */
+  async verifyHistoryDigest(
+    options: ComputeHistoryDigestOptions & { readonly expectedDigest?: string },
+  ): Promise<DigestVerificationResult> {
+    return verifyRangeDigest(this, options);
   }
 
   /**
@@ -190,14 +302,5 @@ export function startMaintenanceTask(
   timer.unref();
   return () => {
     clearInterval(timer);
-  };
-}
-
-function wrapClient(client: PoolClient): Queryable {
-  return {
-    async query(text: string, params: readonly unknown[] = []): Promise<QueryResultRows> {
-      const result = await client.query(text, params as unknown[]);
-      return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount ?? 0 };
-    },
   };
 }

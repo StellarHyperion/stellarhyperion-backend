@@ -1,3 +1,5 @@
+import type { CctpVerificationFailure } from "../rails/types.js";
+import { bounded, safeString } from "../rails/axelar/gmp.js";
 /**
  * Every statement that writes an indexed row, in one file, for both chain families.
  *
@@ -19,8 +21,22 @@
  * had handled the case. `observed_at` is deliberately left out of every update: it records when
  * this indexer first saw the row, and a reorg does not change that.
  */
-import type { Queryable } from "../db/pool.js";
-import { integer, numericString, one, text, textOrNull, timestamp } from "../db/rows.js";
+import { createHash } from "node:crypto";
+import type { Queryable, Transactional } from "../db/pool.js";
+import {
+  bigintOf,
+  boolean,
+  integer,
+  integerOrNull,
+  json,
+  maybeOne,
+  numericString,
+  one,
+  text,
+  textOrNull,
+  timestamp,
+  timestampOrNull,
+} from "../db/rows.js";
 import type { RailRetryClass } from "../rails/types.js";
 
 /** Where on a chain a row was observed. One shape for a ledger and for a block. */
@@ -381,7 +397,143 @@ export interface AttestationRow {
   readonly retryAttempts: number;
   readonly nextAttemptAt: Date | null;
   readonly retryClass: RailRetryClass | null;
-  readonly verificationFailure: CctpVerificationFailure | null;
+  readonly verificationFailure?: CctpVerificationFailure | null;
+}
+
+export interface AxelarQuarantineRow {
+  readonly transferId: bigint;
+  readonly sourceTxHash: string;
+  readonly providerReference: string | null;
+  readonly schema: string;
+  readonly payload: unknown;
+}
+
+export interface AxelarDeliveryEvidenceRow {
+  readonly transferId: bigint;
+  readonly destinationChain: string;
+  readonly commandId: string;
+  readonly executionTxHash: string;
+  readonly receiptBlock: bigint;
+  readonly receiptBlockHash: string;
+  readonly itsAddress: string;
+  readonly tokenId: string;
+  readonly registeredToken: string;
+  readonly tokenManager: string;
+  readonly tokenManagerBlock: bigint;
+  readonly tokenManagerBlockHash: string;
+  readonly paymentLogIndex: number;
+  readonly paymentRecipient: string;
+  readonly paymentAmount: bigint;
+}
+
+export async function writeAxelarQuarantine(
+  db: Queryable,
+  row: AxelarQuarantineRow,
+): Promise<void> {
+  await db.query(
+    `INSERT INTO axelar_status_quarantine
+       (transfer_id, source_tx_hash, provider_reference, provider_reference_key, schema, payload)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (transfer_id, source_tx_hash, provider_reference_key)
+     DO UPDATE SET schema = EXCLUDED.schema,
+                   payload = EXCLUDED.payload,
+                   last_seen_at = now(),
+                   replay_count = axelar_status_quarantine.replay_count + 1`,
+    [
+      row.transferId.toString(),
+      row.sourceTxHash,
+      row.providerReference === null ? null : safeString(row.providerReference),
+      row.providerReference === null ? "" : safeString(row.providerReference),
+      safeString(row.schema),
+      JSON.stringify(bounded(row.payload)),
+    ],
+  );
+}
+
+export async function writeAxelarDeliveryEvidence(
+  db: Queryable,
+  row: AxelarDeliveryEvidenceRow,
+): Promise<bigint> {
+  await db.query(
+    `UPDATE axelar_delivery_evidence
+        SET status = 'superseded'
+      WHERE transfer_id = $1 AND status = 'canonical'
+        AND (command_id, execution_tx_hash, payment_log_index)
+            IS DISTINCT FROM ($2, $3, $4)`,
+    [row.transferId.toString(), row.commandId, row.executionTxHash, row.paymentLogIndex],
+  );
+  const { rows } = await db.query(
+    `INSERT INTO axelar_delivery_evidence
+       (transfer_id, destination_chain, status, command_id, execution_tx_hash, receipt_status,
+        receipt_block, receipt_block_hash, its_address, token_id, registered_token, token_manager,
+        token_manager_block, token_manager_block_hash, payment_log_index, payment_recipient,
+        payment_amount, last_revalidated_at)
+     VALUES ($1, $2, 'canonical', $3, $4, 'success', $5, $6, $7, $8, $9, $10, $11, $12,
+             $13, $14, $15, now())
+     ON CONFLICT (transfer_id, command_id, execution_tx_hash, payment_log_index) DO UPDATE
+       SET status = 'canonical',
+           destination_chain = EXCLUDED.destination_chain,
+           receipt_status = EXCLUDED.receipt_status,
+           receipt_block = EXCLUDED.receipt_block,
+           receipt_block_hash = EXCLUDED.receipt_block_hash,
+           its_address = EXCLUDED.its_address,
+           token_id = EXCLUDED.token_id,
+           registered_token = EXCLUDED.registered_token,
+           token_manager = EXCLUDED.token_manager,
+           token_manager_block = EXCLUDED.token_manager_block,
+           token_manager_block_hash = EXCLUDED.token_manager_block_hash,
+           payment_recipient = EXCLUDED.payment_recipient,
+           payment_amount = EXCLUDED.payment_amount,
+           last_revalidated_at = now()
+     RETURNING id`,
+    [
+      row.transferId.toString(),
+      row.destinationChain,
+      row.commandId,
+      row.executionTxHash,
+      row.receiptBlock.toString(),
+      row.receiptBlockHash,
+      row.itsAddress,
+      row.tokenId,
+      row.registeredToken,
+      row.tokenManager,
+      row.tokenManagerBlock.toString(),
+      row.tokenManagerBlockHash,
+      row.paymentLogIndex,
+      row.paymentRecipient,
+      row.paymentAmount.toString(),
+    ],
+  );
+  const id = rows[0]?.id;
+  if (typeof id !== "string" && typeof id !== "number" && typeof id !== "bigint")
+    throw new Error("Axelar delivery evidence insert did not return its id.");
+  return BigInt(id);
+}
+
+export async function linkAxelarDeliveryEvidence(
+  db: Queryable,
+  row: AxelarDeliveryEvidenceRow,
+  evidenceId: bigint,
+): Promise<void> {
+  const { rowCount } = await db.query(
+    `UPDATE inbound_delivery
+        SET axelar_evidence_id = $5
+      WHERE destination_chain = $1 AND route = 1
+        AND destination_block = $2 AND destination_tx = $3
+        AND destination_log_index = $6
+        AND delivered = true
+        AND (source_chain, source_nonce) =
+            (SELECT origin_chain, nonce FROM outbound_transfer WHERE id = $4)`,
+    [
+      row.destinationChain,
+      row.receiptBlock.toString(),
+      row.executionTxHash,
+      row.transferId.toString(),
+      evidenceId.toString(),
+      row.paymentLogIndex,
+    ],
+  );
+  if (rowCount !== 1) throw new Error("Axelar evidence did not match its inbound delivery.");
 }
 
 export async function writeAttestation(db: Queryable, row: AttestationRow): Promise<void> {
@@ -419,9 +571,399 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
       row.nextAttemptAt,
       row.retryClass,
       row.retryAttempts,
-      row.verificationFailure,
+      row.verificationFailure ?? null,
     ],
   );
+}
+
+export type DigestRecordKind = "outbound_transfer" | "inbound_delivery" | "pending_claim" | "all";
+
+export interface TokenMonetarySummary {
+  readonly outboundGross: string;
+  readonly outboundFee: string;
+  readonly outboundNet: string;
+  readonly inboundAmount: string;
+  readonly claimAmount: string;
+}
+
+export interface MonetarySummary {
+  readonly outboundCount: number;
+  readonly inboundCount: number;
+  readonly claimCount: number;
+  readonly tokens: Readonly<Record<string, TokenMonetarySummary>>;
+}
+
+export interface ComputeHistoryDigestOptions {
+  readonly chainKey: string;
+  readonly startBlock: bigint;
+  readonly endBlock: bigint;
+  readonly recordKind?: DigestRecordKind;
+}
+
+export interface HistoryDigestResult {
+  readonly chainKey: string;
+  readonly recordKind: DigestRecordKind;
+  readonly startBlock: bigint;
+  readonly endBlock: bigint;
+  readonly rowCount: number;
+  readonly digest: string;
+  readonly monetarySummary: MonetarySummary;
+}
+
+export interface StoredHistoryDigest extends HistoryDigestResult {
+  readonly id: bigint;
+  readonly computedAt: Date;
+}
+
+export interface DigestVerificationResult {
+  readonly matches: boolean;
+  readonly expectedDigest: string | null;
+  readonly actualDigest: string;
+  readonly computed: HistoryDigestResult;
+}
+
+interface MutableTokenTotals {
+  outboundGross: bigint;
+  outboundFee: bigint;
+  outboundNet: bigint;
+  inboundAmount: bigint;
+  claimAmount: bigint;
+}
+
+function getOrInitTokenTotals(
+  map: Map<string, MutableTokenTotals>,
+  token: string,
+): MutableTokenTotals {
+  let entry = map.get(token);
+  if (entry === undefined) {
+    entry = {
+      outboundGross: 0n,
+      outboundFee: 0n,
+      outboundNet: 0n,
+      inboundAmount: 0n,
+      claimAmount: 0n,
+    };
+    map.set(token, entry);
+  }
+  return entry;
+}
+
+/**
+ * Compute a deterministic SHA-256 range digest and integer-string monetary summary over indexed
+ * event and monetary records in `[startBlock, endBlock]`.
+ *
+ * Excludes surrogate `id` and `observed_at` timestamps so backfills, replays, and restores
+ * produce the exact same digest whenever the underlying chain facts match.
+ */
+export async function computeHistoryDigest(
+  db: Queryable,
+  options: ComputeHistoryDigestOptions,
+): Promise<HistoryDigestResult> {
+  if ("transaction" in db && typeof db.transaction === "function") {
+    return (db as Transactional).transaction(async (tx) => {
+      await tx.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      return computeHistoryDigestSnapshot(tx, options);
+    });
+  }
+  return computeHistoryDigestSnapshot(db, options);
+}
+
+async function* digestPages(
+  db: Queryable,
+  sql: string,
+  params: readonly unknown[],
+): AsyncGenerator<readonly Record<string, unknown>[]> {
+  const pageSize = 1000;
+  for (let offset = 0; ; offset += pageSize) {
+    const { rows } = await db.query(
+      sql + ` LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, pageSize, offset],
+    );
+    if (rows.length === 0) return;
+    yield rows;
+    if (rows.length < pageSize) return;
+  }
+}
+
+async function computeHistoryDigestSnapshot(
+  db: Queryable,
+  options: ComputeHistoryDigestOptions,
+): Promise<HistoryDigestResult> {
+  const { chainKey, startBlock, endBlock } = options;
+  const recordKind: DigestRecordKind = options.recordKind ?? "all";
+  if (startBlock < 0n || endBlock < startBlock) {
+    throw new RangeError(
+      `invalid digest block range [${startBlock.toString()}, ${endBlock.toString()}]`,
+    );
+  }
+
+  const hash = createHash("sha256");
+  hash.update(
+    `${JSON.stringify({
+      version: 1,
+      chainKey,
+      recordKind,
+      startBlock: startBlock.toString(),
+      endBlock: endBlock.toString(),
+    })}\n`,
+  );
+
+  const tokenMap = new Map<string, MutableTokenTotals>();
+  let outboundCount = 0;
+  let inboundCount = 0;
+  let claimCount = 0;
+  let rowCount = 0;
+
+  if (recordKind === "outbound_transfer" || recordKind === "all") {
+    for await (const rows of digestPages(
+      db,
+      `SELECT origin_chain, origin_router, route, nonce, sender, token, gross_amount, fee, net_amount,
+              destination_chain, destination, rail_ref, origin_block, origin_tx, origin_log_index
+         FROM outbound_transfer
+        WHERE origin_chain = $1
+          AND origin_block BETWEEN $2 AND $3
+        ORDER BY origin_block ASC, origin_router COLLATE "C" ASC, nonce ASC, origin_tx COLLATE "C" ASC, origin_log_index ASC NULLS LAST`,
+      [chainKey, startBlock.toString(), endBlock.toString()],
+    )) {
+      for (const row of rows) {
+        const token = text(row, "token");
+        const grossAmount = bigintOf(row, "gross_amount");
+        const fee = bigintOf(row, "fee");
+        const netAmount = bigintOf(row, "net_amount");
+        const totals = getOrInitTokenTotals(tokenMap, token);
+        totals.outboundGross += grossAmount;
+        totals.outboundFee += fee;
+        totals.outboundNet += netAmount;
+        outboundCount += 1;
+        rowCount += 1;
+
+        hash.update(
+          `${JSON.stringify({
+            kind: "outbound_transfer",
+            originChain: text(row, "origin_chain"),
+            originRouter: text(row, "origin_router"),
+            route: integer(row, "route"),
+            nonce: bigintOf(row, "nonce").toString(),
+            sender: text(row, "sender"),
+            token,
+            grossAmount: grossAmount.toString(),
+            fee: fee.toString(),
+            netAmount: netAmount.toString(),
+            destinationChain: text(row, "destination_chain"),
+            destination: text(row, "destination"),
+            railRef: textOrNull(row, "rail_ref"),
+            originBlock: bigintOf(row, "origin_block").toString(),
+            originTx: text(row, "origin_tx"),
+            originLogIndex: integerOrNull(row, "origin_log_index"),
+          })}\n`,
+        );
+      }
+    }
+  }
+
+  if (recordKind === "inbound_delivery" || recordKind === "all") {
+    for await (const rows of digestPages(
+      db,
+      `SELECT d.destination_chain, d.route, d.source_chain, d.source_nonce, d.rail_message_id,
+              source.origin_router AS source_router, source.origin_tx AS source_origin_tx,
+              d.recipient, d.token, d.amount, d.delivered, d.claim_id, d.destination_block, d.destination_tx,
+              d.destination_log_index
+         FROM inbound_delivery d LEFT JOIN outbound_transfer source ON source.id = d.source_transfer_id
+        WHERE d.destination_chain = $1
+          AND d.destination_block BETWEEN $2 AND $3
+        ORDER BY d.destination_block ASC, d.route ASC, d.source_chain COLLATE "C" ASC, d.source_nonce ASC, source.origin_router COLLATE "C" ASC NULLS FIRST, d.destination_tx COLLATE "C" ASC, d.destination_log_index ASC NULLS LAST`,
+      [chainKey, startBlock.toString(), endBlock.toString()],
+    )) {
+      for (const row of rows) {
+        const token = text(row, "token");
+        const amount = bigintOf(row, "amount");
+        const totals = getOrInitTokenTotals(tokenMap, token);
+        totals.inboundAmount += amount;
+        inboundCount += 1;
+        rowCount += 1;
+
+        const claimIdRaw = row.claim_id;
+        hash.update(
+          `${JSON.stringify({
+            kind: "inbound_delivery",
+            destinationChain: text(row, "destination_chain"),
+            route: integer(row, "route"),
+            sourceChain: text(row, "source_chain"),
+            sourceRouter: textOrNull(row, "source_router"),
+            sourceOriginTx: textOrNull(row, "source_origin_tx"),
+            sourceNonce: bigintOf(row, "source_nonce").toString(),
+            railMessageId: textOrNull(row, "rail_message_id"),
+            recipient: text(row, "recipient"),
+            token,
+            amount: amount.toString(),
+            delivered: boolean(row, "delivered"),
+            claimId:
+              claimIdRaw === null || claimIdRaw === undefined
+                ? null
+                : bigintOf(row, "claim_id").toString(),
+            destinationBlock: bigintOf(row, "destination_block").toString(),
+            destinationTx: text(row, "destination_tx"),
+            destinationLogIndex: integerOrNull(row, "destination_log_index"),
+          })}\n`,
+        );
+      }
+    }
+  }
+
+  if (recordKind === "pending_claim" || recordKind === "all") {
+    for await (const rows of digestPages(
+      db,
+      `SELECT c.chain, c.claim_id, c.recipient, c.token, c.amount, c.route,
+              source.origin_router AS source_router, source.origin_tx AS source_origin_tx,
+              c.source_chain, c.source_nonce, c.created_at, c.settled,
+              c.settled_at, c.settled_by, c.settled_tx
+         FROM pending_claim c
+         LEFT JOIN outbound_transfer source ON source.id = c.source_transfer_id
+        WHERE c.chain = $1 AND EXISTS (
+          SELECT 1 FROM inbound_delivery d
+           WHERE d.destination_chain = c.chain AND d.claim_id = c.claim_id
+             AND d.route = c.route AND d.source_chain = c.source_chain
+             AND d.source_nonce = c.source_nonce
+             AND (c.source_transfer_id IS NULL OR c.source_transfer_id = d.source_transfer_id)
+             AND d.destination_block BETWEEN $2 AND $3
+        )
+        ORDER BY c.claim_id ASC`,
+      [chainKey, startBlock.toString(), endBlock.toString()],
+    )) {
+      for (const row of rows) {
+        const token = text(row, "token");
+        const amount = bigintOf(row, "amount");
+        const totals = getOrInitTokenTotals(tokenMap, token);
+        totals.claimAmount += amount;
+        claimCount += 1;
+        rowCount += 1;
+
+        const settledAt = timestampOrNull(row, "settled_at");
+        hash.update(
+          `${JSON.stringify({
+            kind: "pending_claim",
+            chain: text(row, "chain"),
+            claimId: bigintOf(row, "claim_id").toString(),
+            recipient: text(row, "recipient"),
+            token,
+            amount: amount.toString(),
+            route: integer(row, "route"),
+            sourceChain: text(row, "source_chain"),
+            sourceRouter: textOrNull(row, "source_router"),
+            sourceOriginTx: textOrNull(row, "source_origin_tx"),
+            sourceNonce: bigintOf(row, "source_nonce").toString(),
+            createdAt: timestamp(row, "created_at").toISOString(),
+            settled: boolean(row, "settled"),
+            settledAt: settledAt ? settledAt.toISOString() : null,
+            settledBy: textOrNull(row, "settled_by"),
+            settledTx: textOrNull(row, "settled_tx"),
+          })}\n`,
+        );
+      }
+    }
+  }
+
+  const tokens: Record<string, TokenMonetarySummary> = {};
+  for (const token of Array.from(tokenMap.keys()).sort()) {
+    const totals = tokenMap.get(token);
+    if (totals === undefined) continue;
+    tokens[token] = {
+      outboundGross: totals.outboundGross.toString(),
+      outboundFee: totals.outboundFee.toString(),
+      outboundNet: totals.outboundNet.toString(),
+      inboundAmount: totals.inboundAmount.toString(),
+      claimAmount: totals.claimAmount.toString(),
+    };
+  }
+
+  return {
+    chainKey,
+    recordKind,
+    startBlock,
+    endBlock,
+    rowCount,
+    digest: hash.digest("hex"),
+    monetarySummary: {
+      outboundCount,
+      inboundCount,
+      claimCount,
+      tokens,
+    },
+  };
+}
+
+export async function recordHistoryDigest(
+  db: Queryable,
+  result: HistoryDigestResult,
+): Promise<StoredHistoryDigest> {
+  const { rows } = await db.query(
+    `INSERT INTO indexed_history_digest
+       (chain_key, record_kind, start_block, end_block, row_count, digest, monetary_summary)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (chain_key, record_kind, start_block, end_block) DO UPDATE
+       SET row_count = EXCLUDED.row_count,
+           digest = EXCLUDED.digest,
+           monetary_summary = EXCLUDED.monetary_summary,
+           computed_at = now()
+     RETURNING id, chain_key, record_kind, start_block, end_block, row_count, digest,
+               monetary_summary, computed_at`,
+    [
+      result.chainKey,
+      result.recordKind,
+      result.startBlock.toString(),
+      result.endBlock.toString(),
+      result.rowCount,
+      result.digest,
+      JSON.stringify(result.monetarySummary),
+    ],
+  );
+  const row = one(rows, "recordHistoryDigest");
+  return {
+    id: bigintOf(row, "id"),
+    chainKey: text(row, "chain_key"),
+    recordKind: text(row, "record_kind") as DigestRecordKind,
+    startBlock: bigintOf(row, "start_block"),
+    endBlock: bigintOf(row, "end_block"),
+    rowCount: integer(row, "row_count"),
+    digest: text(row, "digest"),
+    monetarySummary: json(row, "monetary_summary") as MonetarySummary,
+    computedAt: timestamp(row, "computed_at"),
+  };
+}
+
+export async function verifyHistoryDigest(
+  db: Queryable,
+  options: ComputeHistoryDigestOptions & { readonly expectedDigest?: string },
+): Promise<DigestVerificationResult> {
+  const computed = await computeHistoryDigest(db, options);
+  let expectedDigest: string | null = options.expectedDigest ?? null;
+
+  if (expectedDigest === null) {
+    const { rows } = await db.query(
+      `SELECT digest
+         FROM indexed_history_digest
+        WHERE chain_key = $1
+          AND record_kind = $2
+          AND start_block = $3
+          AND end_block = $4
+        LIMIT 1`,
+      [
+        computed.chainKey,
+        computed.recordKind,
+        computed.startBlock.toString(),
+        computed.endBlock.toString(),
+      ],
+    );
+    const stored = maybeOne(rows, "verifyHistoryDigest");
+    expectedDigest = stored ? text(stored, "digest") : null;
+  }
+
+  return {
+    matches: expectedDigest !== null && computed.digest === expectedDigest,
+    expectedDigest,
+    actualDigest: computed.digest,
+    computed,
+  };
 }
 
 // --------------------------------------------------------------------------------------------

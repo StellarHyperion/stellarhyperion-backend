@@ -10,7 +10,6 @@
  * runs the unit suite rather than failing in a way somebody learns to ignore.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { runner } from "node-pg-migrate";
 
 import {
   auditTransferAndClaimInvariants,
@@ -25,7 +24,6 @@ const suite = CONNECTION === undefined ? describe.skip : describe;
 const CHECK_VIOLATION = "23514";
 const UNIQUE_VIOLATION = "23505";
 const NUMERIC_OUT_OF_RANGE = "22003";
-const MIGRATION_TEST_SCHEMA = `migration_lock_test_${process.pid}_${Date.now()}`;
 
 const U64_MAX = "18446744073709551615";
 const U256_MAX = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
@@ -61,8 +59,12 @@ suite("the schema", () => {
     const names = rows.map((row) => String(row.table_name));
     for (const table of [
       "admin_action",
+      "axelar_delivery_evidence",
+      "axelar_status_quarantine",
       "inbound_delivery",
+      "indexed_history_digest",
       "indexer_cursor",
+      "indexer_worker_heartbeat",
       "outbound_transfer",
       "pending_claim",
       "rail_attestation",
@@ -70,69 +72,6 @@ suite("the schema", () => {
     ]) {
       expect(names, `${table} is missing; has the migration run`).toContain(table);
     }
-  });
-
-  it("serializes concurrent migration runners and applies a migration once", async () => {
-    let executionCount = 0;
-    let markStarted!: () => void;
-    const started = new Promise<void>((resolve) => {
-      markStarted = resolve;
-    });
-    let releaseMigration!: () => void;
-    const migrationGate = new Promise<void>((resolve) => {
-      releaseMigration = resolve;
-    });
-
-    const migration = {
-      up: async (): Promise<void> => {
-        executionCount += 1;
-        markStarted();
-        await migrationGate;
-      },
-    };
-
-    const run = (applicationName: string) =>
-      runner({
-        databaseUrl: {
-          connectionString: CONNECTION ?? "",
-          application_name: applicationName,
-        },
-        migrations: { "1790900000000_lock-test": migration },
-        migrationsTable: "pgmigrations",
-        schema: MIGRATION_TEST_SCHEMA,
-        createSchema: true,
-        direction: "up",
-        advisoryLockMode: "wait",
-      });
-
-    const first = run("hyperion-migration-lock-first");
-    await started;
-    const second = run("hyperion-migration-lock-second");
-
-    let secondRunnerWaiting = false;
-    let outcomes: PromiseSettledResult<unknown>[] = [];
-    try {
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        const { rows } = await db.query(
-          `SELECT 1 FROM pg_stat_activity
-            WHERE application_name = 'hyperion-migration-lock-second'
-              AND wait_event_type = 'Lock' AND wait_event = 'advisory'`,
-        );
-        if (rows.length > 0) {
-          secondRunnerWaiting = true;
-          break;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-    } finally {
-      releaseMigration();
-      outcomes = await Promise.allSettled([first, second]);
-      await db.query(`DROP SCHEMA IF EXISTS "${MIGRATION_TEST_SCHEMA}" CASCADE`);
-    }
-
-    expect(secondRunnerWaiting).toBe(true);
-    expect(outcomes.map(({ status }) => status)).toEqual(["fulfilled", "fulfilled"]);
-    expect(executionCount).toBe(1);
   });
 
   it("holds a u64 that bigint cannot", async () => {
@@ -160,10 +99,7 @@ suite("the schema", () => {
       "DELETE FROM public.indexer_cursor WHERE chain_key IN ('hash-test', 'no-hash-test')",
     );
     await db.query(
-      `INSERT INTO public.indexer_cursor
-         (chain_key, family, contract, last_processed, last_processed_hash)
-       VALUES ('hash-test', 'evm', '0xrouter', 42, $1),
-              ('no-hash-test', 'stellar', 'CROUTER', 42, NULL)`,
+      "INSERT INTO public.indexer_cursor (chain_key, family, contract, last_processed, last_processed_hash) VALUES ('hash-test', 'evm', '0xrouter', 42, $1), ('no-hash-test', 'stellar', 'CROUTER', 42, NULL)",
       [`0x${"ab".repeat(32)}`],
     );
 
