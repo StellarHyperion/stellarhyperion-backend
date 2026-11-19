@@ -481,8 +481,7 @@ export async function writeAxelarDeliveryEvidence(
     ).rows[0];
     const expected = row.sourceBinding;
     if (
-      !source ||
-      source.origin_chain !== expected.chain ||
+      source?.origin_chain !== expected.chain ||
       source.origin_router !== expected.router ||
       source.nonce !== expected.nonce ||
       source.origin_tx !== expected.transaction ||

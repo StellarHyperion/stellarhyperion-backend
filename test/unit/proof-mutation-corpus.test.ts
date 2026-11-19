@@ -207,6 +207,11 @@ describe("independent real CCTP and ITS destination proof mutation corpus", () =
           Promise.resolve({
             rows: [
               {
+                origin_chain: transfer.originChain,
+                origin_router: source.router,
+                nonce: transfer.nonce.toString(),
+                origin_tx: transfer.originTx,
+                destination_chain: transfer.destinationChain,
                 sender: "Gsource",
                 token: cctp.expected.sourceToken,
                 net_amount:
