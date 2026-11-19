@@ -340,6 +340,7 @@ export interface AttestationRow {
   /** Consecutive failures for this transfer, distinct from the poller's own backoff. */
   readonly checkFailures: number;
   readonly lastError: string | null;
+  readonly retryAttempts: number;
   readonly nextAttemptAt: Date | null;
   readonly retryClass: RailRetryClass | null;
 }
@@ -348,8 +349,8 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
   await db.query(
     `INSERT INTO rail_attestation
        (transfer_id, route, status, rail_status, rail_reference, attested_at, last_checked_at,
-        check_failures, last_error, next_attempt_at, retry_class)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        check_failures, last_error, next_attempt_at, retry_class, retry_attempts)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
      ON CONFLICT (transfer_id) DO UPDATE
        SET status = EXCLUDED.status,
            rail_status = COALESCE(EXCLUDED.rail_status, rail_attestation.rail_status),
@@ -361,6 +362,7 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
            last_checked_at = EXCLUDED.last_checked_at,
            check_failures = EXCLUDED.check_failures,
            last_error = EXCLUDED.last_error,
+           retry_attempts = EXCLUDED.retry_attempts,
            next_attempt_at = EXCLUDED.next_attempt_at,
            retry_class = EXCLUDED.retry_class,
            updated_at = now()`,
@@ -376,6 +378,7 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
       row.lastError,
       row.nextAttemptAt,
       row.retryClass,
+      row.retryAttempts,
     ],
   );
 }

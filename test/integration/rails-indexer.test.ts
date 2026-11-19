@@ -10,8 +10,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { writeOutbound, writeInbound } from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
 import { outstandingForRail, pendingForRail } from "../../src/rails/queue.js";
-import { RailPass } from "../../src/rails/pass.js";
 import { requeueTerminalTransfer } from "../../src/rails/requeue.js";
+import { RailPass } from "../../src/rails/pass.js";
 import {
   RailError,
   type PendingTransfer,
@@ -436,7 +436,186 @@ suite("rail pollers against real Postgres", () => {
     expect(rows[0]?.status).toBe("pending");
     expect(rows[0]?.delivered).toBe(false);
   });
+  async function seedRetry(nonce: bigint): Promise<void> {
+    await db.transaction(async (tx) => {
+      await writeOutbound(
+        tx,
+        {
+          chainKey: ORIGIN_CHAIN,
+          block: nonce,
+          txHash: `0xretry${nonce}`,
+          logIndex: 0,
+          observedAt: new Date(),
+        },
+        {
+          route: 0,
+          nonce,
+          sender: "0x1111111111111111111111111111111111111111",
+          token: "0x3333333333333333333333333333333333333333",
+          grossAmount: 1001000n,
+          fee: 1000n,
+          netAmount: 1000000n,
+          destinationChain: DESTINATION_CHAIN,
+          destination: "0x2222222222222222222222222222222222222222",
+          railRef: "0x0000",
+        },
+      );
+    });
+  }
 
+  it("keeps transient and rate-limit retries out of permanent exhaustion across restarts", async () => {
+    await seedRetry(606n);
+    const { logger } = capturingLogger();
+    let now = new Date();
+    let calls = 0;
+    const options = {
+      route: 0,
+      db,
+      logger,
+      batchSize: 1,
+      recheckAfterMs: 1000,
+      maxCheckFailures: 1,
+      now: () => now,
+      client: {
+        rail: "cctp",
+        look: () => {
+          calls += 1;
+          return Promise.reject(
+            new RailError("cctp", calls % 2 ? "transient" : "rateLimited", "private", 7_200_000),
+          );
+        },
+      },
+    };
+    for (let i = 0; i < 4; i++) {
+      await new RailPass(options).tick(new AbortController().signal);
+      const { rows } = await db.query("SELECT * FROM rail_attestation");
+      expect(rows[0]?.check_failures).toBe(0);
+      expect(rows[0]?.retry_attempts).toBe(i + 1);
+      expect(rows[0]?.retry_class).toBe(i % 2 ? "rate_limited" : "transient");
+      const next = rows[0]?.next_attempt_at as Date;
+      if (i % 2) expect(next.getTime() - now.getTime()).toBe(7_200_000);
+      now = new Date(next.getTime());
+    }
+    expect(calls).toBe(4);
+  });
+
+  it("skips a replica's active transfer, then commits its schedule once", async () => {
+    await seedRetry(707n);
+    await seedRetry(708n);
+    const { logger } = capturingLogger();
+    let release!: () => void;
+    let started!: () => void;
+    const active = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const seen: bigint[] = [];
+    const options = {
+      route: 0,
+      db,
+      logger,
+      batchSize: 1,
+      recheckAfterMs: 60_000,
+      maxCheckFailures: 5,
+      client: {
+        rail: "cctp",
+        look: async (transfer: PendingTransfer): Promise<RailLookup> => {
+          seen.push(transfer.nonce);
+          if (transfer.nonce === 707n) {
+            started();
+            await held;
+          }
+          return { kind: "missing" };
+        },
+      },
+    };
+    const first = new RailPass(options).tick(new AbortController().signal);
+    await active;
+    try {
+      await new RailPass(options).tick(new AbortController().signal);
+      expect(seen).toEqual([707n, 708n]);
+    } finally {
+      release();
+      await first;
+    }
+    await new RailPass(options).tick(new AbortController().signal);
+    expect(seen).toEqual([707n, 708n]);
+  });
+
+  it("rolls back aborted polling so a restarted worker can retry", async () => {
+    await seedRetry(808n);
+    const { logger } = capturingLogger();
+    const abort = new AbortController();
+    await expect(
+      new RailPass({
+        route: 0,
+        db,
+        logger,
+        batchSize: 1,
+        recheckAfterMs: 60_000,
+        maxCheckFailures: 5,
+        client: {
+          rail: "cctp",
+          look: (): Promise<RailLookup> => {
+            abort.abort();
+            return Promise.resolve({ kind: "missing" });
+          },
+        },
+      }).tick(abort.signal),
+    ).rejects.toThrow();
+    expect((await db.query("SELECT * FROM rail_attestation")).rows).toHaveLength(0);
+    expect(
+      await pendingForRail(db, {
+        route: 0,
+        limit: 1,
+        now: new Date(),
+        notCheckedSince: new Date(),
+        maxCheckFailures: 5,
+      }),
+    ).toHaveLength(1);
+  });
+
+  it("does not settle a parked or wrong-recipient destination event", async () => {
+    await seedRetry(909n);
+    await db.transaction(async (tx) => {
+      await writeInbound(
+        tx,
+        {
+          chainKey: DESTINATION_CHAIN,
+          block: 2000n,
+          txHash: "0xpark909",
+          logIndex: 0,
+          observedAt: new Date(),
+        },
+        {
+          route: 0,
+          sourceChain: ORIGIN_CHAIN,
+          sourceNonce: 909n,
+          recipient: "0x2222222222222222222222222222222222222222",
+          token: "0x3333333333333333333333333333333333333333",
+          amount: 1000000n,
+          delivered: false,
+          claimId: 90n,
+          railMessageId: null,
+        },
+      );
+    });
+    const query = {
+      route: 0,
+      limit: 1,
+      now: new Date(),
+      notCheckedSince: new Date(),
+      maxCheckFailures: 5,
+    };
+    expect((await pendingForRail(db, query))[0]?.delivered).toBe(false);
+    await db.query(
+      "UPDATE inbound_delivery SET delivered = true, claim_id = NULL, recipient = $1",
+      ["0x4444444444444444444444444444444444444444"],
+    );
+    expect((await pendingForRail(db, query))[0]?.delivered).toBe(false);
+  });
   it("requeues an expired transfer with its original identity and records the review", async () => {
     const { logger } = capturingLogger();
     const nonce = 18446744073709551615n;
@@ -627,15 +806,92 @@ suite("rail pollers against real Postgres", () => {
         reason: "Do not repeat a confirmed payout",
       }),
     ).rejects.toMatchObject({ kind: "already_delivered" });
-    const status = await db.query(
-      "SELECT status FROM rail_attestation WHERE transfer_id = $1",
-      [id.toString()],
-    );
+    const status = await db.query("SELECT status FROM rail_attestation WHERE transfer_id = $1", [
+      id.toString(),
+    ]);
     expect(status.rows[0]?.status).toBe("failed");
-    const audit = await db.query(
-      "SELECT id FROM rail_requeue_audit WHERE transfer_id = $1",
+    const audit = await db.query("SELECT id FROM rail_requeue_audit WHERE transfer_id = $1", [
+      id.toString(),
+    ]);
+    expect(audit.rows).toHaveLength(0);
+  });
+  it("audits held evidence recovery exactly once under concurrent operator requests", async () => {
+    await seedRetry(1001n);
+    const id = String(
+      (await db.query("SELECT id FROM outbound_transfer WHERE nonce = 1001")).rows[0]?.id,
+    );
+    await db.query(
+      `INSERT INTO rail_attestation
+      (transfer_id, route, status, check_failures, retry_attempts, retry_class)
+      VALUES ($1, 0, 'pending', 5, 30, 'exhausted')`,
+      [id],
+    );
+    const request = {
+      transferId: BigInt(id),
+      reviewedBy: "operator",
+      reason: "Source evidence corrected",
+    };
+    const results = await Promise.allSettled([
+      requeueTerminalTransfer(db, request),
+      requeueTerminalTransfer(db, request),
+    ]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    const row = (await db.query("SELECT * FROM rail_attestation WHERE transfer_id = $1", [id]))
+      .rows[0];
+    expect(row).toMatchObject({
+      status: "pending",
+      check_failures: 0,
+      retry_attempts: 0,
+      retry_class: null,
+    });
+    const audit = (await db.query("SELECT * FROM rail_requeue_audit WHERE transfer_id = $1", [id]))
+      .rows;
+    expect(audit).toHaveLength(1);
+    expect(audit[0]).toMatchObject({
+      prior_status: "pending",
+      prior_retry_class: "exhausted",
+      reviewed_by: "operator",
+    });
+  });
+
+  it("immediate evaluation respects future schedules and replica ownership", async () => {
+    await seedRetry(1002n);
+    const id = BigInt(
+      String((await db.query("SELECT id FROM outbound_transfer WHERE nonce = 1002")).rows[0]?.id),
+    );
+    await db.query(
+      `INSERT INTO rail_attestation (transfer_id, route, status, next_attempt_at)
+      VALUES ($1, 0, 'pending', now() + interval '1 hour')`,
       [id.toString()],
     );
-    expect(audit.rows).toHaveLength(0);
+    const { logger } = capturingLogger();
+    let calls = 0;
+    const options = {
+      route: 0,
+      db,
+      logger,
+      batchSize: 1,
+      recheckAfterMs: 60_000,
+      maxCheckFailures: 5,
+      client: {
+        rail: "cctp",
+        look: (): Promise<RailLookup> => {
+          calls += 1;
+          return Promise.resolve({ kind: "missing" });
+        },
+      },
+    };
+    expect(await new RailPass(options).evaluateTransfer(id)).toBe(false);
+    expect(calls).toBe(0);
+    await db.query("UPDATE rail_attestation SET next_attempt_at = now() WHERE transfer_id = $1", [
+      id.toString(),
+    ]);
+    await db.transaction(async (tx) => {
+      await tx.query("SELECT id FROM outbound_transfer WHERE id = $1 FOR UPDATE", [id.toString()]);
+      expect(await new RailPass(options).evaluateTransfer(id)).toBe(false);
+      expect(calls).toBe(0);
+    });
+    await new RailPass(options).evaluateTransfer(id);
+    expect(calls).toBe(1);
   });
 });

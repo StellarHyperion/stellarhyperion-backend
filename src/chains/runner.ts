@@ -30,11 +30,7 @@ import { AxelarGmpClient } from "../rails/axelar/gmp.js";
 import { IrisClient } from "../rails/cctp/iris.js";
 import { RailPass } from "../rails/pass.js";
 import { requeueTerminalTransfer } from "../rails/requeue.js";
-import type {
-  RailClient,
-  RailRequeueRequest,
-  RailRequeueResult,
-} from "../rails/types.js";
+import type { RailClient, RailRequeueRequest, RailRequeueResult } from "../rails/types.js";
 import { KeeperWorker } from "../keeper/worker.js";
 import { viemClient } from "./evm/client.js";
 import { EvmWatcher } from "./evm/watcher.js";

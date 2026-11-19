@@ -100,6 +100,7 @@ export interface PendingTransfer {
   /** Null until the first check. */
   readonly status: AttestationStatus | null;
   readonly checkFailures: number;
+  readonly retryAttempts: number;
   /** True when an inbound delivery already exists, which settles it without asking the rail. */
   readonly delivered: boolean;
 }
@@ -115,7 +116,7 @@ export interface RailRequeueRequest {
 export interface RailRequeueResult {
   readonly transferId: bigint;
   readonly route: number;
-  readonly priorStatus: "failed" | "expired";
+  readonly priorStatus: "pending" | "attested" | "failed" | "expired";
 }
 
 /** What a rail client has to offer the pass that polls it. */
