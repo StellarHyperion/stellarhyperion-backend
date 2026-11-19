@@ -26,6 +26,7 @@ import { transferStreamIntervals } from "../stream-intervals.js";
 import { sanitizeRailDiagnostic } from "../../rails/diagnostics.js";
 import { CCTP_VERIFICATION_FAILURES, type CctpVerificationFailure } from "../../rails/types.js";
 import { negotiateSchemaVersion, withSchemaMetadata } from "../schema-version.js";
+import { CursorError, decodeCursor, encodeCursor, type CursorScope } from "../cursor.js";
 
 export type TransferLifecycleStage =
   | "initiated"
@@ -551,15 +552,39 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
           search?: string;
           limit?: string;
           offset?: string;
+          cursor?: string;
         };
       }>,
       reply: FastifyReply,
     ) => {
       const version = negotiateSchemaVersion(request, reply);
       if (version === null) return;
+      const {
+        originChain,
+        destinationChain,
+        route,
+        sender,
+        recipient,
+        search,
+        limit,
+        offset,
+        cursor,
+      } = request.query;
 
-      const { originChain, destinationChain, route, sender, recipient, search, limit, offset } =
-        request.query;
+      const scope: CursorScope = {
+        ...(originChain === undefined ? {} : { originChain }),
+        ...(destinationChain === undefined ? {} : { destinationChain }),
+        ...(route === undefined ? {} : { route }),
+        ...(sender === undefined ? {} : { sender }),
+        ...(recipient === undefined ? {} : { recipient }),
+        ...(search?.trim() ? { search: search.trim() } : {}),
+      };
+      if (cursor !== undefined && offset !== undefined && Number(offset) !== 0) {
+        return reply.code(400).send({
+          error: "invalid_cursor",
+          message: "cursor cannot be combined with offset",
+        });
+      }
 
       const conditions: string[] = [];
       const params: unknown[] = [];
@@ -593,28 +618,51 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         );
       }
 
-      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
       const parsedLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
       const parsedOffset = Math.max(Number(offset) || 0, 0);
 
+      if (cursor !== undefined) {
+        try {
+          const afterId = decodeCursor(cursor, scope);
+          params.push(afterId);
+          conditions.push(`t.id < $${String(params.length)}`);
+        } catch (error) {
+          if (error instanceof CursorError) {
+            return reply.code(400).send({ error: "invalid_cursor", message: error.message });
+          }
+          throw error;
+        }
+      }
+
+      const finalWhereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
       params.push(parsedLimit);
       const limitClause = `LIMIT $${String(params.length)}`;
-      params.push(parsedOffset);
-      const offsetClause = `OFFSET $${String(params.length)}`;
+      let offsetClause = "";
+      if (cursor === undefined) {
+        params.push(parsedOffset);
+        offsetClause = `OFFSET $${String(params.length)}`;
+      }
 
       const { rows } = await db.query(
-        `${TRANSFER_QUERY} ${whereClause} ORDER BY t.id DESC ${limitClause} ${offsetClause}`,
+        `${TRANSFER_QUERY.replace("SELECT t.id,", "SELECT DISTINCT ON (t.id) t.id,")} ${finalWhereClause} ORDER BY t.id DESC, d.destination_block DESC NULLS LAST, d.destination_log_index DESC NULLS LAST ${limitClause} ${offsetClause}`,
         params,
       );
 
+      const lastRow = rows.at(-1);
+      const nextCursor =
+        rows.length === parsedLimit && lastRow !== undefined
+          ? encodeCursor(String(lastRow.id), scope)
+          : null;
       reply.header("Cache-Control", LIST_CACHE_CONTROL);
       return reply.send(
         withSchemaMetadata(
           {
             transfers: rows.map((row) => formatRow(row, deps.config)),
             limit: parsedLimit,
-            offset: parsedOffset,
+            ...(cursor === undefined ? { offset: parsedOffset } : {}),
             count: rows.length,
+            nextCursor,
           },
           version,
         ),

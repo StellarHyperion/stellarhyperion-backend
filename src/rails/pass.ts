@@ -347,8 +347,14 @@ export class RailPass {
         return true;
       }
     }
-    const status =
+    const candidateStatus =
       verificationFailure !== null || report.status === "delivered" ? "pending" : report.status;
+    // Provider discovery may temporarily regress; only explicit proof reconciliation may reopen
+    // established attestation progress.
+    const status =
+      transfer.status === "attested" && candidateStatus === "pending"
+        ? "attested"
+        : candidateStatus;
     await this.write(db, transfer, {
       status,
       railStatus: report.railStatus,

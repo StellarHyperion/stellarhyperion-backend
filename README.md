@@ -156,7 +156,9 @@ for a seeded history.
 ## API and checks
 
 - `GET /health`, `GET /ready`
-- `GET /v1/transfers`, with sender/recipient/chain/route/search/limit/offset filters
+- `GET /v1/transfers`, with sender/recipient/chain/route/search/limit/offset filters. Responses
+  also include an opaque `nextCursor`; pass it back with the same filters for stable keyset
+  pagination. Cursors are scoped to the descending transfer-id order and reject mismatched filters.
 - `GET /v1/transfers/by-tx/:txHash`, `GET /v1/transfers/:originChain/:nonce`
 - `GET /v1/claims`, `GET /v1/claims/:chain/:claimId`
 - `GET /v1/routes/health`, `GET /v1/metrics`
@@ -290,3 +292,17 @@ The bundle records its generation time and the code revision (`HYPERION_REVISION
 or the local Git HEAD when available). URLs, nested authorization/signers and other sensitive
 values are redacted. Output files are created exclusively with mode 0600; choose a new filename
 for each capture. No RPC polling, transactions or wallet operations are performed.
+
+### Rail transition history and transfer cursors
+
+`rail_attestation_history` records actual committed lifecycle changes bound to the source transfer
+id, including changes made by reviewed requeue and destination-proof reorg reconciliation. Identical
+polls create no duplicate entry. Blind backward writes are rejected; repeated real requeue cycles
+retain every transition. History records normalized reasons and bounded public hashes/references,
+without provider response bodies or error credentials.
+
+`GET /v1/transfers` returns `nextCursor` for descending transfer-id pagination. Pass it as `cursor`
+with the same origin/destination/route/sender/recipient/search filters; changing filters or combining
+a cursor with a nonzero offset returns HTTP400 `invalid_cursor`. New inserts sort before the cursor
+and cannot duplicate an already read transfer. Existing offset reads remain available and keep
+their response offset field. A full page can return a cursor whose next page is empty.
