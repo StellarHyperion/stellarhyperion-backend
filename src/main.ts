@@ -10,9 +10,13 @@ import { buildIndexer } from "./chains/runner.js";
 import { loadConfig } from "./config/config.js";
 import { ConfigError } from "./config/env.js";
 import { Database } from "./db/pool.js";
+import { checkSchemaCompatibility } from "./db/schema.js";
+import { createLeaseStore } from "./db/lease.js";
+import { BudgetTracker } from "./runtime/budget.js";
 import { buildServer } from "./http/server.js";
 import { createKeeperRedis } from "./keeper/queue.js";
 import { createLogger } from "./logging/logger.js";
+import { fixedReadiness } from "./runtime/readiness.js";
 import { Shutdown, installSignalHandlers } from "./runtime/shutdown.js";
 
 async function main(): Promise<void> {
@@ -34,8 +38,47 @@ async function main(): Promise<void> {
   const shutdown = new Shutdown(logger, config.shutdownTimeoutMs);
   installSignalHandlers(shutdown, logger);
 
+  const budget = new BudgetTracker(config.catchUpBudgetMs);
+  budget.runBudget();
+  const budgetTimer = setInterval(() => {
+    try {
+      budget.runBudget();
+    } catch {
+      void shutdown.run("catch-up budget expired").then(() => {
+        logger.info({ reason: budget.stopReason() }, "catch-up run stopping");
+        process.exitCode = 0;
+      });
+      clearInterval(budgetTimer);
+    }
+  }, 1000);
+  budgetTimer.unref();
+
   const db = Database.open(config.databaseUrl, { applicationName: "hyperion-backend" });
+  await checkSchemaCompatibility(db, config.schemaVersion);
   shutdown.add("postgres", () => db.close());
+
+  const leaseStore = createLeaseStore(db);
+  const cursors: { readonly chainKey: string; readonly contract: string }[] = [];
+  if (config.indexer.stellar !== null) {
+    cursors.push({ chainKey: config.indexer.stellar.chain, contract: config.indexer.stellar.routerContractId });
+  }
+  for (const chain of config.indexer.evm) {
+    cursors.push({ chainKey: chain.chain, contract: chain.routerAddress });
+  }
+  if (cursors.length > 0) {
+    await leaseStore.acquire(cursors, config.indexerLeaseOwnerId, config.indexerLeaseTtlMs);
+    shutdown.add("indexer-lease", async () => {
+      await leaseStore.release(cursors, config.indexerLeaseOwnerId).catch(() => undefined);
+    });
+    const leaseRenewal = setInterval(() => {
+      void leaseStore
+        .renew(cursors, config.indexerLeaseOwnerId, config.indexerLeaseTtlMs)
+        .catch((error: unknown) => {
+          logger.warn({ err: error }, "indexer lease renewal failed");
+        });
+    }, Math.floor(config.indexerLeaseTtlMs / 2));
+    leaseRenewal.unref();
+  }
 
   const redis = config.keeper.enabled ? createKeeperRedis(config.redisUrl) : undefined;
   if (redis)
@@ -49,12 +92,23 @@ async function main(): Promise<void> {
   const indexer = buildIndexer({ config, logger, db });
   shutdown.add("indexer", () => indexer.stop());
 
+  const leaseReadiness = cursors.length > 0
+    ? [
+        fixedReadiness(
+          "indexer-lease",
+          "ready",
+          `lease held by ${config.indexerLeaseOwnerId} on ${cursors.length} cursor(s)`,
+        ),
+      ]
+    : [];
+  const indexerReadiness = [...indexer.readiness, ...leaseReadiness];
+
   const server = buildServer({
     config,
     logger,
     db,
     ...(redis ? { redis } : {}),
-    readiness: indexer.readiness,
+    readiness: indexerReadiness,
     startedAt,
   });
   // Registered before listen so a failed listen still closes what is already open.
@@ -73,6 +127,7 @@ async function main(): Promise<void> {
       watchingStellar: config.indexer.stellar?.chain ?? null,
       watchingEvm: config.indexer.evm.map((entry) => entry.chain),
       workers: indexer.workers.map((worker) => worker.name),
+      catchUpBudgetMs: config.catchUpBudgetMs,
     },
     "hyperion backend listening",
   );

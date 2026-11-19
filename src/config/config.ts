@@ -13,6 +13,7 @@
  */
 import { readFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
+import { hostname as osHostname } from "node:os";
 
 import type { Chain, ChainKey, DeploymentSet, Hex, NetworkMode } from "@hyperion/protocol";
 import {
@@ -115,6 +116,10 @@ export interface AppConfig {
   readonly rails: RailsConfig;
   readonly keeper: KeeperConfig;
   readonly shutdownTimeoutMs: number;
+  readonly schemaVersion: string;
+  readonly catchUpBudgetMs: number;
+  readonly indexerLeaseTtlMs: number;
+  readonly indexerLeaseOwnerId: string;
 }
 
 /** Injected so the unit suite can hand over a record without touching a disk or a process. */
@@ -335,6 +340,48 @@ const SHUTDOWN_TIMEOUT_MS: VarSpec = {
   purpose: "How long shutdown waits for in-flight work before it stops waiting.",
 };
 
+const SCHEMA_VERSION: VarSpec = {
+  name: "SCHEMA_VERSION",
+  kind: "string",
+  required: false,
+  fallback: "1792000000000_evm-backfill-jobs",
+  printable: true,
+  purpose:
+    "The migration name this build expects the database to have been migrated to. A startup check refuses to serve or index until the expected migration has been applied.";
+};
+
+const CATCH_UP_BUDGET_MS: VarSpec = {
+  name: "CATCH_UP_BUDGET_MS",
+  kind: "integer",
+  required: false,
+  fallback: "120000",
+  min: 1000,
+  printable: true,
+  purpose:
+    "Wall-clock budget in milliseconds for a scheduled catch-up run. Divided among migrations, source scans, proof polling and graceful drain so no stage consumes the whole window.";
+};
+
+const INDEXER_LEASE_TTL_MS: VarSpec = {
+  name: "INDEXER_LEASE_TTL_MS",
+  kind: "integer",
+  required: false,
+  fallback: "30000",
+  min: 5000,
+  printable: true,
+  purpose:
+    "How long an indexer lease stays valid before a replica must renew it or lose ownership to the next starter.";
+};
+
+const INDEXER_LEASE_OWNER_ID: VarSpec = {
+  name: "INDEXER_LEASE_OWNER_ID",
+  kind: "string",
+  required: false,
+  fallback: undefined,
+  printable: true,
+  purpose:
+    "Stable identifier for this replica's indexer lease. Defaults to hostname plus process id, so two replicas on the same machine never share one.";
+};
+
 const STELLAR_RPC_URL: VarSpec = {
   name: "STELLAR_RPC_URL",
   kind: "url",
@@ -469,6 +516,10 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const deploymentsPath = reader.string(DEPLOYMENTS_FILE);
   const indexerEnabled = reader.boolean(INDEXER_ENABLED);
   const shutdownTimeoutMs = reader.integer(SHUTDOWN_TIMEOUT_MS);
+  const schemaVersion = reader.string(SCHEMA_VERSION);
+  const catchUpBudgetMs = reader.integer(CATCH_UP_BUDGET_MS);
+  const indexerLeaseTtlMs = reader.integer(INDEXER_LEASE_TTL_MS);
+  const indexerLeaseOwnerId = reader.string(INDEXER_LEASE_OWNER_ID) || `${osHostname()}:${process.pid}`;
 
   const railsEnabled = reader.boolean(RAILS_ENABLED);
   const irisOverride = reader.url(IRIS_API_URL);
@@ -544,6 +595,10 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       stellarSecret: keeperStellarSecret,
     },
     shutdownTimeoutMs,
+    schemaVersion,
+    catchUpBudgetMs,
+    indexerLeaseTtlMs,
+    indexerLeaseOwnerId,
   };
 }
 

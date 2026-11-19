@@ -3,6 +3,7 @@ import { resolve as resolvePath } from "node:path";
 import type { FastifyInstance } from "fastify";
 import { loadConfig } from "../src/config/config.js";
 import { Database } from "../src/db/pool.js";
+import { checkSchemaCompatibility } from "../src/db/schema.js";
 import { buildServer } from "../src/http/server.js";
 import { createLogger } from "../src/logging/logger.js";
 
@@ -26,6 +27,7 @@ async function getApp(): Promise<FastifyInstance> {
     applicationName: "hyperion-vercel-api",
     connectionTimeoutMs: 2000,
   });
+  await checkSchemaCompatibility(db, config.schemaVersion);
 
   app = buildServer({
     config,

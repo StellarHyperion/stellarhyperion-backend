@@ -15,7 +15,12 @@ ENV NODE_ENV=production \
     HYPERION_DEPLOYMENTS_FILE=./deployments/testnet.json \
     INDEXER_ENABLED=true \
     RAILS_ENABLED=true \
-    KEEPER_ENABLED=false
+    KEEPER_ENABLED=false \
+    SCHEMA_VERSION=1792000000000_evm-backfill-jobs \
+    CATCH_UP_BUDGET_MS=120000 \
+    INDEXER_LEASE_TTL_MS=30000
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+  CMD node --eval "import('http').then(h=>h.get('http://127.0.0.1:8080/ready',r=>process.exit(r.statusCode===200?0:1)))"
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./
