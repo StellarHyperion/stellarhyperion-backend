@@ -108,7 +108,10 @@ describe("independent real CCTP and ITS destination proof mutation corpus", () =
                     abi: ITS_ABI,
                     eventName: "Transfer",
                     args: {
-                      from: rail === "CCTP" ? `0x${"0".repeat(40)}` : (its.expected.its as Hex),
+                      from:
+                        rail === "CCTP"
+                          ? `0x${"0".repeat(40)}`
+                          : (its.expected.tokenManager as Hex),
                       to: its.expected.token as Hex,
                     },
                   }) as [Hex, ...Hex[]],
@@ -237,7 +240,13 @@ describe("independent real CCTP and ITS destination proof mutation corpus", () =
           logs: candidate.logs,
         });
         evm.getBlock.mockResolvedValue({ hash: candidate.blockHash, timestamp: 1700000000n });
-        evm.readContract.mockResolvedValue(its.expected.token);
+        evm.readContract.mockImplementation(({ functionName }: { functionName: string }) =>
+          Promise.resolve(
+            functionName === "registeredTokenAddress"
+              ? its.expected.token
+              : its.expected.tokenManager,
+          ),
+        );
         stellar
           .mockReset()
           .mockResolvedValueOnce(simulation(hexToBytes(its.expected.tokenId as Hex)))

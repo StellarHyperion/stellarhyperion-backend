@@ -77,12 +77,14 @@ export function itsProofFixture(service: Hex = "0x222222222222222222222222222222
   const recipient = "0x1111111111111111111111111111111111111111";
   const its = service;
   const token = "0x3333333333333333333333333333333333333333";
+  const tokenManager = "0x4444444444444444444444444444444444444444";
   const commandId: Hex = `0x${"ab".repeat(32)}`;
   const tokenId: Hex = `0x${"cd".repeat(32)}`;
   const source = stringToHex("Gsource");
   const expected: ExpectedDelivery = {
     its,
     token,
+    tokenManager,
     commandId,
     tokenId,
     sourceChain: "stellar-2026-q1-2",
@@ -108,7 +110,7 @@ export function itsProofFixture(service: Hex = "0x222222222222222222222222222222
     topics: encodeEventTopics({
       abi: ITS_ABI,
       eventName: "Transfer",
-      args: { from: its, to: recipient },
+      args: { from: tokenManager, to: recipient },
     }) as [Hex, ...Hex[]],
     data: encodeAbiParameters([{ type: "uint256" }], [expected.amount]),
     logIndex: 3,

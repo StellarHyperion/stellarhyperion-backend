@@ -50,7 +50,12 @@ export function submitStellar(
   const values = args(signer);
   const intent = createHash("sha256")
     .update(
-      JSON.stringify([chainKey, contract, method, ...values.map((value) => value.toXdr("base64"))]),
+      JSON.stringify([
+        chainKey,
+        contract,
+        method,
+        ...values.map((value) => Buffer.from(value.toXdr()).toString("base64")),
+      ]),
     )
     .digest("hex");
   const client = options.client ?? new rpc.Server(chain.rpcUrl, { timeout: 15_000 });
