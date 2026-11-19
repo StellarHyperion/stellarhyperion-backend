@@ -1,4 +1,4 @@
-import { Account, Keypair, rpc } from "@stellar/stellar-sdk";
+import { Account, Keypair, SorobanDataBuilder, rpc, xdr } from "@stellar/stellar-sdk";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Database } from "../../src/db/pool.js";
 import { checkSchemaCompatibility } from "../../src/db/schema.js";
@@ -30,6 +30,18 @@ const connection = process.env.TEST_DATABASE_URL;
         getNetwork: () =>
           Promise.resolve({ passphrase: config.indexer.stellar!.networkPassphrase }),
         getAccount: () => Promise.resolve(new Account(signer.publicKey(), "1")),
+        simulateTransaction: () => {
+          preparations++;
+          return Promise.resolve({
+            _parsed: true,
+            id: "fixture",
+            latestLedger: 1,
+            events: [],
+            transactionData: new SorobanDataBuilder(),
+            minResourceFee: "0",
+            result: { auth: [], retval: xdr.ScVal.scvVoid() },
+          });
+        },
         prepareTransaction: (transaction: unknown) => {
           preparations++;
           return Promise.resolve(transaction);

@@ -125,6 +125,10 @@ export async function revalidateItsDeliveryProofs(
         String(row.id),
       ]);
       await tx.query(
+        "SELECT set_config('hyperion.rail_reconcile_transfer',$1,true), set_config('hyperion.rail_reconcile_reason','destination_proof_reorg',true)",
+        [String(row.transfer_id)],
+      );
+      await tx.query(
         `UPDATE rail_attestation SET status = 'attested', updated_at = now(),
             next_attempt_at = now(), retry_class = NULL
           WHERE transfer_id = $1 AND status = 'delivered'

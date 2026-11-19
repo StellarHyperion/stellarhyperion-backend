@@ -5,6 +5,7 @@ import type { AppConfig } from "../config/config.js";
 import type { Queryable, Transactional } from "../db/pool.js";
 import { activeKeeperSigner } from "./signers.js";
 import { recordKeeperSubmission, updateKeeperSubmission } from "./outcomes.js";
+import { prepareWithRestore } from "./restore.js";
 
 export type KeeperOperation = "keep_alive" | "settle_claim";
 export interface StellarSubmissionOptions {
@@ -203,11 +204,10 @@ export function submitStellar(
         await updateKeeperSubmission(options.db, submissionId, { stage: "confirmed" });
       return hash;
     };
-    const prepared = options.prepareWithRestore
-      ? await options.prepareWithRestore(client, build, (transaction, phase) =>
-          submitPrepared(transaction, phase),
-        )
-      : await client.prepareTransaction(await build());
+    const prepare = options.prepareWithRestore ?? prepareWithRestore;
+    const prepared = await prepare(client, build, (transaction, phase) =>
+      submitPrepared(transaction, phase),
+    );
     return submitPrepared(prepared, "invoke");
   });
 }

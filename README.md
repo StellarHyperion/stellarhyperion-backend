@@ -23,6 +23,10 @@ npm run build
 node --env-file=.env dist/main.js
 ```
 
+Migration commands use PostgreSQL's session-level advisory lock and wait for another migration
+runner to finish before checking and applying pending steps. The lock is released when the runner
+finishes or its database connection closes. API instances do not run migrations at startup.
+
 The SDK is installed from the committed protocol tarball. `npm run dev` does not load `.env` automatically; export the variables first or run `node --env-file=.env --watch --experimental-strip-types src/main.ts`.
 
 ### Startup schema compatibility check
@@ -51,6 +55,29 @@ The workflow is scheduled every five minutes and can be started manually. GitHub
 
 Deploy the API with `vercel deploy --prod`. Preview environments require their own database. Database credentials stay in Vercel and GitHub secrets, never in browser configuration, Git or logs. The managed PostgreSQL database is the durable state; restarting a worker must not repeat source transfers.
 
+Set `HYPERION_DATABASE_ENV` to the hosting `VERCEL_ENV` (`preview` or `production`).
+Apply migrations explicitly with a migration administrator, then provision the database once:
+
+```sql
+INSERT INTO public.hyperion_database_identity(environment) VALUES ('preview');
+```
+
+Use `production` for the production database. Startup compares this durable marker with both
+configured environment labels; changing a preview label cannot admit production credentials.
+The migration deliberately leaves the marker empty until an administrator binds the database.
+Local development and tests with `VERCEL_ENV=development` and nonproduction `NODE_ENV` do not
+require this hosting marker.
+
+The API requires a dedicated nonprivileged login with `USAGE` on the `public` schema and `SELECT`
+on the tables listed by `API_READ_TABLES` in `src/db/policy.ts` (including `pgmigrations` and the
+identity marker and `rail_attestation_history` for durable SSE replay). Existing API reader
+roles must receive this additional SELECT grant before enabling resumable streams. Grant no
+public-table write privileges or privileged role memberships. API
+connections also use `default_transaction_read_only`; startup verifies the actual role and grants,
+not only the `HYPERION_DATABASE_ROLE=read-only` label. The serverless entrypoint refuses enabled
+background writers. Indexer, rail or keeper processes require `HYPERION_DATABASE_ROLE=read-write`
+and a separately provisioned worker credential. Keep migration privileges separate from both.
+
 Vercel's installed Git integration publishes `main`. GitHub Actions runs validation and the scheduled indexer; it does not need a Vercel deployment token.
 
 ## What establishes status
@@ -59,7 +86,7 @@ Stellar router events establish source transfers and claim changes. The EVM watc
 
 For direct Stellar ITS transfers, Axelar's status API supplies a candidate destination transaction. Delivery is recorded only after the destination RPC confirms a successful receipt, sufficient confirmations, the matching ITS command/token/source/recipient/amount event and a matching token payment. The received asset is the ITS representation of Stellar USDC, with seven decimals. A rail API `executed` status alone is not delivery.
 
-For CCTP, Circle's forwarding hash is a candidate only. The backend binds the attested message to the source transfer, then verifies finalized Circle message execution and the exact native-USDC mint to the recipient in a successful confirmed canonical destination receipt. Activity exposes the actual received amount, token and six-decimal precision, separately from the source amount before forwarding fees. Real acceptance on all three destinations is recorded in `deployments/evidence/2026-10-29-cctp.json` in the contracts repository.
+For CCTP, Circle's forwarding hash is a candidate only. The backend binds the attested message to the source transfer, then verifies finalized Circle message execution and the exact native-USDC mint to the recipient in a successful confirmed canonical destination receipt. Activity exposes the actual received amount, token and six-decimal precision, separately from the source amount before forwarding fees. After applying `1792800000000_cctp-verification-failure-reasons`, transfer and backlog responses also expose a nullable `verificationFailure` category. Recipient, domain, token and amount mismatches remain distinct; missing evidence stays pending and retryable without consuming the provider failure budget. A category never proves delivery. Provider text is bounded and redacted, and oversized message/signature payloads are omitted. Real acceptance on all three destinations is recorded in `deployments/evidence/2026-10-29-cctp.json` in the contracts repository.
 
 Unknown or unreachable APIs produce errors; there are no fabricated deliveries or fallback attestations. Claims, route health and metrics query the actual migrated schema. Transfer amounts remain base-unit integer strings, with decimals/symbol supplied from deployment metadata when known.
 
@@ -99,13 +126,55 @@ Before a signed keeper transaction is broadcast, its hash, intended operation, c
 
 PostgreSQL serializes submissions across replicas sharing a signer. Keep at least two pool connections available: one holds the signer lock while independent journal writes commit before broadcast. The keeper counts confirmations and leaves database claim/delivery changes to indexed events. It does not perform rail second-step delivery or gas top-ups. TTL maintenance covers configured router tokens/routes and recent indexed transfer/claim entries; it is not a guarantee that every adapter or upstream storage entry remains live.
 
+When simulation reports an archived Soroban footprint, the keeper submits the protocol's
+`restoreFootprint` operation for that exact footprint. Its signed public hash is journaled under
+the `restore` phase before broadcast. An uncertain restore blocks further signing until that
+hash is reconciled. After confirmed restoration, the keeper fetches a fresh signer sequence
+and simulates the unchanged `keep_alive` or `settle_claim` call again. Claims remain in the
+indexed database with their original recipient and amount; no database `archived` flag or
+router-specific restore method is assumed. A footprint still requiring restoration after this
+bounded attempt fails explicitly.
+
+### Reconciliation test tooling
+
+`test/tooling/proof-corpus.ts` runs independent mutations through the real CCTP and ITS
+receipt verifiers and records each mutation, expected outcome and observed verifier result.
+Recipient, amount, token, domain and canonical block hash mutations must be rejected;
+unrelated receipt logs must preserve a valid proof. Mock provider exceptions fail the harness.
+
+`docs/api-response-contracts.json` publishes the required transfer and claim response shapes.
+`test/tooling/api-contract.ts` validates actual Fastify responses against those shapes and
+compares recorded fixtures across versions, including nested field removal, integer-string
+coercion, token identity changes and additive metadata.
+
+With a dedicated migrated `TEST_DATABASE_URL`, `test/integration/load-benchmark.test.ts`
+creates deterministic 32- and 512-transfer histories through the actual ingestion writers,
+including pending/attested proof states, delivered rows and canonical replay. It emits
+`HYPERION_DATABASE_BENCHMARK` reports with ingestion/scan timings, query costs, buffer counts
+and `EXPLAIN ANALYZE` plan nodes. Bounds are regression limits on these fixtures, not a
+production throughput guarantee. The suite refuses to substitute an empty database query
+for a seeded history.
+
 ## API and checks
 
 - `GET /health`, `GET /ready`
-- `GET /v1/transfers`, with sender/recipient/chain/route/search/limit/offset filters
+- `GET /v1/transfers`, with sender/recipient/chain/route/search/limit/offset filters. Responses
+  also include an opaque `nextCursor`; pass it back with the same filters for stable keyset
+  pagination. Cursors are scoped to the descending transfer-id order and reject mismatched filters.
 - `GET /v1/transfers/by-tx/:txHash`, `GET /v1/transfers/:originChain/:nonce`
 - `GET /v1/claims`, `GET /v1/claims/:chain/:claimId`
 - `GET /v1/routes/health`, `GET /v1/metrics`
+
+Public reads have a ten-second request budget. A client disconnect cancels the in-flight
+PostgreSQL query through its `AbortSignal`. The database adapter uses a separate connection with
+the same role to cancel the exact active backend, and holds its borrowed connection until cancellation
+finishes so a delayed cancellation cannot affect a later request. The statement timeout remains the
+server-side safeguard. SSE uses opaque, transfer-scoped full-width history cursors. Reconnection with
+`Last-Event-ID` replays committed `rail_transition` events from PostgreSQL, including changes made while
+the client was disconnected, then emits the current `transfer_update` snapshot. Replay is bounded to
+100 transitions and cursors expire after 15 minutes. Invalid, expired or oversized replay windows return
+`409 cursor_expired` with `resync=true`; reconnect without the cursor. Slow clients wait for socket drain
+within a bounded budget, and disconnected clients stop polling.
 
 `npm run check` runs formatting, lint, type checking and tests. Schema/API regressions execute repository migrations in embedded PostgreSQL (PGlite). The full PostgreSQL integration suite requires `TEST_DATABASE_URL`; it is skipped when unset. Use `npm run build` for emitted production code.
 
@@ -153,6 +222,17 @@ reviewing a failed job.
 ## EVM scan finality and historical audits
 
 EVM watcher ownership is scoped to the chain and router. An expired owner may be replaced after a crash, and each cursor commit verifies ownership and its previous revision in the same transaction as event writes. Concurrent replay keeps the existing canonical event serialization and quarantine checks.
+
+Unsupported EVM signatures and malformed payloads retain canonical block hashes, signature,
+router and up to 64 KiB of raw data in the existing quarantine (at most 1000 records per chain).
+Oversized bodies retain metadata and topics without a raw body. After deploying a decoder that
+supports the event, use `npm run evm:quarantine -- replay <configured-chain> [limit 1..100]`
+with a configured router and database writer credential. Legacy diagnostics without raw data
+are preserved but cannot be replayed. Replay verifies the chain, deployment start, confirmed
+boundary and retained block hash, and uses the normal idempotent writers without advancing
+the live cursor. A replayed BridgeIn reconstructs its canonical transaction's ClaimParked
+context within a total 1000-log budget; missing or unsupported context requires operator review.
+No Hyperion EVM router is configured in the active deployment; the command does not infer one.
 
 `EVM_FINALITY_MODE=confirmations` preserves the chain registry's confirmation depth. Set `EVM_FINALITY_MODE=finalized` to require the RPC's finalized-block number and hash as additional evidence; scans never exceed either that block or the configured confirmation boundary. Unsupported tags fail the pass unless `EVM_FINALITY_ALLOW_FALLBACK=true` explicitly permits depth fallback. Invalid finalized evidence fails even with fallback enabled. `evm_scan_provenance` retains the configured policy, actual evidence, hashes and policy transitions for each committed range; weaker policies never rewrite earlier evidence.
 
@@ -236,3 +316,17 @@ The bundle records its generation time and the code revision (`HYPERION_REVISION
 or the local Git HEAD when available). URLs, nested authorization/signers and other sensitive
 values are redacted. Output files are created exclusively with mode 0600; choose a new filename
 for each capture. No RPC polling, transactions or wallet operations are performed.
+
+### Rail transition history and transfer cursors
+
+`rail_attestation_history` records actual committed lifecycle changes bound to the source transfer
+id, including changes made by reviewed requeue and destination-proof reorg reconciliation. Identical
+polls create no duplicate entry. Blind backward writes are rejected; repeated real requeue cycles
+retain every transition. History records normalized reasons and bounded public hashes/references,
+without provider response bodies or error credentials.
+
+`GET /v1/transfers` returns `nextCursor` for descending transfer-id pagination. Pass it as `cursor`
+with the same origin/destination/route/sender/recipient/search filters; changing filters or combining
+a cursor with a nonzero offset returns HTTP400 `invalid_cursor`. New inserts sort before the cursor
+and cannot duplicate an already read transfer. Existing offset reads remain available and keep
+their response offset field. A full page can return a cursor whose next page is empty.

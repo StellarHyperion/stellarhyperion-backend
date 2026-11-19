@@ -334,16 +334,16 @@ export function reportFor(message: IrisMessage): RailReport {
         ? message.fastAttestation.status
         : "";
   const statusLower = rawStatus.toLowerCase();
-  const delay = typeof message.delayReason === "string" ? message.delayReason : null;
+  const delay = safeRailPart(message.delayReason);
   const nonce =
     typeof message.eventNonce === "string"
-      ? message.eventNonce
-      : typeof message.eventNonce === "number"
+      ? safeReference(message.eventNonce)
+      : typeof message.eventNonce === "number" && Number.isSafeInteger(message.eventNonce)
         ? String(message.eventNonce)
         : typeof message.messageId === "string"
-          ? message.messageId
+          ? safeReference(message.messageId)
           : typeof message.id === "string"
-            ? message.id
+            ? safeReference(message.id)
             : null;
 
   let mapped: AttestationStatus;
@@ -359,7 +359,7 @@ export function reportFor(message: IrisMessage): RailReport {
 
   const attested = mapped === "attested";
 
-  const messageBytes =
+  const rawMessage =
     typeof message.message === "string"
       ? message.message
       : typeof message.messageBytes === "string"
@@ -367,23 +367,32 @@ export function reportFor(message: IrisMessage): RailReport {
         : typeof message.rawMessage === "string"
           ? message.rawMessage
           : null;
+  const messageBytes = rawMessage !== null && rawMessage.length <= 8192 ? rawMessage : null;
 
   let attestationSignature: string | null = null;
   if (
     typeof message.attestation === "string" &&
     message.attestation.length > 0 &&
-    message.attestation !== "PENDING"
+    message.attestation !== "PENDING" &&
+    message.attestation.length <= 8192
   ) {
     attestationSignature = message.attestation;
-  } else if (typeof message.signature === "string") {
+  } else if (typeof message.signature === "string" && message.signature.length <= 8192) {
     attestationSignature = message.signature;
-  } else if (typeof message.attestationSignature === "string") {
+  } else if (
+    typeof message.attestationSignature === "string" &&
+    message.attestationSignature.length <= 8192
+  ) {
     attestationSignature = message.attestationSignature;
   } else if (typeof message.fastAttestation === "object" && message.fastAttestation !== null) {
     const fast = message.fastAttestation;
-    if (typeof fast.signature === "string") {
+    if (typeof fast.signature === "string" && fast.signature.length <= 8192) {
       attestationSignature = fast.signature;
-    } else if (typeof fast.attestation === "string" && fast.attestation !== "PENDING") {
+    } else if (
+      typeof fast.attestation === "string" &&
+      fast.attestation !== "PENDING" &&
+      fast.attestation.length <= 8192
+    ) {
       attestationSignature = fast.attestation;
     }
   }
@@ -416,7 +425,8 @@ export function reportFor(message: IrisMessage): RailReport {
     statusLower.includes("fast") ||
     Boolean(message.fastAttestation);
 
-  let railStatus = delay === null ? rawStatus : `${rawStatus}/${delay}`;
+  const safeStatus = safeRailPart(rawStatus) ?? "unknown";
+  let railStatus = delay === null ? safeStatus : `${safeStatus}/${delay}`;
   railStatus = appendExpiry(railStatus, message);
 
   return {
@@ -435,6 +445,26 @@ export function reportFor(message: IrisMessage): RailReport {
     attestationTimestamp,
     fastTransfer: isFast,
   };
+}
+
+function safeRailPart(value: unknown): string | null {
+  if (
+    typeof value !== "string" ||
+    value.length > 64 ||
+    !/^[A-Za-z0-9_. -]+$/.test(value) ||
+    /\b(?:api[_-]?key|token|secret|password|authorization)\b/i.test(value)
+  )
+    return null;
+  return value;
+}
+
+function safeReference(value: string): string | null {
+  return value.length <= 256 &&
+    /^(?:0x[0-9a-fA-F]{64}|\d{1,78}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/.test(
+      value,
+    )
+    ? value
+    : null;
 }
 
 /**
@@ -458,6 +488,8 @@ function appendExpiry(railStatus: string, message: IrisMessage): string {
       : undefined);
   if (typeof raw !== "string" && typeof raw !== "number") return railStatus;
   try {
+    if (typeof raw === "number" && !Number.isSafeInteger(raw)) return railStatus;
+    if (typeof raw === "string" && (raw.length > 78 || !/^\d+$/.test(raw))) return railStatus;
     const block = BigInt(raw);
     return block > 0n && !railStatus.includes("expires@")
       ? `${railStatus} expires@${block.toString()}`
