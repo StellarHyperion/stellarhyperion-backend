@@ -46,6 +46,7 @@ import { transferStreamIntervals } from "../stream-intervals.js";
 import { sanitizeRailDiagnostic } from "../../rails/diagnostics.js";
 import { CCTP_VERIFICATION_FAILURES, type CctpVerificationFailure } from "../../rails/types.js";
 import { negotiateSchemaVersion, withSchemaMetadata } from "../schema-version.js";
+import { coverageMetadata } from "./coverage.js";
 import { CursorError, decodeCursor, encodeCursor, type CursorScope } from "../cursor.js";
 
 export type TransferLifecycleStage =
@@ -894,6 +895,11 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         rows.length === parsedLimit && lastRow !== undefined
           ? encodeCursor(String(lastRow.id), scope)
           : null;
+      const coverageChain = originChain ?? (deps.config.indexer.stellar?.chain ?? "");
+      const coverage = await coverageMetadata(deps.db, {
+        indexer: deps.config.indexer,
+        deploymentMode: deps.config.deploymentMode,
+      }, coverageChain, rows.length);
       reply.header("Cache-Control", LIST_CACHE_CONTROL);
       return reply.send(
         withSchemaMetadata(
@@ -902,6 +908,7 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
             limit: parsedLimit,
             ...(cursor === undefined ? { offset: parsedOffset } : {}),
             count: rows.length,
+            coverage,
             nextCursor,
           },
           version,

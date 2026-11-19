@@ -100,6 +100,12 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     const list = await app.inject("/v1/claims?chain=stellar-testnet");
     expect(list.statusCode).toBe(200);
     expect(list.json().claims).toHaveLength(1);
+    expect(list.json().coverage).toMatchObject({
+      sourceChain: "stellar-testnet",
+      scannedThrough: "123",
+      knownGaps: 0,
+      coverage: "complete",
+    });
   });
   it("supports revalidation for detail claims and updates their revision after settlement", async () => {
     const detailUrl = "/v1/claims/stellar-testnet/7";
@@ -156,6 +162,12 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     const found = await app.inject("/v1/transfers?search=source-hash");
     expect(found.statusCode).toBe(200);
     expect(found.json().transfers).toHaveLength(1);
+    expect(found.json().coverage).toMatchObject({
+      sourceChain: "stellar-testnet",
+      scannedThrough: "123",
+      knownGaps: 0,
+      coverage: "complete",
+    });
     const missing = await app.inject("/v1/transfers?search=no-such-transfer");
     expect(missing.statusCode).toBe(200);
     expect(missing.json().transfers).toHaveLength(0);
