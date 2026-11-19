@@ -5,6 +5,7 @@ import { loadConfig } from "../src/config/config.js";
 import { Database } from "../src/db/pool.js";
 import { checkSchemaCompatibility } from "../src/db/schema.js";
 import { buildServer } from "../src/http/server.js";
+import { createApiRedis } from "../src/http/rate-limit-redis.js";
 import { createLogger } from "../src/logging/logger.js";
 
 let app: FastifyInstance | null = null;
@@ -14,7 +15,6 @@ async function getApp(): Promise<FastifyInstance> {
 
   process.env.HYPERION_NETWORK ??= "testnet";
   process.env.HYPERION_DEPLOYMENTS_FILE ??= resolvePath(process.cwd(), "deployments/testnet.json");
-  process.env.REDIS_URL ??= "redis://127.0.0.1:6379";
   process.env.INDEXER_ENABLED ??= "false";
   process.env.RAILS_ENABLED ??= "false";
   process.env.KEEPER_ENABLED ??= "false";
@@ -33,6 +33,7 @@ async function getApp(): Promise<FastifyInstance> {
     config,
     logger,
     db,
+    ...(config.redisUrl.length > 0 ? { redis: createApiRedis(config.redisUrl) } : {}),
     readiness: [],
     startedAt,
   });

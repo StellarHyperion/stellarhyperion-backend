@@ -149,3 +149,90 @@ Live and historical ingestion share durable event identity and serialized
 materialization, including route-health observations. Provider errors are
 reported with fixed public messages; inspect secure local provider logs when
 reviewing a failed job.
+
+## EVM scan finality and historical audits
+
+EVM watcher ownership is scoped to the chain and router. An expired owner may be replaced after a crash, and each cursor commit verifies ownership and its previous revision in the same transaction as event writes. Concurrent replay keeps the existing canonical event serialization and quarantine checks.
+
+`EVM_FINALITY_MODE=confirmations` preserves the chain registry's confirmation depth. Set `EVM_FINALITY_MODE=finalized` to require the RPC's finalized-block number and hash as additional evidence; scans never exceed either that block or the configured confirmation boundary. Unsupported tags fail the pass unless `EVM_FINALITY_ALLOW_FALLBACK=true` explicitly permits depth fallback. Invalid finalized evidence fails even with fallback enabled. `evm_scan_provenance` retains the configured policy, actual evidence, hashes and policy transitions for each committed range; weaker policies never rewrite earlier evidence.
+
+Scheduled route-health compaction removes bounded batches of old interior duplicates and skips rows locked by ingestion. It retains the first and last samples of each configuration run, every transition, and all samples in the recent retention window. Historical `route_health` queries therefore represent state transitions after compaction; they must not treat old row counts as raw sampling frequency or uptime percentages. Recent raw samples remain available within the configured retention window.
+
+`Database.auditTransferAndClaimInvariants()` reads source amount equations, claim liabilities and actual destination-delivery evidence. Its monetary values remain integer strings, and violations identify source row IDs and routers. Delivery joins use the bound source transfer or an unambiguous legacy hop; a reused deployment nonce cannot prove delivery for another source row.
+
+## Metadata versions, request budgets and durable freshness
+
+Public transfer, claim and route responses default to schema `1.0` and retain their legacy shape.
+Request `X-API-Schema-Version: 1.1` (or `schemaVersion=1.1` for EventSource) to receive the
+`schemaVersion` and `metadata.source=indexed_postgres` envelope. Monetary and token identity
+fields are identical in both versions. Unsupported versions return 400 with the supported list.
+Versioned responses carry distinct ETags and vary on `X-API-Schema-Version`.
+
+Production API requests default to 120 requests per client per minute, with 20 SSE connections
+per minute. `/health` and `/ready` probes, including query-bearing probes, are exempt;
+operational metrics and backfill inspection use the ordinary budget. `buildServer` accepts a
+bounded `rateLimit` policy and explicit `trustProxy` configuration. Forwarded client headers
+are ignored by default; production proxy trust should name the validated proxy addresses.
+When `REDIS_URL` is configured, both continuous and serverless API entry points connect
+with bounded command/connect timeouts; an injected ioredis client shares counters across replicas using the same key prefix; without
+one the bounded cache is local to that process. Redis errors fail requests closed and expose
+only the generic internal error. 429 responses include `Retry-After` and `retryAfterMs`.
+
+Background chain and rail workers persist heartbeats after every completed or failed poll,
+including the actual cursor and consecutive failures. Worker IDs are limited to 128 safe
+characters; diagnostic text and nested metadata are bounded and redact credentials. Older
+writes cannot overwrite newer activity. `/ready` degrades missing configured chain-worker
+heartbeats and timestamps older than 120 seconds, invalid timestamps, or timestamps over 30 seconds
+in the future. A healthy database or a local ready report cannot mask stale persisted activity.
+API replicas with indexing disabled still report the durable heartbeats present in PostgreSQL.
+
+`Database.computeHistoryDigest`/`recordHistoryDigest`/`verifyHistoryDigest` cover indexed
+outbound transfers, inbound deliveries and claims linked to a delivery within the requested
+inclusive block range. Exact integer strings and deployment/source identities contribute to
+the SHA-256 digest; surrogate row IDs, observation times and API presentation do not.
+Rows are read in deterministic pages of 1,000 under a repeatable-read snapshot. A plain
+`Queryable` must already provide snapshot isolation when used concurrently with ingestion.
+Unlinked claims are outside a block-range digest because they have no delivery block evidence.
+
+## Freshness targets and deployment readiness
+
+`/v1/metrics` now reports `freshnessSlo` using persisted source cursors/history gaps and
+source-bound destination delivery or settled-claim evidence. A parked delivery or provider
+status alone cannot settle a backlog entry. Ambiguous legacy hops remain pending.
+Every report identifies the source-scan or destination-proof stage, its chain/lane and target.
+Missing or invalid/future cursor timestamps produce `unknown` with `met=false`; open and
+reconciling history gaps breach source progress. API-only processes evaluate remote durable
+history. Other deployment modes with indexing explicitly disabled label source monitoring
+`disabled` rather than presenting an absent watcher as healthy.
+
+Defaults are 120 seconds for source scan lag, 100 pending proofs per lane and 15 minutes for
+oldest proof age. Set `FRESHNESS_MAX_SCAN_LAG_MS`, `FRESHNESS_MAX_PROOF_BACKLOG_COUNT`,
+`FRESHNESS_MAX_PROOF_BACKLOG_AGE_MS` and optional JSON `FRESHNESS_LANE_TARGETS` to override them.
+Lane keys use `origin->destination`, with `maxSourceScanLagMs`, `maxProofBacklogCount` and
+`maxProofBacklogAgeMs`. The strictest configured lane scan target applies to its origin.
+
+`DEPLOYMENT_MODE` accepts `all-in-one`, `api-only`, `indexer-only`, `keeper-only` or `custom`;
+component flags determine the default mode. `READINESS_DB_POLICY`, `READINESS_INDEXER_POLICY`,
+`READINESS_RAILS_POLICY` and `READINESS_KEEPER_POLICY` accept `required`, `optional` or
+`disabled`. Required dependencies without readiness evidence are down. Required down
+returns 503; stale/degraded evidence remains visible as degraded. Optional down degrades
+without returning 503. Disabled checks explicitly carry `effectiveState=disabled` and do not
+certify absent workers. `/ready` includes the resolved mode and dependency policy.
+
+## Database telemetry and diagnostics
+
+`/v1/metrics.database` reports pool active/idle/queued connections, saturation and latency/error
+counts by a fixed set of workload labels. Ingestion writes and API reads have separate labels.
+Each workload retains at most 256 recent latency samples by default (configurable 1–4096 via
+`Database.open`); SQL text, parameters and wallet identifiers are never retained in telemetry
+or slow-query messages. Saturation is visible while requests queue, before a timeout.
+
+Run `npm run diagnostics -- --output diagnostics.json` to collect configuration presence,
+migrations/table counts, persisted worker freshness, source revisions, proof backlog and local
+pool telemetry. `--compact` emits compact JSON; without `--output`, the bundle goes to stdout.
+Every database connection enforces read-only statements. Failed probes retain normalized
+codes and actionable descriptions, so unavailable data is distinguishable from empty history.
+The bundle records its generation time and the code revision (`HYPERION_REVISION`, `GITHUB_SHA`
+or the local Git HEAD when available). URLs, nested authorization/signers and other sensitive
+values are redacted. Output files are created exclusively with mode 0600; choose a new filename
+for each capture. No RPC polling, transactions or wallet operations are performed.

@@ -14,7 +14,7 @@ import { checkSchemaCompatibility } from "./db/schema.js";
 import { createLeaseStore } from "./db/lease.js";
 import { BudgetTracker } from "./runtime/budget.js";
 import { buildServer } from "./http/server.js";
-import { createKeeperRedis } from "./keeper/queue.js";
+import { createApiRedis } from "./http/rate-limit-redis.js";
 import { createLogger } from "./logging/logger.js";
 import { fixedReadiness } from "./runtime/readiness.js";
 import { Shutdown, installSignalHandlers } from "./runtime/shutdown.js";
@@ -35,6 +35,10 @@ async function main(): Promise<void> {
   })();
 
   const logger = createLogger(config);
+  const shutdown = new Shutdown(logger, config.shutdownTimeoutMs);
+  installSignalHandlers(shutdown, logger);
+
+const logger = createLogger(config);
   const shutdown = new Shutdown(logger, config.shutdownTimeoutMs);
   installSignalHandlers(shutdown, logger);
 
