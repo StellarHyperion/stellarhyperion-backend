@@ -175,3 +175,46 @@ the SHA-256 digest; surrogate row IDs, observation times and API presentation do
 Rows are read in deterministic pages of 1,000 under a repeatable-read snapshot. A plain
 `Queryable` must already provide snapshot isolation when used concurrently with ingestion.
 Unlinked claims are outside a block-range digest because they have no delivery block evidence.
+
+## Freshness targets and deployment readiness
+
+`/v1/metrics` now reports `freshnessSlo` using persisted source cursors/history gaps and
+source-bound destination delivery or settled-claim evidence. A parked delivery or provider
+status alone cannot settle a backlog entry. Ambiguous legacy hops remain pending.
+Every report identifies the source-scan or destination-proof stage, its chain/lane and target.
+Missing or invalid/future cursor timestamps produce `unknown` with `met=false`; open and
+reconciling history gaps breach source progress. API-only processes evaluate remote durable
+history. Other deployment modes with indexing explicitly disabled label source monitoring
+`disabled` rather than presenting an absent watcher as healthy.
+
+Defaults are 120 seconds for source scan lag, 100 pending proofs per lane and 15 minutes for
+oldest proof age. Set `FRESHNESS_MAX_SCAN_LAG_MS`, `FRESHNESS_MAX_PROOF_BACKLOG_COUNT`,
+`FRESHNESS_MAX_PROOF_BACKLOG_AGE_MS` and optional JSON `FRESHNESS_LANE_TARGETS` to override them.
+Lane keys use `origin->destination`, with `maxSourceScanLagMs`, `maxProofBacklogCount` and
+`maxProofBacklogAgeMs`. The strictest configured lane scan target applies to its origin.
+
+`DEPLOYMENT_MODE` accepts `all-in-one`, `api-only`, `indexer-only`, `keeper-only` or `custom`;
+component flags determine the default mode. `READINESS_DB_POLICY`, `READINESS_INDEXER_POLICY`,
+`READINESS_RAILS_POLICY` and `READINESS_KEEPER_POLICY` accept `required`, `optional` or
+`disabled`. Required dependencies without readiness evidence are down. Required down
+returns 503; stale/degraded evidence remains visible as degraded. Optional down degrades
+without returning 503. Disabled checks explicitly carry `effectiveState=disabled` and do not
+certify absent workers. `/ready` includes the resolved mode and dependency policy.
+
+## Database telemetry and diagnostics
+
+`/v1/metrics.database` reports pool active/idle/queued connections, saturation and latency/error
+counts by a fixed set of workload labels. Ingestion writes and API reads have separate labels.
+Each workload retains at most 256 recent latency samples by default (configurable 1–4096 via
+`Database.open`); SQL text, parameters and wallet identifiers are never retained in telemetry
+or slow-query messages. Saturation is visible while requests queue, before a timeout.
+
+Run `npm run diagnostics -- --output diagnostics.json` to collect configuration presence,
+migrations/table counts, persisted worker freshness, source revisions, proof backlog and local
+pool telemetry. `--compact` emits compact JSON; without `--output`, the bundle goes to stdout.
+Every database connection enforces read-only statements. Failed probes retain normalized
+codes and actionable descriptions, so unavailable data is distinguishable from empty history.
+The bundle records its generation time and the code revision (`HYPERION_REVISION`, `GITHUB_SHA`
+or the local Git HEAD when available). URLs, nested authorization/signers and other sensitive
+values are redacted. Output files are created exclusively with mode 0600; choose a new filename
+for each capture. No RPC polling, transactions or wallet operations are performed.

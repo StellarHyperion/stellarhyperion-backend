@@ -31,7 +31,9 @@ const db = {
   },
 };
 const { logger } = capturingLogger();
-const config = loadConfig({ env: completeEnv({ KEEPER_ENABLED: "false" }) });
+const config = loadConfig({
+  env: completeEnv({ KEEPER_ENABLED: "false", RAILS_ENABLED: "false" }),
+});
 const app = buildServer({
   config,
   logger,

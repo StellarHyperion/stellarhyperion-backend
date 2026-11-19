@@ -19,6 +19,7 @@ import type { ServerDeps } from "../server.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import {
   checkRedisHealth,
+  evaluateReadiness,
   evaluateHeartbeatFreshness,
   readWorkerHeartbeats,
   worstOf,
@@ -103,16 +104,18 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
       }
     }
 
-    const state = worstOf(checks);
+    const evaluated = evaluateReadiness(checks, deps.config.readinessPolicy);
     // Degraded still serves. One stalled chain watcher is a reason to alert, not a reason to stop
     // answering questions about the three chains that are fine.
-    const status = state === "down" ? 503 : 200;
+    const status = evaluated.state === "down" ? 503 : 200;
     return reply.code(status).send({
-      status: state,
+      status: evaluated.state,
       meaning: READINESS_MEANING,
       network: deps.config.network,
+      deploymentMode: deps.config.deploymentMode,
+      policy: deps.config.readinessPolicy,
       indexer: deps.config.indexer.enabled ? "enabled" : "disabled",
-      checks,
+      checks: evaluated.checks,
     });
   });
 }

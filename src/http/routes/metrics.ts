@@ -1,3 +1,4 @@
+import { evaluateFreshnessSlo } from "../../runtime/freshness.js";
 /**
  * Metrics REST API endpoint.
  *
@@ -114,6 +115,9 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       };
     });
 
+    const freshnessSlo = await evaluateFreshnessSlo(db, deps.config);
+    const database = typeof db.telemetrySnapshot === "function" ? db.telemetrySnapshot() : null;
+
     return reply.send({
       service: "hyperion-backend",
       network: deps.config.network,
@@ -126,6 +130,9 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       railAttestations: railStatusCounts,
       cursors,
       historyGaps,
+      freshnessSlo,
+      database,
+      deploymentMode: deps.config.deploymentMode,
       workers,
       freshness: {
         totalWorkers: workers.length,

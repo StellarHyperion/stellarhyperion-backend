@@ -575,7 +575,7 @@ describe("REST API endpoints", () => {
 });
 
 describe("Readiness and health probes", () => {
-  const config = loadConfig({ env: completeEnv() });
+  const config = loadConfig({ env: completeEnv({ RAILS_ENABLED: "false" }) });
   const { logger } = capturingLogger();
 
   it("returns 200 when all components (Postgres, Redis, Watchers) are healthy", async () => {

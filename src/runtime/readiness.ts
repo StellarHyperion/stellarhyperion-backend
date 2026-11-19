@@ -404,3 +404,157 @@ export async function readWorkerHeartbeats(db: Queryable): Promise<WorkerHeartbe
     };
   });
 }
+
+export type DeploymentMode = "all-in-one" | "api-only" | "indexer-only" | "keeper-only" | "custom";
+export type DependencyPolicy = "required" | "optional" | "disabled";
+export type DependencyKind = "database" | "indexer" | "rails" | "keeper";
+
+export type ReadinessDependencyPolicies = Readonly<Record<DependencyKind, DependencyPolicy>>;
+
+export interface EvaluatedReadinessReport extends ReadinessReport {
+  readonly dependency: DependencyKind | "unknown";
+  readonly policy: DependencyPolicy;
+  readonly required: boolean;
+  readonly effectiveState: ReadinessState | "disabled";
+}
+
+export interface PolicyResolutionInput {
+  readonly mode?: DeploymentMode;
+  readonly indexerEnabled: boolean;
+  readonly railsEnabled: boolean;
+  readonly keeperEnabled: boolean;
+  readonly overrides?: Partial<ReadinessDependencyPolicies>;
+}
+
+export function inferDeploymentMode(flags: {
+  readonly indexerEnabled: boolean;
+  readonly railsEnabled: boolean;
+  readonly keeperEnabled: boolean;
+}): DeploymentMode {
+  if (!flags.indexerEnabled && !flags.railsEnabled && !flags.keeperEnabled) {
+    return "api-only";
+  }
+  if (flags.indexerEnabled && !flags.railsEnabled && !flags.keeperEnabled) {
+    return "indexer-only";
+  }
+  if (!flags.indexerEnabled && !flags.railsEnabled && flags.keeperEnabled) {
+    return "keeper-only";
+  }
+  return "all-in-one";
+}
+
+export function resolveReadinessPolicy(input: PolicyResolutionInput): ReadinessDependencyPolicies {
+  const mode = input.mode ?? inferDeploymentMode(input);
+
+  let base: ReadinessDependencyPolicies;
+  switch (mode) {
+    case "api-only":
+      base = {
+        database: "required",
+        indexer: "disabled",
+        rails: "disabled",
+        keeper: "disabled",
+      };
+      break;
+    case "indexer-only":
+      base = {
+        database: "required",
+        indexer: "required",
+        rails: input.railsEnabled ? "optional" : "disabled",
+        keeper: input.keeperEnabled ? "optional" : "disabled",
+      };
+      break;
+    case "keeper-only":
+      base = {
+        database: "required",
+        indexer: "disabled",
+        rails: "disabled",
+        keeper: "required",
+      };
+      break;
+    case "all-in-one":
+    case "custom":
+      base = {
+        database: "required",
+        indexer: input.indexerEnabled ? "required" : "disabled",
+        rails: input.railsEnabled ? "required" : "disabled",
+        keeper: input.keeperEnabled ? "required" : "disabled",
+      };
+      break;
+  }
+
+  return {
+    database: input.overrides?.database ?? base.database,
+    indexer: input.overrides?.indexer ?? base.indexer,
+    rails: input.overrides?.rails ?? base.rails,
+    keeper: input.overrides?.keeper ?? base.keeper,
+  };
+}
+
+export function classifyReadinessDependency(name: string): DependencyKind | "unknown" {
+  if (name === "postgres" || name === "database") return "database";
+  if (name === "redis" || name === "bullmq" || name === "keeper") return "keeper";
+  if (name === "rails" || name.startsWith("rail:")) return "rails";
+  if (name === "unknown") return "unknown";
+  return "indexer";
+}
+
+export function evaluateReadiness(
+  reports: readonly ReadinessReport[],
+  policies: ReadinessDependencyPolicies,
+): { readonly state: ReadinessState; readonly checks: readonly EvaluatedReadinessReport[] } {
+  const checks: EvaluatedReadinessReport[] = [];
+  const effectiveStates: ReadinessState[] = [];
+
+  for (const report of reports) {
+    const dependency = classifyReadinessDependency(report.name);
+    const policy: DependencyPolicy = dependency === "unknown" ? "required" : policies[dependency];
+    const required = policy === "required";
+
+    checks.push({
+      ...report,
+      dependency,
+      policy,
+      required,
+      effectiveState:
+        policy === "disabled"
+          ? "disabled"
+          : policy === "optional" && report.state === "down"
+            ? "degraded"
+            : report.state,
+    });
+
+    if (policy === "disabled") {
+      effectiveStates.push("ready");
+    } else if (policy === "optional") {
+      effectiveStates.push(report.state === "down" ? "degraded" : report.state);
+    } else {
+      effectiveStates.push(report.state);
+    }
+  }
+
+  for (const dependency of ["database", "indexer", "rails", "keeper"] as const) {
+    if (
+      policies[dependency] === "required" &&
+      !checks.some((check) => check.dependency === dependency)
+    ) {
+      checks.push({
+        name: dependency,
+        dependency,
+        policy: "required",
+        required: true,
+        state: "down",
+        effectiveState: "down",
+        detail: "required dependency has no readiness evidence",
+      });
+      effectiveStates.push("down");
+    }
+  }
+  const state: ReadinessState = effectiveStates.includes("down")
+    ? "down"
+    : effectiveStates.includes("degraded")
+      ? "degraded"
+      : "ready";
+
+  return { state, checks };
+}

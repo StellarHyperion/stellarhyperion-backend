@@ -15,6 +15,7 @@
   },
   "scripts": {
     "dev": "node --watch --experimental-strip-types src/main.ts",
+    "diagnostics": "node dist/cli/diagnostics.js",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/main.js",
     "rails:backlog": "node --env-file-if-exists=.env --experimental-strip-types src/rails/inspect.ts",
