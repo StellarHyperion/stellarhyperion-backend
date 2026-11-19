@@ -9,6 +9,7 @@
 import { buildIndexer } from "./chains/runner.js";
 import { loadConfig } from "./config/config.js";
 import { ConfigError } from "./config/env.js";
+import { checkDatabasePolicy } from "./db/policy.js";
 import { checkSchemaCompatibility } from "./db/schema.js";
 import { runBudgetedCatchUp } from "./runtime/budget.js";
 import { Database } from "./db/pool.js";
@@ -38,12 +39,14 @@ async function main(): Promise<void> {
 
   const db = Database.open(config.databaseUrl, {
     applicationName: "hyperion-backend",
+    readOnly: config.databaseRole === "read-only",
     logger,
     slowQueryThresholdMs: 1_000,
   });
   shutdown.add("postgres", () => db.close());
   try {
     await checkSchemaCompatibility(db, config.schemaVersion);
+    await checkDatabasePolicy(db, config);
   } catch (error) {
     await db.close();
     throw error;

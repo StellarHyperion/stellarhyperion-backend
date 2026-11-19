@@ -1,3 +1,4 @@
+import type { CctpVerificationFailure } from "../rails/types.js";
 import { bounded, safeString } from "../rails/axelar/gmp.js";
 /**
  * Every statement that writes an indexed row, in one file, for both chain families.
@@ -396,6 +397,7 @@ export interface AttestationRow {
   readonly retryAttempts: number;
   readonly nextAttemptAt: Date | null;
   readonly retryClass: RailRetryClass | null;
+  readonly verificationFailure?: CctpVerificationFailure | null;
 }
 
 export interface AxelarQuarantineRow {
@@ -406,7 +408,19 @@ export interface AxelarQuarantineRow {
   readonly payload: unknown;
 }
 
+export interface AxelarSourceBinding {
+  readonly chain: string;
+  readonly router: string;
+  readonly nonce: string;
+  readonly transaction: string;
+  readonly sender: string;
+  readonly token: string;
+  readonly amount: string;
+  readonly destinationChain: string;
+  readonly destination: string;
+}
 export interface AxelarDeliveryEvidenceRow {
+  readonly sourceBinding?: AxelarSourceBinding;
   readonly transferId: bigint;
   readonly destinationChain: string;
   readonly commandId: string;
@@ -452,6 +466,27 @@ export async function writeAxelarDeliveryEvidence(
   db: Queryable,
   row: AxelarDeliveryEvidenceRow,
 ): Promise<bigint> {
+  if (row.sourceBinding !== undefined) {
+    const source = (
+      await db.query(
+        "SELECT origin_chain,origin_router,nonce::text,origin_tx,sender,token,net_amount::text,destination_chain,destination FROM outbound_transfer WHERE id=$1 AND route=1 FOR UPDATE",
+        [row.transferId.toString()],
+      )
+    ).rows[0];
+    const expected = row.sourceBinding;
+    if (
+      source?.origin_chain !== expected.chain ||
+      source.origin_router !== expected.router ||
+      source.nonce !== expected.nonce ||
+      source.origin_tx !== expected.transaction ||
+      source.sender !== expected.sender ||
+      source.token !== expected.token ||
+      source.net_amount !== expected.amount ||
+      source.destination_chain !== expected.destinationChain ||
+      source.destination !== expected.destination
+    )
+      throw new Error("Axelar verified source binding changed before proof admission.");
+  }
   await db.query(
     `UPDATE axelar_delivery_evidence
         SET status = 'superseded'
@@ -465,9 +500,9 @@ export async function writeAxelarDeliveryEvidence(
        (transfer_id, destination_chain, status, command_id, execution_tx_hash, receipt_status,
         receipt_block, receipt_block_hash, its_address, token_id, registered_token, token_manager,
         token_manager_block, token_manager_block_hash, payment_log_index, payment_recipient,
-        payment_amount, last_revalidated_at)
+        payment_amount, last_revalidated_at,source_binding)
      VALUES ($1, $2, 'canonical', $3, $4, 'success', $5, $6, $7, $8, $9, $10, $11, $12,
-             $13, $14, $15, now())
+             $13, $14, $15, now(),$16::jsonb)
      ON CONFLICT (transfer_id, command_id, execution_tx_hash, payment_log_index) DO UPDATE
        SET status = 'canonical',
            destination_chain = EXCLUDED.destination_chain,
@@ -482,6 +517,7 @@ export async function writeAxelarDeliveryEvidence(
            token_manager_block_hash = EXCLUDED.token_manager_block_hash,
            payment_recipient = EXCLUDED.payment_recipient,
            payment_amount = EXCLUDED.payment_amount,
+           source_binding = EXCLUDED.source_binding,
            last_revalidated_at = now()
      RETURNING id`,
     [
@@ -500,6 +536,7 @@ export async function writeAxelarDeliveryEvidence(
       row.paymentLogIndex,
       row.paymentRecipient,
       row.paymentAmount.toString(),
+      row.sourceBinding === undefined ? null : JSON.stringify(row.sourceBinding),
     ],
   );
   const id = rows[0]?.id;
@@ -538,8 +575,8 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
   await db.query(
     `INSERT INTO rail_attestation
        (transfer_id, route, status, rail_status, rail_reference, attested_at, last_checked_at,
-        check_failures, last_error, next_attempt_at, retry_class, retry_attempts)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        check_failures, last_error, next_attempt_at, retry_class, retry_attempts, verification_failure)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
      ON CONFLICT (transfer_id) DO UPDATE
        SET status = EXCLUDED.status,
            rail_status = COALESCE(EXCLUDED.rail_status, rail_attestation.rail_status),
@@ -554,6 +591,7 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
            retry_attempts = EXCLUDED.retry_attempts,
            next_attempt_at = EXCLUDED.next_attempt_at,
            retry_class = EXCLUDED.retry_class,
+           verification_failure = EXCLUDED.verification_failure,
            updated_at = now()`,
     [
       row.transferId.toString(),
@@ -568,6 +606,7 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
       row.nextAttemptAt,
       row.retryClass,
       row.retryAttempts,
+      row.verificationFailure ?? null,
     ],
   );
 }

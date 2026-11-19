@@ -171,6 +171,8 @@ export class AxelarGmpClient implements RailClient {
       mapped = "pending";
     }
     if (FATAL_FLAGS.some((flag) => row[flag] === true)) mapped = "failed";
+    else if (RECOVERABLE_FLAGS.some((flag) => row[flag] === true) && mapped === "failed")
+      mapped = "pending";
     const words = [status, simplified, ...flags]
       .filter((part): part is string => part !== null)
       .map(safeString);
@@ -186,6 +188,16 @@ export class AxelarGmpClient implements RailClient {
             ? safeString(row.id)
             : null,
       attestedAt: stampOf(row.approved) ?? stampOf(row.executed),
+      ...(flags.length > 0
+        ? {
+            providerFailure: {
+              kind: FATAL_FLAGS.some((flag) => row[flag] === true)
+                ? ("fatal" as const)
+                : ("recoverable" as const),
+              signals: flags,
+            },
+          }
+        : {}),
       ...(unsupportedStatus || unsupportedSchema
         ? {
             quarantine: {
