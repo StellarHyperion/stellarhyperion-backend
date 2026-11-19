@@ -28,14 +28,14 @@ suite("real PostgreSQL archived keeper submission recovery", () => {
       stellar: { ...loaded.indexer.stellar!, chain: "keeper-restoration-test" },
     },
   };
-  const chain = config.indexer.stellar!;
+  const chain = config.indexer.stellar;
   beforeAll(() => {
     db = Database.open(connection!, { applicationName: "hyperion-restore-298" });
   });
   afterAll(async () => {
     await db.query("DELETE FROM keeper_checkpoint WHERE signer = $1", [signer.publicKey()]);
     await db.query("DELETE FROM keeper_signer_state WHERE chain_key=$1", [
-      config.indexer.stellar!.chain,
+      config.indexer.stellar.chain,
     ]);
     await db.close();
   });

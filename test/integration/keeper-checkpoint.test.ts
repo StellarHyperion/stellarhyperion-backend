@@ -25,7 +25,7 @@ const connection = process.env.TEST_DATABASE_URL;
     afterAll(async () => {
       await db.query("DELETE FROM keeper_checkpoint WHERE signer=$1", [signer.publicKey()]);
       await db.query("DELETE FROM keeper_signer_state WHERE chain_key=$1", [
-        config.indexer.stellar!.chain,
+        config.indexer.stellar.chain,
       ]);
       await db.close();
     });
@@ -37,8 +37,7 @@ const connection = process.env.TEST_DATABASE_URL;
       let broadcasts = 0;
       let preparations = 0;
       const client = {
-        getNetwork: () =>
-          Promise.resolve({ passphrase: config.indexer.stellar!.networkPassphrase }),
+        getNetwork: () => Promise.resolve({ passphrase: config.indexer.stellar.networkPassphrase }),
         getAccountEntry: () => Promise.resolve({ balance: 100000000n }),
         getAccount: () => Promise.resolve(new Account(signer.publicKey(), "1")),
         simulateTransaction: () => {
@@ -78,8 +77,8 @@ const connection = process.env.TEST_DATABASE_URL;
         submitStellar(
           config,
           db,
-          config.indexer.stellar!.chain,
-          config.indexer.stellar!.routerContractId,
+          config.indexer.stellar.chain,
+          config.indexer.stellar.routerContractId,
           "settle_claim",
           "settle_claim",
           () => [],
@@ -101,9 +100,9 @@ const connection = process.env.TEST_DATABASE_URL;
       const lock = await db.transaction((tx) =>
         tx.query("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS held", [
           "keeper-ownership:" +
-            config.indexer.stellar!.networkPassphrase +
+            config.indexer.stellar.networkPassphrase +
             ":" +
-            config.indexer.stellar!.chain,
+            config.indexer.stellar.chain,
         ]),
       );
       expect(lock.rows[0]?.held).toBe(true);
