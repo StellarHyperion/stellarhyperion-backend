@@ -31,7 +31,8 @@
     "lint:fix": "eslint . --fix",
     "fmt": "prettier --write \"**/*.{ts,mts,mjs,cjs,json,md,yml,yaml}\"",
     "fmt:check": "prettier --check \"**/*.{ts,mts,mjs,cjs,json,md,yml,yaml}\"",
-    "check": "npm run fmt:check && npm run lint && npm run typecheck && npm run test"
+    "check": "npm run fmt:check && npm run lint && npm run typecheck && npm run test",
+    "evm:backfill": "node --env-file-if-exists=.env dist/chains/evm/backfill-cli.js"
   },
   "dependencies": {
     "@fastify/rate-limit": "^11.2.0",

@@ -114,3 +114,20 @@ Use the source transaction or numeric ID to disambiguate. Receipt verifiers bind
 evidence to the exact source row. Unbound legacy evidence is joined only for an unambiguous
 source nonce; provider status cannot select a deployment or establish delivery. Historical
 rows acquire their router during exact source-event replay without changing their IDs.
+
+### EVM historical jobs
+
+Use `npm run evm:backfill -- start <operator> <chain> <from> <to>` on a trusted
+local machine with database access. The returned job ID supports `resume` and
+`cancel` commands with the same operator. Owner is audit metadata, not HTTP
+authentication. The public API exposes only bounded job status reads.
+
+Jobs commit range progress in the same PostgreSQL transaction as their events.
+Stopping the process rolls back its unfinished range; resume uses the saved
+next block without moving the live cursor. Ranges stay below the configured
+confirmation line, at most 100000 blocks per job and one configured log page
+per transaction. Active jobs are limited to 100 and terminal history to 1000.
+Live and historical ingestion share durable event identity and serialized
+materialization, including route-health observations. Provider errors are
+reported with fixed public messages; inspect secure local provider logs when
+reviewing a failed job.

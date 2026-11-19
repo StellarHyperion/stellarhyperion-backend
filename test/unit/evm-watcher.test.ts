@@ -202,6 +202,30 @@ describe("when the chain changes its mind", () => {
 });
 
 describe("the range and the cursor as one commit", () => {
+  it("can replay a bounded range without moving the live cursor", async () => {
+    const client = new FakeEvmClient({ head: 60n });
+    const { watcher, db } = harness({ client, confirmations: 3 });
+
+    const result = await watcher.backfillRange(ANVIL_START_BLOCK, 57n, AbortSignal.timeout(5_000));
+
+    expect(result.written).toBeGreaterThan(0);
+    expect(cursorWrites(db)).toEqual([]);
+    expect(db.commits).toEqual([1]);
+  });
+
+  it("does not commit a historical range after cancellation", async () => {
+    const client = new FakeEvmClient({ head: 60n });
+    const { watcher, db } = harness({ client, confirmations: 3 });
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(watcher.backfillRange(ANVIL_START_BLOCK, 57n, controller.signal)).rejects.toThrow(
+      "backfill cancelled",
+    );
+    expect(db.commits).toEqual([]);
+    expect(cursorWrites(db)).toEqual([]);
+  });
+
   it("writes every row and the cursor inside the same transaction", async () => {
     const { watcher, db } = harness({ head: 60n, confirmations: 3 });
 
