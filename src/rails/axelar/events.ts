@@ -53,44 +53,115 @@ export interface DeliveryEvidence<T extends DeliveryLog = DeliveryLog> {
   readonly payment: T | null;
 }
 
+interface DestinationInspection<T extends DeliveryLog> extends DeliveryEvidence<T> {
+  readonly diagnostics: readonly VerificationDiagnostic[];
+  readonly ambiguous: boolean;
+}
+
+function inspectDestinationLogs<T extends DeliveryLog>(
+  logs: readonly T[],
+  expected: ExpectedDelivery,
+): DestinationInspection<T> {
+  const diagnostics: VerificationDiagnostic[] = [];
+  const add = (
+    category: VerificationMismatchCategory,
+    expectedValue: unknown,
+    observedValue: unknown,
+  ) => {
+    if (!diagnostics.some((item) => item.category === category))
+      diagnostics.push({
+        category,
+        expected: bounded(expectedValue),
+        observed: bounded(observedValue),
+      });
+  };
+  const received = new Map<string, T>();
+  const payments = new Map<string, T>();
+  for (const log of logs) {
+    let event: ReturnType<
+      typeof decodeEventLog<typeof ITS_ABI, undefined, [Hex, ...Hex[]], Hex, true>
+    >;
+    try {
+      event = decodeEventLog({ abi: ITS_ABI, topics: log.topics, data: log.data });
+    } catch {
+      continue;
+    }
+    const identity = `${String(log.logIndex ?? "none")}:${log.topics.join("").toLowerCase()}:${log.data.toLowerCase()}`;
+    if (
+      event.eventName === "InterchainTransferReceived" &&
+      log.address.toLowerCase() === expected.its.toLowerCase()
+    ) {
+      const args = event.args;
+      const exact =
+        args.commandId.toLowerCase() === expected.commandId.toLowerCase() &&
+        args.tokenId.toLowerCase() === expected.tokenId.toLowerCase() &&
+        args.sourceChain === expected.sourceChain &&
+        args.sourceAddress.toLowerCase() === expected.sourceAddress.toLowerCase() &&
+        args.destinationAddress.toLowerCase() === expected.recipient.toLowerCase() &&
+        args.amount === expected.amount;
+      if (exact) {
+        if (!received.has(identity)) received.set(identity, log);
+        continue;
+      }
+      if (args.commandId.toLowerCase() !== expected.commandId.toLowerCase())
+        add("command", expected.commandId, args.commandId);
+      if (args.tokenId.toLowerCase() !== expected.tokenId.toLowerCase())
+        add("token", expected.tokenId, args.tokenId);
+      if (
+        args.sourceChain !== expected.sourceChain ||
+        args.sourceAddress.toLowerCase() !== expected.sourceAddress.toLowerCase()
+      )
+        add(
+          "source_identity",
+          `${expected.sourceChain}:${expected.sourceAddress}`,
+          `${args.sourceChain}:${args.sourceAddress}`,
+        );
+      if (args.destinationAddress.toLowerCase() !== expected.recipient.toLowerCase())
+        add("recipient", expected.recipient, args.destinationAddress);
+      if (args.amount !== expected.amount) add("amount", expected.amount, args.amount);
+    }
+    if (
+      event.eventName === "Transfer" &&
+      log.address.toLowerCase() === expected.token.toLowerCase()
+    ) {
+      const args = event.args;
+      if (
+        args.from.toLowerCase() === expected.tokenManager.toLowerCase() &&
+        args.to.toLowerCase() === expected.recipient.toLowerCase() &&
+        args.value === expected.amount &&
+        log.logIndex !== null
+      ) {
+        if (!payments.has(identity)) payments.set(identity, log);
+        continue;
+      }
+      if (args.from.toLowerCase() !== expected.tokenManager.toLowerCase())
+        add("token", expected.tokenManager, args.from);
+      if (args.to.toLowerCase() !== expected.recipient.toLowerCase())
+        add("recipient", expected.recipient, args.to);
+      if (args.value !== expected.amount) add("amount", expected.amount, args.value);
+    }
+  }
+  const ambiguous = received.size > 1 || payments.size > 1;
+  if (ambiguous)
+    add(
+      "payment_evidence",
+      "exactly one matching ITS receipt and ERC-20 payment",
+      `${String(received.size)} receipts and ${String(payments.size)} payments`,
+    );
+  return {
+    received: ambiguous ? null : ([...received.values()][0] ?? null),
+    payment: ambiguous ? null : ([...payments.values()][0] ?? null),
+    diagnostics,
+    ambiguous,
+  };
+}
+
 /** Inspect the two independent destination proofs without collapsing a missing one into failure. */
 export function inspectDeliveryEvidence<T extends DeliveryLog>(
   logs: readonly T[],
   expected: ExpectedDelivery,
 ): DeliveryEvidence<T> {
-  let received: T | null = null;
-  let payment: T | null = null;
-  for (const log of logs) {
-    try {
-      const event = decodeEventLog({ abi: ITS_ABI, topics: log.topics, data: log.data });
-      if (
-        event.eventName === "InterchainTransferReceived" &&
-        log.address.toLowerCase() === expected.its.toLowerCase()
-      ) {
-        const args = event.args;
-        if (
-          args.commandId.toLowerCase() === expected.commandId.toLowerCase() &&
-          args.tokenId.toLowerCase() === expected.tokenId.toLowerCase() &&
-          args.sourceChain === expected.sourceChain &&
-          args.sourceAddress.toLowerCase() === expected.sourceAddress.toLowerCase() &&
-          args.destinationAddress.toLowerCase() === expected.recipient.toLowerCase() &&
-          args.amount === expected.amount
-        )
-          received = log;
-      }
-      if (
-        event.eventName === "Transfer" &&
-        log.address.toLowerCase() === expected.token.toLowerCase() &&
-        event.args.from.toLowerCase() === expected.tokenManager.toLowerCase() &&
-        event.args.to.toLowerCase() === expected.recipient.toLowerCase() &&
-        event.args.value === expected.amount &&
-        log.logIndex !== null
-      )
-        payment = log;
-    } catch {
-      /* Receipts contain unrelated events; they cannot establish this delivery. */
-    }
-  }
+  const { received, payment } = inspectDestinationLogs(logs, expected);
   return { received, payment };
 }
 
@@ -127,9 +198,10 @@ export function inspectPayment<T extends DeliveryLog>(
   logs: readonly T[],
   expected: ExpectedDelivery,
 ): PaymentInspection<T> {
-  const evidence = inspectDeliveryEvidence(logs, expected);
-  if (evidence.received && evidence.payment) return { payment: evidence.payment, diagnostics: [] };
-  const diagnostics: VerificationDiagnostic[] = [];
+  const inspection = inspectDestinationLogs(logs, expected);
+  if (inspection.received && inspection.payment)
+    return { payment: inspection.payment, diagnostics: [] };
+  const diagnostics = [...inspection.diagnostics];
   const add = (
     category: VerificationMismatchCategory,
     expectedValue: unknown,
@@ -142,32 +214,9 @@ export function inspectPayment<T extends DeliveryLog>(
         observed: bounded(observedValue),
       });
   };
-  if (!evidence.received) {
-    for (const log of logs) {
-      if (log.address.toLowerCase() !== expected.its.toLowerCase()) continue;
-      try {
-        const event = decodeEventLog({ abi: ITS_ABI, topics: log.topics, data: log.data });
-        if (event.eventName !== "InterchainTransferReceived") continue;
-        const args = event.args;
-        if (args.commandId.toLowerCase() !== expected.commandId.toLowerCase())
-          add("command", expected.commandId, args.commandId);
-        if (args.tokenId.toLowerCase() !== expected.tokenId.toLowerCase())
-          add("token", expected.tokenId, args.tokenId);
-        if (args.sourceChain !== expected.sourceChain)
-          add("source_identity", expected.sourceChain, args.sourceChain);
-        if (args.sourceAddress.toLowerCase() !== expected.sourceAddress.toLowerCase())
-          add("source_identity", expected.sourceAddress, args.sourceAddress);
-        if (args.destinationAddress.toLowerCase() !== expected.recipient.toLowerCase())
-          add("recipient", expected.recipient, args.destinationAddress);
-        if (args.amount !== expected.amount) add("amount", expected.amount, args.amount);
-      } catch {
-        /* Unrelated receipt logs do not establish delivery. */
-      }
-    }
-  }
-  if (!evidence.received || !evidence.payment)
+  if (!inspection.received || !inspection.payment)
     add("payment_evidence", "canonical ITS receipt and matching ERC-20 payment", null);
-  return { payment: null, diagnostics };
+  return { payment: null, diagnostics: normalizeVerificationDiagnostics(diagnostics) };
 }
 
 export function matchingPayment<T extends DeliveryLog>(

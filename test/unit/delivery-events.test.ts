@@ -133,4 +133,60 @@ describe("Destination delivery evidence", () => {
       payment: paid,
     });
   });
+
+  it("never satisfies a transfer with another recipient's payment", () => {
+    const otherRecipient = "0x5555555555555555555555555555555555555555";
+    const otherPaid: DeliveryLog = {
+      ...paid,
+      topics: encodeEventTopics({
+        abi: ITS_ABI,
+        eventName: "Transfer",
+        args: { from: tokenManager, to: otherRecipient },
+      }) as [Hex, ...Hex[]],
+      logIndex: 4,
+    };
+    expect(matchingPayment([received, otherPaid], expected)).toBeNull();
+  });
+
+  it("selects the exact pair among unrelated ITS candidates and payments", () => {
+    const otherCommand: Hex = `0x${"ef".repeat(32)}`;
+    const otherReceived: DeliveryLog = {
+      ...received,
+      topics: encodeEventTopics({
+        abi: ITS_ABI,
+        eventName: "InterchainTransferReceived",
+        args: { commandId: otherCommand, tokenId, destinationAddress: recipient },
+      }) as [Hex, ...Hex[]],
+      logIndex: 1,
+    };
+    const otherPaid: DeliveryLog = {
+      ...paid,
+      topics: encodeEventTopics({
+        abi: ITS_ABI,
+        eventName: "Transfer",
+        args: { from: tokenManager, to: "0x5555555555555555555555555555555555555555" },
+      }) as [Hex, ...Hex[]],
+      logIndex: 4,
+    };
+    expect(matchingPayment([otherReceived, received, otherPaid, paid], expected)).toBe(paid);
+  });
+
+  it("deduplicates replayed identical evidence deterministically", () => {
+    expect(matchingPayment([received, paid, { ...received }, { ...paid }], expected)).toBe(paid);
+  });
+
+  it("remains unverified when exact candidates conflict", () => {
+    expect(matchingPayment([received, { ...received, logIndex: 5 }, paid], expected)).toBeNull();
+    expect(matchingPayment([received, paid, { ...paid, logIndex: 6 }], expected)).toBeNull();
+    const inspection = inspectPayment([received, { ...received, logIndex: 5 }, paid], expected);
+    expect(inspection.payment).toBeNull();
+    expect(inspection.diagnostics).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          category: "payment_evidence",
+          observed: "2 receipts and 1 payments",
+        }),
+      ]),
+    );
+  });
 });
