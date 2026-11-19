@@ -3,7 +3,12 @@ import type { Transaction, xdr } from "@stellar/stellar-sdk";
 import { BASE_FEE, Contract, TransactionBuilder, rpc } from "@stellar/stellar-sdk";
 import type { AppConfig } from "../config/config.js";
 import type { Queryable, Transactional } from "../db/pool.js";
-import { activeKeeperSigner } from "./signers.js";
+import {
+  activeKeeperSigner,
+  assertKeeperSignerOwnership,
+  keeperSignerLock,
+  validateKeeperSigner,
+} from "./signers.js";
 import { recordKeeperSubmission, updateKeeperSubmission } from "./outcomes.js";
 import { prepareWithRestore } from "./restore.js";
 
@@ -53,7 +58,8 @@ export function submitStellar(
     return Promise.reject(
       new Error("Keeper operation must match its supported maintenance method."),
     );
-  const key = activeKeeperSigner(config).key;
+  const selectedSigner = activeKeeperSigner(config);
+  const key = selectedSigner.key;
   const signer = key.publicKey();
   const values = args(signer);
   const intent = createHash("sha256")
@@ -75,10 +81,10 @@ export function submitStellar(
 
   return db.transaction(async (lock) => {
     await lock.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
-      "keeper-signer:" + chain.networkPassphrase + ":" + signer,
+      keeperSignerLock(config),
     ]);
-    if ((await client.getNetwork()).passphrase !== chain.networkPassphrase)
-      throw new Error("Keeper RPC network mismatch.");
+    await validateKeeperSigner(config, selectedSigner, client);
+    await assertKeeperSignerOwnership(lock, config, selectedSigner);
 
     const reconcile = async (hash: string): Promise<"confirmed" | "failed"> => {
       if (!/^[0-9a-f]{64}$/.test(hash))
@@ -97,11 +103,19 @@ export function submitStellar(
             "UPDATE keeper_checkpoint SET state = 'confirmed', confirmed_at = now(), detail = 'confirmed on chain' WHERE hash = $1 AND state = 'submitted'",
             [hash],
           );
+          await db.query(
+            "UPDATE keeper_submission SET stage='confirmed',error_detail=NULL,updated_at=now() WHERE transaction_hash=$1 AND stage IN ('submitted','pending')",
+            [hash],
+          );
           return "confirmed";
         }
         if (result.status === rpc.Api.GetTransactionStatus.FAILED) {
           await db.query(
             "UPDATE keeper_checkpoint SET state = 'failed', detail = 'failed on chain' WHERE hash = $1 AND state = 'submitted'",
+            [hash],
+          );
+          await db.query(
+            "UPDATE keeper_submission SET stage='failed',error_detail='failed on chain',updated_at=now() WHERE transaction_hash=$1 AND stage IN ('submitted','pending')",
             [hash],
           );
           return "failed";
@@ -163,23 +177,25 @@ export function submitStellar(
               transactionHash: hash,
               stage: "submitted",
             })
-          : 0;
+          : null;
       let submitted;
       try {
         submitted = await client.sendTransaction(prepared);
       } catch {
-        if (submissionId !== 0 && options.db !== undefined)
+        if (submissionId !== null && options.db !== undefined)
           await updateKeeperSubmission(options.db, submissionId, { stage: "pending" });
         throw new Error(
           "Keeper broadcast outcome is unknown; reconcile the saved public hash before retry.",
         );
       }
+      if (submissionId !== null && options.db !== undefined)
+        await updateKeeperSubmission(options.db, submissionId, { stage: "pending" });
       if (submitted.hash !== hash)
         throw new Error(
           "Keeper RPC returned a different transaction hash; saved outcome requires reconciliation.",
         );
       if (submitted.status === "ERROR") {
-        if (submissionId !== 0 && options.db !== undefined)
+        if (submissionId !== null && options.db !== undefined)
           await updateKeeperSubmission(options.db, submissionId, {
             stage: "failed",
             errorDetail: "RPC rejected submission",
@@ -193,21 +209,39 @@ export function submitStellar(
       // TRY_AGAIN_LATER is ambiguous: keep the committed checkpoint and never prepare a second
       // envelope until getTransaction proves a terminal result for this exact signed hash.
       if ((await reconcile(hash)) === "failed") {
-        if (submissionId !== 0 && options.db !== undefined)
+        if (submissionId !== null && options.db !== undefined)
           await updateKeeperSubmission(options.db, submissionId, {
             stage: "failed",
             errorDetail: "transaction failed on chain",
           });
         throw new Error("Keeper transaction failed on chain.");
       }
-      if (submissionId !== 0 && options.db !== undefined)
+      if (submissionId !== null && options.db !== undefined)
         await updateKeeperSubmission(options.db, submissionId, { stage: "confirmed" });
       return hash;
     };
     const prepare = options.prepareWithRestore ?? prepareWithRestore;
-    const prepared = await prepare(client, build, (transaction, phase) =>
-      submitPrepared(transaction, phase),
-    );
+    let prepared: Transaction;
+    try {
+      prepared = await prepare(client, build, (transaction, phase) =>
+        submitPrepared(transaction, phase),
+      );
+    } catch {
+      const unresolved = await db.query(
+        "SELECT hash FROM keeper_checkpoint WHERE chain_key=$1 AND signer=$2 AND state='submitted' LIMIT 1",
+        [chainKey, signer],
+      );
+      if (!unresolved.rows.length && options.db !== undefined && options.jobName !== undefined)
+        await recordKeeperSubmission(options.db, {
+          jobName: options.jobName,
+          signerPublicKey: signer,
+          stage: "failed",
+          errorDetail: "maintenance simulation or restore failed",
+        });
+      throw new Error(
+        "Keeper preparation outcome is unknown or failed; reconcile any saved hash before retry.",
+      );
+    }
     return submitPrepared(prepared, "invoke");
   });
 }

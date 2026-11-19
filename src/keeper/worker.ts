@@ -10,8 +10,7 @@ import type { AppConfig } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
 import type { ReadinessReport, ReadinessSource } from "../runtime/readiness.js";
 import { startKeeperQueue, type KeeperHandle } from "./queue.js";
-import { countPendingKeeperSubmissions } from "./outcomes.js";
-import { activeKeeperSigner, validateKeeperSigner } from "./signers.js";
+import { activateKeeperSigner } from "./signers.js";
 
 export class KeeperWorker implements ReadinessSource {
   readonly name = "keeper";
@@ -61,25 +60,11 @@ export class KeeperWorker implements ReadinessSource {
     Promise.resolve()
       .then(async () => {
         if (this.config.keeper.stellarSecrets.length > 0) {
-          const signer = activeKeeperSigner(this.config);
-          await validateKeeperSigner(this.config, signer);
-          let pending = 0;
-          try {
-            pending = await countPendingKeeperSubmissions(this.db);
-          } catch (error) {
-            if (!(
-              typeof error === "object" &&
-              error !== null &&
-              "code" in error &&
-              error.code === "42P01"
-            ))
-              throw error;
-          }
-          if (pending > 0) {
-            throw new Error(
-              `${String(pending)} pending Stellar submission(s) require reconciliation before signer rotation`,
-            );
-          }
+          const signer = await activateKeeperSigner(this.db, this.config);
+          this.logger.info(
+            { signer: signer.publicKey, balance: signer.balance },
+            "funded keeper signer ownership ready",
+          );
         }
         return startKeeperQueue(
           { db: this.db, config: this.config, logger: this.logger },
@@ -93,7 +78,8 @@ export class KeeperWorker implements ReadinessSource {
       })
       .catch((err: unknown) => {
         this.starting = false;
-        this.failedError = err instanceof Error ? err.message : String(err);
+        this.failedError =
+          "signer ownership, balance, network or queue readiness could not be verified";
         this.logger.error({ err }, "failed to start keeper queue");
       });
   }
