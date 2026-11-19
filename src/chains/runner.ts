@@ -12,6 +12,7 @@
  * them apart is why the watcher tests do not sleep, and why the retry policy is one file rather
  * than one per chain.
  */
+import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 
 import type {
@@ -251,7 +252,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   const extra: ReadinessSource[] = [];
 
   if (config.indexer.stellar !== null) {
-    workers.push(stellarWorker(config.indexer.stellar, db, logger));
+    workers.push(stellarWorker(config.indexer.stellar, db, logger, config));
   } else {
     logger.warn("the deployment record has no Stellar router, so nothing is watching Stellar");
   }
@@ -259,7 +260,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // One per chain in the record. Each carries its own confirmations from the registry, which is
   // the honest way to treat one block on Arc and twelve on Ethereum as the same kind of fact.
   for (const chain of config.indexer.evm) {
-    workers.push(evmWorker(chain, db, logger));
+    workers.push(evmWorker(chain, db, logger, config));
   }
 
   // Counted before the rail pollers join the list, because the two questions are different. "Is
@@ -395,9 +396,17 @@ function railWorkersFromPasses(
   });
 }
 
-function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): Worker {
+function evmWorker(
+  config: EvmWatchConfig,
+  db: Transactional,
+  logger: Logger,
+  app?: AppConfig,
+): Worker {
   const child = logger.child({ chain: config.chain, chainId: config.chainId });
   const watcher = new EvmWatcher({
+    ...(app
+      ? { ownerId: `${app.indexerLeaseOwnerId}:${randomUUID()}`, leaseTtlMs: app.indexerLeaseTtlMs }
+      : {}),
     chainKey: config.chain,
     router: config.routerAddress,
     chainId: config.chainId,
@@ -418,9 +427,17 @@ function evmWorker(config: EvmWatchConfig, db: Transactional, logger: Logger): W
   });
 }
 
-function stellarWorker(config: StellarWatchConfig, db: Transactional, logger: Logger): Worker {
+function stellarWorker(
+  config: StellarWatchConfig,
+  db: Transactional,
+  logger: Logger,
+  app?: AppConfig,
+): Worker {
   const child = logger.child({ chain: config.chain });
   const watcher = new StellarWatcher({
+    ...(app
+      ? { ownerId: `${app.indexerLeaseOwnerId}:${randomUUID()}`, leaseTtlMs: app.indexerLeaseTtlMs }
+      : {}),
     chainKey: config.chain,
     router: config.routerContractId,
     startLedger: config.startLedger,
