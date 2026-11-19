@@ -141,3 +141,37 @@ EVM watcher ownership is scoped to the chain and router. An expired owner may be
 Scheduled route-health compaction removes bounded batches of old interior duplicates and skips rows locked by ingestion. It retains the first and last samples of each configuration run, every transition, and all samples in the recent retention window. Historical `route_health` queries therefore represent state transitions after compaction; they must not treat old row counts as raw sampling frequency or uptime percentages. Recent raw samples remain available within the configured retention window.
 
 `Database.auditTransferAndClaimInvariants()` reads source amount equations, claim liabilities and actual destination-delivery evidence. Its monetary values remain integer strings, and violations identify source row IDs and routers. Delivery joins use the bound source transfer or an unambiguous legacy hop; a reused deployment nonce cannot prove delivery for another source row.
+
+## Metadata versions, request budgets and durable freshness
+
+Public transfer, claim and route responses default to schema `1.0` and retain their legacy shape.
+Request `X-API-Schema-Version: 1.1` (or `schemaVersion=1.1` for EventSource) to receive the
+`schemaVersion` and `metadata.source=indexed_postgres` envelope. Monetary and token identity
+fields are identical in both versions. Unsupported versions return 400 with the supported list.
+Versioned responses carry distinct ETags and vary on `X-API-Schema-Version`.
+
+Production API requests default to 120 requests per client per minute, with 20 SSE connections
+per minute. `/health` and `/ready` probes, including query-bearing probes, are exempt;
+operational metrics and backfill inspection use the ordinary budget. `buildServer` accepts a
+bounded `rateLimit` policy and explicit `trustProxy` configuration. Forwarded client headers
+are ignored by default; production proxy trust should name the validated proxy addresses.
+When `REDIS_URL` is configured, both continuous and serverless API entry points connect
+with bounded command/connect timeouts; an injected ioredis client shares counters across replicas using the same key prefix; without
+one the bounded cache is local to that process. Redis errors fail requests closed and expose
+only the generic internal error. 429 responses include `Retry-After` and `retryAfterMs`.
+
+Background chain and rail workers persist heartbeats after every completed or failed poll,
+including the actual cursor and consecutive failures. Worker IDs are limited to 128 safe
+characters; diagnostic text and nested metadata are bounded and redact credentials. Older
+writes cannot overwrite newer activity. `/ready` degrades missing configured chain-worker
+heartbeats and timestamps older than 120 seconds, invalid timestamps, or timestamps over 30 seconds
+in the future. A healthy database or a local ready report cannot mask stale persisted activity.
+API replicas with indexing disabled still report the durable heartbeats present in PostgreSQL.
+
+`Database.computeHistoryDigest`/`recordHistoryDigest`/`verifyHistoryDigest` cover indexed
+outbound transfers, inbound deliveries and claims linked to a delivery within the requested
+inclusive block range. Exact integer strings and deployment/source identities contribute to
+the SHA-256 digest; surrogate row IDs, observation times and API presentation do not.
+Rows are read in deterministic pages of 1,000 under a repeatable-read snapshot. A plain
+`Queryable` must already provide snapshot isolation when used concurrently with ingestion.
+Unlinked claims are outside a block-range digest because they have no delivery block evidence.

@@ -17,8 +17,13 @@ import {
   computeCanonicalETag,
   sendConditionalDetailResponse,
 } from "../etag.js";
-import type { ServerDeps } from "../server.js";
+import {
+  DEFAULT_RATE_LIMIT_WINDOW_MS,
+  DEFAULT_STREAM_RATE_LIMIT_MAX,
+  type ServerDeps,
+} from "../server.js";
 import { transferStreamIntervals } from "../stream-intervals.js";
+import { negotiateSchemaVersion, withSchemaMetadata } from "../schema-version.js";
 
 export type TransferLifecycleStage =
   | "initiated"
@@ -300,6 +305,9 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       request: FastifyRequest<{ Params: { originChain: string; nonce: string } }>,
       reply: FastifyReply,
     ) => {
+      const version = negotiateSchemaVersion(request, reply);
+      if (version === null) return;
+
       const { originChain, nonce } = request.params;
       const { rows } = await db.query(
         `${TRANSFER_QUERY} WHERE t.origin_chain = $1 AND t.nonce = $2 ORDER BY t.id LIMIT 2`,
@@ -322,7 +330,14 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       }
 
       const revision = buildTransferRevision(row, deps.config);
-      return sendConditionalDetailResponse(request, reply, revision.transfer, revision.etag);
+      return sendConditionalDetailResponse(
+        request,
+        reply,
+        withSchemaMetadata(revision.transfer, version),
+        version === "1.0"
+          ? revision.etag
+          : computeCanonicalETag("transfer-v1.1", { base: revision.etag }),
+      );
     },
   );
 
@@ -330,6 +345,9 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
   app.get(
     "/v1/transfers/by-tx/:txHash",
     async (request: FastifyRequest<{ Params: { txHash: string } }>, reply: FastifyReply) => {
+      const version = negotiateSchemaVersion(request, reply);
+      if (version === null) return;
+
       const { txHash } = request.params;
       const { rows } = await db.query(
         `${TRANSFER_QUERY} WHERE t.origin_tx = $1 OR d.destination_tx = $1 LIMIT 1`,
@@ -345,7 +363,14 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       }
 
       const revision = buildTransferRevision(row, deps.config);
-      return sendConditionalDetailResponse(request, reply, revision.transfer, revision.etag);
+      return sendConditionalDetailResponse(
+        request,
+        reply,
+        withSchemaMetadata(revision.transfer, version),
+        version === "1.0"
+          ? revision.etag
+          : computeCanonicalETag("transfer-v1.1", { base: revision.etag }),
+      );
     },
   );
 
@@ -357,6 +382,9 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     }>,
     reply: FastifyReply,
   ) => {
+    const version = negotiateSchemaVersion(request, reply);
+    if (version === null) return;
+
     const { id } = request.params;
     const initial = await queryTransferById(id);
     if (initial === null) {
@@ -372,6 +400,8 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
       "X-Accel-Buffering": "no",
+      "X-API-Schema-Version": version,
+      Vary: "X-API-Schema-Version",
     });
 
     const safeWrite = (chunk: string): boolean => {
@@ -387,15 +417,16 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       }
     };
 
-    safeWrite(`event: transfer_update\ndata: ${JSON.stringify(initial)}\n\n`);
+    const initialPayload = withSchemaMetadata(initial, version);
+    safeWrite(`event: transfer_update\ndata: ${JSON.stringify(initialPayload)}\n\n`);
 
     if (isDeliveryFinalized(initial)) {
-      safeWrite(`event: complete\ndata: ${JSON.stringify(initial)}\n\n`);
+      safeWrite(`event: complete\ndata: ${JSON.stringify(initialPayload)}\n\n`);
       safeEnd();
       return;
     }
 
-    let lastSerialized = JSON.stringify(initial);
+    let lastSerialized = JSON.stringify(initialPayload);
     let closed = false;
 
     const intervals = transferStreamIntervals(request.query);
@@ -429,13 +460,14 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
           const current = await queryTransferById(id);
           if (current === null) return;
 
-          const currentSerialized = JSON.stringify(current);
+          const currentPayload = withSchemaMetadata(current, version);
+          const currentSerialized = JSON.stringify(currentPayload);
           if (currentSerialized !== lastSerialized) {
             lastSerialized = currentSerialized;
-            safeWrite(`event: transfer_update\ndata: ${JSON.stringify(current)}\n\n`);
+            safeWrite(`event: transfer_update\ndata: ${currentSerialized}\n\n`);
 
             if (isDeliveryFinalized(current)) {
-              safeWrite(`event: complete\ndata: ${JSON.stringify(current)}\n\n`);
+              safeWrite(`event: complete\ndata: ${currentSerialized}\n\n`);
               safeEnd();
               cleanup();
             }
@@ -455,14 +487,26 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
     }, intervals.heartbeat);
   };
 
-  app.get("/v1/transfers/:id/stream", handleStream);
-  app.get("/api/v1/transfers/:id/stream", handleStream);
+  const streamRouteConfig = {
+    config: {
+      rateLimit: {
+        max: deps.rateLimit?.streamMax ?? DEFAULT_STREAM_RATE_LIMIT_MAX,
+        timeWindow: deps.rateLimit?.timeWindowMs ?? DEFAULT_RATE_LIMIT_WINDOW_MS,
+      },
+    },
+  };
+
+  app.get("/v1/transfers/:id/stream", streamRouteConfig, handleStream);
+  app.get("/api/v1/transfers/:id/stream", streamRouteConfig, handleStream);
 
   // 4. Look up by ID
   const getTransferById = async (
     request: FastifyRequest<{ Params: { id: string } }>,
     reply: FastifyReply,
   ) => {
+    const version = negotiateSchemaVersion(request, reply);
+    if (version === null) return;
+
     const { id } = request.params;
     const revision = await queryTransferRevisionById(id);
     if (revision === null) {
@@ -471,7 +515,14 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
         message: `no transfer found with id ${id}`,
       });
     }
-    return sendConditionalDetailResponse(request, reply, revision.transfer, revision.etag);
+    return sendConditionalDetailResponse(
+      request,
+      reply,
+      withSchemaMetadata(revision.transfer, version),
+      version === "1.0"
+        ? revision.etag
+        : computeCanonicalETag("transfer-v1.1", { base: revision.etag }),
+    );
   };
 
   app.get("/v1/transfers/:id", getTransferById);
@@ -495,6 +546,9 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       }>,
       reply: FastifyReply,
     ) => {
+      const version = negotiateSchemaVersion(request, reply);
+      if (version === null) return;
+
       const { originChain, destinationChain, route, sender, recipient, search, limit, offset } =
         request.query;
 
@@ -545,12 +599,17 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
       );
 
       reply.header("Cache-Control", LIST_CACHE_CONTROL);
-      return reply.send({
-        transfers: rows.map((row) => formatRow(row, deps.config)),
-        limit: parsedLimit,
-        offset: parsedOffset,
-        count: rows.length,
-      });
+      return reply.send(
+        withSchemaMetadata(
+          {
+            transfers: rows.map((row) => formatRow(row, deps.config)),
+            limit: parsedLimit,
+            offset: parsedOffset,
+            count: rows.length,
+          },
+          version,
+        ),
+      );
     },
   );
 }

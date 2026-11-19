@@ -60,7 +60,9 @@ suite("the schema", () => {
     for (const table of [
       "admin_action",
       "inbound_delivery",
+      "indexed_history_digest",
       "indexer_cursor",
+      "indexer_worker_heartbeat",
       "outbound_transfer",
       "pending_claim",
       "rail_attestation",

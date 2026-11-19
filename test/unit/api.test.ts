@@ -579,7 +579,21 @@ describe("Readiness and health probes", () => {
   const { logger } = capturingLogger();
 
   it("returns 200 when all components (Postgres, Redis, Watchers) are healthy", async () => {
-    const db = new MockDb({});
+    const db = new MockDb({
+      indexer_worker_heartbeat: ["stellar-testnet", "sepolia"].map((chain) => ({
+        worker_name: chain,
+        worker_kind: "chain",
+        chain_key: chain,
+        state: "ready",
+        detail: "current",
+        last_heartbeat_at: new Date(),
+        last_completed_at: new Date(),
+        last_cursor_block: "123",
+        consecutive_failures: 0,
+        last_error: null,
+        metadata: {},
+      })),
+    });
     const mockRedis = {
       ping: () => Promise.resolve("PONG"),
     };

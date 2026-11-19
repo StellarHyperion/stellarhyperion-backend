@@ -15,6 +15,13 @@
 import { Pool } from "pg";
 import type { PoolClient, PoolConfig } from "pg";
 import {
+  computeHistoryDigest as computeRangeDigest,
+  recordHistoryDigest as storeRangeDigest,
+  verifyHistoryDigest as verifyRangeDigest,
+  type ComputeHistoryDigestOptions,
+  type DigestVerificationResult,
+  type HistoryDigestResult,
+  type StoredHistoryDigest,
   auditTransferAndClaimInvariants,
   compactRouteHealthSamples,
   type CompactRouteHealthOptions,
@@ -105,6 +112,23 @@ export class Database implements Transactional {
   /** Cheapest possible proof the database is answering, for the ready check. */
   async ping(): Promise<void> {
     await this.query("SELECT 1");
+  }
+
+  /** Compute a deterministic range digest for indexed event and monetary records (#63). */
+  async computeHistoryDigest(options: ComputeHistoryDigestOptions): Promise<HistoryDigestResult> {
+    return computeRangeDigest(this, options);
+  }
+
+  /** Persist a computed range digest for later backfill/restore verification (#63). */
+  async recordHistoryDigest(result: HistoryDigestResult): Promise<StoredHistoryDigest> {
+    return storeRangeDigest(this, result);
+  }
+
+  /** Recompute and verify a range digest against an expected or stored digest (#63). */
+  async verifyHistoryDigest(
+    options: ComputeHistoryDigestOptions & { readonly expectedDigest?: string },
+  ): Promise<DigestVerificationResult> {
+    return verifyRangeDigest(this, options);
   }
 
   /**

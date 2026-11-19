@@ -31,16 +31,41 @@ const REDACTED_PATHS = [
   "connectionString",
   "password",
   "stellarSecret",
+  "apiKey",
+  "authorization",
+  "historicalRpcUrl",
+  "rpcUrl",
+  "rpcUrls",
+  "failedRpc",
+  "fallbackRpc",
   "*.stellarSecret",
   "config.keeper.stellarSecret",
   "*.databaseUrl",
   "*.redisUrl",
   "*.connectionString",
   "*.password",
+  "*.apiKey",
+  "*.authorization",
+  "*.headers.authorization",
+  "*.historicalRpcUrl",
+  "*.rpcUrl",
+  "*.rpcUrls",
   "err.connectionString",
   "config.databaseUrl",
   "config.redisUrl",
 ];
+
+/** Strip URL userinfo credentials from error messages before logging or persisting diagnostics. */
+export function sanitizeDiagnosticText(input: string): string {
+  return input
+    .replace(/\b(?:https?|postgres(?:ql)?|rediss?):\/\/[^\s"'<>]+/gi, "[redacted URL]")
+    .replace(/\b(Bearer|Basic)\s+[^\s,;]+/gi, "$1 [redacted]")
+    .replace(
+      /\b((?:authorization|password|secret|api[_-]?key|token)\s*[:=]\s*)[^\s,;]+/gi,
+      "$1[redacted]",
+    )
+    .slice(0, 2048);
+}
 
 export function createLogger(config: AppConfig): Logger {
   return pino({
