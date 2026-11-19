@@ -28,6 +28,7 @@
     "test:watch": "vitest",
     "test:unit": "vitest run test/unit",
     "test:integration": "vitest run test/integration",
+    "rails:reconcile": "node --experimental-strip-types src/rails/axelar/reconcile-cli.ts",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "fmt": "prettier --write \"**/*.{ts,mts,mjs,cjs,json,md,yml,yaml}\"",

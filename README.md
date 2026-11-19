@@ -110,6 +110,18 @@ npm run rails:backlog -- [--route 0|1] [--destination <chain>] [--stage <stage>]
 
 The report separates provider discovery from destination receipt verification, includes retry class and due state, and uses stable keyset pagination. It runs its database transaction as read-only.
 
+For a read-only source-to-payout audit of direct Axelar ITS transfers, use the reconciliation
+command. It joins the indexed source transfer, provider reference and destination proof inside one
+repeatable-read transaction; it never calls Axelar, tops up fees or writes state:
+
+```bash
+npm run rails:reconcile -- [--transfer-id <id>] [--limit <1..500>]
+```
+
+The report distinguishes a missing provider record, provider-only evidence, a missing destination
+proof, an amount mismatch and a fully reconciled payout. A provider status is never treated as a
+destination payment.
+
 ## Protocol fees and claims
 
 The active Stellar router charges 0.3% on outbound USDC and transfers that fee directly to its configured treasury during the source transaction. The backend indexes the recorded source fee; bridge and network fees are separate. Received amounts reflect actual destination payment after forwarding fees.
@@ -347,3 +359,15 @@ maintenance signing attempt rechecks funding/network and current ownership. Sign
 changes the fee payer; router claim payout recipients remain fixed by the contract. Public
 readiness exposes the funded public key and integer-string balance in logs; private provider
 errors are replaced by bounded readiness reasons.
+
+### Read-only ITS source-to-payment audit
+
+`npm run rails:reconcile -- --transfer-id <id> --limit <1..500> --format json` reads one
+repeatable, read-only database snapshot and never contacts providers or performs top-ups.
+The report joins the exact source transfer, provider discovery reference and persisted canonical
+ITS command/token-manager/payment proof. Reconciled rows require the verified public source
+snapshot and matching destination chain, command, transaction, recipient, token and integer
+amount. Migration179320 adds nullable source bindings; legacy proofs without that snapshot are
+reported as `missing_source_binding`. Missing backend history and missing canonical proof are
+reported explicitly. Source changes during verification are rejected before proof admission.
+Recoverable provider gas errors remain retryable and cannot by themselves establish payment.
