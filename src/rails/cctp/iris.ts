@@ -602,13 +602,15 @@ async function readJson(response: Response, maxBytes: number): Promise<unknown> 
     throw new IrisResourceLimitError(`response exceeds ${maxBytes} bytes`);
   }
 
-  const reader = response.body.getReader();
+  const reader: ReadableStreamDefaultReader<unknown> = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
+      if (!(value instanceof Uint8Array))
+        throw new RailError("cctp", "transient", "invalid provider byte stream");
       size += value.byteLength;
       if (size > maxBytes) {
         await reader.cancel().catch(() => undefined);
