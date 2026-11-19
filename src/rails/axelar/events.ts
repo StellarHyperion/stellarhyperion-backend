@@ -1,6 +1,7 @@
 import { decodeEventLog, parseAbi, type Hex } from "viem";
 export const ITS_ABI = parseAbi([
   "function registeredTokenAddress(bytes32 tokenId) view returns (address)",
+  "function tokenManagerAddress(bytes32 tokenId) view returns (address)",
   "event InterchainTransferReceived(bytes32 indexed commandId, bytes32 indexed tokenId, string sourceChain, bytes sourceAddress, address indexed destinationAddress, uint256 amount, bytes32 dataHash)",
   "event Transfer(address indexed from, address indexed to, uint256 value)",
 ]);
@@ -13,6 +14,7 @@ export interface DeliveryLog {
 export interface ExpectedDelivery {
   its: string;
   token: string;
+  tokenManager: string;
   commandId: string;
   tokenId: string;
   sourceChain: string;
@@ -87,8 +89,10 @@ export function inspectPayment<T extends DeliveryLog>(
       if (
         event.eventName === "Transfer" &&
         log.address.toLowerCase() === expected.token.toLowerCase() &&
+        event.args.from.toLowerCase() === expected.tokenManager.toLowerCase() &&
         event.args.to.toLowerCase() === expected.recipient.toLowerCase() &&
-        event.args.value === expected.amount
+        event.args.value === expected.amount &&
+        log.logIndex !== null
       )
         payment = log;
     } catch {
