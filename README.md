@@ -164,6 +164,8 @@ Before a signed keeper transaction is broadcast, its hash, intended operation, c
 
 PostgreSQL serializes submissions across replicas sharing a signer. Keep at least two pool connections available: one holds the signer lock while independent journal writes commit before broadcast. The keeper counts confirmations and leaves database claim/delivery changes to indexed events. It does not perform rail second-step delivery or gas top-ups. TTL maintenance covers configured router tokens/routes and recent indexed transfer/claim entries; it is not a guarantee that every adapter or upstream storage entry remains live.
 
+Claim-settlement jobs are bounded to 20 items and submit one independently simulated and confirmed `settle_claim` transaction per claim, so one frozen or unavailable recipient does not fabricate success for other claims. Job results account for each decimal-string claim ID as confirmed, already settled, missing, or pending. A targeted `claimIds` batch accepts up to 20 unique unsigned decimal strings; IDs are never converted through JavaScript numbers. The router's current claim and recipient remain authoritative, and only its confirmed transaction plus indexed chain event changes settlement state.
+
 When simulation reports an archived Soroban footprint, the keeper submits the protocol's
 `restoreFootprint` operation for that exact footprint. Its signed public hash is journaled under
 the `restore` phase before broadcast. An uncertain restore blocks further signing until that
