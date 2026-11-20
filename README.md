@@ -449,3 +449,11 @@ column on an older deployment sets `known: false`, while retaining counts from a
 zero counts with unknown coverage are not evidence of zero failures. Other database errors fail
 the request. SQL returns only bounded categories and exact safe counts; raw hashes, addresses,
 provider messages, expected/observed diagnostics, endpoints, and credentials never become labels.
+
+### Durable worker run correlation
+
+Each indexer build has a generated execution UUID shared by its source and rail workers; each worker also has a distinct run UUID. Before a poll begins, `indexer_worker_run` records a running, partial job. Successful polls that still made progress remain partial; only a poll returning no eligible work records `caught_up`. Failure or interruption records `failed` or `stopped`. A killed process leaves its last running record visible, and a replacement process creates new identities without overwriting that history. A caught-up poll describes that worker's eligible queue at that time and cannot establish destination delivery.
+
+Migration `1793700000000_worker-run-correlation` adds the history table and nullable run references to Stellar scan journals, EVM scan provenance and rail transition history. `Database.transaction` binds the internal worker context with a parameterized, transaction-local setting; insert triggers record the reference in the same commit as the evidence. Rollback removes both evidence and links, and pooled connections clear the setting at transaction end. Existing records remain uncorrelated. Apply migrations and grant the API reader SELECT on `indexer_worker_run` before restarting a reader; no monetary precision, replay identity, delivery predicate or claim ownership changes.
+
+`/ready` and `/v1/metrics` expose at most 100 durable recent worker runs, safe UUIDs, partial/completed status, integer-string counters and correlated scan/verification-transition counts. Legacy heartbeats without a valid run UUID or an explicit caught-up observation remain unverified/partial. No provider URLs, raw metadata or credential-bearing IDs are included in this projection. Scheduled catch-up and process startup logs carry the execution UUID. Run the focused unit and dedicated PostgreSQL `worker-run-correlation.test.ts` suites plus the full check/build before deployment.
