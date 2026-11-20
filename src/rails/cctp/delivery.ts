@@ -10,10 +10,7 @@ import {
 } from "@hyperion/protocol";
 import type { Hex } from "viem";
 import type { Logger } from "pino";
-import {
-  isDestinationVerificationChain,
-  type AppConfig,
-} from "../../config/config.js";
+import { isDestinationVerificationChain, type AppConfig } from "../../config/config.js";
 import type { Queryable } from "../../db/pool.js";
 import { bigintOf, text, textOrNull } from "../../db/rows.js";
 import type { PendingTransfer, RailReport } from "../types.js";
@@ -176,9 +173,10 @@ export async function inspectCctpDelivery(
     failure,
     proofEvidence: null,
   });
+  const forwardTxHash = report.forwardTxHash;
   if (transfer.route !== RouteKind.Cctp || transfer.originChain !== "stellar-testnet")
     return noResult();
-  if (!report.forwardTxHash) return failed("forward_tx_missing");
+  if (!forwardTxHash) return failed("forward_tx_missing");
   if (!report.messageBytes) return failed("message_missing");
   if (report.messageBytes.length > 8192 || !/^0x(?:[0-9a-fA-F]{2})+$/.test(report.messageBytes))
     return failed("invalid_message");
@@ -254,7 +252,7 @@ export async function inspectCctpDelivery(
     destination.chainId,
     options.clientForUrl ?? destinationVerificationViemClient,
     async (client) => {
-      const receipt = await client.getTransactionReceipt({ hash: report.forwardTxHash! });
+      const receipt = await client.getTransactionReceipt({ hash: forwardTxHash });
       if (receipt.status !== "success") return failed("receipt_reverted");
       const head = await client.getBlockNumber();
       if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations))

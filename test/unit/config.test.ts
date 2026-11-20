@@ -261,9 +261,7 @@ describe("watch plan", () => {
     ],
   ])("rejects %s destination RPC overrides (%s)", (value) => {
     expect(
-      faultNames(() =>
-        loadConfig({ env: completeEnv({ EVM_DELIVERY_RPC_URLS_SEPOLIA: value }) }),
-      ),
+      faultNames(() => loadConfig({ env: completeEnv({ EVM_DELIVERY_RPC_URLS_SEPOLIA: value }) })),
     ).toContain("EVM_DELIVERY_RPC_URLS_SEPOLIA");
   });
 

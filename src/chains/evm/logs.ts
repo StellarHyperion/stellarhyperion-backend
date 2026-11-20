@@ -62,11 +62,7 @@ export async function fetchEvmLogsAdaptive(
     const midpoint = query.fromBlock + (query.toBlock - query.fromBlock) / 2n;
     if (midpoint < query.fromBlock || midpoint >= query.toBlock)
       throw new EvmLogRangeLimitError(query.fromBlock, query.toBlock, error);
-    const left = await fetchEvmLogsAdaptive(
-      client,
-      { ...query, toBlock: midpoint },
-      signal,
-    );
+    const left = await fetchEvmLogsAdaptive(client, { ...query, toBlock: midpoint }, signal);
     const right = await fetchEvmLogsAdaptive(
       client,
       { ...query, fromBlock: midpoint + MIN_PROVIDER_LOG_RANGE },

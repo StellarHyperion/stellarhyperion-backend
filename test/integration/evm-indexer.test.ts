@@ -66,10 +66,10 @@ suite("replaying the anvil deployment's logs", () => {
     const { logger } = capturingLogger();
     const client = new FakeEvmClient({ head: ANVIL_HEAD });
     const readLogs = client.logs.bind(client);
-    client.logs = (query, signal) =>
+    client.logs = (query) =>
       query.toBlock - query.fromBlock + 1n > BigInt(providerRangeLimit)
         ? Promise.reject(new Error("block range is too wide"))
-        : readLogs(query, signal);
+        : readLogs(query);
     const watcher = new EvmWatcher({
       chainKey: CHAIN,
       router: ANVIL_ROUTER,

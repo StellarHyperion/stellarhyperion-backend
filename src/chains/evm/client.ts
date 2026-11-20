@@ -12,10 +12,7 @@ import type { Logger } from "pino";
 import { createPublicClient, fallback, http, shouldThrow } from "viem";
 import type { Hex, PublicClient } from "viem";
 
-export type DestinationVerificationViemClient = Pick<
-  PublicClient,
-  "getChainId" | "getBlockNumber" | "getTransactionReceipt" | "getBlock" | "readContract"
->;
+export type DestinationVerificationViemClient = PublicClient;
 
 export interface DestinationRpcClient {
   getChainId(): Promise<number>;
@@ -57,7 +54,9 @@ export function destinationVerificationViemClient(
       ? undefined
       : (input, init) => {
           const combinedSignal =
-            init?.signal === undefined ? signal : AbortSignal.any([signal, init.signal]);
+            init?.signal === undefined || init.signal === null
+              ? signal
+              : AbortSignal.any([signal, init.signal]);
           return globalThis.fetch(input, { ...init, signal: combinedSignal });
         };
   return createPublicClient({
@@ -82,10 +81,12 @@ export async function withDestinationVerification<TClient extends DestinationRpc
   options: DestinationVerificationOptions,
 ): Promise<TResult> {
   let failure: DestinationVerificationRpcError["reason"] = "rpc_failure";
-  let result: TResult | undefined;
-  let hasResult = false;
-  const baselineReads: { readonly method: string; readonly args: unknown; readonly result: unknown }[] =
-    [];
+  let result: { readonly value: TResult } | undefined;
+  const baselineReads: {
+    readonly method: string;
+    readonly args: unknown;
+    readonly result: unknown;
+  }[] = [];
   for (let index = 0; index < urls.length; index += 1) {
     const url = urls[index];
     if (url === undefined) continue;
@@ -111,38 +112,38 @@ export async function withDestinationVerification<TClient extends DestinationRpc
             !["getTransactionReceipt", "getBlock", "readContract"].includes(String(property))
           )
             return value;
-          return (...args: readonly unknown[]) =>
-            Promise.resolve(Reflect.apply(value, target, [...args])).then((observed) => {
-              const read = {
-                method: String(property),
-                args: canonicalEvidence(args),
-                result: canonicalEvidence(observed),
-              };
-              const previous = baselineReads[readIndex];
-              if (
-                previous !== undefined &&
-                (previous.method !== read.method ||
-                  JSON.stringify(previous.args) !== JSON.stringify(read.args) ||
-                  JSON.stringify(previous.result) !== JSON.stringify(read.result))
-              )
-                throw new DestinationVerificationRpcError("inconsistent_evidence");
-              if (previous === undefined) baselineReads.push(read);
-              readIndex += 1;
-              return observed;
-            });
+          return (...args: readonly unknown[]): Promise<unknown> =>
+            Promise.resolve(Reflect.apply(value, target, [...args]) as unknown).then(
+              (observed: unknown): unknown => {
+                const read = {
+                  method: String(property),
+                  args: canonicalEvidence(args),
+                  result: canonicalEvidence(observed),
+                };
+                const previous = baselineReads[readIndex];
+                if (
+                  previous !== undefined &&
+                  (previous.method !== read.method ||
+                    JSON.stringify(previous.args) !== JSON.stringify(read.args) ||
+                    JSON.stringify(previous.result) !== JSON.stringify(read.result))
+                )
+                  throw new DestinationVerificationRpcError("inconsistent_evidence");
+                if (previous === undefined) baselineReads.push(read);
+                readIndex += 1;
+                return observed;
+              },
+            );
         },
       });
       const observedResult = await verify(trackedClient);
       signal.throwIfAborted();
       if (
-        hasResult &&
-        JSON.stringify(canonicalEvidence(result)) !== JSON.stringify(canonicalEvidence(observedResult))
+        result !== undefined &&
+        JSON.stringify(canonicalEvidence(result.value)) !==
+          JSON.stringify(canonicalEvidence(observedResult))
       )
         throw new DestinationVerificationRpcError("inconsistent_evidence");
-      if (!hasResult) {
-        result = observedResult;
-        hasResult = true;
-      }
+      result ??= { value: observedResult };
     } catch (error) {
       if (options.signal?.aborted) throw error;
       if (
@@ -177,7 +178,7 @@ export async function withDestinationVerification<TClient extends DestinationRpc
       }
     }
   }
-  if (hasResult) return result as TResult;
+  if (result !== undefined) return result.value;
   throw new DestinationVerificationRpcError(failure);
 }
 

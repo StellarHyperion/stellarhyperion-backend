@@ -18,12 +18,8 @@ import {
   toEvmAddress,
 } from "@hyperion/protocol";
 import { stringToHex } from "viem";
-import type { PublicClient } from "viem";
 import type { Logger } from "pino";
-import {
-  isDestinationVerificationChain,
-  type AppConfig,
-} from "../../config/config.js";
+import { isDestinationVerificationChain, type AppConfig } from "../../config/config.js";
 import type { Queryable, Transactional } from "../../db/pool.js";
 import { bigintOf, text } from "../../db/rows.js";
 import type { InboundRow, Position } from "../../chains/writers.js";
@@ -79,7 +75,7 @@ export interface AxelarCanonicalityClient {
 export interface RevalidationOptions {
   readonly signal?: AbortSignal;
   readonly clientForChain?: (chainKey: string) => AxelarCanonicalityClient;
-  readonly clientForUrl?: (url: string, signal?: AbortSignal) => AxelarCanonicalityClient;
+  readonly clientForUrl?: DestinationVerificationClientFactory<AxelarCanonicalityClient>;
   readonly logger?: Logger;
 }
 
@@ -110,7 +106,7 @@ export async function revalidateItsDeliveryProofs(
     )
       throw new Error("Axelar proof names an unsupported destination chain.");
     const chainConfig = CHAINS[chain];
-    const urls = config.destinationVerification.evmRpcUrls[chainConfig.key];
+    const urls = config.destinationVerification.evmRpcUrls[chain];
     const blockNumber = bigintOf(row, "receipt_block");
     const blockHash = text(row, "receipt_block_hash");
     const txHash = text(row, "execution_tx_hash") as `0x${string}`;
@@ -141,7 +137,11 @@ export async function revalidateItsDeliveryProofs(
           receipt.transactionHash.toLowerCase() === txHash.toLowerCase()
         );
       },
-      { signal: options.signal, logger: options.logger, chain },
+      {
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+        ...(options.logger === undefined ? {} : { logger: options.logger }),
+        chain,
+      },
     );
     options.signal?.throwIfAborted();
     const changed = await db.transaction(async (tx) => {
@@ -191,8 +191,7 @@ export async function revalidateItsDeliveryProofs(
 }
 
 function canonicalityClient(url: string, signal?: AbortSignal): AxelarCanonicalityClient {
-  const client: PublicClient = destinationVerificationViemClient(url, signal);
-  return client;
+  return destinationVerificationViemClient(url, signal);
 }
 
 // The rail API supplies a candidate receipt. Only matching confirmed chain events establish delivery.

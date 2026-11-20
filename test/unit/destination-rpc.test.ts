@@ -14,10 +14,10 @@ describe("destination verification RPC failover", () => {
     const calls: string[] = [];
     const clientForUrl = (url: string) => ({
       getChainId: () => Promise.resolve(chainId),
-      read: async (method: string) => {
+      read: (method: string): Promise<string> => {
         calls.push(`${url}:${method}`);
         if (url === urls[0] && method === "block") throw new Error("transport failure");
-        return method;
+        return Promise.resolve(method);
       },
     });
 
@@ -48,20 +48,16 @@ describe("destination verification RPC failover", () => {
     }));
 
     await expect(
-      withDestinationVerification(
-        urls,
-        chainId,
-        clientForUrl,
-        async () => "delivered",
-        { chain: "sepolia" },
-      ),
+      withDestinationVerification(urls, chainId, clientForUrl, () => Promise.resolve("delivered"), {
+        chain: "sepolia",
+      }),
     ).rejects.toBeInstanceOf(DestinationVerificationRpcError);
     expect(clientForUrl).toHaveBeenCalledTimes(2);
   });
 
   it("never runs proof reads on a wrong-network endpoint", async () => {
     const verify = vi.fn((client: { readonly getChainId: () => Promise<number> }) =>
-      Promise.resolve(client.getChainId()),
+      client.getChainId(),
     );
     const clientForUrl = (url: string) => ({
       getChainId: () => Promise.resolve(url === urls[0] ? 1 : 5),
@@ -85,7 +81,7 @@ describe("destination verification RPC failover", () => {
   it("fails closed when evidence differs between endpoints", async () => {
     const clientForUrl = (url: string) => ({
       getChainId: () => Promise.resolve(chainId),
-      getTransactionReceipt: () =>
+      getTransactionReceipt: (_args: { readonly hash: string }) =>
         Promise.resolve({ blockHash: url === urls[0] ? "0xaaa" : "0xbbb" }),
     });
 

@@ -12,10 +12,8 @@ import { describe, expect, it } from "vitest";
 import { EvmWatcher } from "../../src/chains/evm/watcher.js";
 import { MAX_OPEN_INGESTION_REJECTIONS } from "../../src/chains/writers.js";
 import { viemClient, type EvmClient, type RawEvmLog } from "../../src/chains/evm/client.js";
-import {
-  EvmLogRangeLimitError,
-  fetchEvmLogsAdaptive,
-} from "../../src/chains/evm/logs.js";
+import { fetchEvmLogsAdaptive } from "../../src/chains/evm/logs.js";
+import type { EvmLogRangeLimitError } from "../../src/chains/evm/logs.js";
 import {
   ANVIL_HISTORY,
   ANVIL_CHAIN_ID,
@@ -111,12 +109,14 @@ describe("the line it will not read past", () => {
     if (!sample) throw new Error("Expected captured EVM log fixture.");
     const queries: { fromBlock: bigint; toBlock: bigint }[] = [];
     const client = {
-      logs: async (query: { fromBlock: bigint; toBlock: bigint }) => {
+      logs: (query: { fromBlock: bigint; toBlock: bigint }): Promise<readonly RawEvmLog[]> => {
         queries.push(query);
         if (query.toBlock - query.fromBlock + 1n > 1n)
-          throw new Error("query returned more than the allowed number of results");
+          return Promise.reject(
+            new Error("query returned more than the allowed number of results"),
+          );
         const log = { ...sample, blockNumber: query.fromBlock, logIndex: 1 };
-        return [log, log];
+        return Promise.resolve([log, log]);
       },
     };
 

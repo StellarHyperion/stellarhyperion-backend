@@ -304,6 +304,13 @@ describe("independent real CCTP and ITS destination proof mutation corpus", () =
         cctp.expected.destinationMessenger.toLowerCase(),
       );
       if (rail === "ITS") {
+        const report: RailReport = {
+          status: "attested",
+          railStatus: "executed",
+          reference: null,
+          attestedAt: null,
+          execution: { txHash: hash, commandId: its.expected.commandId as Hex },
+        };
         evm.getTransactionReceipt.mockRejectedValueOnce(
           new Error("receipt temporarily unavailable"),
         );
@@ -338,8 +345,8 @@ describe("independent real CCTP and ITS destination proof mutation corpus", () =
           status: "success",
           blockNumber: 100n,
           transactionHash: hash,
-          blockHash: candidate.blockHash,
-          logs: candidate.logs,
+          blockHash: hash,
+          logs: [its.received, its.paid],
         });
         evm.getTransactionReceipt.mockRejectedValueOnce(new Error("primary unavailable"));
         stellar
@@ -354,9 +361,9 @@ describe("independent real CCTP and ITS destination proof mutation corpus", () =
           report,
         );
         expect(recovered).not.toBeNull();
-        expect(recovered !== null && "diagnostics" in recovered ? recovered.state : "verified").toBe(
-          "verified",
-        );
+        expect(
+          recovered !== null && "diagnostics" in recovered ? recovered.state : "verified",
+        ).toBe("verified");
         expect(evm.getTransactionReceipt).toHaveBeenCalledTimes(2);
 
         evm.getTransactionReceipt.mockClear().mockRejectedValue(new Error("all endpoints offline"));

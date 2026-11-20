@@ -52,12 +52,7 @@ import {
   type EvmFinalityPolicy,
   type EvmFinalityPolicyChange,
 } from "./store.js";
-import {
-  decodeRouterLog,
-  fetchEvmLogsAdaptive,
-  LogShapeError,
-  signatureOf,
-} from "./logs.js";
+import { decodeRouterLog, fetchEvmLogsAdaptive, LogShapeError, signatureOf } from "./logs.js";
 import type { EvmClient, RawEvmLog } from "./client.js";
 
 /**

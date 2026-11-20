@@ -58,8 +58,7 @@ export async function processClaimSettlement(
         );
   const claims = new Map(rows.map((row) => [bigintOf(row, "claim_id").toString(), row]));
   const orderedIds =
-    requestedIds?.map(String) ??
-    rows.map((row) => bigintOf(row, "claim_id").toString());
+    requestedIds?.map(String) ?? rows.map((row) => bigintOf(row, "claim_id").toString());
   const outcomes: ClaimSettlementItemResult[] = orderedIds.map((claimId) => {
     const row = claims.get(claimId);
     if (!row) return { claimId, outcome: "missing" };
