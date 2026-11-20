@@ -156,6 +156,7 @@ for a seeded history.
 ## API and checks
 
 - `GET /health`, `GET /ready`
+  `GET /health` reports liveness, network, hosting environment, database role, stable public configuration digest (`configDigest`), and effective-setting provenance (`configProvenance` reporting whether settings came from defaults, environment overrides, or deployment records, with secret redaction).
 - `GET /v1/transfers`, with sender/recipient/chain/route/search/limit/offset filters
 - `GET /v1/transfers/by-tx/:txHash`, `GET /v1/transfers/:originChain/:nonce`
 - `GET /v1/claims`, `GET /v1/claims/:chain/:claimId`

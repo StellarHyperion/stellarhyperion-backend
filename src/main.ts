@@ -92,6 +92,7 @@ async function main(): Promise<void> {
       port: config.http.port,
       network: config.network,
       deploymentsFile: config.deploymentsFile,
+      configDigest: config.configDigest,
       watchingStellar: config.indexer.stellar?.chain ?? null,
       watchingEvm: config.indexer.evm.map((entry) => entry.chain),
       workers: indexer.workers.map((worker) => worker.name),

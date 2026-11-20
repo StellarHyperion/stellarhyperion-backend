@@ -11,6 +11,7 @@
  * cast. That is the point of the shared package: there is one description of where Hyperion is
  * deployed, one validator for it, and the backend is not allowed its own opinion.
  */
+import { createHash } from "node:crypto";
 import { hostname } from "node:os";
 import { EXPECTED_SCHEMA_VERSION } from "../db/schema.js";
 import { readFileSync } from "node:fs";
@@ -122,6 +123,21 @@ export interface KeeperConfig {
   readonly stellarSecret: string | null;
 }
 
+export type ConfigSource = "default" | "env" | "deployment";
+
+export interface ConfigProvenanceEntry {
+  readonly name: string;
+  readonly source: ConfigSource;
+  readonly value: string;
+  readonly conflict?: string;
+}
+
+export type ConfigProvenanceReport = readonly ConfigProvenanceEntry[] & {
+  readonly digest?: string;
+  readonly configDigest?: string;
+  readonly provenance?: readonly ConfigProvenanceEntry[];
+};
+
 export interface AppConfig {
   readonly nodeEnv: NodeEnv;
   readonly deploymentEnvironment: DeploymentEnvironment;
@@ -146,6 +162,8 @@ export interface AppConfig {
   readonly catchUpEnabled: boolean;
   readonly indexerLeaseTtlMs: number;
   readonly indexerLeaseOwnerId: string;
+  readonly configDigest: string;
+  readonly configProvenance: ConfigProvenanceReport;
 }
 
 /** Injected so the unit suite can hand over a record without touching a disk or a process. */
@@ -262,6 +280,14 @@ const DEPLOYMENTS_FILE: VarSpec = {
   printable: true,
   purpose:
     "Path to the deployment record the contracts repo writes. Router addresses and start heights come from it, so the watchers never guess where to begin.",
+};
+
+const DEPLOYMENT_REVISION: VarSpec = {
+  name: "DEPLOYMENT_REVISION",
+  kind: "string",
+  required: false,
+  printable: true,
+  purpose: "Selected deployment bytecode commit revision from deployment record or environment.",
 };
 
 const INDEXER_ENABLED: VarSpec = {
@@ -804,6 +830,56 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   // One throw, after everything has had a chance to complain.
   reader.finish();
 
+  const provenanceEntries = buildProvenanceEntries({
+    reader,
+    network,
+    absoluteDeployments,
+    deployments,
+    nodeEnv,
+    deploymentEnvironment,
+    databaseEnvironment,
+    databaseRole,
+    logLevel,
+    host,
+    port,
+    indexerEnabled,
+    railsEnabled,
+    irisOverride,
+    axelarOverride,
+    railPollIntervalMs,
+    railBatchSize,
+    railRecheckAfterMs,
+    railMaxCheckFailures,
+    keeperEnabled,
+    keeperPollIntervalMs,
+    keeperConcurrency,
+    shutdownTimeoutMs,
+    schemaVersion,
+    catchUpBudgetMs,
+    catchUpEnabled,
+    indexerLeaseTtlMs,
+    indexerLeaseOwnerId,
+    deploymentMode,
+    readinessPolicy,
+    freshnessMaxScanLagMs,
+    freshnessMaxProofBacklogCount,
+    freshnessMaxProofBacklogAgeMs,
+    freshnessLanes,
+    stellarRpcOverride,
+    startLedgerOverride,
+    pageSize,
+    stellarPollIntervalMs,
+    evmPollIntervalMs,
+    evmFinalityMode,
+    evmFinalityAllowFallback,
+    logRange,
+    reorgDepthOverride,
+    indexer,
+  });
+
+  const configDigest = computeConfigDigest(provenanceEntries);
+  const configProvenanceReport = createProvenanceReport(provenanceEntries, configDigest);
+
   return {
     nodeEnv,
     deploymentEnvironment,
@@ -848,7 +924,387 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     catchUpEnabled,
     indexerLeaseTtlMs,
     indexerLeaseOwnerId,
+    configDigest,
+    configProvenance: configProvenanceReport,
   };
+}
+
+interface ProvenanceParams {
+  readonly reader: EnvReader;
+  readonly network: NetworkMode;
+  readonly absoluteDeployments: string;
+  readonly deployments: DeploymentSet;
+  readonly nodeEnv: NodeEnv;
+  readonly deploymentEnvironment: DeploymentEnvironment;
+  readonly databaseEnvironment: DeploymentEnvironment;
+  readonly databaseRole: DatabaseRole;
+  readonly logLevel: LogLevel;
+  readonly host: string;
+  readonly port: number;
+  readonly indexerEnabled: boolean;
+  readonly railsEnabled: boolean;
+  readonly irisOverride: string;
+  readonly axelarOverride: string;
+  readonly railPollIntervalMs: number;
+  readonly railBatchSize: number;
+  readonly railRecheckAfterMs: number;
+  readonly railMaxCheckFailures: number;
+  readonly keeperEnabled: boolean;
+  readonly keeperPollIntervalMs: number;
+  readonly keeperConcurrency: number;
+  readonly shutdownTimeoutMs: number;
+  readonly schemaVersion: string;
+  readonly catchUpBudgetMs: number;
+  readonly catchUpEnabled: boolean;
+  readonly indexerLeaseTtlMs: number;
+  readonly indexerLeaseOwnerId: string;
+  readonly deploymentMode: DeploymentMode;
+  readonly readinessPolicy: ReadinessDependencyPolicies;
+  readonly freshnessMaxScanLagMs: number;
+  readonly freshnessMaxProofBacklogCount: number;
+  readonly freshnessMaxProofBacklogAgeMs: number;
+  readonly freshnessLanes: Readonly<Record<string, Partial<LaneFreshnessTarget>>>;
+  readonly stellarRpcOverride: string;
+  readonly startLedgerOverride: number | null;
+  readonly pageSize: number;
+  readonly stellarPollIntervalMs: number;
+  readonly evmPollIntervalMs: number;
+  readonly evmFinalityMode: "confirmations" | "finalized";
+  readonly evmFinalityAllowFallback: boolean;
+  readonly logRange: number;
+  readonly reorgDepthOverride: number | null;
+  readonly indexer: IndexerConfig;
+}
+
+function extractDeploymentRevision(deployments: DeploymentSet): string | null {
+  for (const deployment of Object.values(deployments.networks)) {
+    if (deployment.commit.length > 0) {
+      return deployment.commit;
+    }
+  }
+  return null;
+}
+
+function buildProvenanceEntries(params: ProvenanceParams): ConfigProvenanceEntry[] {
+  const { reader, network, deployments } = params;
+  const entries: ConfigProvenanceEntry[] = [];
+
+  const add = (name: string, source: ConfigSource, value: string, conflict?: string): void => {
+    // Defense-in-depth: Never emit secret values or credential-bearing settings
+    if (
+      name === "DATABASE_URL" ||
+      name === "REDIS_URL" ||
+      name === "KEEPER_STELLAR_SECRET" ||
+      name === "STELLAR_HISTORICAL_RPC_URL" ||
+      /password|secret|database_url|redis_url/i.test(name)
+    ) {
+      return;
+    }
+    entries.push({
+      name,
+      source,
+      value,
+      ...(conflict ? { conflict } : {}),
+    });
+  };
+
+  add("NODE_ENV", reader.has("NODE_ENV") ? "env" : "default", params.nodeEnv);
+  add("VERCEL_ENV", reader.has("VERCEL_ENV") ? "env" : "default", params.deploymentEnvironment);
+  add(
+    "HYPERION_DATABASE_ENV",
+    reader.has("HYPERION_DATABASE_ENV") ? "env" : "default",
+    params.databaseEnvironment,
+  );
+  add(
+    "HYPERION_DATABASE_ROLE",
+    reader.has("HYPERION_DATABASE_ROLE") ? "env" : "default",
+    params.databaseRole,
+  );
+  add("LOG_LEVEL", reader.has("LOG_LEVEL") ? "env" : "default", params.logLevel);
+  add("HTTP_HOST", reader.has("HTTP_HOST") ? "env" : "default", params.host);
+  add("HTTP_PORT", reader.has("HTTP_PORT") ? "env" : "default", String(params.port));
+  add("HYPERION_NETWORK", reader.has("HYPERION_NETWORK") ? "env" : "default", params.network);
+  add(
+    "HYPERION_DEPLOYMENTS_FILE",
+    reader.has("HYPERION_DEPLOYMENTS_FILE") ? "env" : "default",
+    params.absoluteDeployments,
+  );
+
+  const deploymentRev = extractDeploymentRevision(deployments);
+  if (reader.has("DEPLOYMENT_REVISION")) {
+    const envRev = reader.string(DEPLOYMENT_REVISION);
+    const conflict =
+      deploymentRev !== null && envRev !== deploymentRev
+        ? `overrides deployment record revision ${deploymentRev}`
+        : undefined;
+    add("DEPLOYMENT_REVISION", "env", envRev, conflict);
+  } else if (deploymentRev !== null) {
+    add("DEPLOYMENT_REVISION", "deployment", deploymentRev);
+  } else {
+    add("DEPLOYMENT_REVISION", "default", "");
+  }
+
+  add(
+    "INDEXER_ENABLED",
+    reader.has("INDEXER_ENABLED") ? "env" : "default",
+    String(params.indexerEnabled),
+  );
+  add(
+    "RAILS_ENABLED",
+    reader.has("RAILS_ENABLED") ? "env" : "default",
+    String(params.railsEnabled),
+  );
+  add(
+    "IRIS_API_URL",
+    reader.has("IRIS_API_URL") ? "env" : "default",
+    params.irisOverride === "" ? IRIS_API[network] : params.irisOverride,
+  );
+  add(
+    "AXELAR_API_URL",
+    reader.has("AXELAR_API_URL") ? "env" : "default",
+    params.axelarOverride === "" ? AXELARSCAN_API[network] : params.axelarOverride,
+  );
+  add(
+    "RAIL_POLL_INTERVAL_MS",
+    reader.has("RAIL_POLL_INTERVAL_MS") ? "env" : "default",
+    String(params.railPollIntervalMs),
+  );
+  add(
+    "RAIL_BATCH_SIZE",
+    reader.has("RAIL_BATCH_SIZE") ? "env" : "default",
+    String(params.railBatchSize),
+  );
+  add(
+    "RAIL_RECHECK_AFTER_MS",
+    reader.has("RAIL_RECHECK_AFTER_MS") ? "env" : "default",
+    String(params.railRecheckAfterMs),
+  );
+  add(
+    "RAIL_MAX_CHECK_FAILURES",
+    reader.has("RAIL_MAX_CHECK_FAILURES") ? "env" : "default",
+    String(params.railMaxCheckFailures),
+  );
+  add(
+    "KEEPER_ENABLED",
+    reader.has("KEEPER_ENABLED") ? "env" : "default",
+    String(params.keeperEnabled),
+  );
+  add(
+    "KEEPER_POLL_INTERVAL_MS",
+    reader.has("KEEPER_POLL_INTERVAL_MS") ? "env" : "default",
+    String(params.keeperPollIntervalMs),
+  );
+  add(
+    "KEEPER_CONCURRENCY",
+    reader.has("KEEPER_CONCURRENCY") ? "env" : "default",
+    String(params.keeperConcurrency),
+  );
+  add(
+    "SHUTDOWN_TIMEOUT_MS",
+    reader.has("SHUTDOWN_TIMEOUT_MS") ? "env" : "default",
+    String(params.shutdownTimeoutMs),
+  );
+  add("SCHEMA_VERSION", reader.has("SCHEMA_VERSION") ? "env" : "default", params.schemaVersion);
+  add(
+    "CATCH_UP_BUDGET_MS",
+    reader.has("CATCH_UP_BUDGET_MS") ? "env" : "default",
+    String(params.catchUpBudgetMs),
+  );
+  add(
+    "CATCH_UP_ENABLED",
+    reader.has("CATCH_UP_ENABLED") ? "env" : "default",
+    String(params.catchUpEnabled),
+  );
+  add(
+    "INDEXER_LEASE_TTL_MS",
+    reader.has("INDEXER_LEASE_TTL_MS") ? "env" : "default",
+    String(params.indexerLeaseTtlMs),
+  );
+  add(
+    "INDEXER_LEASE_OWNER_ID",
+    reader.has("INDEXER_LEASE_OWNER_ID") ? "env" : "default",
+    params.indexerLeaseOwnerId,
+  );
+  add("DEPLOYMENT_MODE", reader.has("DEPLOYMENT_MODE") ? "env" : "default", params.deploymentMode);
+  add(
+    "READINESS_DB_POLICY",
+    reader.has("READINESS_DB_POLICY") ? "env" : "default",
+    params.readinessPolicy.database,
+  );
+  add(
+    "READINESS_INDEXER_POLICY",
+    reader.has("READINESS_INDEXER_POLICY") ? "env" : "default",
+    params.readinessPolicy.indexer,
+  );
+  add(
+    "READINESS_RAILS_POLICY",
+    reader.has("READINESS_RAILS_POLICY") ? "env" : "default",
+    params.readinessPolicy.rails,
+  );
+  add(
+    "READINESS_KEEPER_POLICY",
+    reader.has("READINESS_KEEPER_POLICY") ? "env" : "default",
+    params.readinessPolicy.keeper,
+  );
+  add(
+    "FRESHNESS_MAX_SCAN_LAG_MS",
+    reader.has("FRESHNESS_MAX_SCAN_LAG_MS") ? "env" : "default",
+    String(params.freshnessMaxScanLagMs),
+  );
+  add(
+    "FRESHNESS_MAX_PROOF_BACKLOG_COUNT",
+    reader.has("FRESHNESS_MAX_PROOF_BACKLOG_COUNT") ? "env" : "default",
+    String(params.freshnessMaxProofBacklogCount),
+  );
+  add(
+    "FRESHNESS_MAX_PROOF_BACKLOG_AGE_MS",
+    reader.has("FRESHNESS_MAX_PROOF_BACKLOG_AGE_MS") ? "env" : "default",
+    String(params.freshnessMaxProofBacklogAgeMs),
+  );
+  add(
+    "FRESHNESS_LANE_TARGETS",
+    reader.has("FRESHNESS_LANE_TARGETS") ? "env" : "default",
+    JSON.stringify(params.freshnessLanes),
+  );
+
+  const stellarDeployment = Object.values(deployments.networks).find(isStellarDeployment);
+  const stellarDefaultRpc = CHAINS["stellar-testnet"].defaultRpcUrl;
+  const stellarEffectiveRpc =
+    params.stellarRpcOverride === ""
+      ? (params.indexer.stellar?.rpcUrl ?? stellarDefaultRpc)
+      : params.stellarRpcOverride;
+  add("STELLAR_RPC_URL", reader.has("STELLAR_RPC_URL") ? "env" : "default", stellarEffectiveRpc);
+
+  const deploymentLedger = stellarDeployment ? stellarDeployment.deployedAt.ledger : null;
+  if (reader.has("STELLAR_START_LEDGER")) {
+    const val = String(params.startLedgerOverride ?? 0);
+    const conflict =
+      deploymentLedger !== null
+        ? `overrides deployment record start ledger ${deploymentLedger}`
+        : undefined;
+    add("STELLAR_START_LEDGER", "env", val, conflict);
+  } else if (deploymentLedger !== null) {
+    add("STELLAR_START_LEDGER", "deployment", String(deploymentLedger));
+  } else {
+    add("STELLAR_START_LEDGER", "default", "");
+  }
+
+  add(
+    "STELLAR_EVENT_PAGE_SIZE",
+    reader.has("STELLAR_EVENT_PAGE_SIZE") ? "env" : "default",
+    String(params.pageSize),
+  );
+  add(
+    "STELLAR_POLL_INTERVAL_MS",
+    reader.has("STELLAR_POLL_INTERVAL_MS") ? "env" : "default",
+    String(params.stellarPollIntervalMs),
+  );
+  add(
+    "EVM_POLL_INTERVAL_MS",
+    reader.has("EVM_POLL_INTERVAL_MS") ? "env" : "default",
+    String(params.evmPollIntervalMs),
+  );
+  add(
+    "EVM_FINALITY_MODE",
+    reader.has("EVM_FINALITY_MODE") ? "env" : "default",
+    params.evmFinalityMode,
+  );
+  add(
+    "EVM_FINALITY_ALLOW_FALLBACK",
+    reader.has("EVM_FINALITY_ALLOW_FALLBACK") ? "env" : "default",
+    String(params.evmFinalityAllowFallback),
+  );
+  add("EVM_LOG_RANGE", reader.has("EVM_LOG_RANGE") ? "env" : "default", String(params.logRange));
+  const effectiveReorg =
+    params.reorgDepthOverride !== null
+      ? String(params.reorgDepthOverride)
+      : params.indexer.evm[0]
+        ? String(params.indexer.evm[0].reorgDepth)
+        : "";
+  add(
+    "EVM_REORG_DEPTH_BLOCKS",
+    reader.has("EVM_REORG_DEPTH_BLOCKS") ? "env" : "default",
+    effectiveReorg,
+  );
+
+  // EVM RPC overrides per chain
+  const chains = chainsFor(network).filter(isEvmChain);
+  for (const chain of chains) {
+    const urlKey = `EVM_RPC_URL_${envSuffixFor(chain.key)}`;
+    const urlsKey = `EVM_RPC_URLS_${envSuffixFor(chain.key)}`;
+    const hasUrls = reader.has(urlsKey);
+    const hasUrl = reader.has(urlKey);
+    if (hasUrls) {
+      const urlsSpec = rpcUrlsOverrideSpec(chain.key);
+      const urlSpec = rpcOverrideSpec(chain.key);
+      add(urlsKey, "env", reader.string(urlsSpec), hasUrl ? `overrides ${urlKey}` : undefined);
+      if (hasUrl) {
+        add(urlKey, "env", reader.string(urlSpec), `overridden by ${urlsKey}`);
+      } else {
+        add(urlKey, "default", chain.defaultRpcUrl);
+      }
+    } else if (hasUrl) {
+      const urlSpec = rpcOverrideSpec(chain.key);
+      add(urlKey, "env", reader.string(urlSpec));
+    } else {
+      add(urlKey, "default", chain.defaultRpcUrl);
+    }
+  }
+
+  // Sort entries deterministically by name
+  entries.sort((a, b) => a.name.localeCompare(b.name));
+  return entries;
+}
+
+export function computeConfigDigest(entries: readonly ConfigProvenanceEntry[]): string {
+  const effective: Record<string, string> = {};
+  for (const entry of entries) {
+    effective[entry.name] = entry.value;
+  }
+  const sortedKeys = Object.keys(effective).sort();
+  const sortedObj: Record<string, string> = {};
+  for (const key of sortedKeys) {
+    sortedObj[key] = effective[key] ?? "";
+  }
+  return createHash("sha256").update(JSON.stringify(sortedObj)).digest("hex");
+}
+
+function createProvenanceReport(
+  entries: readonly ConfigProvenanceEntry[],
+  digest: string,
+): ConfigProvenanceReport {
+  const report = [...entries] as ConfigProvenanceEntry[] & {
+    digest?: string;
+    configDigest?: string;
+    provenance?: readonly ConfigProvenanceEntry[];
+  };
+  Object.defineProperty(report, "digest", {
+    value: digest,
+    enumerable: false,
+    configurable: true,
+  });
+  Object.defineProperty(report, "configDigest", {
+    value: digest,
+    enumerable: false,
+    configurable: true,
+  });
+  Object.defineProperty(report, "provenance", {
+    value: report,
+    enumerable: false,
+    configurable: true,
+  });
+  return Object.freeze(report);
+}
+
+function isAppConfig(input: unknown): input is AppConfig {
+  return typeof input === "object" && input !== null && "configProvenance" in input;
+}
+
+export function configProvenance(input?: AppConfig | LoadOptions): ConfigProvenanceReport {
+  if (isAppConfig(input)) {
+    return input.configProvenance;
+  }
+  return loadConfig(input).configProvenance;
 }
 
 function parseLaneTargets(
