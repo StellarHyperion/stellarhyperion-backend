@@ -71,7 +71,7 @@ export async function recordWorkerRun(
 /** Historical jobs remain separate after restart; public projections contain no raw metadata. */
 export async function readWorkerRuns(db: Queryable) {
   const { rows } = await db.query(
-    `SELECT r.run_id::text,r.execution_id::text,r.worker_name,r.worker_kind,r.chain_key,
+    `/* worker_run_history */ SELECT r.run_id::text,r.execution_id::text,r.worker_name,r.worker_kind,r.chain_key,
       r.state,r.started_at,r.updated_at,r.last_caught_up_at,r.stopped_at,
       r.successful_ticks::text,r.failed_ticks::text,
       (SELECT count(*)::integer FROM stellar_scan_journal j WHERE j.run_id=r.run_id) AS stellar_scans,

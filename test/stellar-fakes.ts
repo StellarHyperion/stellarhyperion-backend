@@ -256,6 +256,26 @@ export class RecordingDb implements Transactional {
     }
     if (text.includes("FROM indexer_worker_run r"))
       return Promise.resolve({ rows: this.workerRuns, rowCount: this.workerRuns.length });
+    if (text.includes("/* historical_coverage_snapshot */")) {
+      // This fake records gap state but does not model committed source coverage.
+      const count = (status: string) =>
+        String(this.gaps.filter((gap) => gap.status === status).length);
+      return Promise.resolve({
+        rows: [
+          {
+            snapshot: {
+              historyGaps: {
+                open: count("open"),
+                reconciling: count("reconciling"),
+                reconciled: count("reconciled"),
+              },
+              sources: [],
+            },
+          },
+        ],
+        rowCount: 1,
+      });
+    }
     if (text.includes("FROM indexer_cursor")) {
       return Promise.resolve({
         rows: this.cursorRow === null ? [] : [this.cursorRow],
