@@ -70,6 +70,20 @@ export type NodeEnv = "development" | "test" | "production";
 export type DeploymentEnvironment = "development" | "preview" | "production";
 export type DatabaseRole = "read-only" | "read-write";
 export type LogLevel = "trace" | "debug" | "info" | "warn" | "error" | "fatal";
+export type DestinationVerificationChain = "sepolia" | "base-sepolia" | "arc-testnet";
+
+const DESTINATION_VERIFICATION_CHAINS: readonly DestinationVerificationChain[] = [
+  "sepolia",
+  "base-sepolia",
+  "arc-testnet",
+];
+const MAX_DESTINATION_RPC_ENDPOINTS = 3;
+
+export function isDestinationVerificationChain(
+  chain: ChainKey,
+): chain is DestinationVerificationChain {
+  return DESTINATION_VERIFICATION_CHAINS.some((supported) => supported === chain);
+}
 
 /** Everything the Soroban watcher needs. One instance, because there is one Stellar per network. */
 export interface StellarWatchConfig {
@@ -162,6 +176,10 @@ export interface AppConfig {
   readonly network: NetworkMode;
   readonly deploymentsFile: string;
   readonly deployments: DeploymentSet;
+  /** Destination-only RPCs; independent of EVM watcher and router deployment settings. */
+  readonly destinationVerification: {
+    readonly evmRpcUrls: Readonly<Record<DestinationVerificationChain, readonly string[]>>;
+  };
   readonly indexer: IndexerConfig;
   readonly rails: RailsConfig;
   readonly keeper: KeeperConfig;
@@ -714,6 +732,17 @@ function rpcUrlsOverrideSpec(chain: ChainKey): VarSpec {
   };
 }
 
+function destinationRpcUrlsOverrideSpec(chain: DestinationVerificationChain): VarSpec {
+  return {
+    name: `EVM_DELIVERY_RPC_URLS_${envSuffixFor(chain)}`,
+    kind: "url",
+    protocols: ["http", "https"],
+    required: false,
+    printable: true,
+    purpose: `Destination-verification RPC endpoints for ${CHAINS[chain].name}, comma-separated. Defaults to the chain registry entry.`,
+  };
+}
+
 /**
  * Read the environment and the deployment record, or explain why not.
  *
@@ -808,6 +837,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const evmFinalityMode = reader.choice(EVM_FINALITY_MODE);
   const evmFinalityAllowFallback = reader.boolean(EVM_FINALITY_ALLOW_FALLBACK);
   const logRange = reader.integer(EVM_LOG_RANGE);
+  const destinationRpcUrls = destinationVerificationRpcUrls(reader, network);
   const reorgDepthOverride = reader.has(EVM_REORG_DEPTH.name)
     ? reader.integer(EVM_REORG_DEPTH)
     : null;
@@ -885,6 +915,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     network,
     deploymentsFile: absoluteDeployments,
     deployments,
+    destinationVerification: { evmRpcUrls: destinationRpcUrls },
     indexer,
     rails: {
       enabled: railsEnabled,
@@ -1102,6 +1133,10 @@ function buildProvenanceEntries(
       add("EVM_LOG_RANGE", watch.logRange);
     }
   }
+  for (const chain of DESTINATION_VERIFICATION_CHAINS) {
+    const name = destinationRpcUrlsOverrideSpec(chain).name;
+    endpoint(name, reader.provided(name) ? "env" : "default");
+  }
   if (config.indexer.enabled) add("INDEXER_LEASE_TTL_MS", config.indexerLeaseTtlMs);
   if (config.rails.enabled) {
     endpoint("IRIS_API_URL", reader.has("IRIS_API_URL") ? "env" : "default");
@@ -1313,6 +1348,32 @@ interface PlanInput {
   readonly logRange: number;
   readonly reorgDepthOverride: number | null;
   readonly env: Readonly<Record<string, string | undefined>>;
+}
+
+function destinationVerificationRpcUrls(
+  reader: EnvReader,
+  network: NetworkMode,
+): Record<DestinationVerificationChain, readonly string[]> {
+  const supported = new Set(chainsFor(network).map((chain) => chain.key));
+  const result = {} as Record<DestinationVerificationChain, readonly string[]>;
+  for (const chain of DESTINATION_VERIFICATION_CHAINS) {
+    const spec = destinationRpcUrlsOverrideSpec(chain);
+    if (!reader.provided(spec.name)) {
+      result[chain] = [CHAINS[chain].defaultRpcUrl];
+      continue;
+    }
+    if (!supported.has(chain)) {
+      reader.reject(spec, `is only supported for testnet destination verification`);
+      result[chain] = [CHAINS[chain].defaultRpcUrl];
+      continue;
+    }
+    const urls = reader.urls(spec);
+    if (urls.length > MAX_DESTINATION_RPC_ENDPOINTS) {
+      reader.reject(spec, `supports at most ${MAX_DESTINATION_RPC_ENDPOINTS} endpoints`);
+    }
+    result[chain] = urls.length > 0 ? urls : [CHAINS[chain].defaultRpcUrl];
+  }
+  return result;
 }
 
 function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {

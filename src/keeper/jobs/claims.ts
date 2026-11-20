@@ -1,25 +1,71 @@
 import { Address, nativeToScVal } from "@stellar/stellar-sdk";
 import { bigintOf } from "../../db/rows.js";
+import { sanitizeDiagnosticText } from "../../logging/logger.js";
 import { submitStellar } from "../stellar.js";
 import { recordKeeperSubmission } from "../outcomes.js";
-import type { ClaimSettlementPayload, ClaimSettlementResult, KeeperContext } from "../types.js";
+import type {
+  ClaimSettlementItemResult,
+  ClaimSettlementPayload,
+  ClaimSettlementResult,
+  KeeperContext,
+} from "../types.js";
+
+const MAX_CLAIM_SETTLEMENT_BATCH_SIZE = 20;
+const MAX_U64 = (1n << 64n) - 1n;
+
 export async function processClaimSettlement(
   ctx: KeeperContext,
   payload: ClaimSettlementPayload = {},
 ): Promise<ClaimSettlementResult> {
+  const limit = payload.limit ?? MAX_CLAIM_SETTLEMENT_BATCH_SIZE;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_CLAIM_SETTLEMENT_BATCH_SIZE)
+    throw new RangeError(
+      `Claim settlement batch size must be between 1 and ${MAX_CLAIM_SETTLEMENT_BATCH_SIZE}.`,
+    );
+  if (payload.claimIds !== undefined && !Array.isArray(payload.claimIds))
+    throw new TypeError("Claim settlement IDs must be an array.");
+  const requestedIds = payload.claimIds?.map(claimIdOf);
+  if (requestedIds !== undefined) {
+    if (requestedIds.length === 0 || requestedIds.length > MAX_CLAIM_SETTLEMENT_BATCH_SIZE)
+      throw new RangeError(
+        `Claim settlement batch must contain 1 to ${MAX_CLAIM_SETTLEMENT_BATCH_SIZE} IDs.`,
+      );
+    if (requestedIds.length > limit)
+      throw new RangeError("Claim settlement ID count exceeds the requested batch size.");
+    if (new Set(requestedIds.map(String)).size !== requestedIds.length)
+      throw new Error("Claim settlement batch contains duplicate IDs.");
+  }
   const chain = ctx.config.indexer.stellar;
   if (!chain)
     return {
       settled: 0,
       attempted: 0,
       pending: 0,
+      missing: 0,
+      claims: [],
       dryRun: true,
       detail: "No Stellar deployment configured.",
     };
-  const { rows } = await ctx.db.query(
-    "SELECT claim_id FROM pending_claim WHERE chain = $1 AND NOT settled ORDER BY claim_id ASC LIMIT $2",
-    [chain.chain, payload.limit ?? 20],
-  );
+  const { rows } =
+    requestedIds === undefined
+      ? await ctx.db.query(
+          "SELECT claim_id, settled FROM pending_claim WHERE chain = $1 AND NOT settled ORDER BY claim_id ASC LIMIT $2",
+          [chain.chain, limit],
+        )
+      : await ctx.db.query(
+          "SELECT claim_id, settled FROM pending_claim WHERE chain = $1 AND claim_id = ANY($2::bigint[]) ORDER BY claim_id ASC",
+          [chain.chain, requestedIds.map(String)],
+        );
+  const claims = new Map(rows.map((row) => [bigintOf(row, "claim_id").toString(), row]));
+  const orderedIds =
+    requestedIds?.map(String) ?? rows.map((row) => bigintOf(row, "claim_id").toString());
+  const outcomes: ClaimSettlementItemResult[] = orderedIds.map((claimId) => {
+    const row = claims.get(claimId);
+    if (!row) return { claimId, outcome: "missing" };
+    if (row.settled === true || row.settled === "true")
+      return { claimId, outcome: "already_settled" };
+    return { claimId, outcome: "pending" };
+  });
   if (ctx.config.keeper.stellarSecrets.length === 0) {
     await recordKeeperSubmission(ctx.db, {
       jobName: "claim-settlement",
@@ -29,14 +75,18 @@ export async function processClaimSettlement(
     return {
       settled: 0,
       attempted: 0,
-      pending: rows.length,
+      pending: outcomes.filter((claim) => claim.outcome === "pending").length,
+      missing: outcomes.filter((claim) => claim.outcome === "missing").length,
+      claims: outcomes,
       dryRun: true,
       detail: "No signer configured; no settlement was attempted.",
     };
   }
-  let settled = 0;
-  for (const row of rows) {
-    const id = bigintOf(row, "claim_id");
+  let attempted = 0;
+  for (let index = 0; index < outcomes.length; index += 1) {
+    const claim = outcomes[index];
+    if (claim?.outcome !== "pending") continue;
+    const id = BigInt(claim.claimId);
     try {
       const hash = await submitStellar(
         ctx.config,
@@ -49,19 +99,36 @@ export async function processClaimSettlement(
         { db: ctx.db, jobName: "claim-settlement" },
       );
       ctx.logger.info(
-        { claimId: String(id), hash },
+        { claimId: claim.claimId, hash },
         "claim settlement confirmed; watcher will update the claim record",
       );
-      settled += 1;
+      outcomes[index] = { claimId: claim.claimId, outcome: "confirmed", transactionHash: hash };
     } catch (error) {
-      ctx.logger.warn({ err: error, claimId: String(id) }, "claim is not ready for settlement");
+      const reason = sanitizeDiagnosticText(error instanceof Error ? error.message : String(error));
+      ctx.logger.warn({ reason, claimId: claim.claimId }, "claim settlement remains unverified");
     }
+    attempted += 1;
   }
+  const settled = outcomes.filter(
+    (claim) => claim.outcome === "confirmed" || claim.outcome === "already_settled",
+  ).length;
+  const pending = outcomes.filter((claim) => claim.outcome === "pending").length;
+  const missing = outcomes.filter((claim) => claim.outcome === "missing").length;
   return {
     settled,
-    attempted: rows.length,
-    pending: rows.length - settled,
+    attempted,
+    pending,
+    missing,
+    claims: outcomes,
     dryRun: false,
-    detail: `${settled} confirmed settlements of ${rows.length} attempts.`,
+    detail: `${settled} settled, ${missing} missing, and ${pending} pending across ${attempted} attempted claims.`,
   };
+}
+
+function claimIdOf(value: unknown): bigint {
+  if (typeof value !== "string" || !/^(0|[1-9]\d*)$/.test(value))
+    throw new TypeError("Claim IDs must be unsigned decimal strings.");
+  const id = BigInt(value);
+  if (id > MAX_U64) throw new RangeError("Claim ID exceeds the Stellar u64 range.");
+  return id;
 }

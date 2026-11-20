@@ -318,15 +318,22 @@ export class RailPass {
       null;
     let verificationFailure: CctpVerificationFailure | null = null;
     if (this.options.config) {
+      const verificationOptions = { signal, logger: this.options.logger };
       const its =
         report.execution || report.forwardTxHash
-          ? await verifyItsDelivery(this.options.config, db, transfer, report)
+          ? await verifyItsDelivery(this.options.config, db, transfer, report, verificationOptions)
           : null;
       diagnostics = its !== null && "diagnostics" in its ? its.diagnostics : [];
       itsVerificationState = its === null ? null : "diagnostics" in its ? its.state : "verified";
       let verified: VerifiedDelivery | null = its !== null && !("diagnostics" in its) ? its : null;
       if (!verified) {
-        const cctp = await inspectCctpDelivery(this.options.config, db, transfer, report);
+        const cctp = await inspectCctpDelivery(
+          this.options.config,
+          db,
+          transfer,
+          report,
+          verificationOptions,
+        );
         verified = cctp.delivery;
         verificationFailure = cctp.failure;
       }

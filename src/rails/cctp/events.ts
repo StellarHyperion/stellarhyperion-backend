@@ -41,6 +41,36 @@ export interface CctpMessageIdentity {
   readonly digest: Hex;
 }
 
+/**
+ * Canonical destination-chain evidence that this exact CCTP message was executed.
+ *
+ * Every field is a bounded public reference drawn from the destination receipt and block.
+ * No provider credential, URL path, or internal adapter address appears here.
+ *
+ * `txHash` and `blockNumber` are the canonical mint transaction and the block that
+ * confirmed it. `messageNonce` and `messageDigest` are the full-width identity of the
+ * exact message bytes that were consumed — not the eight-byte displayed nonce an explorer
+ * shows. A verifier that accepts a shorter nonce accepts a weaker identity.
+ */
+export interface CctpProofEvidence {
+  /** The destination transaction that executed the mint. Full 32-byte hex, 0x-prefixed. */
+  readonly txHash: Hex;
+  /** Block number on the destination chain that contains `txHash`, as an integer string. */
+  readonly blockNumber: string;
+  /** keccak256 hash of that block, used to confirm the block is canonical. */
+  readonly blockHash: Hex;
+  /** Log index of the USDC Transfer event within `txHash`. */
+  readonly mintLogIndex: number;
+  /** The full 32-byte CCTP nonce extracted from the executed message bytes. */
+  readonly messageNonce: Hex;
+  /** keccak256 of the exact message bytes, linking provider record to destination event. */
+  readonly messageDigest: Hex;
+  /** Net USDC amount minted after fees, as an integer string to avoid float imprecision. */
+  readonly mintAmount: string;
+  /** Destination chain key, e.g. "sepolia". */
+  readonly destinationChain: string;
+}
+
 export function cctpMessageIdentity(raw: string): CctpMessageIdentity | null {
   if (raw.length > 8192 || !/^0x(?:[0-9a-fA-F]{2})+$/.test(raw)) return null;
   try {
