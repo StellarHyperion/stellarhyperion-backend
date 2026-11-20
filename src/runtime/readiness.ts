@@ -14,7 +14,7 @@
 
 import type { Queryable } from "../db/pool.js";
 import { integer, json, text, textOrNull, timestamp, timestampOrNull } from "../db/rows.js";
-import { sanitizeDiagnosticText } from "../logging/logger.js";
+import { isSafeOperationIdentifier, sanitizeDiagnosticText } from "../logging/logger.js";
 
 export type ReadinessState = "ready" | "degraded" | "down";
 
@@ -214,6 +214,7 @@ export interface WorkerHeartbeatInput {
   readonly lastCursorBlock?: bigint | null;
   readonly consecutiveFailures: number;
   readonly lastError: string | null;
+  readonly runId?: string | null;
   readonly metadata?: Readonly<Record<string, unknown>>;
   readonly at?: Date;
 }
@@ -229,6 +230,7 @@ export interface WorkerHeartbeatRecord {
   readonly lastCursorBlock: string | null;
   readonly consecutiveFailures: number;
   readonly lastError: string | null;
+  readonly runId?: string | null;
   readonly metadata: Readonly<Record<string, unknown>>;
 }
 
@@ -317,6 +319,11 @@ export async function recordWorkerHeartbeat(
   ) {
     throw new RangeError("worker heartbeat identity is invalid or exceeds128 characters");
   }
+  const runId =
+    input.runId ?? (typeof input.metadata?.runId === "string" ? input.metadata.runId : null);
+  if (runId !== null && !isSafeOperationIdentifier(runId)) {
+    throw new RangeError("worker run identifier is invalid or exceeds 128 characters");
+  }
   if (
     !Number.isFinite(now.getTime()) ||
     now.getTime() > Date.now() + 30_000 ||
@@ -331,6 +338,14 @@ export async function recordWorkerHeartbeat(
     input.lastCursorBlock === undefined || input.lastCursorBlock === null
       ? null
       : input.lastCursorBlock.toString();
+
+  const rawMetadata: Record<string, unknown> = {
+    ...(input.metadata ?? {}),
+    completed: input.completed,
+  };
+  if (runId !== null) {
+    rawMetadata.runId = runId;
+  }
 
   await db.query(
     `INSERT INTO indexer_worker_heartbeat
@@ -368,7 +383,7 @@ export async function recordWorkerHeartbeat(
       cursorBlock,
       input.consecutiveFailures,
       lastError,
-      JSON.stringify(sanitizeHeartbeatMetadata(input.metadata ?? {})),
+      JSON.stringify(sanitizeHeartbeatMetadata(rawMetadata)),
     ],
   );
 }
@@ -387,6 +402,10 @@ export async function readWorkerHeartbeats(db: Queryable): Promise<WorkerHeartbe
       typeof rawMeta === "object" && rawMeta !== null && !Array.isArray(rawMeta)
         ? (rawMeta as Record<string, unknown>)
         : {};
+    const rawRunId =
+      typeof metadata.runId === "string" && isSafeOperationIdentifier(metadata.runId)
+        ? metadata.runId
+        : null;
     return {
       workerName: WORKER_ID.test(text(row, "worker_name"))
         ? text(row, "worker_name")
@@ -400,6 +419,7 @@ export async function readWorkerHeartbeats(db: Queryable): Promise<WorkerHeartbe
       lastCursorBlock: textOrNull(row, "last_cursor_block"),
       consecutiveFailures: integer(row, "consecutive_failures"),
       lastError: row.last_error === null ? null : sanitizeDiagnosticText(text(row, "last_error")),
+      runId: rawRunId,
       metadata: sanitizeHeartbeatMetadata(metadata),
     };
   });

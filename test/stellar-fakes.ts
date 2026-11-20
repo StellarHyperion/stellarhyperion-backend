@@ -201,6 +201,7 @@ export class RecordingDb implements Transactional {
     reconciled_at: Date | null;
   }[] = [];
   backfillRow: Record<string, unknown> | null = null;
+  readonly heartbeatRows: Record<string, unknown>[] = [];
   /** Set to make every statement inside the next transaction throw. */
   failInTransaction: Error | null = null;
 
@@ -222,6 +223,35 @@ export class RecordingDb implements Transactional {
         rows: this.cursorRow === null ? [] : [this.cursorRow],
         rowCount: this.cursorRow === null ? 0 : 1,
       });
+    }
+    if (text.includes("FROM indexer_worker_heartbeat")) {
+      return Promise.resolve({
+        rows: this.heartbeatRows,
+        rowCount: this.heartbeatRows.length,
+      });
+    }
+    if (text.includes("INSERT INTO indexer_worker_heartbeat")) {
+      const workerName = String(params[0]);
+      const existing = this.heartbeatRows.find((r) => r.worker_name === workerName);
+      const row: Record<string, unknown> = {
+        worker_name: workerName,
+        worker_kind: String(params[1]),
+        chain_key: params[2] ?? null,
+        state: String(params[3]),
+        detail: String(params[4]),
+        last_heartbeat_at: params[5],
+        last_completed_at: params[6] ?? existing?.last_completed_at ?? null,
+        last_cursor_block: params[7] ?? existing?.last_cursor_block ?? null,
+        consecutive_failures: Number(params[8]),
+        last_error: params[9] ?? null,
+        metadata: typeof params[10] === "string" ? JSON.parse(params[10]) : (params[10] ?? {}),
+      };
+      if (existing !== undefined) {
+        Object.assign(existing, row);
+      } else {
+        this.heartbeatRows.push(row);
+      }
+      return Promise.resolve({ rows: [], rowCount: 1 });
     }
     if (text.includes("INSERT INTO indexer_cursor") || text.includes("UPDATE indexer_cursor")) {
       if (text.includes("ON CONFLICT (chain_key) DO NOTHING")) {
@@ -457,6 +487,10 @@ export class RecordingDb implements Transactional {
   /** Statements matching a fragment, which is how a test names the one it cares about. */
   matching(fragment: string): readonly RecordedQuery[] {
     return this.queries.filter((entry) => entry.text.includes(fragment));
+  }
+
+  ping(): Promise<void> {
+    return Promise.resolve();
   }
 }
 

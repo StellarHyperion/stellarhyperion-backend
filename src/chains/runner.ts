@@ -56,6 +56,7 @@ const FAILURES_BEFORE_DEGRADED = 3;
 /** What every background component offers the runner. */
 export interface Worker extends ReadinessSource {
   readonly name: string;
+  readonly runId?: string;
   start(): void;
   stop(): Promise<void>;
 }
@@ -100,6 +101,7 @@ export class PolledWorker implements Worker {
   private readonly db: Transactional | undefined;
   private readonly workerKind: WorkerKind;
   private readonly chainKey: string | null;
+  readonly runId: string;
 
   constructor(
     private readonly pass: Pass,
@@ -110,6 +112,7 @@ export class PolledWorker implements Worker {
     this.db = options.db;
     this.workerKind = options.workerKind ?? "other";
     this.chainKey = options.chainKey ?? null;
+    this.runId = randomUUID();
     this.poller = new Poller({
       name: pass.name,
       intervalMs,
@@ -127,7 +130,10 @@ export class PolledWorker implements Worker {
         } finally {
           if (this.db !== undefined) {
             await this.persistHeartbeat(completed, error).catch((err: unknown) => {
-              logger.warn({ err, worker: pass.name }, "failed to persist worker heartbeat");
+              logger.warn(
+                { err, worker: pass.name, runId: this.runId },
+                "failed to persist worker heartbeat",
+              );
             });
           }
         }
@@ -156,7 +162,9 @@ export class PolledWorker implements Worker {
             : null,
       consecutiveFailures,
       lastError: completed ? null : error instanceof Error ? error.message : String(error),
+      runId: this.runId,
       metadata: {
+        runId: this.runId,
         ticks: stats.ticks,
         running: stats.running,
       },

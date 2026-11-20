@@ -16,7 +16,7 @@
 import type { FastifyInstance } from "fastify";
 
 import type { ServerDeps } from "../server.js";
-import type { ReadinessReport } from "../../runtime/readiness.js";
+import type { ReadinessReport, WorkerHeartbeatRecord } from "../../runtime/readiness.js";
 import {
   checkRedisHealth,
   evaluateReadiness,
@@ -66,9 +66,10 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
       }
     }
 
+    let heartbeats: WorkerHeartbeatRecord[] = [];
     if (dbCheck.state !== "down") {
       try {
-        const heartbeats = await readWorkerHeartbeats(deps.db);
+        heartbeats = await readWorkerHeartbeats(deps.db);
         const now = new Date();
         if (deps.config.indexer.enabled) {
           const expectedChains = [
@@ -107,6 +108,20 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
       }
     }
 
+    const runCorrelation = heartbeats.map((hb: WorkerHeartbeatRecord) => {
+      const metaCompleted = hb.metadata.completed;
+      const partial =
+        metaCompleted === false ||
+        hb.lastCompletedAt === null ||
+        hb.lastCompletedAt.getTime() < hb.lastHeartbeatAt.getTime();
+      const metaRunId = hb.metadata.runId;
+      return {
+        workerName: hb.workerName,
+        runId: hb.runId ?? (typeof metaRunId === "string" ? metaRunId : null),
+        partial,
+      };
+    });
+
     const evaluated = evaluateReadiness(checks, deps.config.readinessPolicy);
     // Degraded still serves. One stalled chain watcher is a reason to alert, not a reason to stop
     // answering questions about the three chains that are fine.
@@ -119,6 +134,7 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
       policy: deps.config.readinessPolicy,
       indexer: deps.config.indexer.enabled ? "enabled" : "disabled",
       checks: evaluated.checks,
+      runCorrelation,
     });
   });
 }

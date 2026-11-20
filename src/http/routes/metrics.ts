@@ -99,6 +99,10 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       if (freshness.stale) staleWorkers += 1;
       if (freshness.report.state === "degraded") degradedWorkers += 1;
       if (freshness.report.state === "down") downWorkers += 1;
+      const completedTicks =
+        typeof hb.metadata.ticks === "number" && Number.isSafeInteger(hb.metadata.ticks)
+          ? hb.metadata.ticks
+          : 0;
       return {
         name: hb.workerName,
         kind: hb.workerKind,
@@ -112,6 +116,8 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
         lastError: hb.lastError,
         stale: freshness.stale,
         ageSeconds: freshness.ageSeconds,
+        runId: hb.runId ?? (typeof hb.metadata.runId === "string" ? hb.metadata.runId : null),
+        completedTicks,
       };
     });
 
