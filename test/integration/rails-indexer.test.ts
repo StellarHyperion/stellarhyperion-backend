@@ -44,6 +44,22 @@ suite("rail pollers against real Postgres", () => {
 
   beforeEach(clean);
 
+  const settleWithin = async <T>(work: Promise<T>, ms: number): Promise<T | "timeout"> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        work,
+        new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => {
+            resolve("timeout");
+          }, ms);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
+
   afterAll(async () => {
     await clean();
     await db.close();
@@ -470,7 +486,7 @@ suite("rail pollers against real Postgres", () => {
         tx,
         {
           chainKey: ORIGIN_CHAIN,
-          block: nonce,
+          block: 1_010n,
           txHash: `0xretry${nonce}`,
           logIndex: 0,
           observedAt: new Date(),
@@ -483,6 +499,33 @@ suite("rail pollers against real Postgres", () => {
           grossAmount: 1001000n,
           fee: 1000n,
           netAmount: 1000000n,
+          destinationChain: DESTINATION_CHAIN,
+          destination: "0x2222222222222222222222222222222222222222",
+          railRef: "0x0000",
+        },
+      );
+    });
+  }
+
+  async function seedWideTransfer(nonce: bigint, netAmount: bigint): Promise<void> {
+    await db.transaction(async (tx) => {
+      await writeOutbound(
+        tx,
+        {
+          chainKey: ORIGIN_CHAIN,
+          block: 1_009n,
+          txHash: `0xwide${nonce.toString(16)}`,
+          logIndex: 0,
+          observedAt: new Date(),
+        },
+        {
+          route: 0,
+          nonce,
+          sender: "0x1111111111111111111111111111111111111111",
+          token: "0x3333333333333333333333333333333333333333",
+          grossAmount: netAmount + 1_000n,
+          fee: 1_000n,
+          netAmount,
           destinationChain: DESTINATION_CHAIN,
           destination: "0x2222222222222222222222222222222222222222",
           railRef: "0x0000",
@@ -603,6 +646,146 @@ suite("rail pollers against real Postgres", () => {
         maxCheckFailures: 5,
       }),
     ).toHaveLength(1);
+  });
+
+  it("bounds a provider read that ignores the signal and leaves the transfer for a fresh pass", async () => {
+    const nonce = 2n ** 64n + 11n;
+    const netAmount = 2n ** 80n + 2n;
+    await seedWideTransfer(nonce, netAmount);
+    const { logger } = capturingLogger();
+    const controller = new AbortController();
+    let started!: () => void;
+    const startedPromise = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let calls = 0;
+    const tick = new RailPass({
+      route: 0,
+      client: {
+        rail: "cctp",
+        look: (): Promise<RailLookup> => {
+          calls += 1;
+          started();
+          return new Promise<RailLookup>(() => undefined);
+        },
+      },
+      db,
+      logger,
+      batchSize: 1,
+      recheckAfterMs: 60_000,
+      maxCheckFailures: 5,
+    }).tick(controller.signal);
+    await startedPromise;
+    controller.abort();
+
+    const outcome = await settleWithin(
+      tick.then(
+        () => "resolved" as const,
+        () => "rejected" as const,
+      ),
+      2_000,
+    );
+    expect(outcome).toBe("rejected");
+    expect(calls).toBe(1);
+    expect((await db.query("SELECT * FROM rail_attestation")).rows).toHaveLength(0);
+
+    const seen: bigint[] = [];
+    await new RailPass({
+      route: 0,
+      client: {
+        rail: "cctp",
+        look: (transfer: PendingTransfer): Promise<RailLookup> => {
+          seen.push(transfer.nonce);
+          return Promise.resolve({ kind: "missing" });
+        },
+      },
+      db,
+      logger,
+      batchSize: 1,
+      recheckAfterMs: 60_000,
+      maxCheckFailures: 5,
+    }).tick(new AbortController().signal);
+    expect(seen).toEqual([nonce]);
+
+    const { rows } = await db.query(
+      `SELECT a.status, a.retry_class, t.nonce, t.net_amount::text AS net_amount
+         FROM rail_attestation a
+         JOIN outbound_transfer t ON t.id = a.transfer_id
+        WHERE t.route = 0`,
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.status).toBe("pending");
+    expect(rows[0]?.retry_class).toBeNull();
+    expect(rows[0]?.nonce).toBe(nonce.toString());
+    expect(rows[0]?.net_amount).toBe(netAmount.toString());
+  });
+
+  it("stops immediate evaluation on shutdown without recording a failure", async () => {
+    const nonce = 2n ** 64n + 12n;
+    await seedRetry(nonce);
+    const { logger } = capturingLogger();
+    const shutdown = new AbortController();
+    const pending = await pendingForRail(db, {
+      route: 0,
+      limit: 1,
+      now: new Date(),
+      notCheckedSince: new Date(0),
+      maxCheckFailures: 5,
+    });
+    const transfer = pending.find((candidate) => candidate.nonce === nonce);
+    expect(transfer).toBeDefined();
+    if (transfer === undefined) return;
+
+    let started!: () => void;
+    const startedPromise = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const evaluating = new RailPass({
+      route: 0,
+      client: {
+        rail: "cctp",
+        look: (): Promise<RailLookup> => {
+          started();
+          return new Promise<RailLookup>(() => undefined);
+        },
+      },
+      db,
+      logger,
+      batchSize: 1,
+      recheckAfterMs: 60_000,
+      maxCheckFailures: 5,
+      shutdownSignal: shutdown.signal,
+    }).evaluateTransfer(transfer.transferId);
+    await startedPromise;
+    shutdown.abort();
+
+    const outcome = await settleWithin(
+      evaluating.then(
+        () => "resolved" as const,
+        () => "rejected" as const,
+      ),
+      2_000,
+    );
+    expect(outcome).toBe("resolved");
+    expect((await db.query("SELECT * FROM rail_attestation")).rows).toHaveLength(0);
+
+    const seen: bigint[] = [];
+    await new RailPass({
+      route: 0,
+      client: {
+        rail: "cctp",
+        look: (candidate: PendingTransfer): Promise<RailLookup> => {
+          seen.push(candidate.nonce);
+          return Promise.resolve({ kind: "missing" });
+        },
+      },
+      db,
+      logger,
+      batchSize: 1,
+      recheckAfterMs: 60_000,
+      maxCheckFailures: 5,
+    }).tick(new AbortController().signal);
+    expect(seen).toEqual([nonce]);
   });
 
   it("does not settle a parked or wrong-recipient destination event", async () => {

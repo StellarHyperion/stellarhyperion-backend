@@ -21,6 +21,7 @@ import type { AxelarDeliveryEvidenceRow } from "../chains/writers.js";
  * second would spend those five minutes refreshing the block.
  */
 import type { AppConfig } from "../config/config.js";
+import { abortable, combinedSignal } from "./cancellation.js";
 import { revalidateItsDeliveryProofs, verifyItsDelivery } from "./axelar/delivery.js";
 import type { VerificationDiagnostic } from "./axelar/events.js";
 import { inspectCctpDelivery } from "./cctp/delivery.js";
@@ -50,6 +51,7 @@ import {
   type RailClient,
   type RailRetryClass,
   type CctpVerificationFailure,
+  type RailCancellationOptions,
 } from "./types.js";
 
 /**
@@ -62,7 +64,7 @@ import {
 const BACKLOG_MULTIPLE_BEFORE_DEGRADED = 3;
 const MAX_RETRY_DELAY_MS = 60 * 60 * 1000;
 
-export interface RailPassOptions {
+export interface RailPassOptions extends RailCancellationOptions {
   readonly route: number;
   readonly client: RailClient;
   readonly db: Transactional;
@@ -156,6 +158,8 @@ export class RailPass {
   /** One pass. Returns true when it filled a batch, which means there is more behind it. */
   async tick(signal: AbortSignal): Promise<boolean> {
     const { db, logger, batchSize, client } = this.options;
+    const effective = this.effectiveSignal(signal);
+    effective.throwIfAborted();
 
     const cooldown = this.cooldownUntil;
     if (cooldown !== null && cooldown > this.now()) return false;
@@ -166,7 +170,10 @@ export class RailPass {
       this.options.route === RouteKind.AxelarIts &&
       client.rail === "axelar"
     )
-      await revalidateItsDeliveryProofs(this.options.config, db, batchSize, { signal });
+      await abortable(
+        revalidateItsDeliveryProofs(this.options.config, db, batchSize, { signal: effective }),
+        effective,
+      );
 
     let checked = 0;
     let settled = 0;
@@ -177,7 +184,7 @@ export class RailPass {
 
     // One locked transfer per transaction: replicas skip active work and cannot commit stale
     // schedules. A crash rolls back the claim; no process-local ownership survives a restart.
-    while (selected < batchSize && !signal.aborted) {
+    while (selected < batchSize && !effective.aborted) {
       const outcome = await db.transaction(async (tx) => {
         const queue = await pendingForRail(tx, {
           route: this.options.route,
@@ -187,16 +194,17 @@ export class RailPass {
           maxCheckFailures: this.options.maxCheckFailures,
           lock: true,
           excludedTransferIds: seen,
+          signal: effective,
         });
         const transfer = queue[0];
         if (!transfer) return "empty";
         selected += 1;
         seen.push(transfer.transferId);
         try {
-          if (await this.handle(transfer, tx, signal)) settled += 1;
+          if (await this.handle(transfer, tx, effective)) settled += 1;
           checked += 1;
         } catch (error) {
-          signal.throwIfAborted();
+          effective.throwIfAborted();
           failures += 1;
           await this.recordFailure(transfer, error, tx);
           if (error instanceof RailError && error.kind === "rateLimited") {
@@ -214,6 +222,7 @@ export class RailPass {
       if (outcome !== "processed") break;
     }
 
+    effective.throwIfAborted();
     const outstanding = await outstandingForRail(db, this.options.route);
     this.lastProgress = { checked, settled, failures, outstanding, at: this.now() };
 
@@ -225,7 +234,7 @@ export class RailPass {
     }
 
     // A full batch means the queue is longer than one pass, so come straight back.
-    return selected >= batchSize && !stoppedForCooldown;
+    return selected >= batchSize && !stoppedForCooldown && !effective.aborted;
   }
 
   /** Re-evaluate one reopened transfer immediately, without changing its source identity. */
@@ -233,7 +242,8 @@ export class RailPass {
     transferId: bigint,
     signal: AbortSignal = new AbortController().signal,
   ): Promise<boolean> {
-    if (signal.aborted) return false;
+    const effective = this.effectiveSignal(signal);
+    if (effective.aborted) return false;
     const cooldown = this.cooldownUntil;
     if (cooldown !== null && cooldown > this.now()) return false;
     return this.options.db.transaction(async (tx) => {
@@ -242,12 +252,13 @@ export class RailPass {
         this.options.route,
         transferId,
         this.options.maxCheckFailures,
+        effective,
       );
       if (transfer === null) return false;
       try {
-        return await this.handle(transfer, tx, signal);
+        return await this.handle(transfer, tx, effective);
       } catch (error) {
-        signal.throwIfAborted();
+        if (effective.aborted) return false;
         await this.recordFailure(transfer, error, tx);
         if (error instanceof RailError && error.kind === "rateLimited") {
           this.cooldownUntil = this.failureRetryAt(this.now(), transfer.retryAttempts + 1, error);
@@ -284,7 +295,7 @@ export class RailPass {
       return true;
     }
 
-    const lookup = await this.options.client.look(transfer, signal);
+    const lookup = await abortable(this.options.client.look(transfer, signal), signal);
     signal.throwIfAborted();
     if (lookup.kind === "missing") {
       // Normal. The rail has not indexed the burn yet, which is where every transfer starts.
@@ -320,13 +331,18 @@ export class RailPass {
     if (this.options.config) {
       const its =
         report.execution || report.forwardTxHash
-          ? await verifyItsDelivery(this.options.config, db, transfer, report)
+          ? await abortable(verifyItsDelivery(this.options.config, db, transfer, report), signal)
           : null;
+      signal.throwIfAborted();
       diagnostics = its !== null && "diagnostics" in its ? its.diagnostics : [];
       itsVerificationState = its === null ? null : "diagnostics" in its ? its.state : "verified";
       let verified: VerifiedDelivery | null = its !== null && !("diagnostics" in its) ? its : null;
       if (!verified) {
-        const cctp = await inspectCctpDelivery(this.options.config, db, transfer, report);
+        const cctp = await abortable(
+          inspectCctpDelivery(this.options.config, db, transfer, report),
+          signal,
+        );
+        signal.throwIfAborted();
         verified = cctp.delivery;
         verificationFailure = cctp.failure;
       }
@@ -369,6 +385,7 @@ export class RailPass {
       transfer.status === "attested" && candidateStatus === "pending"
         ? "attested"
         : candidateStatus;
+    signal.throwIfAborted();
     await this.write(db, transfer, {
       status,
       railStatus: report.railStatus,
@@ -498,6 +515,10 @@ export class RailPass {
         ? Math.min(Math.max(1_000, finiteDelay), 8_640_000_000_000_000 - at.getTime())
         : Math.min(Math.max(1_000, finiteDelay), MAX_RETRY_DELAY_MS);
     return new Date(at.getTime() + delay);
+  }
+
+  private effectiveSignal(signal: AbortSignal): AbortSignal {
+    return combinedSignal(signal, this.options.shutdownSignal);
   }
 
   private now(): Date {

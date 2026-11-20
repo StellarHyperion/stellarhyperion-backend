@@ -172,6 +172,10 @@ export interface RailClient {
   look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup>;
 }
 
+export interface RailCancellationOptions {
+  readonly shutdownSignal?: AbortSignal;
+}
+
 export type MissingProofStage =
   "provider_discovery" | "destination_receipt_verification" | "attestation_reconciliation";
 
