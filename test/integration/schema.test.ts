@@ -663,14 +663,15 @@ suite("ingestion rejections", () => {
          VALUES ($1, 'evm', '0xrouter', 1, '0xtx', 'check', $2, true, $3, $4::jsonb)`,
         [chainKey, errorClass, detail, payload],
       );
+    // Thunks, so each insert starts only when awaited and no rejection goes unhandled.
     for (const attempt of [
-      insert("postgresql://u:p@db/hyperion", "{}"),
-      insert("api_key=abc", "{}"),
-      insert("ok", JSON.stringify({ blob: "z".repeat(5000) })),
-      insert("ok", "[]"),
-      insert("ok", "{}", "provider_status"),
+      () => insert("postgresql://u:p@db/hyperion", "{}"),
+      () => insert("api_key=abc", "{}"),
+      () => insert("ok", JSON.stringify({ blob: "z".repeat(5000) })),
+      () => insert("ok", "[]"),
+      () => insert("ok", "{}", "provider_status"),
     ]) {
-      await expect(attempt).rejects.toSatisfy((error) => codeOf(error) === CHECK_VIOLATION);
+      await expect(attempt()).rejects.toSatisfy((error) => codeOf(error) === CHECK_VIOLATION);
     }
   });
 });

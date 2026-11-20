@@ -153,7 +153,13 @@ suite("migration upgrade fixtures", () => {
   it("rolls back a failed monetary upgrade and resumes from the unchanged recorded boundary", async () => {
     const directory = await mkdtemp(resolve(tmpdir(), "hyperion-upgrade-boundary-"));
     await cp(MIGRATIONS, directory, { recursive: true });
-    const file = resolve(directory, "1793400000000_fault-boundary.sql");
+    // Always one step after the newest shipped migration, so the fault fixture never sorts before
+    // a real migration and trips checkOrder as new migrations land.
+    const newest = (await readdir(MIGRATIONS))
+      .filter((name) => /^\d{13}_.+\.sql$/.test(name))
+      .map((name) => BigInt(name.slice(0, 13)))
+      .reduce((max, value) => (value > max ? value : max), 0n);
+    const file = resolve(directory, `${String(newest + 100000000n)}_fault-boundary.sql`);
     const before = await client.query(
       `SELECT name FROM ${SCHEMA}.schema_migrations ORDER BY run_on,id`,
     );

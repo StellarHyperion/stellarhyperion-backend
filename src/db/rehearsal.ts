@@ -66,9 +66,9 @@ export interface RehearsalJoinFingerprint {
   }[];
   /** Provenance links per materialized record kind and role. */
   readonly links: Readonly<Record<string, number>>;
-  /** Links whose materialized record does not exist. Must be zero. */
+  /** Links whose materialized record does not exist. A restore must preserve this count. */
   readonly danglingLinks: number;
-  /** Arrivals whose source transfer does not exist. Must be zero. */
+  /** Arrivals whose source transfer does not exist. A restore must preserve this count. */
   readonly danglingDeliveries: number;
 }
 
@@ -426,9 +426,15 @@ export async function validateRehearsalRestore(
   }
   if (JSON.stringify(actual.joins) !== JSON.stringify(manifest.joins))
     mismatches.push("joins: cursor or provenance join fingerprint differs");
-  if (actual.joins.danglingLinks !== 0)
-    mismatches.push(`joins: ${String(actual.joins.danglingLinks)} dangling provenance links`);
-  if (actual.joins.danglingDeliveries !== 0)
-    mismatches.push(`joins: ${String(actual.joins.danglingDeliveries)} dangling deliveries`);
+  // Links have no foreign key to their record (a reorg may remove a row), so a faithful restore
+  // preserves the source's dangling count rather than requiring zero.
+  if (actual.joins.danglingLinks !== manifest.joins.danglingLinks)
+    mismatches.push(
+      `joins: dangling provenance links ${String(manifest.joins.danglingLinks)} -> ${String(actual.joins.danglingLinks)}`,
+    );
+  if (actual.joins.danglingDeliveries !== manifest.joins.danglingDeliveries)
+    mismatches.push(
+      `joins: dangling deliveries ${String(manifest.joins.danglingDeliveries)} -> ${String(actual.joins.danglingDeliveries)}`,
+    );
   return { ok: mismatches.length === 0, mismatches };
 }

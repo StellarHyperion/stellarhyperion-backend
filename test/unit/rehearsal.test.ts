@@ -300,7 +300,7 @@ describe("backup and restore rehearsal", () => {
           "count admin_action: expected 1, restored 0",
           "digest stellar-testnet: history digest differs",
           "joins: cursor or provenance join fingerprint differs",
-          "joins: 1 dangling provenance links",
+          "joins: dangling provenance links 0 -> 1",
         ]),
       );
     } finally {
