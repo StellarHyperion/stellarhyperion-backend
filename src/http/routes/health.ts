@@ -45,6 +45,8 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
     databaseEnvironment: deps.config.databaseEnvironment,
     databaseRole: deps.config.databaseRole,
     uptimeSeconds: Math.floor((Date.now() - startedAt.getTime()) / 1000),
+    configDigest: deps.config.configDigest,
+    configProvenance: deps.config.configProvenance,
   }));
 
   app.get("/ready", async (_request, reply) => {

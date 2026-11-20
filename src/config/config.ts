@@ -11,6 +11,7 @@
  * cast. That is the point of the shared package: there is one description of where Hyperion is
  * deployed, one validator for it, and the backend is not allowed its own opinion.
  */
+import { createHash } from "node:crypto";
 import { hostname } from "node:os";
 import { EXPECTED_SCHEMA_VERSION } from "../db/schema.js";
 import { readFileSync } from "node:fs";
@@ -124,6 +125,23 @@ export interface KeeperConfig {
   readonly activeSigner: string | null;
 }
 
+export type ConfigSource = "default" | "env" | "deployment";
+
+export interface ConfigProvenanceEntry {
+  readonly name: string;
+  readonly source: ConfigSource;
+  readonly value: string;
+  readonly conflict?: string;
+  /** Diagnostic-only entries never affect the effective public digest. */
+  readonly effective?: boolean;
+}
+
+export type ConfigProvenanceReport = readonly ConfigProvenanceEntry[] & {
+  readonly digest?: string;
+  readonly configDigest?: string;
+  readonly provenance?: readonly ConfigProvenanceEntry[];
+};
+
 export interface AppConfig {
   readonly nodeEnv: NodeEnv;
   readonly deploymentEnvironment: DeploymentEnvironment;
@@ -148,6 +166,8 @@ export interface AppConfig {
   readonly catchUpEnabled: boolean;
   readonly indexerLeaseTtlMs: number;
   readonly indexerLeaseOwnerId: string;
+  readonly configDigest: string;
+  readonly configProvenance: ConfigProvenanceReport;
 }
 
 /** Injected so the unit suite can hand over a record without touching a disk or a process. */
@@ -264,6 +284,14 @@ const DEPLOYMENTS_FILE: VarSpec = {
   printable: true,
   purpose:
     "Path to the deployment record the contracts repo writes. Router addresses and start heights come from it, so the watchers never guess where to begin.",
+};
+
+const DEPLOYMENT_REVISION: VarSpec = {
+  name: "DEPLOYMENT_REVISION",
+  kind: "string",
+  required: false,
+  printable: false,
+  purpose: "Optional expected deployment commit; it does not select different deployment bytes.",
 };
 
 const INDEXER_ENABLED: VarSpec = {
@@ -831,10 +859,13 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     ? parseLaneTargets(reader, reader.string(FRESHNESS_LANE_TARGETS))
     : {};
 
-  // One throw, after everything has had a chance to complain.
-  reader.finish();
+  const expectedRevision = reader.has(DEPLOYMENT_REVISION.name)
+    ? reader.string(DEPLOYMENT_REVISION)
+    : null;
+  if (expectedRevision !== null && !/^[0-9a-fA-F]{7,40}$/.test(expectedRevision))
+    reader.reject(DEPLOYMENT_REVISION, "must be a hexadecimal Git commit revision");
 
-  return {
+  const resolved: ResolvedConfig = {
     nodeEnv,
     deploymentEnvironment,
     databaseEnvironment,
@@ -881,6 +912,264 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     indexerLeaseTtlMs,
     indexerLeaseOwnerId,
   };
+  const entries = buildProvenanceEntries(reader, resolved, expectedRevision);
+  // Every value and selected revision is validated before the public report escapes.
+  reader.finish();
+  const configDigest = computeConfigDigest(entries);
+  return {
+    ...resolved,
+    configDigest,
+    configProvenance: createProvenanceReport(entries, configDigest),
+  };
+}
+
+type ResolvedConfig = Omit<AppConfig, "configDigest" | "configProvenance">;
+
+function canonicalJson(value: unknown): string {
+  const canonical = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(canonical);
+    if (typeof item !== "object" || item === null) return item;
+    return Object.fromEntries(
+      Object.entries(item)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, entry]) => [key, canonical(entry)]),
+    );
+  };
+  return JSON.stringify(canonical(value));
+}
+
+/** Explicit projection: URLs, opaque strings, paths and process identity never enter it. */
+function buildProvenanceEntries(
+  reader: EnvReader,
+  config: ResolvedConfig,
+  expectedRevision: string | null,
+): ConfigProvenanceEntry[] {
+  const entries: ConfigProvenanceEntry[] = [];
+  const add = (
+    name: string,
+    value: string | number | boolean,
+    source?: ConfigSource,
+    conflict?: string,
+  ): void => {
+    entries.push({
+      name,
+      value: String(value),
+      source: source ?? (reader.has(name) ? "env" : "default"),
+      ...(conflict === undefined ? {} : { conflict }),
+    });
+  };
+  const endpoint = (name: string, source: ConfigSource, conflict?: string): void => {
+    entries.push({
+      name,
+      source,
+      value: "omitted",
+      effective: false,
+      ...(conflict === undefined ? {} : { conflict }),
+    });
+  };
+  add("NODE_ENV", config.nodeEnv);
+  add("VERCEL_ENV", config.deploymentEnvironment);
+  add("HYPERION_DATABASE_ENV", config.databaseEnvironment);
+  add("HYPERION_DATABASE_ROLE", config.databaseRole);
+  add("LOG_LEVEL", config.logLevel);
+  add("HTTP_PORT", config.http.port);
+  add("HYPERION_NETWORK", config.network);
+  add("DEPLOYMENT_MODE", config.deploymentMode);
+  add("INDEXER_ENABLED", config.indexer.enabled);
+  add("RAILS_ENABLED", config.rails.enabled);
+  add("KEEPER_ENABLED", config.keeper.enabled);
+  add("SHUTDOWN_TIMEOUT_MS", config.shutdownTimeoutMs);
+  add("SCHEMA_VERSION", config.schemaVersion);
+  add("CATCH_UP_ENABLED", config.catchUpEnabled);
+  if (config.catchUpEnabled) add("CATCH_UP_BUDGET_MS", config.catchUpBudgetMs);
+  for (const [dependency, value] of Object.entries(config.readinessPolicy))
+    add(
+      `READINESS_${dependency.toUpperCase() === "DATABASE" ? "DB" : dependency.toUpperCase()}_POLICY`,
+      value,
+    );
+
+  const selected = [
+    config.indexer.stellar?.chain,
+    ...config.indexer.evm.map((watch) => watch.chain),
+  ]
+    .filter((chain): chain is ChainKey => chain !== undefined)
+    .sort();
+  const revisions: Record<string, string> = {};
+  for (const chain of selected) {
+    const deployment = config.deployments.networks[chain];
+    if (deployment === undefined) continue;
+    if (!/^[0-9a-fA-F]{7,40}$/.test(deployment.commit)) {
+      reader.reject(
+        DEPLOYMENTS_FILE,
+        "selected deployment commit must be a hexadecimal Git revision",
+      );
+      continue;
+    }
+    revisions[chain] = deployment.commit.toLowerCase();
+    add(`DEPLOYMENT_ROUTER_${envSuffixFor(chain)}`, deployment.router, "deployment");
+    add(`DEPLOYMENT_REVISION_${envSuffixFor(chain)}`, revisions[chain], "deployment");
+    for (const token of Object.values(deployment.tokens)) {
+      const address = "sacId" in token ? token.sacId : token.address;
+      add(
+        `DEPLOYMENT_TOKEN_${envSuffixFor(chain)}_${address}`,
+        canonicalJson({
+          address,
+          decimals: token.decimals,
+          flowLimit: String(token.flowLimit),
+          routes: [...token.routes].sort(),
+        }),
+        "deployment",
+      );
+    }
+    // Only validated chain/route/address identities, never arbitrary deployment metadata.
+    for (const [route, address] of Object.entries(deployment.adapters))
+      if (
+        Object.values(RouteKind).some((kind) => String(kind) === route) &&
+        typeof address === "string"
+      )
+        add(
+          `DEPLOYMENT_ADAPTER_${envSuffixFor(chain)}_${route.toUpperCase().replaceAll("-", "_")}`,
+          address,
+          "deployment",
+        );
+  }
+  const commits = [...new Set(Object.values(revisions))];
+  add(
+    "DEPLOYMENT_REVISION",
+    commits.length === 1 ? (commits[0] ?? "") : canonicalJson(revisions),
+    selected.length > 0 ? "deployment" : "default",
+    expectedRevision !== null && commits.some((commit) => commit !== expectedRevision.toLowerCase())
+      ? "DEPLOYMENT_REVISION expectation conflicts with selected deployment records; selected bytes are unchanged"
+      : undefined,
+  );
+
+  const stellar = config.indexer.stellar;
+  if (stellar !== null) {
+    endpoint("STELLAR_RPC_URL", reader.has("STELLAR_RPC_URL") ? "env" : "default");
+    if (config.indexer.enabled) {
+      const deployment = config.deployments.networks[stellar.chain];
+      const ledger =
+        deployment !== undefined && isStellarDeployment(deployment)
+          ? deployment.deployedAt.ledger
+          : null;
+      add(
+        "STELLAR_START_LEDGER",
+        stellar.startLedger,
+        reader.has("STELLAR_START_LEDGER") ? "env" : "deployment",
+        ledger !== null && ledger !== stellar.startLedger
+          ? "overrides deployment record start ledger"
+          : undefined,
+      );
+      add("STELLAR_EVENT_PAGE_SIZE", stellar.pageSize);
+      add("STELLAR_POLL_INTERVAL_MS", stellar.pollIntervalMs);
+    }
+  }
+  for (const watch of config.indexer.evm) {
+    const suffix = envSuffixFor(watch.chain);
+    const single = `EVM_RPC_URL_${suffix}`,
+      multiple = `EVM_RPC_URLS_${suffix}`;
+    endpoint(
+      reader.has(multiple) ? multiple : single,
+      reader.has(multiple) || reader.has(single) ? "env" : "default",
+      reader.has(multiple) && reader.has(single) ? `overrides ${single}` : undefined,
+    );
+    if (reader.has(multiple) && reader.has(single))
+      endpoint(single, "env", `ignored because ${multiple} is selected`);
+    if (config.indexer.enabled) {
+      add(`EVM_START_BLOCK_${suffix}`, String(watch.startBlock), "deployment");
+      add(`EVM_CONFIRMATIONS_${suffix}`, watch.confirmations, "default");
+      add(
+        `EVM_REORG_DEPTH_BLOCKS_${suffix}`,
+        watch.reorgDepth,
+        reader.has("EVM_REORG_DEPTH_BLOCKS") ? "env" : "default",
+      );
+      add("EVM_POLL_INTERVAL_MS", watch.pollIntervalMs);
+      add("EVM_FINALITY_MODE", watch.finalityMode ?? "confirmations");
+      add("EVM_FINALITY_ALLOW_FALLBACK", watch.allowFinalityFallback ?? false);
+      add("EVM_LOG_RANGE", watch.logRange);
+    }
+  }
+  if (config.indexer.enabled) add("INDEXER_LEASE_TTL_MS", config.indexerLeaseTtlMs);
+  if (config.rails.enabled) {
+    endpoint("IRIS_API_URL", reader.has("IRIS_API_URL") ? "env" : "default");
+    endpoint("AXELAR_API_URL", reader.has("AXELAR_API_URL") ? "env" : "default");
+    add("RAIL_POLL_INTERVAL_MS", config.rails.pollIntervalMs);
+    add("RAIL_BATCH_SIZE", config.rails.batchSize);
+    add("RAIL_RECHECK_AFTER_MS", config.rails.recheckAfterMs);
+    add("RAIL_MAX_CHECK_FAILURES", config.rails.maxCheckFailures);
+  }
+  if (config.keeper.enabled) {
+    add("KEEPER_POLL_INTERVAL_MS", config.keeper.pollIntervalMs);
+    add("KEEPER_CONCURRENCY", config.keeper.concurrency);
+  }
+  const defaults = config.freshnessSlo.defaults;
+  add("FRESHNESS_MAX_SCAN_LAG_MS", defaults.maxSourceScanLagMs);
+  add("FRESHNESS_MAX_PROOF_BACKLOG_COUNT", defaults.maxProofBacklogCount);
+  add("FRESHNESS_MAX_PROOF_BACKLOG_AGE_MS", defaults.maxProofBacklogAgeMs);
+  // Resolve only supported lane names; arbitrary operator keys cannot become public strings.
+  const chainNames = chainsFor(config.network).map((chain) => chain.key);
+  for (const origin of chainNames) {
+    for (const lane of [origin, ...chainNames.map((destination) => `${origin}->${destination}`)]) {
+      const override = config.freshnessSlo.lanes[lane];
+      if (override === undefined) continue;
+      const effective = { ...defaults, ...override };
+      if (canonicalJson(effective) !== canonicalJson(defaults))
+        add(`FRESHNESS_TARGET_${lane}`, canonicalJson(effective), "env");
+    }
+  }
+  return entries.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export function computeConfigDigest(entries: readonly ConfigProvenanceEntry[]): string {
+  const effective: Record<string, string> = {};
+  for (const entry of entries) {
+    if (entry.effective === false) continue;
+    effective[entry.name] = entry.value;
+  }
+  const sortedKeys = Object.keys(effective).sort();
+  const sortedObj: Record<string, string> = {};
+  for (const key of sortedKeys) {
+    sortedObj[key] = effective[key] ?? "";
+  }
+  return createHash("sha256").update(JSON.stringify(sortedObj)).digest("hex");
+}
+
+function createProvenanceReport(
+  entries: readonly ConfigProvenanceEntry[],
+  digest: string,
+): ConfigProvenanceReport {
+  const report = [...entries] as ConfigProvenanceEntry[] & {
+    digest?: string;
+    configDigest?: string;
+    provenance?: readonly ConfigProvenanceEntry[];
+  };
+  Object.defineProperty(report, "digest", {
+    value: digest,
+    enumerable: false,
+    configurable: true,
+  });
+  Object.defineProperty(report, "configDigest", {
+    value: digest,
+    enumerable: false,
+    configurable: true,
+  });
+  Object.defineProperty(report, "provenance", {
+    value: report,
+    enumerable: false,
+    configurable: true,
+  });
+  return Object.freeze(report);
+}
+
+function isAppConfig(input: unknown): input is AppConfig {
+  return typeof input === "object" && input !== null && "configProvenance" in input;
+}
+
+export function configProvenance(input?: AppConfig | LoadOptions): ConfigProvenanceReport {
+  if (isAppConfig(input)) {
+    return input.configProvenance;
+  }
+  return loadConfig(input).configProvenance;
 }
 
 function parseLaneTargets(

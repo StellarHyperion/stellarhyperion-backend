@@ -180,6 +180,16 @@ for a seeded history.
 ## API and checks
 
 - `GET /health`, `GET /ready`
+  `GET /health` reports hosting environment, database role, a stable public configuration digest
+  (`configDigest`) and effective-setting provenance (`configProvenance`). The report uses selected
+  deployment routers and per-chain commits, with safe names for conflicting overrides.
+  `DEPLOYMENT_REVISION` is an expected Git commit and never replaces the selected deployment
+  record. Endpoints are reported only as omitted values and their source; database credentials,
+  signer material, host/path/process identity and arbitrary metadata are excluded. The digest
+  covers public effective settings and selected deployment identities, excluding endpoint
+  credentials, diagnostic-only overrides and tuning for disabled workers. Equivalent explicit
+  defaults and reordered JSON targets therefore share a digest. Provider health does not
+  establish destination delivery.
 - `GET /v1/transfers`, with sender/recipient/chain/route/search/limit/offset filters. Responses
   also include an opaque `nextCursor`; pass it back with the same filters for stable keyset
   pagination. Cursors are scoped to the descending transfer-id order and reject mismatched filters.
