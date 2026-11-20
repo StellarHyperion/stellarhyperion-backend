@@ -33,6 +33,7 @@ import type {
   AttestationStatus,
 } from "../types.js";
 import { RailError } from "../types.js";
+import { sanitizeRailDiagnostic } from "../diagnostics.js";
 import { cctpMessageIdentity } from "./events.js";
 
 /** Circle's own status values. */
@@ -505,7 +506,7 @@ function safeRailPart(value: unknown): string | null {
     typeof value !== "string" ||
     value.length > 64 ||
     !/^[A-Za-z0-9_. -]+$/.test(value) ||
-    /\b(?:api[_-]?key|token|secret|password|authorization)\b/i.test(value)
+    /\b(?:api[_-]?key|token|secret|password|authorization|credential)\b/i.test(value)
   )
     return null;
   return value;
@@ -613,9 +614,11 @@ async function describeError(response: Response): Promise<string> {
       message?: unknown;
     };
     // Two shapes, both real: the reference documents `{code, message}` and the sandbox returns
-    // `{error}`.
-    if (typeof body.error === "string") return body.error;
-    if (typeof body.message === "string") return body.message;
+    // `{error}`. Redact any sensitive details or credentials from provider responses.
+    if (typeof body.error === "string")
+      return sanitizeRailDiagnostic(body.error) ?? "no reason given";
+    if (typeof body.message === "string")
+      return sanitizeRailDiagnostic(body.message) ?? "no reason given";
     return "no reason given";
   } catch (error) {
     if (error instanceof IrisResourceLimitError) throw error;
@@ -689,7 +692,8 @@ function messageLimitViolation(message: IrisMessage): string | null {
 }
 
 function describe(cause: unknown): string {
-  return cause instanceof Error ? cause.message : String(cause);
+  const raw = cause instanceof Error ? cause.message : String(cause);
+  return sanitizeRailDiagnostic(raw) ?? "unknown error";
 }
 
 export { PENDING as IRIS_PENDING, COMPLETE as IRIS_COMPLETE, RATE_LIMIT_COOLDOWN_MS };
