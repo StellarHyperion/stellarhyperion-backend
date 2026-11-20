@@ -34,6 +34,8 @@ class MockDb {
       });
     if (text.includes("/* proof_rejection_metrics */"))
       return Promise.resolve({ rows: [], rowCount: 0 });
+    if (text.includes("/* worker_run_history */"))
+      return Promise.resolve({ rows: [], rowCount: 0 });
     for (const [key, rows] of Object.entries(this.queryMap)) {
       if (text.includes(key)) {
         if (text.includes("WHERE t.id = $1") && params.length > 0) {

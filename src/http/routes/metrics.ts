@@ -17,6 +17,7 @@ import {
 import type { ServerDeps } from "../server.js";
 import { readProofRejectionMetrics } from "../proof-rejection-metrics.js";
 import { readKeeperSubmissionMetrics } from "../../keeper/outcomes.js";
+import { readWorkerRuns } from "../../runtime/worker-runs.js";
 
 export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
@@ -103,6 +104,10 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       if (freshness.stale) staleWorkers += 1;
       if (freshness.report.state === "degraded") degradedWorkers += 1;
       if (freshness.report.state === "down") downWorkers += 1;
+      const completedTicks =
+        typeof hb.metadata.ticks === "number" && Number.isSafeInteger(hb.metadata.ticks)
+          ? hb.metadata.ticks
+          : 0;
       return {
         name: hb.workerName,
         kind: hb.workerKind,
@@ -116,6 +121,8 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
         lastError: hb.lastError,
         stale: freshness.stale,
         ageSeconds: freshness.ageSeconds,
+        runId: hb.runId ?? null,
+        completedTicks,
       };
     });
 
@@ -161,6 +168,7 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       database,
       deploymentMode: deps.config.deploymentMode,
       workers,
+      workerRuns: await readWorkerRuns(db),
       freshness: {
         totalWorkers: workers.length,
         staleWorkers,

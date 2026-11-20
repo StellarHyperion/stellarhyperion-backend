@@ -80,7 +80,10 @@ async function main(): Promise<void> {
   // starts first makes its initial RPC calls while nothing can report on them.
   if (config.catchUpEnabled) {
     await runBudgetedCatchUp(indexer.workers, config.catchUpBudgetMs, async (reason) => {
-      logger.info({ reason }, "scheduled catch-up stages complete; committed progress retained");
+      logger.info(
+        { reason, executionId: indexer.executionId ?? null },
+        "scheduled catch-up stages complete; committed progress retained",
+      );
       await shutdown.run(reason);
     });
     return;
@@ -91,7 +94,9 @@ async function main(): Promise<void> {
       host: config.http.host,
       port: config.http.port,
       network: config.network,
+      executionId: indexer.executionId ?? null,
       deploymentsFile: config.deploymentsFile,
+      configDigest: config.configDigest,
       watchingStellar: config.indexer.stellar?.chain ?? null,
       watchingEvm: config.indexer.evm.map((entry) => entry.chain),
       workers: indexer.workers.map((worker) => worker.name),

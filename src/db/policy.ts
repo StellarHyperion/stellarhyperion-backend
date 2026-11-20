@@ -13,6 +13,7 @@ export const API_READ_TABLES = [
   "route_health",
   "indexer_cursor",
   "indexer_worker_heartbeat",
+  "indexer_worker_run",
   "stellar_history_gap",
   "indexed_history_digest",
   "axelar_delivery_evidence",
