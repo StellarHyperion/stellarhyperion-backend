@@ -10,6 +10,7 @@
 import { describe, expect, it } from "vitest";
 
 import { EvmWatcher } from "../../src/chains/evm/watcher.js";
+import { MAX_OPEN_INGESTION_REJECTIONS } from "../../src/chains/writers.js";
 import { viemClient, type EvmClient, type RawEvmLog } from "../../src/chains/evm/client.js";
 import {
   ANVIL_HISTORY,
@@ -77,6 +78,14 @@ function cursorRow(
 }
 
 /** Cursor writes, read back from the parameters rather than from the watcher's own cache. */
+function rawCursorWrites(db: RecordingDb) {
+  return db.queries.filter(
+    (entry) =>
+      entry.text.includes("INSERT INTO indexer_cursor") ||
+      entry.text.includes("UPDATE indexer_cursor"),
+  );
+}
+
 function cursorWrites(db: RecordingDb): { block: bigint; family: string; hash: string | null }[] {
   // writeCursor takes (chain_key, family, contract, last_processed, last_processed_at, hash).
   return db.queries
@@ -505,7 +514,40 @@ describe("an arrival, which the capture has none of", () => {
     expect(db.matching("INSERT INTO inbound_delivery")).toHaveLength(0);
     expect(db.matching("INSERT INTO pending_claim")).toHaveLength(0);
     expect(db.matching("INSERT INTO evm_log_quarantine")).toHaveLength(100);
+    // The raw diagnostic is capped, but every excluded log keeps a durable rejection in the
+    // transaction that advances the cursor, so none is passed silently.
+    const rejections = db.matching("INSERT INTO ingestion_rejection");
+    expect(rejections).toHaveLength(120);
+    const cursorTx = rawCursorWrites(db)[0]?.transaction;
+    expect(cursorTx).not.toBeNull();
+    expect(rejections.every((entry) => entry.transaction === cursorTx)).toBe(true);
+    expect(rejections[0]?.params).toEqual(
+      expect.arrayContaining(["evm", "ordering_conflict", false]),
+    );
     expect(cursorWrites(db)).toHaveLength(1);
+  });
+
+  it("advances no cursor past a rejection when the open rejection bound is reached", async () => {
+    const [parked, inbound] = parkedDelivery(60n);
+    if (!parked || !inbound) throw new Error("missing pair");
+    const { watcher, db } = harness({
+      client: new FakeEvmClient({
+        head: 100n,
+        logs: [
+          { ...inbound, logIndex: 0 },
+          { ...parked, logIndex: 1 },
+        ],
+      }),
+      confirmations: 0,
+    });
+    db.openRejections = MAX_OPEN_INGESTION_REJECTIONS;
+    await watcher.tick(AbortSignal.timeout(5_000)).catch(() => undefined);
+    expect(db.matching("INSERT INTO ingestion_rejection")).toHaveLength(0);
+    expect(
+      rawCursorWrites(db).filter(
+        (entry) => entry.transaction !== null && db.commits.includes(entry.transaction),
+      ),
+    ).toHaveLength(0);
   });
 
   it("normalizes provider enumeration order before pairing a valid arrival", async () => {

@@ -33,6 +33,7 @@ import type {
   AttestationStatus,
 } from "../types.js";
 import { RailError } from "../types.js";
+import { cctpMessageIdentity } from "./events.js";
 
 /** Circle's own status values. */
 const PENDING = "pending_confirmations";
@@ -388,7 +389,20 @@ export function reportFor(message: IrisMessage): RailReport {
         : typeof message.rawMessage === "string"
           ? message.rawMessage
           : null;
-  const messageBytes = rawMessage !== null && rawMessage.length <= 8192 ? rawMessage : null;
+  const candidateBytes = rawMessage !== null && rawMessage.length <= 8192 ? rawMessage : null;
+  // Bind the provider record to the exact message it carries. A provider nonce that contradicts
+  // the message's own full nonce means the record cannot be trusted to describe that message, so
+  // the message is withheld rather than attributed to a reference it does not belong to.
+  const identity = candidateBytes === null ? null : cctpMessageIdentity(candidateBytes);
+  const eventNonce =
+    typeof message.eventNonce === "string"
+      ? safeReference(message.eventNonce)
+      : typeof message.eventNonce === "number" && Number.isSafeInteger(message.eventNonce)
+        ? String(message.eventNonce)
+        : null;
+  const consistent = identity === null || providerNonceMatches(eventNonce, identity.nonce);
+  const messageBytes = consistent ? candidateBytes : null;
+  const reference = identity !== null ? (consistent ? identity.nonce : null) : nonce;
 
   let attestationSignature: string | null = null;
   if (
@@ -457,15 +471,33 @@ export function reportFor(message: IrisMessage): RailReport {
       : {}),
     status: mapped,
     railStatus,
-    reference: nonce,
+    reference,
     attestedAt: attested ? (attestationTimestamp ?? new Date()) : null,
     message: messageBytes,
     messageBytes,
+    messageNonce: consistent ? (identity?.nonce ?? null) : null,
+    messageDigest: consistent ? (identity?.digest ?? null) : null,
     attestation: attestationSignature,
     attestationSignature,
     attestationTimestamp,
     fastTransfer: isFast,
   };
+}
+
+/**
+ * Whether Circle's displayed reference agrees with the message's full nonce.
+ *
+ * Iris may show the full word or only the bottom eight bytes in decimal. The shortened form is
+ * accepted as agreement but never used as an identity, because many full nonces share it.
+ */
+function providerNonceMatches(reference: string | null, fullNonce: string): boolean {
+  if (reference === null) return true;
+  if (/^0x[0-9a-fA-F]{64}$/.test(reference)) return reference.toLowerCase() === fullNonce;
+  if (/^\d{1,78}$/.test(reference)) {
+    const displayed = BigInt(`0x${fullNonce.slice(-16)}`);
+    return BigInt(reference) === displayed;
+  }
+  return false;
 }
 
 function safeRailPart(value: unknown): string | null {

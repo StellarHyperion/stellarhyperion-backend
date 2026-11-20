@@ -44,6 +44,7 @@ export const CCTP_VERIFICATION_FAILURES = [
   "receipt_reverted",
   "confirmations_pending",
   "non_canonical_receipt",
+  "message_already_delivered",
 ] as const;
 export type CctpVerificationFailure = (typeof CCTP_VERIFICATION_FAILURES)[number];
 
@@ -86,6 +87,13 @@ export interface RailReport {
   };
   readonly message?: string | null;
   readonly messageBytes?: string | null;
+  /**
+   * The full 32-byte CCTP nonce and keccak256 digest of `messageBytes`, bound when the provider
+   * record was read. A candidate identity only: delivery is still proven from the destination
+   * receipt, which must execute exactly this message.
+   */
+  readonly messageNonce?: string | null;
+  readonly messageDigest?: string | null;
   readonly attestation?: string | null;
   readonly attestationSignature?: string | null;
   readonly attestationTimestamp?: Date | null;
