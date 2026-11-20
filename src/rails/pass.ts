@@ -1,3 +1,4 @@
+import type { VerifiedDelivery } from "./axelar/delivery.js";
 import { RouteKind } from "@hyperion/protocol";
 import type { AxelarDeliveryEvidenceRow } from "../chains/writers.js";
 /**
@@ -21,7 +22,8 @@ import type { AxelarDeliveryEvidenceRow } from "../chains/writers.js";
  */
 import type { AppConfig } from "../config/config.js";
 import { revalidateItsDeliveryProofs, verifyItsDelivery } from "./axelar/delivery.js";
-import { verifyCctpDelivery } from "./cctp/delivery.js";
+import type { VerificationDiagnostic } from "./axelar/events.js";
+import { inspectCctpDelivery } from "./cctp/delivery.js";
 import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
@@ -47,6 +49,7 @@ import {
   type PendingTransfer,
   type RailClient,
   type RailRetryClass,
+  type CctpVerificationFailure,
 } from "./types.js";
 
 /**
@@ -276,6 +279,7 @@ export class RailPass {
         error: null,
         nextAttemptAt: null,
         retryClass: null,
+        verificationFailure: null,
       });
       return true;
     }
@@ -295,6 +299,7 @@ export class RailPass {
         error: null,
         nextAttemptAt: this.nextCheckAt(at),
         retryClass: null,
+        verificationFailure: null,
       });
       return false;
     }
@@ -308,10 +313,23 @@ export class RailPass {
         schema: report.quarantine.schema,
         payload: report.quarantine.payload,
       });
-    if (this.options.config && (report.execution || report.forwardTxHash)) {
-      const verified =
-        (await verifyItsDelivery(this.options.config, db, transfer, report)) ??
-        (await verifyCctpDelivery(this.options.config, db, transfer, report));
+    let diagnostics: readonly VerificationDiagnostic[] = [];
+    let itsVerificationState: "receipt_unavailable" | "payout_unverified" | "verified" | null =
+      null;
+    let verificationFailure: CctpVerificationFailure | null = null;
+    if (this.options.config) {
+      const its =
+        report.execution || report.forwardTxHash
+          ? await verifyItsDelivery(this.options.config, db, transfer, report)
+          : null;
+      diagnostics = its !== null && "diagnostics" in its ? its.diagnostics : [];
+      itsVerificationState = its === null ? null : "diagnostics" in its ? its.state : "verified";
+      let verified: VerifiedDelivery | null = its !== null && !("diagnostics" in its) ? its : null;
+      if (!verified) {
+        const cctp = await inspectCctpDelivery(this.options.config, db, transfer, report);
+        verified = cctp.delivery;
+        verificationFailure = cctp.failure;
+      }
       if (verified) {
         signal.throwIfAborted();
         if (transfer.route === RouteKind.AxelarIts && "evidence" in verified) {
@@ -331,11 +349,26 @@ export class RailPass {
           error: null,
           nextAttemptAt: null,
           retryClass: null,
+          diagnostics,
+          itsVerificationState,
+          verificationFailure: null,
         });
         return true;
       }
     }
-    const status = report.status === "delivered" ? "pending" : report.status;
+    const candidateStatus =
+      verificationFailure !== null ||
+      itsVerificationState === "receipt_unavailable" ||
+      itsVerificationState === "payout_unverified" ||
+      report.status === "delivered"
+        ? "pending"
+        : report.status;
+    // Provider discovery may temporarily regress; only explicit proof reconciliation may reopen
+    // established attestation progress.
+    const status =
+      transfer.status === "attested" && candidateStatus === "pending"
+        ? "attested"
+        : candidateStatus;
     await this.write(db, transfer, {
       status,
       railStatus: report.railStatus,
@@ -347,6 +380,9 @@ export class RailPass {
       error: null,
       nextAttemptAt: isTerminal(status) ? null : this.nextCheckAt(at),
       retryClass: null,
+      diagnostics,
+      itsVerificationState,
+      verificationFailure,
     });
     return isTerminal(status);
   }
@@ -403,6 +439,7 @@ export class RailPass {
           ? null
           : this.failureRetryAt(this.now(), attempts, error),
       retryClass,
+      verificationFailure: null,
     });
   }
 
@@ -420,6 +457,10 @@ export class RailPass {
       readonly error: string | null;
       readonly nextAttemptAt: Date | null;
       readonly retryClass: RailRetryClass | null;
+      readonly diagnostics?: readonly VerificationDiagnostic[];
+      readonly itsVerificationState?:
+        "receipt_unavailable" | "payout_unverified" | "verified" | null;
+      readonly verificationFailure: CctpVerificationFailure | null;
     },
   ): Promise<void> {
     await writeAttestation(db, {
@@ -435,6 +476,9 @@ export class RailPass {
       lastError: fields.error,
       nextAttemptAt: fields.nextAttemptAt,
       retryClass: fields.retryClass,
+      diagnostics: fields.diagnostics ?? [],
+      itsVerificationState: fields.itsVerificationState ?? null,
+      verificationFailure: fields.verificationFailure,
     });
   }
 

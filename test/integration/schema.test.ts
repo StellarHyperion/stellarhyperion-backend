@@ -10,12 +10,25 @@
  * runs the unit suite rather than failing in a way somebody learns to ignore.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { runner } from "node-pg-migrate";
+import { Client } from "pg";
 
 import {
   auditTransferAndClaimInvariants,
   compactRouteHealthSamples,
+  pruneUnlinkedSourceEvents,
+  readOpenIngestionRejections,
+  readSourceProvenance,
+  reconcileIngestionRejection,
+  recordIngestionRejection,
+  recordSourceEvent,
+  writeClaim,
 } from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
+import { concurrencyBarrier, runConcurrent } from "../helpers.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
 const suite = CONNECTION === undefined ? describe.skip : describe;
@@ -24,6 +37,7 @@ const suite = CONNECTION === undefined ? describe.skip : describe;
 const CHECK_VIOLATION = "23514";
 const UNIQUE_VIOLATION = "23505";
 const NUMERIC_OUT_OF_RANGE = "22003";
+const MIGRATION_TEST_SCHEMA = `migration_lock_test_${process.pid}_${Date.now()}`;
 
 const U64_MAX = "18446744073709551615";
 const U256_MAX = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
@@ -65,14 +79,176 @@ suite("the schema", () => {
       "indexed_history_digest",
       "indexer_cursor",
       "indexer_worker_heartbeat",
+      "ingestion_rejection",
       "outbound_transfer",
       "pending_claim",
       "rail_attestation",
       "route_health",
+      "source_event",
+      "source_event_conflict",
+      "source_event_link",
     ]) {
       expect(names, `${table} is missing; has the migration run`).toContain(table);
     }
   });
+
+  it("serializes real SQL migration runners and applies each step once", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "hyperion-migration-lock-"));
+    const file = join(directory, "1790900000000_lock-test.sql");
+    await writeFile(
+      file,
+      "-- Up Migration\nSELECT pg_sleep(1); CREATE TABLE lock_once (id integer PRIMARY KEY); INSERT INTO lock_once VALUES (1);\n-- Down Migration\nDROP TABLE lock_once;",
+    );
+    const run = (applicationName: string) =>
+      runner({
+        databaseUrl: { connectionString: CONNECTION ?? "", application_name: applicationName },
+        dir: directory,
+        migrationsTable: "pgmigrations",
+        schema: MIGRATION_TEST_SCHEMA,
+        createSchema: true,
+        direction: "up",
+        advisoryLockMode: "wait",
+        log: () => undefined,
+      });
+    const first = run("hyperion-migration-lock-first");
+    let second: Promise<unknown> | undefined;
+    let secondRunnerWaiting = false;
+    try {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const { rows } = await db.query(
+          "SELECT 1 FROM pg_stat_activity WHERE application_name='hyperion-migration-lock-first' AND wait_event='PgSleep'",
+        );
+        if (rows.length) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      second = run("hyperion-migration-lock-second");
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const { rows } = await db.query(
+          "SELECT 1 FROM pg_stat_activity WHERE application_name='hyperion-migration-lock-second' AND wait_event_type='Lock' AND wait_event='advisory'",
+        );
+        if (rows.length) {
+          secondRunnerWaiting = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const outcomes = await Promise.allSettled([first, second]);
+      expect(outcomes.map((value) => value.status)).toEqual(["fulfilled", "fulfilled"]);
+      expect(secondRunnerWaiting).toBe(true);
+      const { rows } = await db.query(
+        `SELECT count(*)::integer AS count FROM "${MIGRATION_TEST_SCHEMA}".lock_once`,
+      );
+      expect(rows[0]?.count).toBe(1);
+    } finally {
+      await Promise.allSettled([first, ...(second ? [second] : [])]);
+      await db.query(`DROP SCHEMA IF EXISTS "${MIGRATION_TEST_SCHEMA}" CASCADE`);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("releases advisory ownership after a failed SQL migration and permits a clean retry", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "hyperion-migration-failure-"));
+    const file = join(directory, "1790900000000_failure-test.sql");
+    const schema = MIGRATION_TEST_SCHEMA + "_failed";
+    const run = () =>
+      runner({
+        databaseUrl: CONNECTION ?? "",
+        dir: directory,
+        migrationsTable: "pgmigrations",
+        schema,
+        createSchema: true,
+        direction: "up",
+        advisoryLockMode: "wait",
+        log: () => undefined,
+      });
+    try {
+      await writeFile(file, "-- Up Migration\nSELECT 1/0;\n-- Down Migration\nSELECT 1;");
+      await expect(run()).rejects.toThrow();
+      await writeFile(
+        file,
+        "-- Up Migration\nCREATE TABLE retry_once(id integer PRIMARY KEY); INSERT INTO retry_once VALUES (1);\n-- Down Migration\nDROP TABLE retry_once;",
+      );
+      await expect(run()).resolves.toHaveLength(1);
+    } finally {
+      await db.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("releases migration ownership when PostgreSQL interrupts the runner", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "hyperion-migration-interrupted-"));
+    const file = join(directory, "1790900000000_interrupted.sql");
+    const schema = `${MIGRATION_TEST_SCHEMA}_interrupted`;
+    const interruptedClient = new Client({
+      connectionString: CONNECTION ?? "",
+      application_name: "hyperion-migration-interrupted",
+    });
+    const connectionErrors: Error[] = [];
+    interruptedClient.on("error", (error: Error) => connectionErrors.push(error));
+    const run = () =>
+      runner({
+        databaseUrl: {
+          connectionString: CONNECTION ?? "",
+          application_name: "hyperion-migration-interrupted",
+        },
+        dir: directory,
+        migrationsTable: "pgmigrations",
+        schema,
+        createSchema: true,
+        direction: "up",
+        advisoryLockMode: "wait",
+        log: () => undefined,
+      });
+    try {
+      await writeFile(
+        file,
+        "-- Up Migration\nSELECT pg_sleep(30); CREATE TABLE interrupted_once(id integer PRIMARY KEY);\n-- Down Migration\nDROP TABLE interrupted_once;",
+      );
+      // Attach the rejection handler before interrupting the connection.
+      await interruptedClient.connect();
+      const interrupted = runner({
+        dbClient: interruptedClient,
+        dir: directory,
+        migrationsTable: "pgmigrations",
+        schema,
+        createSchema: true,
+        direction: "up",
+        advisoryLockMode: "wait",
+        log: () => undefined,
+      }).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      let pid: number | null = null;
+      for (let attempt = 0; attempt < 100 && pid === null; attempt += 1) {
+        const result = await db.query(
+          "SELECT pid FROM pg_stat_activity WHERE application_name='hyperion-migration-interrupted' AND query LIKE '%pg_sleep(30)%' AND state='active'",
+        );
+        const value = result.rows[0]?.pid;
+        if (typeof value === "number") pid = value;
+        else await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(pid).not.toBeNull();
+      await db.query("SELECT pg_terminate_backend($1)", [pid]);
+      expect(await interrupted).toBeInstanceOf(Error);
+      expect(
+        connectionErrors.every((error) => error.message === "Connection terminated unexpectedly"),
+      ).toBe(true);
+      await writeFile(
+        file,
+        "-- Up Migration\nCREATE TABLE interrupted_once(id integer PRIMARY KEY); INSERT INTO interrupted_once VALUES(1);\n-- Down Migration\nDROP TABLE interrupted_once;",
+      );
+      await expect(run()).resolves.toHaveLength(1);
+      const result = await db.query(
+        `SELECT count(*)::int AS count FROM "${schema}".interrupted_once`,
+      );
+      expect(result.rows[0]?.count).toBe(1);
+    } finally {
+      await interruptedClient.end();
+      await db.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 10_000);
 
   it("holds a u64 that bigint cannot", async () => {
     // The entire reason nonces and claim ids are NUMERIC(20,0). Postgres int8 stops at 2^63-1 and
@@ -99,10 +275,7 @@ suite("the schema", () => {
       "DELETE FROM public.indexer_cursor WHERE chain_key IN ('hash-test', 'no-hash-test')",
     );
     await db.query(
-      `INSERT INTO public.indexer_cursor
-         (chain_key, family, contract, last_processed, last_processed_hash)
-       VALUES ('hash-test', 'evm', '0xrouter', 42, $1),
-              ('no-hash-test', 'stellar', 'CROUTER', 42, NULL)`,
+      "INSERT INTO public.indexer_cursor (chain_key, family, contract, last_processed, last_processed_hash) VALUES ('hash-test', 'evm', '0xrouter', 42, $1), ('no-hash-test', 'stellar', 'CROUTER', 42, NULL)",
       [`0x${"ab".repeat(32)}`],
     );
 
@@ -135,6 +308,42 @@ suite("the schema", () => {
     expect(reloptions).toBeDefined();
     expect(reloptions).toContain("autovacuum_vacuum_scale_factor=0.05");
     expect(reloptions).toContain("autovacuum_vacuum_cost_limit=500");
+  });
+
+  it("serializes competing worker transactions without losing an update", async () => {
+    await db.query(
+      "CREATE TABLE IF NOT EXISTS public.hyperion_concurrency_test (id integer PRIMARY KEY, value integer NOT NULL)",
+    );
+    await db.query("DELETE FROM public.hyperion_concurrency_test");
+    await db.query("INSERT INTO public.hyperion_concurrency_test (id, value) VALUES (1, 0)");
+
+    const started = concurrencyBarrier(2);
+    const lockReady = concurrencyBarrier(2);
+    const outcomes = await runConcurrent(2, async (worker) =>
+      db.transaction(async (tx) => {
+        await tx.query("SET LOCAL lock_timeout = '2s'");
+        await started.wait();
+        if (worker === 0) {
+          await tx.query(
+            "UPDATE public.hyperion_concurrency_test SET value = value + 1 WHERE id = 1",
+          );
+          await lockReady.wait();
+        } else {
+          await lockReady.wait();
+          await tx.query(
+            "UPDATE public.hyperion_concurrency_test SET value = value + 1 WHERE id = 1",
+          );
+        }
+        return worker;
+      }),
+    );
+
+    expect(outcomes.every((outcome) => outcome.status === "fulfilled")).toBe(true);
+    const { rows } = await db.query(
+      "SELECT value FROM public.hyperion_concurrency_test WHERE id = 1",
+    );
+    expect(rows[0]?.value).toBe(2);
+    await db.query("DROP TABLE public.hyperion_concurrency_test");
   });
 });
 
@@ -402,5 +611,153 @@ suite("maintenance and pruning", () => {
     expect(Array.isArray(report.claimLiabilityViolations)).toBe(true);
     expect(Array.isArray(report.deliverySettlementViolations)).toBe(true);
     expect(Array.isArray(report.unsettledLiabilities)).toBe(true);
+  });
+});
+
+suite("ingestion rejections", () => {
+  let db: Database;
+  const chainKey = `rejection-schema-${process.pid}`;
+  const source = {
+    chainKey,
+    family: "evm" as const,
+    contract: "0x00000000000000000000000000000000000000aa",
+    block: BigInt(U64_MAX),
+    txHash: `0x${"ab".repeat(32)}`,
+    position: 7,
+  };
+
+  beforeAll(() => {
+    db = Database.open(CONNECTION ?? "", { applicationName: "hyperion-schema-test" });
+  });
+
+  afterAll(async () => {
+    await db.query("DELETE FROM public.ingestion_rejection WHERE chain_key = $1", [chainKey]);
+    await db.close();
+  });
+
+  it("keeps full-width source references and reconciles only on successful replay", async () => {
+    await recordIngestionRejection(db, {
+      ...source,
+      errorClass: "unsupported_payload",
+      detail: "LogShapeError via https://rpc.example/key/abc123",
+    });
+    const [open] = await readOpenIngestionRejections(db, chainKey);
+    expect(open).toMatchObject({
+      block: BigInt(U64_MAX),
+      txHash: source.txHash,
+      position: "7",
+      errorClass: "unsupported_payload",
+      replayEligible: true,
+      detail: "LogShapeError via [redacted URL]",
+    });
+    expect(await reconcileIngestionRejection(db, source)).toBe(true);
+    expect(await readOpenIngestionRejections(db, chainKey)).toHaveLength(0);
+  });
+
+  it("rejects credential-bearing detail, unbounded payloads and unknown classes", async () => {
+    const insert = (detail: string, payload: string, errorClass = "decode_error") =>
+      db.query(
+        `INSERT INTO public.ingestion_rejection
+           (chain_key, family, contract, block_number, tx_hash, source_position, error_class,
+            replay_eligible, detail, payload)
+         VALUES ($1, 'evm', '0xrouter', 1, '0xtx', 'check', $2, true, $3, $4::jsonb)`,
+        [chainKey, errorClass, detail, payload],
+      );
+    // Thunks, so each insert starts only when awaited and no rejection goes unhandled.
+    for (const attempt of [
+      () => insert("postgresql://u:p@db/hyperion", "{}"),
+      () => insert("api_key=abc", "{}"),
+      () => insert("ok", JSON.stringify({ blob: "z".repeat(5000) })),
+      () => insert("ok", "[]"),
+      () => insert("ok", "{}", "provider_status"),
+    ]) {
+      await expect(attempt()).rejects.toSatisfy((error) => codeOf(error) === CHECK_VIOLATION);
+    }
+  });
+});
+
+suite("source event provenance", () => {
+  let db: Database;
+  const chainKey = `provenance-schema-${process.pid}`;
+  const identity = {
+    chainKey,
+    family: "evm" as const,
+    contract: "0x00000000000000000000000000000000000000bb",
+    block: BigInt(U64_MAX),
+    txHash: `0x${"ab".repeat(32)}`,
+    position: 4,
+    eventKind: "ClaimParked",
+    payloadDigest: "cd".repeat(32),
+  };
+
+  beforeAll(() => {
+    db = Database.open(CONNECTION ?? "", { applicationName: "hyperion-schema-test" });
+  });
+
+  afterAll(async () => {
+    await db.query(
+      "DELETE FROM public.source_event_link WHERE source_event_id IN (SELECT id FROM public.source_event WHERE chain_key = $1)",
+      [chainKey],
+    );
+    await db.query(
+      "DELETE FROM public.source_event_conflict WHERE source_event_id IN (SELECT id FROM public.source_event WHERE chain_key = $1)",
+      [chainKey],
+    );
+    await db.query("DELETE FROM public.source_event WHERE chain_key = $1", [chainKey]);
+    await db.query("DELETE FROM public.pending_claim WHERE chain = $1", [chainKey]);
+    await db.close();
+  });
+
+  it("links replays to one raw identity and keeps the original digest on conflict", async () => {
+    const first = await recordSourceEvent(db, identity);
+    const at = {
+      chainKey,
+      block: BigInt(U64_MAX),
+      txHash: identity.txHash,
+      logIndex: 4,
+      observedAt: new Date("2026-11-20T00:00:00Z"),
+      sourceEventId: first.id,
+    };
+    const claim = {
+      claimId: BigInt(U64_MAX),
+      recipient: "0xrecipient",
+      token: "0xtoken",
+      amount: BigInt(U256_MAX),
+      route: 0,
+      sourceChain: "stellar-testnet",
+      sourceNonce: 1n,
+      createdAt: at.observedAt,
+    };
+    await writeClaim(db, at, claim);
+    const replay = await recordSourceEvent(db, identity);
+    await writeClaim(db, { ...at, sourceEventId: replay.id }, claim);
+    expect(replay).toEqual({ kind: "replay", id: first.id });
+    const links = await readSourceProvenance(db, "pending_claim", `${chainKey}:${U64_MAX}`);
+    expect(links).toHaveLength(1);
+    expect(links[0]).toMatchObject({ block: BigInt(U64_MAX), replays: 1, conflicts: 0 });
+
+    expect(
+      (await recordSourceEvent(db, { ...identity, payloadDigest: "ef".repeat(32) })).kind,
+    ).toBe("conflict");
+    const stored = await db.query("SELECT payload_digest FROM public.source_event WHERE id = $1", [
+      first.id.toString(),
+    ]);
+    expect(stored.rows[0]?.payload_digest).toBe(identity.payloadDigest);
+    await expect(
+      db.query("UPDATE public.source_event SET payload_digest = $1 WHERE id = $2", [
+        "ef".repeat(32),
+        first.id.toString(),
+      ]),
+    ).rejects.toSatisfy((error) => codeOf(error) === CHECK_VIOLATION);
+    await expect(
+      db.query("DELETE FROM public.source_event WHERE id = $1", [first.id.toString()]),
+    ).rejects.toSatisfy((error) => codeOf(error) === "23503");
+    expect(
+      await pruneUnlinkedSourceEvents(db, new Date(Date.now() + 60_000), 10),
+    ).toBeGreaterThanOrEqual(0);
+    expect(
+      (await db.query("SELECT 1 FROM public.source_event WHERE id = $1", [first.id.toString()]))
+        .rows,
+    ).toHaveLength(1);
   });
 });

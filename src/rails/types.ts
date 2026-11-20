@@ -23,6 +23,31 @@
  */
 export type AttestationStatus = "pending" | "attested" | "delivered" | "failed" | "expired";
 
+export const CCTP_VERIFICATION_FAILURES = [
+  "forward_tx_missing",
+  "message_missing",
+  "invalid_message",
+  "configuration_unavailable",
+  "source_transfer_missing",
+  "source_domain_mismatch",
+  "destination_domain_mismatch",
+  "messenger_mismatch",
+  "source_adapter_mismatch",
+  "token_mismatch",
+  "recipient_mismatch",
+  "amount_mismatch",
+  "fee_mismatch",
+  "finality_mismatch",
+  "receipt_missing",
+  "receipt_mismatch",
+  "mint_missing",
+  "receipt_reverted",
+  "confirmations_pending",
+  "non_canonical_receipt",
+  "message_already_delivered",
+] as const;
+export type CctpVerificationFailure = (typeof CCTP_VERIFICATION_FAILURES)[number];
+
 /** Terminal states. Nothing polls a transfer again once it reaches one. */
 export const TERMINAL: readonly AttestationStatus[] = ["delivered", "failed", "expired"];
 
@@ -51,8 +76,24 @@ export interface RailReport {
   /** The identifier to quote at the rail's support. Circle's event nonce, Axelar's message id. */
   readonly reference: string | null;
   readonly attestedAt: Date | null;
+  /**
+   * A provider-side failure is evidence about the rail, not evidence that the destination
+   * receipt or payout is absent. Keeping the two separate prevents a provider error from being
+   * presented as a failed payment.
+   */
+  readonly providerFailure?: {
+    readonly kind: "recoverable" | "fatal";
+    readonly signals: readonly string[];
+  };
   readonly message?: string | null;
   readonly messageBytes?: string | null;
+  /**
+   * The full 32-byte CCTP nonce and keccak256 digest of `messageBytes`, bound when the provider
+   * record was read. A candidate identity only: delivery is still proven from the destination
+   * receipt, which must execute exactly this message.
+   */
+  readonly messageNonce?: string | null;
+  readonly messageDigest?: string | null;
   readonly attestation?: string | null;
   readonly attestationSignature?: string | null;
   readonly attestationTimestamp?: Date | null;
@@ -157,6 +198,7 @@ export interface BacklogCandidate {
   readonly observedAt: string;
   readonly attestationStatus: AttestationStatus | null;
   readonly railStatus: string | null;
+  readonly verificationFailure: CctpVerificationFailure | null;
   readonly railReference: string | null;
   readonly attestedAt: string | null;
   readonly lastCheckedAt: string | null;
