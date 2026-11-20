@@ -316,7 +316,9 @@ describe("independent real CCTP and ITS destination proof mutation corpus", () =
         );
         stellar
           .mockReset()
-          .mockResolvedValueOnce(simulation(hexToBytes(its.expected.tokenId as Hex)));
+          .mockResolvedValueOnce(simulation(hexToBytes(its.expected.tokenId as Hex)))
+          .mockResolvedValueOnce(simulation({ its: cctp.expected.sourceAdapter }))
+          .mockResolvedValueOnce(simulation(its.expected.sourceChain));
         const unavailable = await verifyItsDelivery(
           modifiedConfig,
           db,
