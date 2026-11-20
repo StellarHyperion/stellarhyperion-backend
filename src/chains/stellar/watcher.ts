@@ -28,7 +28,11 @@ import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
-import { reconcileIngestionRejection, recordIngestionRejection } from "../writers.js";
+import {
+  reconcileIngestionRejection,
+  recordIngestionRejection,
+  recordSourceEvent,
+} from "../writers.js";
 import {
   boundedWindowEnd,
   completeThrough,
@@ -48,6 +52,7 @@ import type { EventSource, EventsQuery, RetainedHistoryWindow } from "./rpc.js";
 import { StellarRpcError, retentionWindowOf } from "./rpc.js";
 import {
   type ChainCursor,
+  canonicalEventPayload,
   recordDeploymentRevision,
   recordQuarantinedEvent,
   boundDecodeError,
@@ -1112,7 +1117,26 @@ export class StellarWatcher {
         conflicts += 1;
         continue;
       }
-      if (await this.apply(tx, context, raw, event)) {
+      // Raw identity and payload digest, kept apart from the rows this event materializes.
+      const observed = await recordSourceEvent(tx, {
+        ...source,
+        eventKind: event.kind,
+        payloadDigest: String(canonicalEventPayload(raw, event).sha256),
+      });
+      if (observed.kind === "conflict") {
+        this.options.logger.warn(
+          {
+            chain: chainKey,
+            eventId: raw.id,
+            originalDigest: observed.originalDigest,
+            incomingDigest: observed.incomingDigest,
+          },
+          "a stellar event arrived with a different payload at an already recorded source position; keeping the original",
+        );
+        conflicts += 1;
+        continue;
+      }
+      if (await this.apply(tx, { ...context, sourceEventId: observed.id }, raw, event)) {
         decoded += 1;
         await tx.query(
           `UPDATE stellar_event_quarantine SET replayed_at = clock_timestamp()

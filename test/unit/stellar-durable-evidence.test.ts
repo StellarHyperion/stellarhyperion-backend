@@ -50,6 +50,7 @@ beforeAll(async () => {
     "1791400000000_stellar-cursor-cas-leases-gaps.sql",
     "1791500000000_stellar-revisions-and-quarantine.sql",
     "1793500000000_ingestion-rejections.sql",
+    "1793600000000_source-event-provenance.sql",
   ]) {
     await pg.exec(
       readFileSync(new URL(`../../migrations/${file}`, import.meta.url), "utf8").split(

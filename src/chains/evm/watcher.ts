@@ -35,6 +35,7 @@ import { readCursor, writeCursor } from "../stellar/store.js";
 import {
   reconcileIngestionRejection,
   recordIngestionRejection,
+  recordSourceEvent,
   type IngestionErrorClass,
   type IngestionSource,
   type Position,
@@ -786,6 +787,26 @@ export class EvmWatcher {
 
     const digest = createHash("sha256").update(log.data).update(log.topics.join("|")).digest("hex");
     const key = [chainKey, router, log.blockNumber.toString(), log.transactionHash, log.logIndex];
+    // Raw identity first, kept apart from the rows it materializes. A replay resolves to the same
+    // source event; a different payload at the same position is evidence, never a replacement.
+    const source = await recordSourceEvent(tx, {
+      ...this.sourceOf(log),
+      eventKind: decoded.name,
+      payloadDigest: digest,
+    });
+    if (source.kind === "conflict") {
+      logger.warn(
+        {
+          chain: chainKey,
+          block: log.blockNumber.toString(),
+          logIndex: log.logIndex,
+          originalDigest: source.originalDigest,
+          incomingDigest: source.incomingDigest,
+        },
+        "an EVM log arrived with a different payload at an already recorded source position; keeping the original",
+      );
+      return false;
+    }
     const evidence = await tx.query(
       `SELECT digest FROM evm_applied_event
       WHERE chain_key=$1 AND contract=$2 AND block_number=$3 AND tx_hash=$4 AND log_index=$5`,
@@ -825,6 +846,7 @@ export class EvmWatcher {
       // Unlike Soroban, which orders events within a transaction instead.
       logIndex: log.logIndex,
       observedAt: new Date(Number(timestamp) * 1000),
+      sourceEventId: source.id,
     };
 
     await tx.query("SAVEPOINT evm_log_decode");
