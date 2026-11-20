@@ -1226,7 +1226,7 @@ suite("rail pollers against real Postgres", () => {
     limited.simulateRetryAfter(30);
     const unrelated = new RateLimitSimulator({
       rail: "axelar-its",
-      look: () => Promise.resolve({ kind: "missing" }),
+      look: (): Promise<RailLookup> => Promise.resolve({ kind: "missing" }),
     });
     const options = { db, logger, batchSize: 1, recheckAfterMs: 5000, maxCheckFailures: 5 };
     const pass = new RailPass({ ...options, route: 0, client: limited });
