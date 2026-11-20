@@ -32,6 +32,8 @@ class MockDb {
         ],
         rowCount: 1,
       });
+    if (text.includes("/* proof_rejection_metrics */"))
+      return Promise.resolve({ rows: [], rowCount: 0 });
     for (const [key, rows] of Object.entries(this.queryMap)) {
       if (text.includes(key)) {
         if (text.includes("WHERE t.id = $1") && params.length > 0) {

@@ -1,3 +1,4 @@
+import { readProofRejectionMetrics } from "../../src/http/proof-rejection-metrics.js";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as Viem from "viem";
 import { RouteKind } from "@hyperion/protocol";
@@ -178,11 +179,21 @@ const connection = process.env.TEST_DATABASE_URL;
     },
   );
   it("persists a bounded mismatch and clears it only when canonical proof establishes delivery", async () => {
+    const baseline = await readProofRejectionMetrics(db);
     await db.query(
       "UPDATE outbound_transfer SET net_amount=net_amount+10,gross_amount=gross_amount+10 WHERE id=$1",
       [id],
     );
     expect((await tick(report))?.verification_failure).toBe("amount_mismatch");
+    const rejected = await readProofRejectionMetrics(db);
+    expect(rejected.byRail.cctp.amount).toBe(baseline.byRail.cctp.amount + 1);
+    expect(rejected.coverage.known).toBe(true);
+    expect(
+      (await db.query("SELECT 1 FROM inbound_delivery WHERE source_nonce=9998300")).rows,
+    ).toHaveLength(0);
+    expect(JSON.stringify(rejected)).not.toMatch(
+      /source_adapter|forwardTxHash|cctp-diagnostic-source/,
+    );
     await db.query(
       "UPDATE outbound_transfer SET net_amount=net_amount-10,gross_amount=gross_amount-10 WHERE id=$1",
       [id],
@@ -190,6 +201,8 @@ const connection = process.env.TEST_DATABASE_URL;
     const delivered = await tick(report);
     expect(delivered?.status).toBe("delivered");
     expect(delivered?.verification_failure).toBeNull();
+    const resolved = await readProofRejectionMetrics(db);
+    expect(resolved.byRail.cctp.amount).toBe(baseline.byRail.cctp.amount);
     await expect(
       db.query(
         "UPDATE rail_attestation SET verification_failure='token=private-provider-value' WHERE transfer_id=$1",

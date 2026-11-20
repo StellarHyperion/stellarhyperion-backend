@@ -751,7 +751,18 @@ suite("source event provenance", () => {
     ).rejects.toSatisfy((error) => codeOf(error) === CHECK_VIOLATION);
     await expect(
       db.query("DELETE FROM public.source_event WHERE id = $1", [first.id.toString()]),
-    ).rejects.toSatisfy((error) => codeOf(error) === "23503");
+    ).rejects.toSatisfy(
+      // PostgreSQL 18 reports RESTRICT as 23001; older versions use 23503.
+      (error) =>
+        ["23001", "23503"].includes(codeOf(error) ?? "") &&
+        typeof error === "object" &&
+        error !== null &&
+        "constraint" in error &&
+        [
+          "source_event_conflict_source_event_id_fkey",
+          "source_event_link_source_event_id_fkey",
+        ].includes(String(error.constraint)),
+    );
     expect(
       await pruneUnlinkedSourceEvents(db, new Date(Date.now() + 60_000), 10),
     ).toBeGreaterThanOrEqual(0);

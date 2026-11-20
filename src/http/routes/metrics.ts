@@ -15,6 +15,7 @@ import {
   type WorkerHeartbeatRecord,
 } from "../../runtime/readiness.js";
 import type { ServerDeps } from "../server.js";
+import { readProofRejectionMetrics } from "../proof-rejection-metrics.js";
 import { readKeeperSubmissionMetrics } from "../../keeper/outcomes.js";
 
 export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): void {
@@ -71,6 +72,8 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
     for (const evm of deps.config.indexer.evm)
       configuredSources.push({ chain: evm.chain, family: "evm", contract: evm.router });
     const { historyGaps, historicalCoverage } = await readHistoricalCoverage(db, configuredSources);
+
+    const proofRejections = await readProofRejectionMetrics(db);
 
     // 7. Persistent worker heartbeats & freshness (#107)
     let heartbeatRecords: WorkerHeartbeatRecord[] = [];
@@ -146,6 +149,10 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       cursors,
       historyGaps,
       historicalCoverage,
+      proofRejections: proofRejections.total,
+      proofRejectionsByRail: proofRejections.byRail,
+      proofRejectionIngestion: proofRejections.ingestion,
+      proofRejectionCoverage: proofRejections.coverage,
       freshnessSlo,
       database,
       deploymentMode: deps.config.deploymentMode,

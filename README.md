@@ -415,3 +415,27 @@ coverage. No cursor, no committed scan provenance, an incomplete deployment repl
 missing schema keeps historical coverage explicitly unknown. Schema-unavailable unresolved
 counts are null. Zero recorded gaps alone does not establish known history. These diagnostics
 are read-only and do not establish transfer delivery or activate an EVM router.
+
+### Proof rejection metrics (#109)
+
+`GET /v1/metrics` exposes the fixed categories `recipient`, `token`, `amount`, `finality`, and
+`provider_inconsistency`. `proofRejections` sums current unresolved CCTP/ITS verification reasons
+and durable unreconciled ingestion records. `proofRejectionsByRail` uses the same vocabulary for
+both rails; `proofRejectionIngestion` separates structural decoder/ordering failures. These are
+current reason gauges, not successful delivery counts or monotonic attempt counters. One ITS
+transfer can contribute to several distinct mismatch categories, once per category. Rechecking
+an unchanged failure does not increment the gauge; canonical verified proof clears its reasons.
+
+CCTP recipient/destination-domain mismatches map to recipient, token/messenger/source-adapter
+mismatches to token, amount/fee mismatches to amount, and finality/receipt/confirmation failures
+to finality. Other identity/message/provider failures map to provider inconsistency. ITS retains
+recipient/token/amount diagnostics, maps unavailable receipts to finality, and maps missing
+payment/source/command evidence to provider inconsistency. Source decode/ordering rejections
+are provider inconsistency. Prunable raw quarantine rows are not counted again alongside their
+durable ingestion rejection. Provider success alone never establishes destination delivery.
+
+`proofRejectionCoverage` is version 1 and reports availability of each source. A missing table or
+column on an older deployment sets `known: false`, while retaining counts from available sources;
+zero counts with unknown coverage are not evidence of zero failures. Other database errors fail
+the request. SQL returns only bounded categories and exact safe counts; raw hashes, addresses,
+provider messages, expected/observed diagnostics, endpoints, and credentials never become labels.

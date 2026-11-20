@@ -1,4 +1,7 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { readProofRejectionMetrics } from "../../src/http/proof-rejection-metrics.js";
+import { inspectPayment, type VerificationDiagnostic } from "../../src/rails/axelar/events.js";
+import { itsProofFixture } from "../tooling/proof-fixtures.js";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { Database } from "../../src/db/pool.js";
 import { writeAttestation } from "../../src/chains/writers.js";
 const connection = process.env.TEST_DATABASE_URL;
@@ -20,7 +23,7 @@ const connection = process.env.TEST_DATABASE_URL;
   });
   const write = (
     state: "receipt_unavailable" | "payout_unverified" | "verified" | null,
-    diagnostics: readonly { category: "recipient"; expected: string; observed: string }[] = [],
+    diagnostics: readonly VerificationDiagnostic[] = [],
   ) =>
     writeAttestation(db, {
       transferId: id,
@@ -74,6 +77,31 @@ const connection = process.env.TEST_DATABASE_URL;
       its_verification_state: "verified",
       diagnostics: [],
     });
+  });
+  it("counts ITS mismatches once per category without accepting provider success as delivery", async () => {
+    const fixture = itsProofFixture();
+    const provider = {
+      getTransactionReceipt: vi
+        .fn()
+        .mockResolvedValue({ status: "success", logs: [fixture.received, fixture.paid] }),
+    };
+    const receipt = await provider.getTransactionReceipt();
+    const inspection = inspectPayment(receipt.logs, {
+      ...fixture.expected,
+      recipient: "0x5555555555555555555555555555555555555555",
+    });
+    expect(inspection.payment).toBeNull();
+    const baseline = await readProofRejectionMetrics(db);
+    await write("payout_unverified", [...inspection.diagnostics, ...inspection.diagnostics]);
+    const failed = await readProofRejectionMetrics(db);
+    expect(failed.byRail.its.recipient).toBe(baseline.byRail.its.recipient + 1);
+    expect(failed.byRail.its.provider_inconsistency).toBe(
+      baseline.byRail.its.provider_inconsistency + 1,
+    );
+    expect((await read())?.status).toBe("attested");
+    expect(JSON.stringify(failed)).not.toContain(fixture.expected.commandId);
+    await write("verified");
+    expect((await readProofRejectionMetrics(db)).byRail.its).toEqual(baseline.byRail.its);
   });
   it("enforces diagnostic size and shape in PostgreSQL", async () => {
     for (const value of [
