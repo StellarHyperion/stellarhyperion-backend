@@ -74,6 +74,20 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
         historyGaps[status] = count;
       }
     }
+    const oldestGapResult = await db.query(
+      `SELECT start_ledger, end_ledger
+         FROM stellar_history_gap
+        WHERE status <> 'reconciled'
+        ORDER BY start_ledger ASC
+        LIMIT 1`,
+    );
+    const oldestGap = oldestGapResult.rows[0];
+    const historicalCoverage = {
+      unresolved: historyGaps.open + historyGaps.reconciling,
+      oldestMissingStartLedger: oldestGap ? text(oldestGap, "start_ledger") : null,
+      oldestMissingEndLedger: oldestGap ? text(oldestGap, "end_ledger") : null,
+      unknown: oldestGap === undefined && historyGaps.open + historyGaps.reconciling > 0,
+    };
 
     // 7. Persistent worker heartbeats & freshness (#107)
     let heartbeatRecords: WorkerHeartbeatRecord[] = [];
@@ -130,6 +144,7 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       railAttestations: railStatusCounts,
       cursors,
       historyGaps,
+      historicalCoverage,
       freshnessSlo,
       database,
       deploymentMode: deps.config.deploymentMode,
