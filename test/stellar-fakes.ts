@@ -201,8 +201,14 @@ export class RecordingDb implements Transactional {
     reconciled_at: Date | null;
   }[] = [];
   backfillRow: Record<string, unknown> | null = null;
+  readonly heartbeatRows: Record<string, unknown>[] = [];
+  readonly workerRuns: Record<string, unknown>[] = [];
   /** Set to make every statement inside the next transaction throw. */
   failInTransaction: Error | null = null;
+  /** What the open ingestion rejection count reports, to exercise the boundary limit. */
+  openRejections = 0;
+  /** Source events recorded so far; each insert is treated as a first observation. */
+  sourceEvents = 0;
 
   private identities = new Map<string, unknown>();
   private conflicts = new Map<string, unknown>();
@@ -217,11 +223,93 @@ export class RecordingDb implements Transactional {
     if (this.failInTransaction !== null && this.open !== null) {
       return Promise.reject(this.failInTransaction);
     }
+    if (/INSERT INTO source_event\s*\(/.test(text)) {
+      this.sourceEvents += 1;
+      return Promise.resolve({ rows: [{ id: String(this.sourceEvents) }], rowCount: 1 });
+    }
+    if (text.includes("AS open FROM ingestion_rejection")) {
+      return Promise.resolve({ rows: [{ open: this.openRejections }], rowCount: 1 });
+    }
+    if (text.includes("INSERT INTO indexer_worker_run")) {
+      const previous = this.workerRuns.find((row) => row.run_id === params[0]);
+      const row = {
+        run_id: params[0],
+        execution_id: params[1],
+        worker_name: params[2],
+        worker_kind: params[3],
+        chain_key: params[4],
+        state: params[5],
+        successful_ticks: String(Number(previous?.successful_ticks ?? 0) + Number(params[6])),
+        failed_ticks: String(Number(previous?.failed_ticks ?? 0) + Number(params[7])),
+        started_at: previous?.started_at ?? new Date(),
+        updated_at: new Date(),
+        last_caught_up_at:
+          params[5] === "caught_up" ? new Date() : (previous?.last_caught_up_at ?? null),
+        stopped_at: params[5] === "stopped" ? new Date() : null,
+        stellar_scans: 0,
+        evm_scans: 0,
+        verification_transitions: 0,
+      };
+      if (previous !== undefined) Object.assign(previous, row);
+      else this.workerRuns.push(row);
+      return Promise.resolve({ rows: [{ run_id: params[0] }], rowCount: 1 });
+    }
+    if (text.includes("FROM indexer_worker_run r"))
+      return Promise.resolve({ rows: this.workerRuns, rowCount: this.workerRuns.length });
+    if (text.includes("/* historical_coverage_snapshot */")) {
+      // This fake records gap state but does not model committed source coverage.
+      const count = (status: string) =>
+        String(this.gaps.filter((gap) => gap.status === status).length);
+      return Promise.resolve({
+        rows: [
+          {
+            snapshot: {
+              historyGaps: {
+                open: count("open"),
+                reconciling: count("reconciling"),
+                reconciled: count("reconciled"),
+              },
+              sources: [],
+            },
+          },
+        ],
+        rowCount: 1,
+      });
+    }
     if (text.includes("FROM indexer_cursor")) {
       return Promise.resolve({
         rows: this.cursorRow === null ? [] : [this.cursorRow],
         rowCount: this.cursorRow === null ? 0 : 1,
       });
+    }
+    if (text.includes("FROM indexer_worker_heartbeat")) {
+      return Promise.resolve({
+        rows: this.heartbeatRows,
+        rowCount: this.heartbeatRows.length,
+      });
+    }
+    if (text.includes("INSERT INTO indexer_worker_heartbeat")) {
+      const workerName = String(params[0]);
+      const existing = this.heartbeatRows.find((r) => r.worker_name === workerName);
+      const row: Record<string, unknown> = {
+        worker_name: workerName,
+        worker_kind: String(params[1]),
+        chain_key: params[2] ?? null,
+        state: String(params[3]),
+        detail: String(params[4]),
+        last_heartbeat_at: params[5],
+        last_completed_at: params[6] ?? existing?.last_completed_at ?? null,
+        last_cursor_block: params[7] ?? existing?.last_cursor_block ?? null,
+        consecutive_failures: Number(params[8]),
+        last_error: params[9] ?? null,
+        metadata: typeof params[10] === "string" ? JSON.parse(params[10]) : (params[10] ?? {}),
+      };
+      if (existing !== undefined) {
+        Object.assign(existing, row);
+      } else {
+        this.heartbeatRows.push(row);
+      }
+      return Promise.resolve({ rows: [], rowCount: 1 });
     }
     if (text.includes("INSERT INTO indexer_cursor") || text.includes("UPDATE indexer_cursor")) {
       if (text.includes("ON CONFLICT (chain_key) DO NOTHING")) {
@@ -457,6 +545,10 @@ export class RecordingDb implements Transactional {
   /** Statements matching a fragment, which is how a test names the one it cares about. */
   matching(fragment: string): readonly RecordedQuery[] {
     return this.queries.filter((entry) => entry.text.includes(fragment));
+  }
+
+  ping(): Promise<void> {
+    return Promise.resolve();
   }
 }
 

@@ -10,7 +10,8 @@
 import { describe, expect, it } from "vitest";
 
 import { EvmWatcher } from "../../src/chains/evm/watcher.js";
-import { viemClient, type EvmClient } from "../../src/chains/evm/client.js";
+import { MAX_OPEN_INGESTION_REJECTIONS } from "../../src/chains/writers.js";
+import { viemClient, type EvmClient, type RawEvmLog } from "../../src/chains/evm/client.js";
 import {
   ANVIL_HISTORY,
   ANVIL_CHAIN_ID,
@@ -37,6 +38,8 @@ function harness(
     readonly reorgDepth?: number;
     readonly logRange?: number;
     readonly client?: FakeEvmClient;
+    readonly finalityMode?: "confirmations" | "finalized";
+    readonly allowFinalityFallback?: boolean;
   } = {},
 ): Harness {
   const db = new RecordingDb();
@@ -49,6 +52,8 @@ function harness(
     chainId: ANVIL_CHAIN_ID,
     startBlock: ANVIL_START_BLOCK,
     confirmations: options.confirmations ?? 3,
+    finalityMode: options.finalityMode ?? "confirmations",
+    allowFinalityFallback: options.allowFinalityFallback ?? false,
     reorgDepth: options.reorgDepth ?? 5,
     logRange: options.logRange ?? 2_000,
     client,
@@ -73,16 +78,103 @@ function cursorRow(
 }
 
 /** Cursor writes, read back from the parameters rather than from the watcher's own cache. */
+function rawCursorWrites(db: RecordingDb) {
+  return db.queries.filter(
+    (entry) =>
+      entry.text.includes("INSERT INTO indexer_cursor") ||
+      entry.text.includes("UPDATE indexer_cursor"),
+  );
+}
+
 function cursorWrites(db: RecordingDb): { block: bigint; family: string; hash: string | null }[] {
   // writeCursor takes (chain_key, family, contract, last_processed, last_processed_at, hash).
-  return db.matching("INSERT INTO indexer_cursor").map((entry) => ({
-    block: BigInt(String(entry.params[3])),
-    family: String(entry.params[1]),
-    hash: typeof entry.params[5] === "string" ? entry.params[5] : null,
-  }));
+  return db.queries
+    .filter(
+      (entry) =>
+        entry.text.includes("INSERT INTO indexer_cursor") ||
+        entry.text.includes("UPDATE indexer_cursor"),
+    )
+    .map((entry) => ({
+      block: BigInt(String(entry.params[3])),
+      family: String(entry.params[1]),
+      hash: typeof entry.params[5] === "string" ? entry.params[5] : null,
+    }));
 }
 
 describe("the line it will not read past", () => {
+  it("records finalized-block evidence and stops at its boundary", async () => {
+    class FinalizedClient extends FakeEvmClient {
+      finalizedBlock() {
+        return Promise.resolve({ number: 20n, hash: this.stampFor(20n).hash });
+      }
+    }
+    const { watcher, db, client } = harness({
+      client: new FinalizedClient({ head: 100n }),
+      finalityMode: "finalized",
+    });
+    await watcher.tick(AbortSignal.timeout(5_000));
+    expect(client.logQueries[0]?.toBlock).toBe(20n);
+    const record = db.matching("INSERT INTO evm_scan_provenance")[0];
+    expect(record?.params.slice(13)).toEqual([
+      "finalized",
+      false,
+      "finalized",
+      "20",
+      client.stampFor(20n).hash,
+    ]);
+  });
+
+  it("requires explicit fallback when finalized tags are unsupported", async () => {
+    const strict = harness({ head: 100n, finalityMode: "finalized" });
+    await expect(strict.watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+      "fallback is disabled",
+    );
+    expect(cursorWrites(strict.db)).toEqual([]);
+    const fallback = harness({
+      head: 100n,
+      finalityMode: "finalized",
+      allowFinalityFallback: true,
+    });
+    await fallback.watcher.tick(AbortSignal.timeout(5_000));
+    expect(fallback.client.logQueries[0]?.toBlock).toBe(97n);
+    expect(fallback.db.matching("INSERT INTO evm_scan_provenance")[0]?.params.slice(13)).toEqual([
+      "finalized",
+      true,
+      "confirmations",
+      null,
+      null,
+    ]);
+  });
+
+  it("rejects impossible finalized evidence even if unsupported-tag fallback is enabled", async () => {
+    class InvalidClient extends FakeEvmClient {
+      finalizedBlock() {
+        return Promise.resolve({ number: 101n, hash: this.stampFor(101n).hash });
+      }
+    }
+    const { watcher, db } = harness({
+      client: new InvalidClient({ head: 100n }),
+      finalityMode: "finalized",
+      allowFinalityFallback: true,
+    });
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+      "invalid finalized block evidence",
+    );
+    expect(cursorWrites(db)).toEqual([]);
+  });
+
+  it("aborts the cursor transaction if ownership is lost during provider reads", async () => {
+    const { watcher, db, client } = harness({ head: 100n });
+    const original = client.logs.bind(client);
+    client.logs = (query) => {
+      db.leaseRow = { owner_id: "replacement-worker", lease_until: new Date(Date.now() + 60_000) };
+      return original(query);
+    };
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow("watcher lease lost");
+    expect(cursorWrites(db)).toEqual([]);
+    expect(db.rollbacks).toEqual([1]);
+  });
+
   it("stops at the head minus this chain's confirmations", async () => {
     // One block on Arc and twelve on Ethereum are the same kind of fact, which is why the number
     // comes from the registry per chain rather than from one constant here.
@@ -231,7 +323,9 @@ describe("the range and the cursor as one commit", () => {
 
     await watcher.tick(AbortSignal.timeout(5_000));
 
-    const inserts = db.queries.filter((entry) => entry.text.includes("INSERT INTO"));
+    const inserts = db.queries.filter(
+      (entry) => entry.text.includes("INSERT INTO") && !entry.text.includes("indexer_lease"),
+    );
     expect(inserts.length).toBeGreaterThan(1);
     expect(new Set(inserts.map((entry) => entry.transaction)).size).toBe(1);
     expect(db.commits).toEqual([1]);
@@ -329,6 +423,34 @@ describe("what the watcher says about itself", () => {
   });
 });
 
+describe("unknown router logs", () => {
+  it("quarantines the raw payload instead of materializing a transfer", async () => {
+    const unknown: RawEvmLog = {
+      address: ANVIL_ROUTER,
+      blockNumber: 20n,
+      transactionHash: `0x${"12".repeat(32)}`,
+      logIndex: 0,
+      data: "0xdeadbeef",
+      topics: [`0x${"34".repeat(32)}`],
+      removed: false,
+    };
+    const { watcher, db } = harness({
+      client: new FakeEvmClient({ logs: [unknown], head: 60n }),
+      confirmations: 3,
+    });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    expect(db.matching("INSERT INTO evm_log_quarantine")).toHaveLength(1);
+    expect(db.matching("INSERT INTO outbound_transfer")).toHaveLength(0);
+    expect(db.matching("INSERT INTO inbound_delivery")).toHaveLength(0);
+    expect(db.matching("DELETE FROM evm_log_quarantine")).toHaveLength(1);
+    expect(db.matching("INSERT INTO evm_log_quarantine")[0]?.params).toEqual(
+      expect.arrayContaining(["unsupported_signature_or_payload", unknown.data]),
+    );
+  });
+});
+
 describe("an arrival, which the capture has none of", () => {
   const RECIPIENT = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8";
   const TOKEN = "0x5fbdb2315678afecb367f032d93f642f64180aa3";
@@ -392,7 +514,40 @@ describe("an arrival, which the capture has none of", () => {
     expect(db.matching("INSERT INTO inbound_delivery")).toHaveLength(0);
     expect(db.matching("INSERT INTO pending_claim")).toHaveLength(0);
     expect(db.matching("INSERT INTO evm_log_quarantine")).toHaveLength(100);
+    // The raw diagnostic is capped, but every excluded log keeps a durable rejection in the
+    // transaction that advances the cursor, so none is passed silently.
+    const rejections = db.matching("INSERT INTO ingestion_rejection");
+    expect(rejections).toHaveLength(120);
+    const cursorTx = rawCursorWrites(db)[0]?.transaction;
+    expect(cursorTx).not.toBeNull();
+    expect(rejections.every((entry) => entry.transaction === cursorTx)).toBe(true);
+    expect(rejections[0]?.params).toEqual(
+      expect.arrayContaining(["evm", "ordering_conflict", false]),
+    );
     expect(cursorWrites(db)).toHaveLength(1);
+  });
+
+  it("advances no cursor past a rejection when the open rejection bound is reached", async () => {
+    const [parked, inbound] = parkedDelivery(60n);
+    if (!parked || !inbound) throw new Error("missing pair");
+    const { watcher, db } = harness({
+      client: new FakeEvmClient({
+        head: 100n,
+        logs: [
+          { ...inbound, logIndex: 0 },
+          { ...parked, logIndex: 1 },
+        ],
+      }),
+      confirmations: 0,
+    });
+    db.openRejections = MAX_OPEN_INGESTION_REJECTIONS;
+    await watcher.tick(AbortSignal.timeout(5_000)).catch(() => undefined);
+    expect(db.matching("INSERT INTO ingestion_rejection")).toHaveLength(0);
+    expect(
+      rawCursorWrites(db).filter(
+        (entry) => entry.transaction !== null && db.commits.includes(entry.transaction),
+      ),
+    ).toHaveLength(0);
   });
 
   it("normalizes provider enumeration order before pairing a valid arrival", async () => {

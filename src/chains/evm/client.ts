@@ -52,6 +52,8 @@ export interface EvmClient {
    */
   chainId(signal?: AbortSignal): Promise<number>;
   blockNumber(signal?: AbortSignal): Promise<bigint>;
+  /** Explicit finalized-block evidence; absent support is never an implicit depth fallback. */
+  finalizedBlock?(signal?: AbortSignal): Promise<{ readonly number: bigint; readonly hash: Hex }>;
   /**
    * Logs from one address over an inclusive block range.
    *
@@ -138,6 +140,11 @@ export function viemClient(
     chainId: () => client.getChainId(),
 
     blockNumber: () => client.getBlockNumber({ cacheTime: 0 }),
+
+    finalizedBlock: async () => {
+      const block = await client.getBlock({ blockTag: "finalized", includeTransactions: false });
+      return { number: block.number, hash: block.hash };
+    },
 
     logs: async (query) => {
       const logs = await client.getLogs({

@@ -20,6 +20,22 @@ class MockDb {
     text: string,
     params: readonly unknown[] = [],
   ): Promise<{ rows: readonly Record<string, unknown>[]; rowCount: number }> {
+    if (text.includes("/* historical_coverage_snapshot */"))
+      return Promise.resolve({
+        rows: [
+          {
+            snapshot: {
+              historyGaps: { open: "0", reconciling: "0", reconciled: "0" },
+              sources: [],
+            },
+          },
+        ],
+        rowCount: 1,
+      });
+    if (text.includes("/* proof_rejection_metrics */"))
+      return Promise.resolve({ rows: [], rowCount: 0 });
+    if (text.includes("/* worker_run_history */"))
+      return Promise.resolve({ rows: [], rowCount: 0 });
     for (const [key, rows] of Object.entries(this.queryMap)) {
       if (text.includes(key)) {
         if (text.includes("WHERE t.id = $1") && params.length > 0) {
@@ -41,6 +57,49 @@ class MockDb {
 describe("REST API endpoints", () => {
   const config = loadConfig({ env: completeEnv() });
   const { logger } = capturingLogger();
+
+  it.each([
+    [400, "bad_request"],
+    [404, "not_found"],
+    [408, "timeout"],
+    [503, "unavailable"],
+    [504, "timeout"],
+    [500, "internal_error"],
+  ] as const)("normalizes HTTP %s without exposing database details", async (statusCode, code) => {
+    const app = buildServer({
+      config,
+      logger,
+      db: new MockDb({}) as unknown as Database,
+      readiness: [],
+    });
+    app.get("/test/error", () => {
+      throw Object.assign(
+        new Error("SELECT private_table; postgres://user:password@database/private"),
+        { statusCode },
+      );
+    });
+    const response = await app.inject({ method: "GET", url: "/test/error" });
+    expect(response.statusCode).toBe(statusCode);
+    expect(response.json()).toMatchObject({ code });
+    expect(response.body).not.toMatch(/private_table|password|postgres:/);
+    await app.close();
+  });
+
+  it("preserves legacy route error and adds the stable validation category", async () => {
+    const app = buildServer({
+      config,
+      logger,
+      db: new MockDb({}) as unknown as Database,
+      readiness: [],
+    });
+    const response = await app.inject({
+      method: "GET",
+      url: "/v1/transfers?cursor=invalid",
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ code: "bad_request", error: "invalid_cursor" });
+    await app.close();
+  });
 
   it("serves transfer status by origin chain and nonce", async () => {
     const db = new MockDb({
@@ -182,6 +241,20 @@ describe("REST API endpoints", () => {
 
     expect(res.statusCode).toBe(404);
     expect(res.json().error).toBe("not_found");
+    expect(res.json().code).toBe("not_found");
+  });
+
+  it("uses a stable error code without exposing route details", async () => {
+    const app = buildServer({
+      config,
+      logger,
+      db: new MockDb({}) as unknown as Database,
+      readiness: [],
+    });
+    const res = await app.inject({ method: "GET", url: "/no-such-route?secret=not-for-response" });
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toMatchObject({ error: "not_found", code: "not_found" });
+    expect(res.body).not.toContain("secret");
   });
 
   it("lists transfers with pagination metadata", async () => {
@@ -466,9 +539,102 @@ describe("REST API endpoints", () => {
     expect(res.statusCode).toBe(200);
     expect(res.headers["content-type"]).toBe("text/event-stream");
     expect(res.headers["cache-control"]).toBe("no-cache");
+    expect(res.payload).toMatch(/^id: [A-Za-z0-9_-]+\nevent: transfer_update/);
     expect(res.payload).toContain("event: transfer_update\ndata: ");
     expect(res.payload).toContain("event: complete\ndata: ");
     expect(res.payload).toContain('"stage":"delivered"');
+  });
+
+  it("replays an accepted Last-Event-ID cursor", async () => {
+    const db = new MockDb({
+      outbound_transfer: [
+        {
+          id: "resume-1",
+          origin_chain: "sepolia",
+          route: 0,
+          nonce: "45",
+          sender: "0x1111",
+          token: "0x2222",
+          gross_amount: "1000",
+          fee: "10",
+          net_amount: "990",
+          destination_chain: "stellar-testnet",
+          destination: "GBB...",
+          rail_ref: null,
+          origin_block: "100",
+          origin_tx: "0xresume",
+          observed_at: new Date("2026-10-07T12:00:00Z"),
+          attestation_status: "delivered",
+          rail_status: "complete",
+          rail_reference: "resume-45",
+          attested_at: new Date("2026-10-07T12:01:00Z"),
+          last_error: null,
+          inbound_delivered: true,
+          destination_block: "500",
+          destination_tx: "0xdef",
+          delivered_at: new Date("2026-10-07T12:05:00Z"),
+          claim_id: null,
+          claim_settled: false,
+        },
+      ],
+    });
+    const app = buildServer({ config, logger, db: db as unknown as Database, readiness: [] });
+
+    const first = await app.inject("/v1/transfers/resume-1/stream");
+    expect(first.statusCode).toBe(200);
+    const cursor = first.payload.split("\n")[0]?.slice(4) ?? "";
+    expect(cursor).toMatch(/^[A-Za-z0-9_-]+$/);
+
+    const resumed = await app.inject({
+      method: "GET",
+      url: "/v1/transfers/resume-1/stream",
+      headers: { "last-event-id": cursor },
+    });
+    expect(resumed.statusCode).toBe(200);
+    expect(resumed.payload).toMatch(/^id: [A-Za-z0-9_-]+\nevent: transfer_update/);
+  });
+
+  it("rejects malformed SSE cursors with a client error", async () => {
+    const db = new MockDb({
+      outbound_transfer: [
+        {
+          id: "resume-invalid",
+          origin_chain: "sepolia",
+          route: 0,
+          nonce: "46",
+          sender: "0x1111",
+          token: "0x2222",
+          gross_amount: "1000",
+          fee: "10",
+          net_amount: "990",
+          destination_chain: "stellar-testnet",
+          destination: "GBB...",
+          rail_ref: null,
+          origin_block: "100",
+          origin_tx: "0xinvalid",
+          observed_at: new Date("2026-10-07T12:00:00Z"),
+          attestation_status: "delivered",
+          rail_status: "complete",
+          rail_reference: "invalid-46",
+          attested_at: new Date("2026-10-07T12:01:00Z"),
+          last_error: null,
+          inbound_delivered: true,
+          destination_block: "500",
+          destination_tx: "0xdef",
+          delivered_at: new Date("2026-10-07T12:05:00Z"),
+          claim_id: null,
+          claim_settled: false,
+        },
+      ],
+    });
+    const app = buildServer({ config, logger, db: db as unknown as Database, readiness: [] });
+    const response = await app.inject({
+      method: "GET",
+      url: "/v1/transfers/resume-invalid/stream",
+      headers: { "last-event-id": "not-a-cursor" },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ error: "cursor_expired", resync: true });
   });
 
   it("emits transfer_update on status change and sends periodic ping comments", async () => {
@@ -643,11 +809,25 @@ describe("REST API endpoints", () => {
 });
 
 describe("Readiness and health probes", () => {
-  const config = loadConfig({ env: completeEnv() });
+  const config = loadConfig({ env: completeEnv({ RAILS_ENABLED: "false" }) });
   const { logger } = capturingLogger();
 
   it("returns 200 when all components (Postgres, Redis, Watchers) are healthy", async () => {
-    const db = new MockDb({});
+    const db = new MockDb({
+      indexer_worker_heartbeat: ["stellar-testnet", "sepolia"].map((chain) => ({
+        worker_name: chain,
+        worker_kind: "chain",
+        chain_key: chain,
+        state: "ready",
+        detail: "current",
+        last_heartbeat_at: new Date(),
+        last_completed_at: new Date(),
+        last_cursor_block: "123",
+        consecutive_failures: 0,
+        last_error: null,
+        metadata: {},
+      })),
+    });
     const mockRedis = {
       ping: () => Promise.resolve("PONG"),
     };

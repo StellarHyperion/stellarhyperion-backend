@@ -31,16 +31,61 @@ const REDACTED_PATHS = [
   "connectionString",
   "password",
   "stellarSecret",
+  "params",
+  "sqlParams",
+  "apiKey",
+  "authorization",
+  "historicalRpcUrl",
+  "rpcUrl",
+  "rpcUrls",
+  "failedRpc",
+  "fallbackRpc",
   "*.stellarSecret",
   "config.keeper.stellarSecret",
+  "stellarSecrets",
+  "config.keeper.stellarSecrets",
   "*.databaseUrl",
   "*.redisUrl",
   "*.connectionString",
   "*.password",
+  "*.params",
+  "*.sqlParams",
+  "*.apiKey",
+  "*.authorization",
+  "*.headers.authorization",
+  "*.historicalRpcUrl",
+  "*.rpcUrl",
+  "*.rpcUrls",
   "err.connectionString",
   "config.databaseUrl",
   "config.redisUrl",
 ];
+
+/** Strip URL userinfo credentials from error messages before logging or persisting diagnostics. */
+export function sanitizeDiagnosticText(input: string): string {
+  return input
+    .replace(/\b(?:https?|postgres(?:ql)?|rediss?):\/\/[^\s"'<>]+/gi, "[redacted URL]")
+    .replace(/\b(Bearer|Basic)\s+[^\s,;]+/gi, "$1 [redacted]")
+    .replace(
+      /\b((?:authorization|password|secret|api[_-]?key|token)\s*[:=]\s*)[^\s,;]+/gi,
+      "$1[redacted]",
+    )
+    .slice(0, 2048);
+}
+
+const SAFE_OPERATION_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
+
+/** Check if an identifier is a safe operation or run identity. */
+export function isSafeOperationIdentifier(input: unknown): input is string {
+  return typeof input === "string" && SAFE_OPERATION_ID.test(input);
+}
+
+/** Sanitize an operation or run identifier, returning null if unsafe. */
+export function sanitizeOperationIdentifier(input: unknown): string | null {
+  if (typeof input !== "string") return null;
+  const sanitized = sanitizeDiagnosticText(input).trim();
+  return SAFE_OPERATION_ID.test(sanitized) ? sanitized : null;
+}
 
 export function createLogger(config: AppConfig): Logger {
   return pino({

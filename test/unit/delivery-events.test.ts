@@ -2,19 +2,24 @@ import { describe, expect, it } from "vitest";
 import { encodeAbiParameters, encodeEventTopics, stringToHex, type Hex } from "viem";
 import {
   ITS_ABI,
+  inspectDeliveryEvidence,
   matchingPayment,
+  inspectPayment,
+  normalizeVerificationDiagnostics,
   type DeliveryLog,
   type ExpectedDelivery,
 } from "../../src/rails/axelar/events.js";
 const recipient = "0x1111111111111111111111111111111111111111";
 const its = "0x2222222222222222222222222222222222222222";
 const token = "0x3333333333333333333333333333333333333333";
+const tokenManager = "0x4444444444444444444444444444444444444444";
 const commandId: Hex = `0x${"ab".repeat(32)}`;
 const tokenId: Hex = `0x${"cd".repeat(32)}`;
 const source = stringToHex("Gsource");
 const expected: ExpectedDelivery = {
   its,
   token,
+  tokenManager,
   commandId,
   tokenId,
   sourceChain: "stellar-2026-q1-2",
@@ -40,7 +45,7 @@ const paid: DeliveryLog = {
   topics: encodeEventTopics({
     abi: ITS_ABI,
     eventName: "Transfer",
-    args: { from: its, to: recipient },
+    args: { from: tokenManager, to: recipient },
   }) as [Hex, ...Hex[]],
   data: encodeAbiParameters([{ type: "uint256" }], [expected.amount]),
   logIndex: 3,
@@ -59,6 +64,7 @@ describe("Destination delivery evidence", () => {
     "sourceChain",
     "sourceAddress",
     "recipient",
+    "tokenManager",
   ] as const)("rejects mismatched %s", (key) => {
     expect(matchingPayment([received, paid], { ...expected, [key]: "different" })).toBeNull();
   });
@@ -67,8 +73,64 @@ describe("Destination delivery evidence", () => {
       matchingPayment([received, paid], { ...expected, amount: expected.amount + 1n }),
     ).toBeNull();
   });
+  it("returns bounded structured diagnostics for invalid evidence", () => {
+    const inspection = inspectPayment([received, paid], {
+      ...expected,
+      recipient: "0x4444444444444444444444444444444444444444",
+    });
+    expect(inspection.payment).toBeNull();
+    expect(inspection.diagnostics).toEqual(
+      expect.arrayContaining([
+        {
+          category: "recipient",
+          expected: "0x4444444444444444444444444444444444444444",
+          observed: recipient,
+        },
+      ]),
+    );
+  });
   it("does not lose a matching receipt event when another transfer shares the transaction", () => {
     const unrelated = { ...received, address: token as Hex };
     expect(matchingPayment([received, unrelated, paid], expected)).toBe(paid);
+  });
+
+  it("accepts the exact pair alongside a mismatched ITS event", () => {
+    const unrelated = {
+      ...received,
+      data: encodeAbiParameters(
+        [{ type: "string" }, { type: "bytes" }, { type: "uint256" }, { type: "bytes32" }],
+        ["other-source", source, expected.amount + 1n, `0x${"0".repeat(64)}`],
+      ),
+    };
+    expect(inspectPayment([unrelated, received, paid], expected)).toEqual({
+      payment: paid,
+      diagnostics: [],
+    });
+  });
+
+  it("normalizes, bounds and sanitizes persisted diagnostic identifiers", () => {
+    const result = normalizeVerificationDiagnostics([
+      {
+        category: "source_identity",
+        expected: "public-source",
+        observed: "https://user:password@provider/path?token=private-value",
+      },
+      { category: "amount", expected: "1", observed: "9".repeat(1000) },
+      { category: "amount", expected: "ignored-duplicate", observed: "2" },
+    ]);
+    expect(result).toHaveLength(2);
+    expect(JSON.stringify(result)).not.toMatch(/password|private-value|ignored-duplicate/);
+    expect(result.every((item) => (item.observed?.length ?? 0) <= 128)).toBe(true);
+  });
+
+  it("reports receipt and payout evidence independently", () => {
+    expect(inspectDeliveryEvidence([received], expected)).toEqual({
+      received,
+      payment: null,
+    });
+    expect(inspectDeliveryEvidence([paid], expected)).toEqual({
+      received: null,
+      payment: paid,
+    });
   });
 });

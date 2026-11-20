@@ -135,6 +135,31 @@ suite("rail pollers against real Postgres", () => {
     expect(row.rail_reference).toBe("iris-ref-101");
     expect(row.attested_at).toBeInstanceOf(Date);
     expect((row.attested_at as Date).toISOString()).toBe("2026-10-07T12:00:00.000Z");
+
+    const history = await db.query(
+      `SELECT old_status, new_status, rail_status, evidence_reference
+         FROM rail_attestation_history
+        WHERE transfer_id = $1
+        ORDER BY id`,
+      [first.transferId.toString()],
+    );
+    expect(history.rows).toEqual([
+      {
+        old_status: "unobserved",
+        new_status: "attested",
+        rail_status: "complete",
+        evidence_reference: "iris-ref-101",
+      },
+    ]);
+
+    // Replaying the same provider result is harmless: the current state is updated, but history
+    // keeps one copy of the same committed observation.
+    await pass.tick(new AbortController().signal);
+    const replay = await db.query(
+      "SELECT count(*)::int AS n FROM rail_attestation_history WHERE transfer_id = $1",
+      [first.transferId.toString()],
+    );
+    expect(replay.rows[0]?.n).toBe(1);
   });
 
   it("short-circuits to delivered when inbound_delivery exists", async () => {
