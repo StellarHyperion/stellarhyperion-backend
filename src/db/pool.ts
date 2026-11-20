@@ -16,6 +16,7 @@ import { performance } from "node:perf_hooks";
 
 import { Client, Pool } from "pg";
 import type { PoolClient, PoolConfig } from "pg";
+import { currentWorkerRun } from "../runtime/worker-runs.js";
 import {
   computeHistoryDigest as computeRangeDigest,
   recordHistoryDigest as storeRangeDigest,
@@ -153,6 +154,9 @@ export class Database implements Transactional {
     const client = await this.pool.connect();
     try {
       await this.measure("transaction", () => client.query("BEGIN"));
+      const run = currentWorkerRun();
+      if (run !== undefined)
+        await client.query("SELECT set_config('hyperion.worker_run_id',$1,true)", [run.runId]);
       const value = await work(this.wrapClient(client));
       await this.measure("transaction", () => client.query("COMMIT"));
       return value;
