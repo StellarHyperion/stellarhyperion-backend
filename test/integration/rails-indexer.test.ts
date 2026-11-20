@@ -20,6 +20,7 @@ import {
   type RailLookup,
 } from "../../src/rails/types.js";
 import { capturingLogger } from "../stellar-fakes.js";
+import { RateLimitSimulator } from "../helpers.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
 const suite = CONNECTION === undefined ? describe.skip : describe;
@@ -1102,5 +1103,47 @@ suite("rail pollers against real Postgres", () => {
     });
     expect(snapshot.candidates.map((row) => row.nonce)).toEqual(["1101"]);
     expect((await db.query("SELECT * FROM rail_attestation")).rows).toHaveLength(0);
+  });
+
+  it("emulates Retry-After backoff and cooldown using RateLimitSimulator", async () => {
+    await seedRetry(1201n);
+    const { logger } = capturingLogger();
+    let now = new Date();
+    const sim = new RateLimitSimulator();
+    sim.simulateRetryAfter(30);
+
+    const options = {
+      route: 0,
+      client: sim,
+      db,
+      logger,
+      batchSize: 10,
+      recheckAfterMs: 5_000,
+      maxCheckFailures: 5,
+      now: () => now,
+    };
+
+    await new RailPass(options).tick(new AbortController().signal);
+    expect(sim.callCount).toBe(1);
+
+    const { rows } = await db.query(
+      `SELECT a.retry_class, a.next_attempt_at
+         FROM rail_attestation a
+         JOIN outbound_transfer t ON t.id = a.transfer_id
+        WHERE t.nonce = 1201 AND t.route = 0`,
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.retry_class).toBe("rate_limited");
+    expect(rows[0]?.next_attempt_at).toEqual(new Date(now.getTime() + 30_000));
+
+    // Advancing 15s - should not recheck
+    now = new Date(now.getTime() + 15_000);
+    await new RailPass(options).tick(new AbortController().signal);
+    expect(sim.callCount).toBe(1);
+
+    // Advancing past cooldown
+    now = new Date(now.getTime() + 16_000);
+    await new RailPass(options).tick(new AbortController().signal);
+    expect(sim.callCount).toBe(2);
   });
 });
