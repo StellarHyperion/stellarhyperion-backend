@@ -66,6 +66,21 @@ const connection = process.env.TEST_DATABASE_URL;
         reader.query("UPDATE hyperion_database_identity SET environment='production'"),
       ).rejects.toThrow();
     });
+    it("rejects a reader without the durable SSE history grant before serving requests", async () => {
+      await admin.query(`REVOKE SELECT ON public.rail_attestation_history FROM "${role}"`);
+      try {
+        await expect(checkDatabasePolicy(reader, config)).rejects.toThrow("required SELECT grants");
+        await expect(
+          reader.query("SELECT id FROM public.rail_attestation_history LIMIT 1"),
+        ).rejects.toThrow();
+      } finally {
+        await admin.query(`GRANT SELECT ON public.rail_attestation_history TO "${role}"`);
+      }
+      await expect(checkDatabasePolicy(reader, config)).resolves.toBeUndefined();
+      await expect(
+        reader.query("SELECT id FROM public.rail_attestation_history LIMIT 1"),
+      ).resolves.toBeDefined();
+    });
     it("rejects an escalation membership even when the login itself has no write grants", async () => {
       const writingRole = `${role}_writer`;
       await admin.query(`CREATE ROLE "${writingRole}" NOLOGIN`);

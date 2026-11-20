@@ -40,6 +40,7 @@ const { logger } = capturingLogger();
 const config = loadConfig({
   env: completeEnv({ KEEPER_ENABLED: "false", RAILS_ENABLED: "false" }),
 });
+const CURSOR_WALLET = config.deployments.networks["stellar-testnet"]!.treasury;
 const app = buildServer({
   config,
   logger,
@@ -64,6 +65,11 @@ beforeAll(async () => {
     "1792200000000_evm-scan-provenance.sql",
     "1792300000000_indexed-history-digests.sql",
     "1792400000000_indexer-worker-heartbeat.sql",
+    "1792500000000_axelar-delivery-evidence.sql",
+    "1792600000000_keeper-checkpoints.sql",
+    "1792800000000_cctp-verification-failure-reasons.sql",
+    "1792900000000_rail-transition-history.sql",
+    "1793700000000_worker-run-correlation.sql",
   ]) {
     const sql = readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8").split(
       "-- Down Migration",
@@ -157,6 +163,20 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     const quoted = await app.inject("/v1/transfers?search=%27%20OR%201%3D1%20--");
     expect(quoted.statusCode).toBe(200);
     expect(quoted.json().transfers).toHaveLength(0);
+  });
+  it("returns an opaque cursor and rejects a cursor used with different filters", async () => {
+    const first = await app.inject("/v1/transfers?limit=1&originChain=stellar-testnet");
+    expect(first.statusCode).toBe(200);
+    expect(first.json().nextCursor).toEqual(expect.any(String));
+    const next = await app.inject(
+      `/v1/transfers?limit=1&originChain=stellar-testnet&cursor=${encodeURIComponent(first.json().nextCursor)}`,
+    );
+    expect(next.statusCode).toBe(200);
+    const mismatched = await app.inject(
+      `/v1/transfers?originChain=sepolia&cursor=${encodeURIComponent(first.json().nextCursor)}`,
+    );
+    expect(mismatched.statusCode).toBe(400);
+    expect(mismatched.json().error).toBe("invalid_cursor");
   });
   it("reports the actual native-USDC payout after Circle fees in destination precision", async () => {
     const source = config.deployments.networks["stellar-testnet"];
@@ -566,5 +586,43 @@ describe("public response differential runner", () => {
     expect(differentialReport(previous, { ...previous, statusCode: 500 }).breaking).toEqual([
       "$statusCode",
     ]);
+  });
+  it("walks each transfer once while new rows arrive and retains offset compatibility", async () => {
+    const insert = async (nonce: number) =>
+      pg.query(
+        `INSERT INTO outbound_transfer(origin_chain,route,nonce,sender,token,gross_amount,fee,net_amount,destination_chain,destination,origin_block,origin_tx)
+       VALUES ('stellar-testnet',1,$1,$3,'USDC',100,0,100,'sepolia','recipient',123,$2) RETURNING id`,
+        [nonce, `cursor-source-${String(nonce)}`, CURSOR_WALLET],
+      );
+    const ids: string[] = [];
+    for (let nonce = 9201; nonce <= 9205; nonce += 1) {
+      const result = await insert(nonce);
+      ids.unshift(String((result.rows[0] as { id: unknown }).id));
+    }
+    const first = await app.inject(`/v1/transfers?sender=${CURSOR_WALLET}&limit=2`);
+    expect(first.statusCode).toBe(200);
+    const seen = first.json().transfers.map((row: { id: string }) => row.id) as string[];
+    expect(seen).toEqual(ids.slice(0, 2));
+    await insert(9206);
+    let cursor = first.json().nextCursor as string | null;
+    while (cursor !== null) {
+      const next = await app.inject(
+        `/v1/transfers?sender=${CURSOR_WALLET}&limit=2&cursor=${encodeURIComponent(cursor)}`,
+      );
+      expect(next.statusCode).toBe(200);
+      expect(next.json().offset).toBeUndefined();
+      seen.push(...next.json().transfers.map((row: { id: string }) => row.id));
+      cursor = next.json().nextCursor as string | null;
+    }
+    expect(seen).toEqual(ids);
+    const offset = await app.inject(`/v1/transfers?sender=${CURSOR_WALLET}&limit=2&offset=1`);
+    expect(offset.statusCode).toBe(200);
+    expect(offset.json().offset).toBe(1);
+    expect(offset.json().transfers.map((row: { id: string }) => row.id)).toEqual(ids.slice(0, 2));
+    const mixed = await app.inject(
+      `/v1/transfers?sender=${CURSOR_WALLET}&offset=1&cursor=${encodeURIComponent(first.json().nextCursor)}`,
+    );
+    expect(mixed.statusCode).toBe(400);
+    await pg.query("DELETE FROM outbound_transfer WHERE sender=$1", [CURSOR_WALLET]);
   });
 });

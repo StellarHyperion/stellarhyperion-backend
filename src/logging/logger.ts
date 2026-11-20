@@ -42,6 +42,8 @@ const REDACTED_PATHS = [
   "fallbackRpc",
   "*.stellarSecret",
   "config.keeper.stellarSecret",
+  "stellarSecrets",
+  "config.keeper.stellarSecrets",
   "*.databaseUrl",
   "*.redisUrl",
   "*.connectionString",
@@ -69,6 +71,20 @@ export function sanitizeDiagnosticText(input: string): string {
       "$1[redacted]",
     )
     .slice(0, 2048);
+}
+
+const SAFE_OPERATION_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
+
+/** Check if an identifier is a safe operation or run identity. */
+export function isSafeOperationIdentifier(input: unknown): input is string {
+  return typeof input === "string" && SAFE_OPERATION_ID.test(input);
+}
+
+/** Sanitize an operation or run identifier, returning null if unsafe. */
+export function sanitizeOperationIdentifier(input: unknown): string | null {
+  if (typeof input !== "string") return null;
+  const sanitized = sanitizeDiagnosticText(input).trim();
+  return SAFE_OPERATION_ID.test(sanitized) ? sanitized : null;
 }
 
 export function createLogger(config: AppConfig): Logger {
