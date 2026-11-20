@@ -20,13 +20,23 @@ const suite = connection === undefined ? describe.skip : describe;
 suite("real PostgreSQL archived keeper submission recovery", () => {
   let db: Database;
   const signer = Keypair.random();
-  const config = loadConfig({ env: completeEnv({ KEEPER_STELLAR_SECRET: signer.secret() }) });
-  const chain = config.indexer.stellar!;
+  const loaded = loadConfig({ env: completeEnv({ KEEPER_STELLAR_SECRET: signer.secret() }) });
+  const config = {
+    ...loaded,
+    indexer: {
+      ...loaded.indexer,
+      stellar: { ...loaded.indexer.stellar!, chain: "stellar-testnet" as const },
+    },
+  };
+  const chain = config.indexer.stellar;
   beforeAll(() => {
     db = Database.open(connection!, { applicationName: "hyperion-restore-298" });
   });
   afterAll(async () => {
     await db.query("DELETE FROM keeper_checkpoint WHERE signer = $1", [signer.publicKey()]);
+    await db.query("DELETE FROM keeper_signer_state WHERE chain_key=$1", [
+      config.indexer.stellar.chain,
+    ]);
     await db.close();
   });
   it("commits an uncertain restore hash across lock rollback, reconciles it, and submits the unchanged claim once", async () => {
@@ -46,6 +56,7 @@ suite("real PostgreSQL archived keeper submission recovery", () => {
     };
     const client = {
       getNetwork: () => Promise.resolve({ passphrase: chain.networkPassphrase }),
+      getAccountEntry: () => Promise.resolve({ balance: 100000000n }),
       getAccount: () => Promise.resolve(new Account(signer.publicKey(), String(sequence++))),
       simulateTransaction: () => {
         simulations++;

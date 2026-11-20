@@ -120,6 +120,8 @@ export interface KeeperConfig {
   readonly pollIntervalMs: number;
   readonly concurrency: number;
   readonly stellarSecret: string | null;
+  readonly stellarSecrets: readonly string[];
+  readonly activeSigner: string | null;
 }
 
 export interface AppConfig {
@@ -385,6 +387,22 @@ const KEEPER_STELLAR_SECRET: VarSpec = {
   printable: false,
   purpose:
     "Secret key for submitting Stellar keep_alive and claim transactions. Optional; runs dry-run when absent.",
+};
+
+const KEEPER_STELLAR_SECRETS: VarSpec = {
+  name: "KEEPER_STELLAR_SECRETS",
+  kind: "string",
+  required: false,
+  printable: false,
+  purpose: "Comma-separated Stellar signer secrets used for safe signer rotation.",
+};
+
+const KEEPER_STELLAR_ACTIVE_SIGNER: VarSpec = {
+  name: "KEEPER_STELLAR_ACTIVE_SIGNER",
+  kind: "string",
+  required: false,
+  printable: true,
+  purpose: "Public key of the funded signer to use after pending submissions are reconciled.",
 };
 
 const SHUTDOWN_TIMEOUT_MS: VarSpec = {
@@ -729,6 +747,18 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const keeperStellarSecret = reader.has(KEEPER_STELLAR_SECRET.name)
     ? reader.string(KEEPER_STELLAR_SECRET)
     : null;
+  const keeperStellarSecrets = reader.has(KEEPER_STELLAR_SECRETS.name)
+    ? reader
+        .string(KEEPER_STELLAR_SECRETS)
+        .split(",")
+        .map((secret) => secret.trim())
+        .filter((secret) => secret.length > 0)
+    : keeperStellarSecret === null
+      ? []
+      : [keeperStellarSecret];
+  const keeperActiveSigner = reader.has(KEEPER_STELLAR_ACTIVE_SIGNER.name)
+    ? reader.string(KEEPER_STELLAR_ACTIVE_SIGNER)
+    : null;
   const stellarRpcOverride = reader.url(STELLAR_RPC_URL);
   const stellarHistoricalRpcUrl = reader.has(STELLAR_HISTORICAL_RPC_URL.name)
     ? reader.url(STELLAR_HISTORICAL_RPC_URL)
@@ -831,6 +861,8 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       pollIntervalMs: keeperPollIntervalMs,
       concurrency: keeperConcurrency,
       stellarSecret: keeperStellarSecret,
+      stellarSecrets: keeperStellarSecrets,
+      activeSigner: keeperActiveSigner,
     },
     deploymentMode,
     readinessPolicy,

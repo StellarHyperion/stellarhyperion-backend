@@ -24,12 +24,22 @@ function fixture() {
       pending = { hash: params[0], intent_key: params[5], phase: params[6] };
     if (sql.includes("UPDATE keeper_checkpoint")) pending = null;
     return Promise.resolve({
-      rows: sql.includes("state = 'submitted' ORDER BY") && pending ? [pending] : [],
+      rows: sql.includes("SELECT active_signer,network_passphrase")
+        ? [
+            {
+              active_signer: signer.publicKey(),
+              network_passphrase: config.indexer.stellar!.networkPassphrase,
+            },
+          ]
+        : sql.includes("state = 'submitted' ORDER BY") && pending
+          ? [pending]
+          : [],
       rowCount: 1,
     });
   }
   const client = {
     getNetwork: () => Promise.resolve({ passphrase: config.indexer.stellar!.networkPassphrase }),
+    getAccountEntry: () => Promise.resolve({ balance: 100000000n }),
     getAccount: () => Promise.resolve(new Account(signer.publicKey(), "1")),
     simulateTransaction: () => {
       preparations++;

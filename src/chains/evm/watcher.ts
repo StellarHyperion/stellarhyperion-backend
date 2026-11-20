@@ -32,7 +32,14 @@ import { createHash } from "node:crypto";
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
-import type { Position } from "../writers.js";
+import {
+  reconcileIngestionRejection,
+  recordIngestionRejection,
+  recordSourceEvent,
+  type IngestionErrorClass,
+  type IngestionSource,
+  type Position,
+} from "../writers.js";
 import {
   acquireLease,
   applyRouterLog,
@@ -40,11 +47,12 @@ import {
   ClaimPairing,
   recordEvmScanProvenance,
   quarantineEvmLog,
+  readQuarantinedEvmLogs,
   releaseLease,
   type EvmFinalityPolicy,
   type EvmFinalityPolicyChange,
 } from "./store.js";
-import { decodeRouterLog, signatureOf } from "./logs.js";
+import { decodeRouterLog, LogShapeError, signatureOf } from "./logs.js";
 import type { EvmClient, RawEvmLog } from "./client.js";
 
 /**
@@ -156,6 +164,102 @@ export class EvmWatcher {
     });
   }
 
+  /** Decode retained raw evidence only after confirming its configured deployment and canonical block. */
+  async replayQuarantined(
+    signal: AbortSignal,
+    limit = 100,
+  ): Promise<{ written: number; ignored: number }> {
+    throwIfAborted(signal);
+    const { db, client, chainKey, router } = this.options;
+    await this.confirmChain(signal);
+    const evidence = await readQuarantinedEvmLogs(db, chainKey, router, limit);
+    const head = await client.blockNumber(signal);
+    const boundary = (await this.scanLimit(head, signal)).boundary;
+    const blocks = await client.blocks(
+      [...new Set(evidence.map((entry) => entry.log.blockNumber))],
+      signal,
+    );
+    // A quarantined BridgeIn may be replayed after its ClaimParked already succeeded, or
+    // after the bounded evidence page split their transaction. Reconstruct the canonical
+    // transaction context rather than interpreting the delivery as successful in isolation.
+    const context = new Map<string, readonly RawEvmLog[]>();
+    const contextsByBlock = new Map<bigint, readonly RawEvmLog[]>();
+    let contextLogCount = 0;
+    for (const entry of evidence) {
+      if (decodeRouterLog(entry.log)?.name !== "BridgeIn") continue;
+      let logs = contextsByBlock.get(entry.log.blockNumber);
+      if (logs === undefined) {
+        logs = await client.logs(
+          {
+            address: router,
+            fromBlock: entry.log.blockNumber,
+            toBlock: entry.log.blockNumber,
+          },
+          signal,
+        );
+        contextLogCount += logs.length;
+        if (contextLogCount > 1000)
+          throw new Error("Canonical replay context exceeds its log budget.");
+        contextsByBlock.set(entry.log.blockNumber, logs);
+      }
+      const transaction = logs.filter(
+        (log) =>
+          !log.removed &&
+          log.address.toLowerCase() === router.toLowerCase() &&
+          log.blockNumber === entry.log.blockNumber &&
+          log.transactionHash.toLowerCase() === entry.log.transactionHash.toLowerCase(),
+      );
+      const retained = transaction.find((log) => log.logIndex === entry.log.logIndex);
+      if (
+        retained?.data !== entry.log.data ||
+        retained.topics.join("|") !== entry.log.topics.join("|") ||
+        transaction.some((log) => decodeRouterLog(log) === null)
+      )
+        throw new Error("Canonical replay transaction context is missing or unsupported.");
+      context.set(logKey(entry.log), transaction);
+    }
+    const pairing = new ClaimPairing();
+    const conflicts = this.findOrderingConflicts(
+      [
+        ...evidence.map((entry) => entry.log).filter((log) => !context.has(logKey(log))),
+        ...[...context.values()].flat(),
+      ].filter(
+        (log, index, logs) => logs.findIndex((other) => logKey(other) === logKey(log)) === index,
+      ),
+    );
+    let written = 0;
+    let ignored = 0;
+    await db.transaction(async (tx) => {
+      await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [
+        "evm-events:" + chainKey,
+      ]);
+      for (const entry of evidence) {
+        throwIfAborted(signal);
+        const stamp = blocks.get(entry.log.blockNumber);
+        if (
+          entry.log.blockNumber < this.options.startBlock ||
+          entry.log.blockNumber > boundary ||
+          stamp?.hash.toLowerCase() !== entry.blockHash.toLowerCase()
+        )
+          throw new Error("Quarantined evidence is outside the confirmed canonical deployment.");
+        if (conflicts.has(logKey(entry.log))) {
+          ignored++;
+          continue;
+        }
+        for (const support of context.get(logKey(entry.log)) ?? []) {
+          if (
+            support.logIndex < entry.log.logIndex &&
+            decodeRouterLog(support)?.name === "ClaimParked"
+          )
+            await this.apply(tx, support, stamp.timestamp, pairing, stamp.hash);
+        }
+        if (await this.apply(tx, entry.log, stamp.timestamp, pairing, stamp.hash)) written++;
+        else ignored++;
+      }
+    });
+    return { written, ignored };
+  }
+
   /**
    * Apply one historical range without reading or advancing the live cursor.
    *
@@ -222,6 +326,8 @@ export class EvmWatcher {
         if (conflict) {
           const timestamp = blocks.get(log.blockNumber)?.timestamp;
           if (timestamp === undefined) throw new Error("missing canonical quarantine timestamp");
+          // The raw diagnostic is capped per pass; the durable rejection never is.
+          await this.reject(tx, log, "ordering_conflict", conflict.reason, conflict.eventName);
           if (diagnosticCount++ < MAX_QUARANTINED_LOGS_PER_PASS)
             await quarantineEvmLog(
               tx,
@@ -238,11 +344,11 @@ export class EvmWatcher {
           ignored += 1;
           continue;
         }
-        const timestamp = blocks.get(log.blockNumber)?.timestamp;
-        if (timestamp === undefined) {
+        const stamp = blocks.get(log.blockNumber);
+        if (stamp === undefined) {
           throw new Error(`no timestamp for block ${log.blockNumber.toString()} on ${chainKey}`);
         }
-        if (await this.apply(tx, log, timestamp, pairing)) written += 1;
+        if (await this.apply(tx, log, stamp.timestamp, pairing, stamp.hash)) written += 1;
         else ignored += 1;
       }
     });
@@ -423,6 +529,9 @@ export class EvmWatcher {
                 `no timestamp for quarantined block ${log.blockNumber.toString()} on ${chainKey}`,
               );
             }
+            // The raw diagnostic is capped per pass; the durable rejection never is, so the
+            // cursor advance in this transaction cannot pass the log silently.
+            await this.reject(tx, log, "ordering_conflict", conflict.reason, conflict.eventName);
             if (recordedQuarantines < MAX_QUARANTINED_LOGS_PER_PASS) {
               recordedQuarantines += 1;
               await quarantineEvmLog(
@@ -453,13 +562,13 @@ export class EvmWatcher {
             ignored += 1;
             continue;
           }
-          const timestamp = blocks.get(log.blockNumber)?.timestamp;
-          if (timestamp === undefined) {
+          const stamp = blocks.get(log.blockNumber);
+          if (stamp === undefined) {
             throw new Error(
               `no timestamp for block ${log.blockNumber.toString()} on ${chainKey}, which three columns need`,
             );
           }
-          if (await this.apply(tx, log, timestamp, pairing)) written += 1;
+          if (await this.apply(tx, log, stamp.timestamp, pairing, stamp.hash)) written += 1;
           else ignored += 1;
         }
         await writeCursor(tx, {
@@ -645,23 +754,59 @@ export class EvmWatcher {
     log: RawEvmLog,
     timestamp: bigint,
     pairing: ClaimPairing,
+    blockHash: Hex,
   ): Promise<boolean> {
     const { chainKey, router, logger } = this.options;
     const decoded = decodeRouterLog(log);
     if (decoded === null) {
       const signature = signatureOf(log);
-      if (!this.reportedUnknown.has(signature)) {
+      if (!this.reportedUnknown.has(signature) && this.reportedUnknown.size < 64) {
         this.reportedUnknown.add(signature);
         logger.warn(
           { chain: chainKey, signature },
           "the router emitted an event signature this build does not know; it is running ahead of the indexer",
         );
       }
+      await quarantineEvmLog(
+        tx,
+        {
+          chainKey,
+          block: log.blockNumber,
+          txHash: log.transactionHash,
+          logIndex: log.logIndex,
+          eventName: signature.slice(0, 200),
+          reason: "unsupported_signature_or_payload",
+          raw: log,
+          blockHash,
+        },
+        new Date(Number(timestamp) * 1000),
+      );
+      await this.reject(tx, log, "unknown_event", "unsupported signature", signature);
       return false;
     }
 
     const digest = createHash("sha256").update(log.data).update(log.topics.join("|")).digest("hex");
     const key = [chainKey, router, log.blockNumber.toString(), log.transactionHash, log.logIndex];
+    // Raw identity first, kept apart from the rows it materializes. A replay resolves to the same
+    // source event; a different payload at the same position is evidence, never a replacement.
+    const source = await recordSourceEvent(tx, {
+      ...this.sourceOf(log),
+      eventKind: decoded.name,
+      payloadDigest: digest,
+    });
+    if (source.kind === "conflict") {
+      logger.warn(
+        {
+          chain: chainKey,
+          block: log.blockNumber.toString(),
+          logIndex: log.logIndex,
+          originalDigest: source.originalDigest,
+          incomingDigest: source.incomingDigest,
+        },
+        "an EVM log arrived with a different payload at an already recorded source position; keeping the original",
+      );
+      return false;
+    }
     const evidence = await tx.query(
       `SELECT digest FROM evm_applied_event
       WHERE chain_key=$1 AND contract=$2 AND block_number=$3 AND tx_hash=$4 AND log_index=$5`,
@@ -701,9 +846,35 @@ export class EvmWatcher {
       // Unlike Soroban, which orders events within a transaction instead.
       logIndex: log.logIndex,
       observedAt: new Date(Number(timestamp) * 1000),
+      sourceEventId: source.id,
     };
 
-    const applied = await applyRouterLog(tx, at, decoded, pairing);
+    await tx.query("SAVEPOINT evm_log_decode");
+    let applied;
+    try {
+      applied = await applyRouterLog(tx, at, decoded, pairing);
+      await tx.query("RELEASE SAVEPOINT evm_log_decode");
+    } catch (error) {
+      if (!(error instanceof LogShapeError)) throw error;
+      await tx.query("ROLLBACK TO SAVEPOINT evm_log_decode");
+      await tx.query("RELEASE SAVEPOINT evm_log_decode");
+      await quarantineEvmLog(
+        tx,
+        {
+          chainKey,
+          block: log.blockNumber,
+          txHash: log.transactionHash,
+          logIndex: log.logIndex,
+          eventName: decoded.name,
+          reason: "unsupported_payload",
+          raw: log,
+          blockHash,
+        },
+        at.observedAt,
+      );
+      await this.reject(tx, log, "unsupported_payload", error.name, decoded.name);
+      return false;
+    }
     if (applied.kind === "unmatched") {
       // A settlement for a row this indexer never saw created, which means the creating log is
       // before the start block. Inventing a row from a settlement would record a claim with no
@@ -714,13 +885,42 @@ export class EvmWatcher {
       );
       return false;
     }
-    if (applied.kind === "written")
+    if (applied.kind === "written") {
       await tx.query(
         `INSERT INTO evm_applied_event
       (chain_key,contract,block_number,tx_hash,log_index,digest) VALUES($1,$2,$3,$4,$5,$6)`,
         [...key, digest],
       );
+      await reconcileIngestionRejection(tx, this.sourceOf(log));
+    }
     return applied.kind === "written";
+  }
+
+  private sourceOf(log: RawEvmLog): IngestionSource {
+    return {
+      chainKey: this.options.chainKey,
+      family: "evm",
+      contract: this.options.router.toLowerCase(),
+      block: log.blockNumber,
+      txHash: log.transactionHash,
+      position: log.logIndex,
+    };
+  }
+
+  /** Durable, uncapped evidence written in the transaction that advances past the log. */
+  private async reject(
+    tx: Queryable,
+    log: RawEvmLog,
+    errorClass: IngestionErrorClass,
+    detail: string,
+    eventName: string,
+  ): Promise<void> {
+    await recordIngestionRejection(tx, {
+      ...this.sourceOf(log),
+      errorClass,
+      detail,
+      payload: { event: eventName.slice(0, 200) },
+    });
   }
 
   private findOrderingConflicts(logs: readonly RawEvmLog[]): Map<string, OrderingConflict> {

@@ -16,6 +16,7 @@
   "scripts": {
     "dev": "node --watch --experimental-strip-types src/main.ts",
     "diagnostics": "node dist/cli/diagnostics.js",
+    "rehearsal": "node --env-file-if-exists=.env dist/cli/rehearsal.js",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/main.js",
     "rails:backlog": "node --env-file-if-exists=.env --experimental-strip-types src/rails/inspect.ts",
@@ -28,12 +29,14 @@
     "test:watch": "vitest",
     "test:unit": "vitest run test/unit",
     "test:integration": "vitest run test/integration",
+    "rails:reconcile": "node --experimental-strip-types src/rails/axelar/reconcile-cli.ts",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "fmt": "prettier --write \"**/*.{ts,mts,mjs,cjs,json,md,yml,yaml}\"",
     "fmt:check": "prettier --check \"**/*.{ts,mts,mjs,cjs,json,md,yml,yaml}\"",
     "check": "npm run fmt:check && npm run lint && npm run typecheck && npm run test",
-    "evm:backfill": "node --env-file-if-exists=.env dist/chains/evm/backfill-cli.js"
+    "evm:backfill": "node --env-file-if-exists=.env dist/chains/evm/backfill-cli.js",
+    "evm:quarantine": "node --env-file-if-exists=.env dist/chains/evm/quarantine-cli.js"
   },
   "dependencies": {
     "@fastify/rate-limit": "^11.2.0",
