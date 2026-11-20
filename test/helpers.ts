@@ -10,6 +10,13 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  RailError,
+  type PendingTransfer,
+  type RailClient,
+  type RailLookup,
+} from "../src/rails/types.js";
+
 export const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 
 export const TESTNET_DEPLOYMENTS = join(FIXTURES_DIR, "deployments-testnet.json");
@@ -111,4 +118,159 @@ export function destinationProofMutations(delivery: {
       mutated: flip(delivery.canonicalHash),
     },
   ];
+}
+
+export class RailRateLimitError extends RailError {
+  readonly retryAfter: number;
+
+  constructor(rail: string, seconds: number, message = "rate limited") {
+    super(rail, "rateLimited", message, seconds * 1000);
+    this.name = "RailRateLimitError";
+    this.retryAfter = seconds;
+  }
+}
+
+export class RailTimeoutError extends RailError {
+  constructor(rail: string, message = "timeout") {
+    super(rail, "transient", message);
+    this.name = "RailTimeoutError";
+    this.message = message;
+  }
+}
+
+export interface RateLimitSimulatorOptions {
+  readonly timeoutRate?: number;
+  readonly malformedRate?: number;
+  readonly defaultRetryAfterSeconds?: number;
+}
+
+type SimulationAction =
+  | { readonly kind: "retryAfter"; readonly seconds: number }
+  | { readonly kind: "timeout"; readonly message: string }
+  | { readonly kind: "malformed" };
+
+export class RateLimitSimulator implements RailClient {
+  readonly rail: string;
+  readonly wrapped: RailClient;
+  private readonly options: RateLimitSimulatorOptions;
+  private queuedActions: SimulationAction[] = [];
+  private callsByTransfer = new Map<bigint, number>();
+  private observedBackoffs: number[] = [];
+  callCount = 0;
+
+  constructor(options?: RateLimitSimulatorOptions);
+  constructor(wrapped?: RailClient, options?: RateLimitSimulatorOptions);
+  constructor(
+    wrappedOrOptions?: RailClient | RateLimitSimulatorOptions,
+    maybeOptions?: RateLimitSimulatorOptions,
+  ) {
+    if (wrappedOrOptions && "look" in wrappedOrOptions) {
+      this.wrapped = wrappedOrOptions;
+      this.options = maybeOptions ?? {};
+    } else {
+      this.options = wrappedOrOptions ?? maybeOptions ?? {};
+      this.wrapped = {
+        rail: "cctp",
+        look: (_transfer: PendingTransfer): Promise<RailLookup> =>
+          Promise.resolve({
+            kind: "found",
+            report: {
+              status: "pending",
+              railStatus: "pending_confirmations",
+              reference: "ref-default",
+              attestedAt: null,
+            },
+          }),
+      };
+    }
+    this.rail = this.wrapped.rail;
+  }
+
+  get backoffTimesObserved(): readonly number[] {
+    return this.observedBackoffs;
+  }
+
+  simulateRetryAfter(seconds: number): void {
+    this.queuedActions.push({ kind: "retryAfter", seconds });
+  }
+
+  simulateTimeout(message = "timeout"): void {
+    this.queuedActions.push({ kind: "timeout", message });
+  }
+
+  simulateMalformed(): void {
+    this.queuedActions.push({ kind: "malformed" });
+  }
+
+  simulateDelivered(): void {
+    throw new Error(
+      "Simulator cannot generate fake delivered records: provider status alone must never establish destination delivery",
+    );
+  }
+
+  callsFor(transferId: bigint): number {
+    return this.callsByTransfer.get(transferId) ?? 0;
+  }
+
+  reset(): void {
+    this.callCount = 0;
+    this.callsByTransfer.clear();
+    this.queuedActions = [];
+    this.observedBackoffs = [];
+  }
+
+  async look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup> {
+    this.callCount += 1;
+    this.callsByTransfer.set(
+      transfer.transferId,
+      (this.callsByTransfer.get(transfer.transferId) ?? 0) + 1,
+    );
+
+    if (this.queuedActions.length > 0) {
+      const action = this.queuedActions.shift()!;
+      if (action.kind === "retryAfter") {
+        this.observedBackoffs.push(action.seconds);
+        throw new RailRateLimitError(this.rail, action.seconds);
+      } else if (action.kind === "timeout") {
+        throw new RailTimeoutError(this.rail, action.message);
+      } else {
+        return {
+          kind: "malformed",
+          report: null,
+        } as unknown as RailLookup;
+      }
+    }
+
+    if (this.options.timeoutRate !== undefined && Math.random() < this.options.timeoutRate) {
+      throw new RailTimeoutError(this.rail, "timeout");
+    }
+
+    if (this.options.malformedRate !== undefined && Math.random() < this.options.malformedRate) {
+      return {
+        kind: "malformed",
+        report: null,
+      } as unknown as RailLookup;
+    }
+
+    const lookup = await this.wrapped.look(transfer, signal);
+
+    // CRITICAL: simulator must NEVER produce a "delivered" status for any transfer — it may only produce "pending", "failed", or error states
+    if (lookup.kind === "found") {
+      const status = lookup.report.status;
+      if (status === "delivered" || (status !== "pending" && status !== "failed")) {
+        // Strip delivery-only fields so the report is a valid "pending" RailReport.
+        // We destructure to omit rather than set to undefined (exactOptionalPropertyTypes).
+        const { forwardTxHash: _fwd, execution: _exec, ...rest } = lookup.report;
+        return {
+          kind: "found",
+          report: {
+            ...rest,
+            status: "pending",
+          },
+        };
+      }
+    }
+
+    return lookup;
+  }
 }
