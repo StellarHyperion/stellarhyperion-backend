@@ -70,7 +70,9 @@ require this hosting marker.
 
 The API requires a dedicated nonprivileged login with `USAGE` on the `public` schema and `SELECT`
 on the tables listed by `API_READ_TABLES` in `src/db/policy.ts` (including `pgmigrations` and the
-identity marker). Grant no public-table write privileges or privileged role memberships. API
+identity marker and `rail_attestation_history` for durable SSE replay). Existing API reader
+roles must receive this additional SELECT grant before enabling resumable streams. Grant no
+public-table write privileges or privileged role memberships. API
 connections also use `default_transaction_read_only`; startup verifies the actual role and grants,
 not only the `HYPERION_DATABASE_ROLE=read-only` label. The serverless entrypoint refuses enabled
 background writers. Indexer, rail or keeper processes require `HYPERION_DATABASE_ROLE=read-write`
@@ -84,7 +86,7 @@ Stellar router events establish source transfers and claim changes. The EVM watc
 
 For direct Stellar ITS transfers, Axelar's status API supplies a candidate destination transaction. Delivery is recorded only after the destination RPC confirms a successful receipt, sufficient confirmations, the matching ITS command/token/source/recipient/amount event and a matching token payment. The received asset is the ITS representation of Stellar USDC, with seven decimals. A rail API `executed` status alone is not delivery.
 
-For CCTP, Circle's forwarding hash is a candidate only. The backend binds the attested message to the source transfer, then verifies finalized Circle message execution and the exact native-USDC mint to the recipient in a successful confirmed canonical destination receipt. Activity exposes the actual received amount, token and six-decimal precision, separately from the source amount before forwarding fees. Real acceptance on all three destinations is recorded in `deployments/evidence/2026-10-29-cctp.json` in the contracts repository.
+For CCTP, Circle's forwarding hash is a candidate only. The backend binds the attested message to the source transfer, then verifies finalized Circle message execution and the exact native-USDC mint to the recipient in a successful confirmed canonical destination receipt. Activity exposes the actual received amount, token and six-decimal precision, separately from the source amount before forwarding fees. After applying `1792800000000_cctp-verification-failure-reasons`, transfer and backlog responses also expose a nullable `verificationFailure` category. Recipient, domain, token and amount mismatches remain distinct; missing evidence stays pending and retryable without consuming the provider failure budget. A category never proves delivery. Provider text is bounded and redacted, and oversized message/signature payloads are omitted. Real acceptance on all three destinations is recorded in `deployments/evidence/2026-10-29-cctp.json` in the contracts repository.
 
 Unknown or unreachable APIs produce errors; there are no fabricated deliveries or fallback attestations. Claims, route health and metrics query the actual migrated schema. Transfer amounts remain base-unit integer strings, with decimals/symbol supplied from deployment metadata when known.
 
@@ -107,6 +109,18 @@ npm run rails:backlog -- [--route 0|1] [--destination <chain>] [--stage <stage>]
 ```
 
 The report separates provider discovery from destination receipt verification, includes retry class and due state, and uses stable keyset pagination. It runs its database transaction as read-only.
+
+For a read-only source-to-payout audit of direct Axelar ITS transfers, use the reconciliation
+command. It joins the indexed source transfer, provider reference and destination proof inside one
+repeatable-read transaction; it never calls Axelar, tops up fees or writes state:
+
+```bash
+npm run rails:reconcile -- [--transfer-id <id>] [--limit <1..500>]
+```
+
+The report distinguishes a missing provider record, provider-only evidence, a missing destination
+proof, an amount mismatch and a fully reconciled payout. A provider status is never treated as a
+destination payment.
 
 ## Protocol fees and claims
 
@@ -156,10 +170,23 @@ for a seeded history.
 ## API and checks
 
 - `GET /health`, `GET /ready`
-- `GET /v1/transfers`, with sender/recipient/chain/route/search/limit/offset filters
+- `GET /v1/transfers`, with sender/recipient/chain/route/search/limit/offset filters. Responses
+  also include an opaque `nextCursor`; pass it back with the same filters for stable keyset
+  pagination. Cursors are scoped to the descending transfer-id order and reject mismatched filters.
 - `GET /v1/transfers/by-tx/:txHash`, `GET /v1/transfers/:originChain/:nonce`
 - `GET /v1/claims`, `GET /v1/claims/:chain/:claimId`
 - `GET /v1/routes/health`, `GET /v1/metrics`
+
+Public reads have a ten-second request budget. A client disconnect cancels the in-flight
+PostgreSQL query through its `AbortSignal`. The database adapter uses a separate connection with
+the same role to cancel the exact active backend, and holds its borrowed connection until cancellation
+finishes so a delayed cancellation cannot affect a later request. The statement timeout remains the
+server-side safeguard. SSE uses opaque, transfer-scoped full-width history cursors. Reconnection with
+`Last-Event-ID` replays committed `rail_transition` events from PostgreSQL, including changes made while
+the client was disconnected, then emits the current `transfer_update` snapshot. Replay is bounded to
+100 transitions and cursors expire after 15 minutes. Invalid, expired or oversized replay windows return
+`409 cursor_expired` with `resync=true`; reconnect without the cursor. Slow clients wait for socket drain
+within a bounded budget, and disconnected clients stop polling.
 
 `npm run check` runs formatting, lint, type checking and tests. Schema/API regressions execute repository migrations in embedded PostgreSQL (PGlite). The full PostgreSQL integration suite requires `TEST_DATABASE_URL`; it is skipped when unset. Use `npm run build` for emitted production code.
 
@@ -207,6 +234,17 @@ reviewing a failed job.
 ## EVM scan finality and historical audits
 
 EVM watcher ownership is scoped to the chain and router. An expired owner may be replaced after a crash, and each cursor commit verifies ownership and its previous revision in the same transaction as event writes. Concurrent replay keeps the existing canonical event serialization and quarantine checks.
+
+Unsupported EVM signatures and malformed payloads retain canonical block hashes, signature,
+router and up to 64 KiB of raw data in the existing quarantine (at most 1000 records per chain).
+Oversized bodies retain metadata and topics without a raw body. After deploying a decoder that
+supports the event, use `npm run evm:quarantine -- replay <configured-chain> [limit 1..100]`
+with a configured router and database writer credential. Legacy diagnostics without raw data
+are preserved but cannot be replayed. Replay verifies the chain, deployment start, confirmed
+boundary and retained block hash, and uses the normal idempotent writers without advancing
+the live cursor. A replayed BridgeIn reconstructs its canonical transaction's ClaimParked
+context within a total 1000-log budget; missing or unsupported context requires operator review.
+No Hyperion EVM router is configured in the active deployment; the command does not infer one.
 
 `EVM_FINALITY_MODE=confirmations` preserves the chain registry's confirmation depth. Set `EVM_FINALITY_MODE=finalized` to require the RPC's finalized-block number and hash as additional evidence; scans never exceed either that block or the configured confirmation boundary. Unsupported tags fail the pass unless `EVM_FINALITY_ALLOW_FALLBACK=true` explicitly permits depth fallback. Invalid finalized evidence fails even with fallback enabled. `evm_scan_provenance` retains the configured policy, actual evidence, hashes and policy transitions for each committed range; weaker policies never rewrite earlier evidence.
 
@@ -290,3 +328,114 @@ The bundle records its generation time and the code revision (`HYPERION_REVISION
 or the local Git HEAD when available). URLs, nested authorization/signers and other sensitive
 values are redacted. Output files are created exclusively with mode 0600; choose a new filename
 for each capture. No RPC polling, transactions or wallet operations are performed.
+
+### Backup and restore rehearsals
+
+`npm run rehearsal -- rehearse --output snapshot.json` exports the indexed history tables from
+`DATABASE_URL` (read-only), restores them into the dedicated database named by
+`HYPERION_REHEARSAL_DATABASE_URL`, and validates the result. `export`, `restore` and `validate`
+run the steps separately. Every value travels as PostgreSQL text, so full-width identifiers and
+integer-string amounts round-trip exactly. Validation recomputes row counts, the per-chain
+monetary history digests and a cursor/provenance join fingerprint, and fails on any difference,
+including a change in the number of dangling provenance links. The target must be migrated to the same schema version, must be empty, and
+must not be the source. A target provisioned as `production` or `preview` is refused unless both
+`--allow-protected-target` and `HYPERION_REHEARSAL_ALLOW_PROTECTED=true` are set. Snapshots
+hold rows and digests only, never connection strings, are capped at 100,000 rows per table, and
+carry a SHA-256 so a modified file is refused.
+
+### Rail transition history and transfer cursors
+
+`rail_attestation_history` records actual committed lifecycle changes bound to the source transfer
+id, including changes made by reviewed requeue and destination-proof reorg reconciliation. Identical
+polls create no duplicate entry. Blind backward writes are rejected; repeated real requeue cycles
+retain every transition. History records normalized reasons and bounded public hashes/references,
+without provider response bodies or error credentials.
+
+`GET /v1/transfers` returns `nextCursor` for descending transfer-id pagination. Pass it as `cursor`
+with the same origin/destination/route/sender/recipient/search filters; changing filters or combining
+a cursor with a nonzero offset returns HTTP400 `invalid_cursor`. New inserts sort before the cursor
+and cannot duplicate an already read transfer. Existing offset reads remain available and keep
+their response offset field. A full page can return a cursor whose next page is empty.
+
+### Keeper outcomes and signer rotation
+
+Keeper maintenance records separate simulated, submitted, pending, confirmed and failed outcomes
+in `keeper_submission`. `/v1/metrics` returns aggregate counts without transaction-hash labels;
+public hashes are retained for recovery. API readers require SELECT on `keeper_submission`
+and `keeper_checkpoint` after migration179310. Dry runs never count as confirmed maintenance.
+
+Configure `KEEPER_STELLAR_SECRETS` as the comma-separated local signer secret sources and
+`KEEPER_STELLAR_ACTIVE_SIGNER` as one configured public key. Startup verifies the account's
+Stellar network and positive balance, then reconciles up to100 old pending public hashes before
+changing persistent signer ownership. Unknown outcomes block rotation. The same chain ownership
+lock protects submission, and old replicas refuse preparation after ownership changes. Every
+maintenance signing attempt rechecks funding/network and current ownership. Signer rotation
+changes the fee payer; router claim payout recipients remain fixed by the contract. Public
+readiness exposes the funded public key and integer-string balance in logs; private provider
+errors are replaced by bounded readiness reasons.
+
+### Read-only ITS source-to-payment audit
+
+`npm run rails:reconcile -- --transfer-id <id> --limit <1..500> --format json` reads one
+repeatable, read-only database snapshot and never contacts providers or performs top-ups.
+The report joins the exact source transfer, provider discovery reference and persisted canonical
+ITS command/token-manager/payment proof. Reconciled rows require the verified public source
+snapshot and matching destination chain, command, transaction, recipient, token and integer
+amount. Migration179320 adds nullable source bindings; legacy proofs without that snapshot are
+reported as `missing_source_binding`. Missing backend history and missing canonical proof are
+reported explicitly. Source changes during verification are rejected before proof admission.
+Recoverable provider gas errors remain retryable and cannot by themselves establish payment.
+
+### Public API error compatibility
+
+JSON errors retain their existing `error`, status code and route-specific fields. The additive `code` is one stable category: `bad_request`, `not_found`, `timeout`, `unavailable`, `internal_error` or `too_many_requests`. Clients can migrate to `code` while existing clients continue reading `error`. Errors include a safe message and request ID; empty indexed history remains HTTP 200 with an empty page. SSE resync frames retain their existing event contract.
+
+ITS verification stores at most six bounded public mismatch categories and an independent `its_verification_state`: `receipt_unavailable` leaves verification retryable, `payout_unverified` records invalid receipt/payment evidence, and `verified` requires the exact canonical ITS event and matching ERC-20 payment. Unrelated events in the same transaction do not invalidate an exact pair. Diagnostics never establish delivery.
+
+The PostgreSQL upgrade fixture starts with representative full-width transfer and claim records in the initial schema, then checks identity, monetary constraints and exact source joins after every supported migration. Upgrades run in one transaction with recorded migration history. A simulated failing monetary step verifies both data and the history boundary roll back; after repairing that step, retry applies it once and repeated migration runs preserve the same rows. Inspect the migration history and failed step before retrying an interrupted production upgrade.
+
+Transfer responses expose typed source and destination provenance with chain, transaction, canonical indexed block height and log index. Destination provenance is `unverified` until independent delivery is recorded. Rail references are explicitly labeled `candidate` and remain sanitized. Claim source provenance uses the exact source-transfer foreign key; ambiguous legacy deployment nonces return no source provenance. Combined transfer filters validate canonical account/address formats, the selected network, configured source asset/adapter support and direct destination rail support before issuing parameterized SQL. EVM recipients accept canonical20-byte or zero-padded32-byte addresses; direct CCTP/ITS destinations do not require a Hyperion EVM router.
+
+### Historical coverage metrics (#112)
+
+`GET /v1/metrics` retains `historyGaps` and adds version 1 `historicalCoverage`, separate from
+current cursor lag. One PostgreSQL statement reads unresolved counts, remaining ranges, and
+source observation status, so a concurrent backfill cannot mix an old count with a new range.
+Each `sources` entry reports its chain and family, unresolved range records, exact integer-string
+`oldestMissingStart`/`oldestMissingEnd`, and `unknown` status. A recent cursor cannot hide an older
+retention gap. Partial Stellar replay advances the first missing ledger; reconciliation removes
+the record. EVM queued/running/failed/cancelled declared backfill intervals remain missing from
+`next_block` through `to_block` until their range is fully scanned. Overlapping gap/job records
+are counted as records, not as a union of unique missing blocks.
+
+The retained `oldestMissingStartLedger` and `oldestMissingEndLedger` fields summarize Stellar
+ranges; EVM block ranges use the per-source fields. Global `unresolved` includes both families.
+`scope: recorded_ranges` means recorded watcher/backfill history, not universal blockchain
+coverage. No cursor, no committed scan provenance, an incomplete deployment replacement, or
+missing schema keeps historical coverage explicitly unknown. Schema-unavailable unresolved
+counts are null. Zero recorded gaps alone does not establish known history. These diagnostics
+are read-only and do not establish transfer delivery or activate an EVM router.
+
+### Proof rejection metrics (#109)
+
+`GET /v1/metrics` exposes the fixed categories `recipient`, `token`, `amount`, `finality`, and
+`provider_inconsistency`. `proofRejections` sums current unresolved CCTP/ITS verification reasons
+and durable unreconciled ingestion records. `proofRejectionsByRail` uses the same vocabulary for
+both rails; `proofRejectionIngestion` separates structural decoder/ordering failures. These are
+current reason gauges, not successful delivery counts or monotonic attempt counters. One ITS
+transfer can contribute to several distinct mismatch categories, once per category. Rechecking
+an unchanged failure does not increment the gauge; canonical verified proof clears its reasons.
+
+CCTP recipient/destination-domain mismatches map to recipient, token/messenger/source-adapter
+mismatches to token, amount/fee mismatches to amount, and finality/receipt/confirmation failures
+to finality. Other identity/message/provider failures map to provider inconsistency. ITS retains
+recipient/token/amount diagnostics, maps unavailable receipts to finality, and maps missing
+payment/source/command evidence to provider inconsistency. Source decode/ordering rejections
+are provider inconsistency. Prunable raw quarantine rows are not counted again alongside their
+durable ingestion rejection. Provider success alone never establishes destination delivery.
+
+`proofRejectionCoverage` is version 1 and reports availability of each source. A missing table or
+column on an older deployment sets `known: false`, while retaining counts from available sources;
+zero counts with unknown coverage are not evidence of zero failures. Other database errors fail
+the request. SQL returns only bounded categories and exact safe counts; raw hashes, addresses,
+provider messages, expected/observed diagnostics, endpoints, and credentials never become labels.

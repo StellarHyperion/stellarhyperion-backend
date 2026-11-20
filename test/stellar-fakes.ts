@@ -204,6 +204,10 @@ export class RecordingDb implements Transactional {
   readonly heartbeatRows: Record<string, unknown>[] = [];
   /** Set to make every statement inside the next transaction throw. */
   failInTransaction: Error | null = null;
+  /** What the open ingestion rejection count reports, to exercise the boundary limit. */
+  openRejections = 0;
+  /** Source events recorded so far; each insert is treated as a first observation. */
+  sourceEvents = 0;
 
   private identities = new Map<string, unknown>();
   private conflicts = new Map<string, unknown>();
@@ -217,6 +221,13 @@ export class RecordingDb implements Transactional {
     this.queries.push({ text, params, transaction: this.open });
     if (this.failInTransaction !== null && this.open !== null) {
       return Promise.reject(this.failInTransaction);
+    }
+    if (/INSERT INTO source_event\s*\(/.test(text)) {
+      this.sourceEvents += 1;
+      return Promise.resolve({ rows: [{ id: String(this.sourceEvents) }], rowCount: 1 });
+    }
+    if (text.includes("AS open FROM ingestion_rejection")) {
+      return Promise.resolve({ rows: [{ open: this.openRejections }], rowCount: 1 });
     }
     if (text.includes("FROM indexer_cursor")) {
       return Promise.resolve({

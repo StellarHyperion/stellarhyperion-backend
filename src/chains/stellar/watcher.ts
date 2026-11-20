@@ -29,6 +29,11 @@ import type { Logger } from "pino";
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import {
+  reconcileIngestionRejection,
+  recordIngestionRejection,
+  recordSourceEvent,
+} from "../writers.js";
+import {
   boundedWindowEnd,
   completeThrough,
   computeScanWindowEnd,
@@ -47,6 +52,7 @@ import type { EventSource, EventsQuery, RetainedHistoryWindow } from "./rpc.js";
 import { StellarRpcError, retentionWindowOf } from "./rpc.js";
 import {
   type ChainCursor,
+  canonicalEventPayload,
   recordDeploymentRevision,
   recordQuarantinedEvent,
   boundDecodeError,
@@ -1047,6 +1053,15 @@ export class StellarWatcher {
         txHash: raw.txHash,
         closedAt: new Date(raw.ledgerClosedAt),
       };
+      const source = {
+        chainKey,
+        family: "stellar" as const,
+        contract: this.options.router,
+        deploymentRevision: revision,
+        block: BigInt(raw.ledger),
+        txHash: raw.txHash,
+        position: raw.id,
+      };
       let event: StellarEvent;
       try {
         event = decodeStellarEvent(raw);
@@ -1065,6 +1080,12 @@ export class StellarWatcher {
           tag: null,
           decodeError,
         });
+        // Same transaction as the cursor advance: the boundary cannot pass this event silently.
+        await recordIngestionRejection(tx, {
+          ...source,
+          errorClass: "decode_error",
+          detail: decodeError,
+        });
         quarantined += 1;
         skipped += 1;
         continue;
@@ -1079,6 +1100,11 @@ export class StellarWatcher {
           tag: event.tag.slice(0, 128),
           decodeError: null,
         });
+        await recordIngestionRejection(tx, {
+          ...source,
+          errorClass: "unknown_event",
+          payload: { tag: event.tag.slice(0, 128) },
+        });
         // Do not freeze a decoded identity before a decoder exists. A later replay may classify
         // the same source event, while successful row writes still require durable conflict checks.
         quarantined += 1;
@@ -1091,13 +1117,33 @@ export class StellarWatcher {
         conflicts += 1;
         continue;
       }
-      if (await this.apply(tx, context, raw, event)) {
+      // Raw identity and payload digest, kept apart from the rows this event materializes.
+      const observed = await recordSourceEvent(tx, {
+        ...source,
+        eventKind: event.kind,
+        payloadDigest: String(canonicalEventPayload(raw, event).sha256),
+      });
+      if (observed.kind === "conflict") {
+        this.options.logger.warn(
+          {
+            chain: chainKey,
+            eventId: raw.id,
+            originalDigest: observed.originalDigest,
+            incomingDigest: observed.incomingDigest,
+          },
+          "a stellar event arrived with a different payload at an already recorded source position; keeping the original",
+        );
+        conflicts += 1;
+        continue;
+      }
+      if (await this.apply(tx, { ...context, sourceEventId: observed.id }, raw, event)) {
         decoded += 1;
         await tx.query(
           `UPDATE stellar_event_quarantine SET replayed_at = clock_timestamp()
           WHERE chain_key = $1 AND contract = $2 AND event_id = $3 AND replayed_at IS NULL`,
           [chainKey, this.options.router, raw.id],
         );
+        await reconcileIngestionRejection(tx, source);
       } else skipped += 1;
     }
     return { decoded, skipped, conflicts, quarantined, closedAt };
