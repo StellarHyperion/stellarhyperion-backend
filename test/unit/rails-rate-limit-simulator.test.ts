@@ -114,8 +114,8 @@ describe("fault-only rail provider simulator", () => {
     expect(() => new RateLimitSimulator({ latencyMs: -1 })).toThrow(RangeError);
     const simulator = new RateLimitSimulator({ timeoutRate: 1, random: () => NaN });
     await expect(simulator.look(transfer())).rejects.toThrow(RangeError);
-    expect(() => simulator.simulateRetryAfter(Infinity)).toThrow(RangeError);
-    expect(() => simulator.simulateRetryAfter(-1)).toThrow(RangeError);
+    expect(() => { simulator.simulateRetryAfter(Infinity); }).toThrow(RangeError);
+    expect(() => { simulator.simulateRetryAfter(-1); }).toThrow(RangeError);
   });
 
   it("cancels a delayed request before a provider call and can reset queued faults", async () => {
