@@ -19,6 +19,9 @@ import { Client } from "pg";
 import {
   auditTransferAndClaimInvariants,
   compactRouteHealthSamples,
+  readOpenIngestionRejections,
+  reconcileIngestionRejection,
+  recordIngestionRejection,
 } from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
 import { concurrencyBarrier, runConcurrent } from "../helpers.js";
@@ -72,6 +75,7 @@ suite("the schema", () => {
       "indexed_history_digest",
       "indexer_cursor",
       "indexer_worker_heartbeat",
+      "ingestion_rejection",
       "outbound_transfer",
       "pending_claim",
       "rail_attestation",
@@ -600,5 +604,66 @@ suite("maintenance and pruning", () => {
     expect(Array.isArray(report.claimLiabilityViolations)).toBe(true);
     expect(Array.isArray(report.deliverySettlementViolations)).toBe(true);
     expect(Array.isArray(report.unsettledLiabilities)).toBe(true);
+  });
+});
+
+suite("ingestion rejections", () => {
+  let db: Database;
+  const chainKey = `rejection-schema-${process.pid}`;
+  const source = {
+    chainKey,
+    family: "evm" as const,
+    contract: "0x00000000000000000000000000000000000000aa",
+    block: BigInt(U64_MAX),
+    txHash: `0x${"ab".repeat(32)}`,
+    position: 7,
+  };
+
+  beforeAll(() => {
+    db = Database.open(CONNECTION ?? "", { applicationName: "hyperion-schema-test" });
+  });
+
+  afterAll(async () => {
+    await db.query("DELETE FROM public.ingestion_rejection WHERE chain_key = $1", [chainKey]);
+    await db.close();
+  });
+
+  it("keeps full-width source references and reconciles only on successful replay", async () => {
+    await recordIngestionRejection(db, {
+      ...source,
+      errorClass: "unsupported_payload",
+      detail: "LogShapeError via https://rpc.example/key/abc123",
+    });
+    const [open] = await readOpenIngestionRejections(db, chainKey);
+    expect(open).toMatchObject({
+      block: BigInt(U64_MAX),
+      txHash: source.txHash,
+      position: "7",
+      errorClass: "unsupported_payload",
+      replayEligible: true,
+      detail: "LogShapeError via [redacted URL]",
+    });
+    expect(await reconcileIngestionRejection(db, source)).toBe(true);
+    expect(await readOpenIngestionRejections(db, chainKey)).toHaveLength(0);
+  });
+
+  it("rejects credential-bearing detail, unbounded payloads and unknown classes", async () => {
+    const insert = (detail: string, payload: string, errorClass = "decode_error") =>
+      db.query(
+        `INSERT INTO public.ingestion_rejection
+           (chain_key, family, contract, block_number, tx_hash, source_position, error_class,
+            replay_eligible, detail, payload)
+         VALUES ($1, 'evm', '0xrouter', 1, '0xtx', 'check', $2, true, $3, $4::jsonb)`,
+        [chainKey, errorClass, detail, payload],
+      );
+    for (const attempt of [
+      insert("postgresql://u:p@db/hyperion", "{}"),
+      insert("api_key=abc", "{}"),
+      insert("ok", JSON.stringify({ blob: "z".repeat(5000) })),
+      insert("ok", "[]"),
+      insert("ok", "{}", "provider_status"),
+    ]) {
+      await expect(attempt).rejects.toSatisfy((error) => codeOf(error) === CHECK_VIOLATION);
+    }
   });
 });

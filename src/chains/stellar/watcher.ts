@@ -28,6 +28,7 @@ import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
+import { reconcileIngestionRejection, recordIngestionRejection } from "../writers.js";
 import {
   boundedWindowEnd,
   completeThrough,
@@ -1047,6 +1048,15 @@ export class StellarWatcher {
         txHash: raw.txHash,
         closedAt: new Date(raw.ledgerClosedAt),
       };
+      const source = {
+        chainKey,
+        family: "stellar" as const,
+        contract: this.options.router,
+        deploymentRevision: revision,
+        block: BigInt(raw.ledger),
+        txHash: raw.txHash,
+        position: raw.id,
+      };
       let event: StellarEvent;
       try {
         event = decodeStellarEvent(raw);
@@ -1065,6 +1075,12 @@ export class StellarWatcher {
           tag: null,
           decodeError,
         });
+        // Same transaction as the cursor advance: the boundary cannot pass this event silently.
+        await recordIngestionRejection(tx, {
+          ...source,
+          errorClass: "decode_error",
+          detail: decodeError,
+        });
         quarantined += 1;
         skipped += 1;
         continue;
@@ -1078,6 +1094,11 @@ export class StellarWatcher {
           reason: "unknown_tag",
           tag: event.tag.slice(0, 128),
           decodeError: null,
+        });
+        await recordIngestionRejection(tx, {
+          ...source,
+          errorClass: "unknown_event",
+          payload: { tag: event.tag.slice(0, 128) },
         });
         // Do not freeze a decoded identity before a decoder exists. A later replay may classify
         // the same source event, while successful row writes still require durable conflict checks.
@@ -1098,6 +1119,7 @@ export class StellarWatcher {
           WHERE chain_key = $1 AND contract = $2 AND event_id = $3 AND replayed_at IS NULL`,
           [chainKey, this.options.router, raw.id],
         );
+        await reconcileIngestionRejection(tx, source);
       } else skipped += 1;
     }
     return { decoded, skipped, conflicts, quarantined, closedAt };

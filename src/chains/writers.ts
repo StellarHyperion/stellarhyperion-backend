@@ -1493,3 +1493,252 @@ export async function releaseLease(
 }
 
 export { textOrNull };
+
+// --------------------------------------------------------------------------------------------
+// Ingestion rejections (#62)
+// --------------------------------------------------------------------------------------------
+
+/** Normalized reasons a source record could not be applied. */
+export const INGESTION_ERROR_CLASSES = [
+  "decode_error",
+  "unknown_event",
+  "unsupported_payload",
+  "ordering_conflict",
+] as const;
+export type IngestionErrorClass = (typeof INGESTION_ERROR_CLASSES)[number];
+
+/**
+ * Whether a decoder or indexer upgrade can apply the record by replaying its source position.
+ * An ordering conflict depends on neighbouring logs, so it needs an operator rather than a replay.
+ */
+export function isReplayEligible(errorClass: IngestionErrorClass): boolean {
+  return errorClass !== "ordering_conflict";
+}
+
+/** Open rejections a chain may hold before ingestion stops instead of advancing past more. */
+export const MAX_OPEN_INGESTION_REJECTIONS = 10_000;
+const MAX_REJECTION_ATTEMPTS = 1_000_000;
+const MAX_REJECTION_DETAIL = 256;
+const MAX_REJECTION_PAYLOAD_BYTES = 4096;
+
+export class IngestionRejectionLimitError extends Error {
+  constructor(readonly chainKey: string) {
+    super(
+      `${chainKey} has ${String(MAX_OPEN_INGESTION_REJECTIONS)} unreconciled ingestion rejections; refusing to advance past another`,
+    );
+    this.name = "IngestionRejectionLimitError";
+  }
+}
+
+export interface IngestionSource {
+  readonly chainKey: string;
+  readonly family: "stellar" | "evm";
+  readonly contract: string;
+  readonly deploymentRevision?: number;
+  readonly block: bigint;
+  readonly txHash: string;
+  /** Stellar event id, or the EVM log index. */
+  readonly position: string | number;
+}
+
+export interface IngestionRejection extends IngestionSource {
+  readonly errorClass: IngestionErrorClass;
+  readonly detail?: string | null;
+  readonly payload?: Readonly<Record<string, unknown>>;
+}
+
+export interface StoredIngestionRejection {
+  readonly id: bigint;
+  readonly chainKey: string;
+  readonly family: "stellar" | "evm";
+  readonly contract: string;
+  readonly deploymentRevision: number;
+  readonly block: bigint;
+  readonly txHash: string;
+  readonly position: string;
+  readonly errorClass: IngestionErrorClass;
+  readonly replayEligible: boolean;
+  readonly detail: string | null;
+  readonly payload: unknown;
+  readonly attempts: number;
+  readonly firstSeenAt: Date;
+  readonly lastSeenAt: Date;
+  readonly reconciledAt: Date | null;
+}
+
+const CREDENTIAL_KEY = /secret|password|authorization|credential|private.?key|token|api.?key/i;
+
+/** Keep a diagnostic category only: no URLs, no credential assignments, no raw provider text. */
+export function boundRejectionDetail(detail: string | null | undefined): string | null {
+  if (detail === null || detail === undefined) return null;
+  const cleaned = detail
+    .replace(/\b(?:https?|postgres(?:ql)?|rediss?):\/\/\S+/gi, "[redacted URL]")
+    .replace(/\b(Bearer|Basic)\s+\S+/gi, "$1 [redacted]")
+    .replace(
+      /\b(?:authorization|password|secret|api[_-]?key|token)\s*[:=]\s*\S+/gi,
+      "[redacted credential]",
+    )
+    .replace(/[^A-Za-z0-9 _.,()[\]/-]/g, "?")
+    .slice(0, MAX_REJECTION_DETAIL)
+    .trim();
+  return cleaned.length > 0 ? cleaned : null;
+}
+
+/** Scalars only, credential-like keys removed, and the whole object capped in bytes. */
+export function boundRejectionPayload(
+  payload: Readonly<Record<string, unknown>> | undefined,
+): string {
+  const out: Record<string, string | number | boolean | null> = {};
+  for (const [key, value] of Object.entries(payload ?? {}).slice(0, 16)) {
+    if (CREDENTIAL_KEY.test(key) || !/^[A-Za-z0-9_]{1,64}$/.test(key)) continue;
+    if (typeof value === "string") out[key] = boundRejectionDetail(value);
+    else if (typeof value === "bigint") out[key] = value.toString();
+    else if (typeof value === "number" && Number.isFinite(value)) out[key] = value;
+    else if (typeof value === "boolean" || value === null) out[key] = value;
+  }
+  const serialized = JSON.stringify(out);
+  return Buffer.byteLength(serialized, "utf8") <= MAX_REJECTION_PAYLOAD_BYTES
+    ? serialized
+    : JSON.stringify({ truncated: true });
+}
+
+function sourcePosition(position: string | number): string {
+  const value = String(position);
+  if (!/^[0-9A-Za-z_-]{1,64}$/.test(value))
+    throw new RangeError("Invalid ingestion source position.");
+  return value;
+}
+
+function sourceKey(source: Omit<IngestionSource, "family">): readonly unknown[] {
+  return [
+    source.chainKey,
+    source.contract,
+    source.deploymentRevision ?? 1,
+    source.block.toString(),
+    source.txHash,
+    sourcePosition(source.position),
+  ];
+}
+
+/**
+ * Record that a source record was not applied, in the caller's transaction.
+ *
+ * Call it in the same transaction as the cursor advance that passes the record: if this write
+ * fails, or the chain already holds too many open rejections, the transaction aborts and the
+ * committed boundary stays where it was. A repeat failure for the same source reopens and counts
+ * it instead of adding a row.
+ */
+export async function recordIngestionRejection(
+  db: Queryable,
+  rejection: IngestionRejection,
+): Promise<void> {
+  const key = sourceKey(rejection);
+  const { rows: existing } = await db.query(
+    `SELECT reconciled_at FROM ingestion_rejection
+      WHERE chain_key = $1 AND contract = $2 AND deployment_revision = $3
+        AND block_number = $4 AND tx_hash = $5 AND source_position = $6`,
+    key,
+  );
+  const reopens = existing.length === 0 || existing[0]?.reconciled_at != null;
+  if (reopens) {
+    const { rows } = await db.query(
+      `SELECT count(*)::int AS open FROM ingestion_rejection
+        WHERE chain_key = $1 AND reconciled_at IS NULL`,
+      [rejection.chainKey],
+    );
+    if (integer(one(rows, "open rejection count"), "open") >= MAX_OPEN_INGESTION_REJECTIONS)
+      throw new IngestionRejectionLimitError(rejection.chainKey);
+  }
+  await db.query(
+    `INSERT INTO ingestion_rejection
+       (chain_key, contract, deployment_revision, block_number, tx_hash, source_position,
+        family, error_class, replay_eligible, detail, payload)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+     ON CONFLICT ON CONSTRAINT ingestion_rejection_source DO UPDATE
+       SET error_class = EXCLUDED.error_class,
+           replay_eligible = EXCLUDED.replay_eligible,
+           detail = EXCLUDED.detail,
+           payload = EXCLUDED.payload,
+           attempts = LEAST(ingestion_rejection.attempts + 1, ${String(MAX_REJECTION_ATTEMPTS)}),
+           last_seen_at = GREATEST(clock_timestamp(), ingestion_rejection.first_seen_at),
+           reconciled_at = NULL`,
+    [
+      ...key,
+      rejection.family,
+      rejection.errorClass,
+      isReplayEligible(rejection.errorClass),
+      boundRejectionDetail(rejection.detail),
+      boundRejectionPayload(rejection.payload),
+    ],
+  );
+}
+
+/** Mark a source record's open rejection reconciled after it applied. Returns whether one was. */
+export async function reconcileIngestionRejection(
+  db: Queryable,
+  source: Omit<IngestionSource, "family">,
+): Promise<boolean> {
+  const { rowCount } = await db.query(
+    `UPDATE ingestion_rejection
+        SET reconciled_at = GREATEST(clock_timestamp(), first_seen_at)
+      WHERE chain_key = $1 AND contract = $2 AND deployment_revision = $3
+        AND block_number = $4 AND tx_hash = $5 AND source_position = $6
+        AND reconciled_at IS NULL`,
+    sourceKey(source),
+  );
+  return rowCount > 0;
+}
+
+export async function readOpenIngestionRejections(
+  db: Queryable,
+  chainKey: string,
+  limit = 100,
+): Promise<readonly StoredIngestionRejection[]> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000)
+    throw new RangeError("Ingestion rejection limit must be 1 to 1000.");
+  const { rows } = await db.query(
+    `SELECT id, chain_key, family, contract, deployment_revision, block_number, tx_hash,
+            source_position, error_class, replay_eligible, detail, payload, attempts,
+            first_seen_at, last_seen_at, reconciled_at
+       FROM ingestion_rejection
+      WHERE chain_key = $1 AND reconciled_at IS NULL
+      ORDER BY block_number, id LIMIT $2`,
+    [chainKey, limit],
+  );
+  return rows.map((row) => ({
+    id: bigintOf(row, "id"),
+    chainKey: text(row, "chain_key"),
+    family: text(row, "family") === "evm" ? "evm" : "stellar",
+    contract: text(row, "contract"),
+    deploymentRevision: integer(row, "deployment_revision"),
+    block: bigintOf(row, "block_number"),
+    txHash: text(row, "tx_hash"),
+    position: text(row, "source_position"),
+    errorClass: text(row, "error_class") as IngestionErrorClass,
+    replayEligible: boolean(row, "replay_eligible"),
+    detail: textOrNull(row, "detail"),
+    payload: json(row, "payload"),
+    attempts: integer(row, "attempts"),
+    firstSeenAt: timestamp(row, "first_seen_at"),
+    lastSeenAt: timestamp(row, "last_seen_at"),
+    reconciledAt: timestampOrNull(row, "reconciled_at"),
+  }));
+}
+
+/** Bounded maintenance: delete only reconciled rows older than the cutoff, a batch at a time. */
+export async function pruneReconciledIngestionRejections(
+  db: Queryable,
+  olderThan: Date,
+  limit = 1000,
+): Promise<number> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000)
+    throw new RangeError("Ingestion rejection prune batch must be 1 to 10000.");
+  const { rowCount } = await db.query(
+    `DELETE FROM ingestion_rejection WHERE id IN (
+       SELECT id FROM ingestion_rejection
+        WHERE reconciled_at IS NOT NULL AND reconciled_at < $1
+        ORDER BY reconciled_at LIMIT $2)`,
+    [olderThan, limit],
+  );
+  return rowCount;
+}

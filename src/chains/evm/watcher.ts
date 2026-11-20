@@ -32,7 +32,13 @@ import { createHash } from "node:crypto";
 import type { Queryable, Transactional } from "../../db/pool.js";
 import type { ReadinessReport } from "../../runtime/readiness.js";
 import { readCursor, writeCursor } from "../stellar/store.js";
-import type { Position } from "../writers.js";
+import {
+  reconcileIngestionRejection,
+  recordIngestionRejection,
+  type IngestionErrorClass,
+  type IngestionSource,
+  type Position,
+} from "../writers.js";
 import {
   acquireLease,
   applyRouterLog,
@@ -319,6 +325,8 @@ export class EvmWatcher {
         if (conflict) {
           const timestamp = blocks.get(log.blockNumber)?.timestamp;
           if (timestamp === undefined) throw new Error("missing canonical quarantine timestamp");
+          // The raw diagnostic is capped per pass; the durable rejection never is.
+          await this.reject(tx, log, "ordering_conflict", conflict.reason, conflict.eventName);
           if (diagnosticCount++ < MAX_QUARANTINED_LOGS_PER_PASS)
             await quarantineEvmLog(
               tx,
@@ -520,6 +528,9 @@ export class EvmWatcher {
                 `no timestamp for quarantined block ${log.blockNumber.toString()} on ${chainKey}`,
               );
             }
+            // The raw diagnostic is capped per pass; the durable rejection never is, so the
+            // cursor advance in this transaction cannot pass the log silently.
+            await this.reject(tx, log, "ordering_conflict", conflict.reason, conflict.eventName);
             if (recordedQuarantines < MAX_QUARANTINED_LOGS_PER_PASS) {
               recordedQuarantines += 1;
               await quarantineEvmLog(
@@ -769,6 +780,7 @@ export class EvmWatcher {
         },
         new Date(Number(timestamp) * 1000),
       );
+      await this.reject(tx, log, "unknown_event", "unsupported signature", signature);
       return false;
     }
 
@@ -838,6 +850,7 @@ export class EvmWatcher {
         },
         at.observedAt,
       );
+      await this.reject(tx, log, "unsupported_payload", error.name, decoded.name);
       return false;
     }
     if (applied.kind === "unmatched") {
@@ -850,13 +863,42 @@ export class EvmWatcher {
       );
       return false;
     }
-    if (applied.kind === "written")
+    if (applied.kind === "written") {
       await tx.query(
         `INSERT INTO evm_applied_event
       (chain_key,contract,block_number,tx_hash,log_index,digest) VALUES($1,$2,$3,$4,$5,$6)`,
         [...key, digest],
       );
+      await reconcileIngestionRejection(tx, this.sourceOf(log));
+    }
     return applied.kind === "written";
+  }
+
+  private sourceOf(log: RawEvmLog): IngestionSource {
+    return {
+      chainKey: this.options.chainKey,
+      family: "evm",
+      contract: this.options.router.toLowerCase(),
+      block: log.blockNumber,
+      txHash: log.transactionHash,
+      position: log.logIndex,
+    };
+  }
+
+  /** Durable, uncapped evidence written in the transaction that advances past the log. */
+  private async reject(
+    tx: Queryable,
+    log: RawEvmLog,
+    errorClass: IngestionErrorClass,
+    detail: string,
+    eventName: string,
+  ): Promise<void> {
+    await recordIngestionRejection(tx, {
+      ...this.sourceOf(log),
+      errorClass,
+      detail,
+      payload: { event: eventName.slice(0, 200) },
+    });
   }
 
   private findOrderingConflicts(logs: readonly RawEvmLog[]): Map<string, OrderingConflict> {
