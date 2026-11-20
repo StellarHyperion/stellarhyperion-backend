@@ -14,6 +14,7 @@ import {
   type WorkerHeartbeatRecord,
 } from "../../runtime/readiness.js";
 import type { ServerDeps } from "../server.js";
+import { emptyProofFailureCategories, normalizeProofFailureReason } from "../proof-failure-categories.js";
 
 export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
@@ -75,6 +76,22 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       }
     }
 
+    // 7. Bounded proof rejection categories. Raw reasons remain internal and are never labels.
+    const proofRejections = emptyProofFailureCategories();
+    try {
+      const rejected = await db.query(
+        `SELECT reason FROM evm_log_quarantine
+         UNION ALL
+         SELECT reason FROM stellar_event_quarantine`,
+      );
+      for (const row of rejected.rows) {
+        const category = normalizeProofFailureReason(text(row, "reason"));
+        proofRejections[category] += 1;
+      }
+    } catch (error) {
+      if (!isUndefinedTable(error)) throw error;
+    }
+
     // 7. Persistent worker heartbeats & freshness (#107)
     let heartbeatRecords: WorkerHeartbeatRecord[] = [];
     try {
@@ -130,6 +147,7 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       railAttestations: railStatusCounts,
       cursors,
       historyGaps,
+      proofRejections,
       freshnessSlo,
       database,
       deploymentMode: deps.config.deploymentMode,
@@ -142,4 +160,9 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       },
     });
   });
+}
+
+function isUndefinedTable(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error &&
+    (error as { code?: unknown }).code === "42P01";
 }
