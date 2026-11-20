@@ -105,10 +105,13 @@ export async function readHistoricalCoverage(db: Queryable, expected: readonly C
   if (!Number.isSafeInteger(unresolved))
     throw new RowError("unresolved", "exceeds the supported metric range");
   const oldest = sources
-    .filter((source) => source.family === "stellar" && source.oldestMissingStart !== null)
+    .filter(
+      (source): source is typeof source & { oldestMissingStart: string } =>
+        source.family === "stellar" && source.oldestMissingStart !== null,
+    )
     .sort((a, b) => {
-      const left = BigInt(a.oldestMissingStart!),
-        right = BigInt(b.oldestMissingStart!);
+      const left = BigInt(a.oldestMissingStart),
+        right = BigInt(b.oldestMissingStart);
       return left < right ? -1 : left > right ? 1 : a.chain.localeCompare(b.chain);
     })[0];
   return {

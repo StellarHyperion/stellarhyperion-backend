@@ -68,9 +68,13 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
     const configuredSources: CoverageSource[] = [];
     const stellar = deps.config.indexer.stellar;
     if (stellar !== null)
-      configuredSources.push({ chain: stellar.chain, family: "stellar", contract: stellar.router });
+      configuredSources.push({
+        chain: stellar.chain,
+        family: "stellar",
+        contract: stellar.routerContractId,
+      });
     for (const evm of deps.config.indexer.evm)
-      configuredSources.push({ chain: evm.chain, family: "evm", contract: evm.router });
+      configuredSources.push({ chain: evm.chain, family: "evm", contract: evm.routerAddress });
     const { historyGaps, historicalCoverage } = await readHistoricalCoverage(db, configuredSources);
 
     const proofRejections = await readProofRejectionMetrics(db);
