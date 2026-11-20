@@ -80,6 +80,16 @@ and a separately provisioned worker credential. Keep migration privileges separa
 
 Vercel's installed Git integration publishes `main`. GitHub Actions runs validation and the scheduled indexer; it does not need a Vercel deployment token.
 
+### Serverless deployment (Vercel)
+
+Serverless invocations via `api/index.ts` reuse a cached Fastify application and database connection pool across warm invocations within an execution environment. To avoid exhausting connection limits across concurrent serverless instances, the database pool is restricted to a maximum of 2 connections (`max: 2`).
+
+Each warm invocation pings the database before handing off its HTTP request. Initialization, health checks and teardown share one serialized lifecycle, including direct harness calls, so concurrent invocations cannot create duplicate pools or let an old failure close a replacement. An idle PostgreSQL connection error removes that client from the pool without exposing its raw error; the next query can reconnect. If a health probe fails, that invocation receives the fixed, credential-free 500 response, and the app, owned Redis connection and pool are released before the next call attempts initialization. Startup failures at schema admission, privilege admission, server construction or readiness also release their owned resources.
+
+The cache belongs to one execution environment; separate serverless instances each have their own two-connection budget. `closeApp()` provides an explicit restart boundary for the harness and drains pending initialization before disposal. No platform shutdown callback is assumed. Run `npm run test -- test/unit/serverless-lifecycle.test.ts` for overlap/failure fixtures and, after migrating a dedicated local `TEST_DATABASE_URL`, `npm run test -- test/integration/serverless-lifecycle.test.ts` for repeated restart, pool limits, real read-only grants and terminated-idle-connection recovery.
+
+Background processes must be disabled in serverless functions: `INDEXER_ENABLED=false`, `RAILS_ENABLED=false`, and `KEEPER_ENABLED=false`. Furthermore, database credentials must use `HYPERION_DATABASE_ROLE=read-only`.
+
 ## What establishes status
 
 Stellar router events establish source transfers and claim changes. The EVM watcher indexes configured Hyperion routers with confirmation and reorg checks. The default record does not deploy an EVM Hyperion router.
