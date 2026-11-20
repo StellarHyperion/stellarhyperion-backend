@@ -17,6 +17,7 @@ import {
 import type { ServerDeps } from "../server.js";
 import { readProofRejectionMetrics } from "../proof-rejection-metrics.js";
 import { readKeeperSubmissionMetrics } from "../../keeper/outcomes.js";
+import { readWorkerRuns } from "../../runtime/worker-runs.js";
 
 export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
@@ -120,7 +121,7 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
         lastError: hb.lastError,
         stale: freshness.stale,
         ageSeconds: freshness.ageSeconds,
-        runId: hb.runId ?? (typeof hb.metadata.runId === "string" ? hb.metadata.runId : null),
+        runId: hb.runId ?? null,
         completedTicks,
       };
     });
@@ -167,6 +168,7 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       database,
       deploymentMode: deps.config.deploymentMode,
       workers,
+      workerRuns: await readWorkerRuns(db),
       freshness: {
         totalWorkers: workers.length,
         staleWorkers,

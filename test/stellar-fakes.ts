@@ -202,6 +202,7 @@ export class RecordingDb implements Transactional {
   }[] = [];
   backfillRow: Record<string, unknown> | null = null;
   readonly heartbeatRows: Record<string, unknown>[] = [];
+  readonly workerRuns: Record<string, unknown>[] = [];
   /** Set to make every statement inside the next transaction throw. */
   failInTransaction: Error | null = null;
   /** What the open ingestion rejection count reports, to exercise the boundary limit. */
@@ -229,6 +230,32 @@ export class RecordingDb implements Transactional {
     if (text.includes("AS open FROM ingestion_rejection")) {
       return Promise.resolve({ rows: [{ open: this.openRejections }], rowCount: 1 });
     }
+    if (text.includes("INSERT INTO indexer_worker_run")) {
+      const previous = this.workerRuns.find((row) => row.run_id === params[0]);
+      const row = {
+        run_id: params[0],
+        execution_id: params[1],
+        worker_name: params[2],
+        worker_kind: params[3],
+        chain_key: params[4],
+        state: params[5],
+        successful_ticks: String(Number(previous?.successful_ticks ?? 0) + Number(params[6])),
+        failed_ticks: String(Number(previous?.failed_ticks ?? 0) + Number(params[7])),
+        started_at: previous?.started_at ?? new Date(),
+        updated_at: new Date(),
+        last_caught_up_at:
+          params[5] === "caught_up" ? new Date() : (previous?.last_caught_up_at ?? null),
+        stopped_at: params[5] === "stopped" ? new Date() : null,
+        stellar_scans: 0,
+        evm_scans: 0,
+        verification_transitions: 0,
+      };
+      if (previous !== undefined) Object.assign(previous, row);
+      else this.workerRuns.push(row);
+      return Promise.resolve({ rows: [{ run_id: params[0] }], rowCount: 1 });
+    }
+    if (text.includes("FROM indexer_worker_run r"))
+      return Promise.resolve({ rows: this.workerRuns, rowCount: this.workerRuns.length });
     if (text.includes("FROM indexer_cursor")) {
       return Promise.resolve({
         rows: this.cursorRow === null ? [] : [this.cursorRow],

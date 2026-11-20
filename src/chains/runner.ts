@@ -25,6 +25,12 @@ import type { Transactional } from "../db/pool.js";
 import { Poller } from "../runtime/poller.js";
 import type { ReadinessReport, ReadinessSource, WorkerKind } from "../runtime/readiness.js";
 import { fixedReadiness, recordWorkerHeartbeat } from "../runtime/readiness.js";
+import {
+  recordWorkerRun,
+  withWorkerRun,
+  type WorkerRunIdentity,
+  type WorkerRunState,
+} from "../runtime/worker-runs.js";
 import { RouteKind } from "@hyperion/protocol";
 
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
@@ -57,11 +63,13 @@ const FAILURES_BEFORE_DEGRADED = 3;
 export interface Worker extends ReadinessSource {
   readonly name: string;
   readonly runId?: string;
+  readonly executionId?: string;
   start(): void;
   stop(): Promise<void>;
 }
 
 export interface IndexerHandle {
+  readonly executionId?: string;
   readonly workers: readonly Worker[];
   readonly readiness: readonly ReadinessSource[];
   /** Read-only operator inspection; it does not start workers or change transfer state. */
@@ -87,6 +95,7 @@ export interface PolledWorkerOptions {
   readonly db?: Transactional;
   readonly workerKind?: WorkerKind;
   readonly chainKey?: string | null;
+  readonly executionId?: string;
 }
 
 /**
@@ -102,6 +111,9 @@ export class PolledWorker implements Worker {
   private readonly workerKind: WorkerKind;
   private readonly chainKey: string | null;
   readonly runId: string;
+  readonly executionId: string;
+  private runState: WorkerRunState = "running";
+  private started = false;
 
   constructor(
     private readonly pass: Pass,
@@ -113,32 +125,58 @@ export class PolledWorker implements Worker {
     this.workerKind = options.workerKind ?? "other";
     this.chainKey = options.chainKey ?? null;
     this.runId = randomUUID();
+    this.executionId = options.executionId ?? this.runId;
     this.poller = new Poller({
       name: pass.name,
       intervalMs,
       logger,
-      tick: async (signal) => {
-        let error: unknown;
-        let completed = false;
-        try {
-          const result = await pass.tick(signal);
-          completed = true;
-          return result;
-        } catch (failure) {
-          error = failure;
-          throw failure;
-        } finally {
-          if (this.db !== undefined) {
-            await this.persistHeartbeat(completed, error).catch((err: unknown) => {
-              logger.warn(
-                { err, worker: pass.name, runId: this.runId },
-                "failed to persist worker heartbeat",
-              );
-            });
+      tick: (signal) =>
+        withWorkerRun(this.runIdentity(), async () => {
+          this.runState = "running";
+          if (this.db !== undefined) await recordWorkerRun(this.db, this.runIdentity(), "running");
+          this.started = true;
+          let error: unknown;
+          let completed = false;
+          try {
+            const result = await pass.tick(signal);
+            completed = true;
+            this.runState = signal.aborted ? "stopped" : result ? "running" : "caught_up";
+            if (this.db !== undefined)
+              await recordWorkerRun(this.db, this.runIdentity(), this.runState, true);
+            return result;
+          } catch (failure) {
+            error = failure;
+            this.runState = signal.aborted ? "stopped" : "failed";
+            if (this.db !== undefined)
+              await recordWorkerRun(this.db, this.runIdentity(), this.runState).catch(() => {
+                logger.warn(
+                  { event: "worker_run_persistence_failed", worker: pass.name, runId: this.runId },
+                  "failed to persist worker outcome",
+                );
+              });
+            throw failure;
+          } finally {
+            if (this.db !== undefined) {
+              await this.persistHeartbeat(completed, error).catch((err: unknown) => {
+                logger.warn(
+                  { err, worker: pass.name, runId: this.runId },
+                  "failed to persist worker heartbeat",
+                );
+              });
+            }
           }
-        }
-      },
+        }),
     });
+  }
+
+  private runIdentity(): WorkerRunIdentity {
+    return {
+      runId: this.runId,
+      executionId: this.executionId,
+      workerName: this.name,
+      workerKind: this.workerKind,
+      chainKey: this.chainKey,
+    };
   }
 
   private async persistHeartbeat(completed: boolean, error?: unknown): Promise<void> {
@@ -165,7 +203,9 @@ export class PolledWorker implements Worker {
       runId: this.runId,
       metadata: {
         runId: this.runId,
-        ticks: stats.ticks,
+        executionId: this.executionId,
+        caughtUp: this.runState === "caught_up",
+        ticks: stats.ticks + (completed ? 1 : 0),
         running: stats.running,
       },
     });
@@ -181,6 +221,10 @@ export class PolledWorker implements Worker {
 
   async stop(): Promise<void> {
     await this.poller.stop();
+    if (this.started && this.runState === "running" && this.db !== undefined) {
+      this.runState = "stopped";
+      await recordWorkerRun(this.db, this.runIdentity(), "stopped");
+    }
     if (this.pass.release !== undefined) {
       await this.pass.release().catch(() => undefined);
     }
@@ -215,6 +259,7 @@ export interface BuildIndexerDeps {
  */
 export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   const { config, logger, db } = deps;
+  const executionId = randomUUID();
   const passes = buildRailPasses(config.rails, config.network, db, logger, config);
   const inspectBacklog = (
     options: InspectRailBacklogOptions = {},
@@ -241,6 +286,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
 
   if (!config.indexer.enabled) {
     return {
+      executionId,
       workers: [],
       readiness: [
         fixedReadiness(
@@ -260,7 +306,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   const extra: ReadinessSource[] = [];
 
   if (config.indexer.stellar !== null) {
-    workers.push(stellarWorker(config.indexer.stellar, db, logger, config));
+    workers.push(stellarWorker(config.indexer.stellar, db, logger, config, executionId));
   } else {
     logger.warn("the deployment record has no Stellar router, so nothing is watching Stellar");
   }
@@ -268,7 +314,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // One per chain in the record. Each carries its own confirmations from the registry, which is
   // the honest way to treat one block on Arc and twelve on Ethereum as the same kind of fact.
   for (const chain of config.indexer.evm) {
-    workers.push(evmWorker(chain, db, logger, config));
+    workers.push(evmWorker(chain, db, logger, config, executionId));
   }
 
   // Counted before the rail pollers join the list, because the two questions are different. "Is
@@ -281,7 +327,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // They are not conditional on a router being watched: a transfer indexed by a previous run is
   // still waiting on its rail whether or not this replica is watching the chain it left.
   if (config.rails.enabled) {
-    for (const worker of railWorkersFromPasses(passes, config.rails, db, logger)) {
+    for (const worker of railWorkersFromPasses(passes, config.rails, db, logger, executionId)) {
       workers.push(worker);
     }
   } else {
@@ -321,6 +367,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   }
 
   return {
+    executionId,
     workers,
     readiness: [...workers, ...extra],
     inspectBacklog,
@@ -393,6 +440,7 @@ function railWorkersFromPasses(
   config: RailsConfig,
   db: Transactional,
   logger: Logger,
+  executionId: string,
 ): readonly Worker[] {
   return passes.map((pass) => {
     const child = logger.child({ rail: pass.rail, route: pass.route });
@@ -400,6 +448,7 @@ function railWorkersFromPasses(
       db,
       workerKind: "rail",
       chainKey: null,
+      executionId,
     });
   });
 }
@@ -409,6 +458,7 @@ function evmWorker(
   db: Transactional,
   logger: Logger,
   app?: AppConfig,
+  executionId?: string,
 ): Worker {
   const child = logger.child({ chain: config.chain, chainId: config.chainId });
   const watcher = new EvmWatcher({
@@ -432,6 +482,7 @@ function evmWorker(
     db,
     workerKind: "chain",
     chainKey: config.chain,
+    ...(executionId === undefined ? {} : { executionId }),
   });
 }
 
@@ -440,6 +491,7 @@ function stellarWorker(
   db: Transactional,
   logger: Logger,
   app?: AppConfig,
+  executionId?: string,
 ): Worker {
   const child = logger.child({ chain: config.chain });
   const watcher = new StellarWatcher({
@@ -463,5 +515,6 @@ function stellarWorker(
     db,
     workerKind: "chain",
     chainKey: config.chain,
+    ...(executionId === undefined ? {} : { executionId }),
   });
 }

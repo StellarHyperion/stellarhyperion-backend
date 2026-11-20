@@ -3,6 +3,7 @@ import { PolledWorker } from "../../src/chains/runner.js";
 import { loadConfig } from "../../src/config/config.js";
 import type { Database } from "../../src/db/pool.js";
 import { buildServer } from "../../src/http/server.js";
+import { readWorkerRuns } from "../../src/runtime/worker-runs.js";
 import {
   readWorkerHeartbeats,
   recordWorkerHeartbeat,
@@ -16,6 +17,80 @@ describe("worker run correlation across catch-up jobs (#114)", () => {
     env: completeEnv({ RAILS_ENABLED: "false", KEEPER_ENABLED: "false" }),
   });
   const { logger } = capturingLogger();
+
+  it("records an in-progress run before a blocked tick and treats shutdown during it as partial", async () => {
+    const db = new RecordingDb();
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered = false;
+    const worker = new PolledWorker(
+      {
+        name: "stellar-testnet",
+        readiness: () => ({ name: "stellar-testnet", state: "ready", detail: "current" }),
+        tick: async () => {
+          entered = true;
+          await gate;
+          return false;
+        },
+      },
+      10,
+      logger,
+      { db, workerKind: "chain", chainKey: "stellar-testnet" },
+    );
+    worker.start();
+    try {
+      await expect.poll(() => entered).toBe(true);
+      expect(await readWorkerRuns(db)).toMatchObject([
+        { runId: worker.runId, state: "running", partial: true, successfulTicks: "0" },
+      ]);
+      const stopping = worker.stop();
+      release();
+      await stopping;
+      expect(await readWorkerRuns(db)).toMatchObject([
+        { runId: worker.runId, state: "stopped", partial: true },
+      ]);
+    } finally {
+      release();
+      await worker.stop();
+    }
+  });
+
+  it("never uses an unsafe legacy metadata run ID as a public fallback", async () => {
+    const db = new RecordingDb();
+    await recordWorkerHeartbeat(db, {
+      workerName: "stellar-testnet",
+      workerKind: "chain",
+      chainKey: "stellar-testnet",
+      state: "ready",
+      detail: "legacy",
+      completed: true,
+      consecutiveFailures: 0,
+      lastError: null,
+    });
+    const row = db.heartbeatRows[0];
+    if (row === undefined) throw new Error("missing heartbeat fixture");
+    row.metadata = { runId: "https://user:private@rpc.invalid/key", completed: true };
+    const app = buildServer({
+      config,
+      logger,
+      db: db as unknown as Database,
+      readiness: [],
+      redis: { ping: () => Promise.resolve("PONG") },
+    });
+    try {
+      const response = await app.inject({ method: "GET", url: "/ready" });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().runCorrelation).toEqual([
+        { workerName: "stellar-testnet", runId: null, partial: true },
+      ]);
+      expect(response.body).not.toContain("private");
+      expect(response.body).not.toContain("rpc.invalid");
+    } finally {
+      await app.close();
+    }
+  });
 
   it("generates a UUID runId per PolledWorker instance that persists across ticks and changes on restart", async () => {
     const db = new RecordingDb();
@@ -126,8 +201,8 @@ describe("worker run correlation across catch-up jobs (#114)", () => {
 
   it("exposes runId and completedTicks in GET /v1/metrics per worker", async () => {
     const db = new RecordingDb();
-    const runIdStellar = "11111111-2222-3333-4444-555555555555";
-    const runIdSepolia = "66666666-7777-8888-9999-000000000000";
+    const runIdStellar = "11111111-2222-4333-8444-555555555555";
+    const runIdSepolia = "66666666-7777-4888-9999-000000000000";
 
     await recordWorkerHeartbeat(db, {
       workerName: "stellar-testnet",
@@ -187,8 +262,8 @@ describe("worker run correlation across catch-up jobs (#114)", () => {
 
   it("distinguishes completed vs partial runs in /ready runCorrelation", async () => {
     const db = new RecordingDb();
-    const completedRunId = "c0c0c0c0-1111-2222-3333-444444444444";
-    const partialRunId = "p0p0p0p0-5555-6666-7777-888888888888";
+    const completedRunId = "c0c0c0c0-1111-4222-8333-444444444444";
+    const partialRunId = "a0a0a0a0-5555-4666-8777-888888888888";
 
     // Completed worker: completed = true
     await recordWorkerHeartbeat(db, {
@@ -201,7 +276,7 @@ describe("worker run correlation across catch-up jobs (#114)", () => {
       consecutiveFailures: 0,
       lastError: null,
       runId: completedRunId,
-      metadata: { ticks: 10 },
+      metadata: { ticks: 10, caughtUp: true },
     });
 
     // Partial worker: completed = false (e.g. tick threw or stopped mid-job)

@@ -17,6 +17,7 @@ import type { FastifyInstance } from "fastify";
 
 import type { ServerDeps } from "../server.js";
 import type { ReadinessReport, WorkerHeartbeatRecord } from "../../runtime/readiness.js";
+import { readWorkerRuns } from "../../runtime/worker-runs.js";
 import {
   checkRedisHealth,
   evaluateReadiness,
@@ -109,15 +110,10 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
     }
 
     const runCorrelation = heartbeats.map((hb: WorkerHeartbeatRecord) => {
-      const metaCompleted = hb.metadata.completed;
-      const partial =
-        metaCompleted === false ||
-        hb.lastCompletedAt === null ||
-        hb.lastCompletedAt.getTime() < hb.lastHeartbeatAt.getTime();
-      const metaRunId = hb.metadata.runId;
+      const partial = hb.metadata.caughtUp !== true;
       return {
         workerName: hb.workerName,
-        runId: hb.runId ?? (typeof metaRunId === "string" ? metaRunId : null),
+        runId: hb.runId ?? null,
         partial,
       };
     });
@@ -135,6 +131,7 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
       indexer: deps.config.indexer.enabled ? "enabled" : "disabled",
       checks: evaluated.checks,
       runCorrelation,
+      workerRuns: dbCheck.state === "down" ? [] : await readWorkerRuns(deps.db),
     });
   });
 }
