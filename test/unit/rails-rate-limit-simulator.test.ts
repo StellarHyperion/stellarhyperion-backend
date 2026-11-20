@@ -1,311 +1,133 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
-import { RailPass } from "../../src/rails/pass.js";
-import { RailError, type PendingTransfer, type RailClient } from "../../src/rails/types.js";
+import { describe, expect, it } from "vitest";
 import { RateLimitSimulator, RailRateLimitError, RailTimeoutError } from "../helpers.js";
-import { RecordingDb, capturingLogger, seedOutboundTransfer } from "../stellar-fakes.js";
+import { RailError, type PendingTransfer, type RailClient } from "../../src/rails/types.js";
 
-describe("RateLimitSimulator and RailPass backoff coordination", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-  });
+const transfer = (id = 1n): PendingTransfer => ({
+  transferId: id,
+  route: 0,
+  originChain: "sepolia",
+  destinationChain: "stellar-testnet",
+  nonce: 18446744073709551615n,
+  originTx: "source",
+  status: "pending",
+  checkFailures: 0,
+  retryAttempts: 0,
+  delivered: false,
+});
 
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("does not attempt next check for the SAME transfer after Retry-After until cooldown passes", async () => {
-    const startTime = new Date("2026-11-19T12:00:00.000Z");
-    vi.setSystemTime(startTime);
-
-    const db = new RecordingDb();
-    const { logger } = capturingLogger();
-    const transferId = seedOutboundTransfer(db, { route: 0, nonce: 101n });
-
-    const sim = new RateLimitSimulator();
-    sim.simulateRetryAfter(30); // 30 second cooldown
-
-    const pass = new RailPass({
-      route: 0,
-      client: sim,
-      db,
-      logger,
-      batchSize: 10,
-      recheckAfterMs: 5_000,
-      maxCheckFailures: 5,
+describe("fault-only rail provider simulator", () => {
+  it("targets faults by transfer independently of concurrent request order", async () => {
+    const simulator = new RateLimitSimulator();
+    simulator.simulateRetryAfter(45, 1n);
+    simulator.simulateTimeout("intermittent timeout", 2n);
+    const results = await Promise.allSettled([
+      simulator.look(transfer(3n)),
+      simulator.look(transfer(2n)),
+      simulator.look(transfer(1n)),
+    ]);
+    expect(results[0]).toMatchObject({
+      status: "fulfilled",
+      value: { kind: "found", report: { status: "pending" } },
     });
-
-    // 1st tick: encounters Retry-After 30s
-    await pass.tick(new AbortController().signal);
-    expect(sim.callCount).toBe(1);
-    expect(sim.callsFor(transferId)).toBe(1);
-    expect(sim.backoffTimesObserved).toEqual([30]);
-
-    // Check DB attestation row
-    const attestation = db.railAttestations.get(transferId);
-    expect(attestation).toBeDefined();
-    expect(attestation?.status).toBe("pending");
-    expect(attestation?.retry_class).toBe("rate_limited");
-    expect(attestation?.retry_attempts).toBe(1);
-    expect(attestation?.next_attempt_at?.toISOString()).toBe("2026-11-19T12:00:30.000Z");
-
-    // Advance 15s (still within 30s cooldown)
-    vi.advanceTimersByTime(15_000);
-    await pass.tick(new AbortController().signal);
-    expect(sim.callCount).toBe(1);
-    expect(sim.callsFor(transferId)).toBe(1);
-
-    // Advance another 14s (total 29s, still within cooldown)
-    vi.advanceTimersByTime(14_000);
-    await pass.tick(new AbortController().signal);
-    expect(sim.callCount).toBe(1);
-    expect(sim.callsFor(transferId)).toBe(1);
-
-    // Advance another 2s (total 31s, cooldown has passed)
-    vi.advanceTimersByTime(2_000);
-    await pass.tick(new AbortController().signal);
-    expect(sim.callCount).toBe(2);
-    expect(sim.callsFor(transferId)).toBe(2);
+    expect(results[1]).toMatchObject({ status: "rejected", reason: { kind: "transient" } });
+    expect(results[2]).toMatchObject({
+      status: "rejected",
+      reason: { kind: "rateLimited", retryAfterMs: 45000 },
+    });
+    expect(simulator.backoffTimesObserved).toEqual([45]);
+    expect(simulator.callsFor(1n)).toBe(1);
   });
 
-  it("does not starve unrelated transfers when one is in backoff", async () => {
-    const startTime = new Date("2026-11-19T12:00:00.000Z");
-    vi.setSystemTime(startTime);
+  it.each(["pending", "attested", "delivered"] as const)(
+    "strips every proof/execution field from a wrapped %s report",
+    async (status) => {
+      const wrapped: RailClient = {
+        rail: "axelar-its",
+        look: () =>
+          Promise.resolve({
+            kind: "found",
+            report: {
+              status,
+              railStatus: "complete",
+              reference: "private-reference",
+              attestedAt: new Date(),
+              forwardTxHash: "0x1234",
+              execution: { txHash: "0x5678", commandId: "0xabcd" },
+              quarantine: {
+                schema: "raw",
+                providerReference: "private",
+                payload: { delivered: true },
+              },
+              messageBytes: "private-message",
+              attestationSignature: "private-signature",
+            },
+          }),
+      };
+      const simulator = new RateLimitSimulator(wrapped);
+      expect(await simulator.look(transfer())).toEqual({
+        kind: "found",
+        report: {
+          status: "pending",
+          railStatus: "simulated_pending",
+          reference: null,
+          attestedAt: null,
+        },
+      });
+      expect(() => simulator.simulateDelivered()).toThrow("cannot generate fake delivered");
+    },
+  );
 
-    const db = new RecordingDb();
-    const { logger } = capturingLogger();
-
-    // Transfer 1 and Transfer 2 on same route
-    const transfer1 = seedOutboundTransfer(db, { route: 0, nonce: 201n });
-    const transfer2 = seedOutboundTransfer(db, { route: 0, nonce: 202n });
-
-    const sim = new RateLimitSimulator();
-    // Simulate timeout for transfer 1 (transient exponential backoff)
-    sim.simulateTimeout("provider timeout");
-
-    const pass = new RailPass({
-      route: 0,
-      client: sim,
-      db,
-      logger,
-      batchSize: 1, // 1 per batch to process them distinctly
-      recheckAfterMs: 20_000,
-      maxCheckFailures: 5,
-    });
-
-    // 1st tick processes transfer 1 and fails with timeout -> backoff 20s
-    await pass.tick(new AbortController().signal);
-    expect(sim.callsFor(transfer1)).toBe(1);
-    expect(sim.callsFor(transfer2)).toBe(0);
-
-    const a1 = db.railAttestations.get(transfer1);
-    expect(a1?.retry_class).toBe("transient");
-    expect(a1?.next_attempt_at?.toISOString()).toBe("2026-11-19T12:00:20.000Z");
-
-    // 2nd tick immediately: transfer 1 is cooling down (next_attempt_at in +20s),
-    // but transfer 2 is ready and NOT starved!
-    await pass.tick(new AbortController().signal);
-    expect(sim.callsFor(transfer1)).toBe(1);
-    expect(sim.callsFor(transfer2)).toBe(1);
-
-    const a2 = db.railAttestations.get(transfer2);
-    expect(a2?.status).toBe("pending");
-  });
-
-  it("does not corrupt the transfer record or mark it delivered on malformed responses", async () => {
-    const startTime = new Date("2026-11-19T12:00:00.000Z");
-    vi.setSystemTime(startTime);
-
-    const db = new RecordingDb();
-    const { logger } = capturingLogger();
-    const transferId = seedOutboundTransfer(db, { route: 0, nonce: 301n });
-
-    const sim = new RateLimitSimulator();
-    sim.simulateMalformed();
-
-    const pass = new RailPass({
-      route: 0,
-      client: sim,
-      db,
-      logger,
-      batchSize: 10,
-      recheckAfterMs: 5_000,
-      maxCheckFailures: 5,
-    });
-
-    await pass.tick(new AbortController().signal);
-    expect(sim.callCount).toBe(1);
-
-    const attestation = db.railAttestations.get(transferId);
-    expect(attestation).toBeDefined();
-    // Status must remain pending and NEVER delivered
-    expect(attestation?.status).toBe("pending");
-    expect(attestation?.status).not.toBe("delivered");
-    expect(attestation?.check_failures).toBe(1);
-    expect(attestation?.last_error).toBe("lookup or delivery evidence verification failed");
-  });
-
-  it("does not mark the transfer as delivered on timeout", async () => {
-    const startTime = new Date("2026-11-19T12:00:00.000Z");
-    vi.setSystemTime(startTime);
-
-    const db = new RecordingDb();
-    const { logger } = capturingLogger();
-    const transferId = seedOutboundTransfer(db, { route: 0, nonce: 401n });
-
-    const sim = new RateLimitSimulator();
-    sim.simulateTimeout("gateway timeout");
-
-    const pass = new RailPass({
-      route: 0,
-      client: sim,
-      db,
-      logger,
-      batchSize: 10,
-      recheckAfterMs: 5_000,
-      maxCheckFailures: 5,
-    });
-
-    await pass.tick(new AbortController().signal);
-    expect(sim.callCount).toBe(1);
-
-    const attestation = db.railAttestations.get(transferId);
-    expect(attestation).toBeDefined();
-    expect(attestation?.status).toBe("pending");
-    expect(attestation?.status).not.toBe("delivered");
-    expect(attestation?.retry_class).toBe("transient");
-    expect(attestation?.retry_attempts).toBe(1);
-    expect(attestation?.last_error).toBe("cctp transient lookup failure");
-  });
-
-  it("retains durable backoff decisions across process restart (new RailPass instance with same DB)", async () => {
-    const startTime = new Date("2026-11-19T12:00:00.000Z");
-    vi.setSystemTime(startTime);
-
-    const db = new RecordingDb();
-    const { logger } = capturingLogger();
-    const transferId = seedOutboundTransfer(db, { route: 0, nonce: 501n });
-
-    const sim = new RateLimitSimulator();
-    sim.simulateRetryAfter(60); // 60s cooldown
-
-    const pass1 = new RailPass({
-      route: 0,
-      client: sim,
-      db,
-      logger,
-      batchSize: 10,
-      recheckAfterMs: 5_000,
-      maxCheckFailures: 5,
-    });
-
-    // Run first process instance
-    await pass1.tick(new AbortController().signal);
-    expect(sim.callCount).toBe(1);
-    const saved = db.railAttestations.get(transferId);
-    expect(saved?.next_attempt_at?.toISOString()).toBe("2026-11-19T12:01:00.000Z");
-
-    // Simulate process crash / restart:
-    // Create new pass instance with same DB. Its in-memory state (cooldownUntil) starts fresh null.
-    const pass2 = new RailPass({
-      route: 0,
-      client: sim,
-      db,
-      logger,
-      batchSize: 10,
-      recheckAfterMs: 5_000,
-      maxCheckFailures: 5,
-    });
-
-    // Advance 30 seconds (still within durable 60s backoff in DB)
-    vi.advanceTimersByTime(30_000);
-    await pass2.tick(new AbortController().signal);
-    // Durable backoff state from DB prevents recheck
-    expect(sim.callCount).toBe(1);
-
-    // Advance 31 more seconds (now 61s elapsed, past backoff)
-    vi.advanceTimersByTime(31_000);
-    await pass2.tick(new AbortController().signal);
-    // Should now be picked up from DB queue
-    expect(sim.callCount).toBe(2);
-  });
-
-  it("CRITICAL: simulator cannot generate fake delivered records", async () => {
-    const transfer: PendingTransfer = {
-      transferId: 601n,
-      route: 0,
-      originChain: "sepolia",
-      destinationChain: "stellar-testnet",
-      nonce: 601n,
-      originTx: "0x123",
-      status: "pending",
-      checkFailures: 0,
-      retryAttempts: 0,
-      delivered: false,
-    };
-
-    // A fake client attempting to return "delivered"
-    const rogueClient: RailClient = {
+  it("normalizes malformed provider responses through the same transient boundary as timeouts", async () => {
+    const simulator = new RateLimitSimulator();
+    simulator.simulateMalformed();
+    await expect(simulator.look(transfer())).rejects.toMatchObject({
+      kind: "transient",
       rail: "cctp",
-      look: () =>
-        Promise.resolve({
-          kind: "found",
-          report: {
-            status: "delivered",
-            railStatus: "complete",
-            reference: "rogue-ref",
-            attestedAt: new Date(),
-          },
-        }),
-    };
-
-    const sim = new RateLimitSimulator(rogueClient);
-    const lookup = await sim.look(transfer);
-    expect(lookup.kind).toBe("found");
-    if (lookup.kind === "found") {
-      expect(lookup.report.status).not.toBe("delivered");
-      expect(lookup.report.status).toBe("pending");
-    }
-
-    expect(() => {
-      sim.simulateDelivered();
-    }).toThrow(/cannot generate fake delivered records/i);
+    });
+    expect(new RailRateLimitError("cctp", 45).retryAfterMs).toBe(45000);
+    expect(new RailTimeoutError("cctp")).toBeInstanceOf(RailError);
   });
 
-  it("supports intermittent timeouts and malformed responses with configured rates", async () => {
-    const transfer: PendingTransfer = {
-      transferId: 701n,
-      route: 0,
-      originChain: "sepolia",
-      destinationChain: "stellar-testnet",
-      nonce: 701n,
-      originTx: "0x777",
-      status: "pending",
-      checkFailures: 0,
-      retryAttempts: 0,
-      delivered: false,
+  it("replays intermittent fault rates deterministically with an injected random source", async () => {
+    const outcomes = async () => {
+      const samples = [0.1, 0.9, 0.2, 0.9, 0.9];
+      const simulator = new RateLimitSimulator({
+        timeoutRate: 0.5,
+        malformedRate: 0.5,
+        random: () => samples.shift() ?? 0.9,
+      });
+      return Promise.allSettled([
+        simulator.look(transfer()),
+        simulator.look(transfer()),
+        simulator.look(transfer()),
+      ]);
     };
-
-    const simTimeout = new RateLimitSimulator({ timeoutRate: 1.0 });
-    await expect(simTimeout.look(transfer)).rejects.toThrow("timeout");
-
-    const simMalformed = new RateLimitSimulator({ malformedRate: 1.0 });
-    const malformedResult = await simMalformed.look(transfer);
-    expect(malformedResult.kind).toBe("malformed");
+    const first = await outcomes(),
+      second = await outcomes();
+    expect(first.map((result) => result.status)).toEqual(["rejected", "rejected", "fulfilled"]);
+    expect(second.map((result) => result.status)).toEqual(first.map((result) => result.status));
   });
 
-  it("verifies error classes have expected properties", () => {
-    const rateLimitError = new RailRateLimitError("cctp", 45);
-    expect(rateLimitError.rail).toBe("cctp");
-    expect(rateLimitError.kind).toBe("rateLimited");
-    expect(rateLimitError.retryAfter).toBe(45);
-    expect(rateLimitError.retryAfterMs).toBe(45_000);
-    expect(rateLimitError).toBeInstanceOf(RailError);
+  it("rejects invalid rates, delays, random samples and Retry-After bounds", async () => {
+    for (const rate of [NaN, Infinity, -1, 2])
+      expect(() => new RateLimitSimulator({ timeoutRate: rate })).toThrow(RangeError);
+    expect(() => new RateLimitSimulator({ latencyMs: -1 })).toThrow(RangeError);
+    const simulator = new RateLimitSimulator({ timeoutRate: 1, random: () => NaN });
+    await expect(simulator.look(transfer())).rejects.toThrow(RangeError);
+    expect(() => simulator.simulateRetryAfter(Infinity)).toThrow(RangeError);
+    expect(() => simulator.simulateRetryAfter(-1)).toThrow(RangeError);
+  });
 
-    const timeoutError = new RailTimeoutError("cctp", "timeout");
-    expect(timeoutError.rail).toBe("cctp");
-    expect(timeoutError.kind).toBe("transient");
-    expect(timeoutError.message).toBe("timeout");
-    expect(timeoutError).toBeInstanceOf(RailError);
+  it("cancels a delayed request before a provider call and can reset queued faults", async () => {
+    const simulator = new RateLimitSimulator({ latencyMs: 1000 });
+    const controller = new AbortController();
+    const request = simulator.look(transfer(), controller.signal);
+    controller.abort();
+    await expect(request).rejects.toMatchObject({ kind: "transient" });
+    expect(simulator.callCount).toBe(0);
+    simulator.simulateTimeout();
+    simulator.reset();
+    expect(simulator.backoffTimesObserved).toEqual([]);
+    expect(simulator.callsFor(1n)).toBe(0);
   });
 });

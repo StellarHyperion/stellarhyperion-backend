@@ -20,7 +20,7 @@ import {
   type RailLookup,
 } from "../../src/rails/types.js";
 import { capturingLogger } from "../stellar-fakes.js";
-import { RateLimitSimulator } from "../helpers.js";
+import { RateLimitSimulator, concurrencyBarrier } from "../helpers.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
 const suite = CONNECTION === undefined ? describe.skip : describe;
@@ -465,7 +465,7 @@ suite("rail pollers against real Postgres", () => {
     expect(rows[0]?.status).toBe("pending");
     expect(rows[0]?.delivered).toBe(false);
   });
-  async function seedRetry(nonce: bigint): Promise<void> {
+  async function seedRetry(nonce: bigint, route = 0): Promise<void> {
     await db.transaction(async (tx) => {
       await writeOutbound(
         tx,
@@ -477,7 +477,7 @@ suite("rail pollers against real Postgres", () => {
           observedAt: new Date(),
         },
         {
-          route: 0,
+          route,
           nonce,
           sender: "0x1111111111111111111111111111111111111111",
           token: "0x3333333333333333333333333333333333333333",
@@ -1145,5 +1145,170 @@ suite("rail pollers against real Postgres", () => {
     now = new Date(now.getTime() + 16_000);
     await new RailPass(options).tick(new AbortController().signal);
     expect(sim.callCount).toBe(2);
+  });
+  it("overlaps provider workers while PostgreSQL prevents duplicate transfer claims", async () => {
+    await seedRetry(31701n);
+    await seedRetry(31702n);
+    const barrier = concurrencyBarrier(2);
+    const { logger } = capturingLogger();
+    const provider: RailClient = {
+      rail: "cctp",
+      look: async () => {
+        await barrier.wait();
+        return {
+          kind: "found",
+          report: { status: "pending", railStatus: "pending", reference: null, attestedAt: null },
+        };
+      },
+    };
+    const simulator = new RateLimitSimulator(provider);
+    const options = {
+      route: 0,
+      client: simulator,
+      db,
+      logger,
+      batchSize: 1,
+      recheckAfterMs: 5000,
+      maxCheckFailures: 5,
+    };
+    await Promise.all([
+      new RailPass(options).tick(new AbortController().signal),
+      new RailPass(options).tick(new AbortController().signal),
+    ]);
+    const rows = await db.query(
+      "SELECT t.id::text,a.status FROM outbound_transfer t JOIN rail_attestation a ON a.transfer_id=t.id WHERE t.nonce IN (31701,31702)",
+    );
+    expect(rows.rows).toHaveLength(2);
+    for (const row of rows.rows) {
+      expect(simulator.callsFor(BigInt(String(row.id)))).toBe(1);
+      expect(row.status).toBe("pending");
+    }
+    expect(simulator.callCount).toBe(2);
+  });
+
+  it("retains simulator backoff through closed pools and new provider/pass instances", async () => {
+    await seedRetry(31703n);
+    const { logger } = capturingLogger();
+    let now = new Date();
+    const initial = new RateLimitSimulator();
+    initial.simulateRetryAfter(30);
+    const options = {
+      route: 0,
+      db,
+      logger,
+      batchSize: 1,
+      recheckAfterMs: 5000,
+      maxCheckFailures: 5,
+      now: () => now,
+    };
+    await new RailPass({ ...options, client: initial }).tick(new AbortController().signal);
+    const before = await db.query("SELECT next_attempt_at,retry_attempts FROM rail_attestation");
+    expect(before.rows[0]?.next_attempt_at).toEqual(new Date(now.getTime() + 30000));
+    await db.close();
+    db = Database.open(CONNECTION ?? "", { applicationName: "hyperion-simulator-restart" });
+    const restarted = new RateLimitSimulator();
+    now = new Date(now.getTime() + 15000);
+    await new RailPass({ ...options, db, client: restarted }).tick(new AbortController().signal);
+    expect(restarted.callCount).toBe(0);
+    expect(
+      (await db.query("SELECT next_attempt_at,retry_attempts FROM rail_attestation")).rows,
+    ).toEqual(before.rows);
+    now = new Date(now.getTime() + 16000);
+    await new RailPass({ ...options, db, client: restarted }).tick(new AbortController().signal);
+    expect(restarted.callCount).toBe(1);
+  });
+
+  it("does not starve a separate provider while another rail is cooling down", async () => {
+    await seedRetry(31704n, 0);
+    await seedRetry(31705n, 1);
+    const { logger } = capturingLogger();
+    const limited = new RateLimitSimulator();
+    limited.simulateRetryAfter(30);
+    const unrelated = new RateLimitSimulator({
+      rail: "axelar-its",
+      look: () => Promise.resolve({ kind: "missing" }),
+    });
+    const options = { db, logger, batchSize: 1, recheckAfterMs: 5000, maxCheckFailures: 5 };
+    const pass = new RailPass({ ...options, route: 0, client: limited });
+    await Promise.all([
+      pass.tick(new AbortController().signal),
+      new RailPass({ ...options, route: 1, client: unrelated }).tick(new AbortController().signal),
+    ]);
+    await pass.tick(new AbortController().signal);
+    expect(limited.callCount).toBe(1);
+    expect(unrelated.callCount).toBe(1);
+    expect(
+      (await db.query("SELECT route,retry_class,status FROM rail_attestation ORDER BY route")).rows,
+    ).toMatchObject([
+      { route: 0, retry_class: "rate_limited", status: "pending" },
+      { route: 1, status: "pending" },
+    ]);
+  });
+
+  it("cannot create delivered rows or alter source amounts from malformed, timeout or claimed execution responses", async () => {
+    await seedRetry(31706n);
+    await seedRetry(31707n);
+    await seedRetry(31708n);
+    const source = await db.query(
+      "SELECT id::text,nonce::text,gross_amount::text,fee::text,net_amount::text,origin_tx FROM outbound_transfer ORDER BY id",
+    );
+    const provider: RailClient = {
+      rail: "cctp",
+      look: () =>
+        Promise.resolve({
+          kind: "found",
+          report: {
+            status: "delivered",
+            railStatus: "complete",
+            reference: "claimed",
+            attestedAt: new Date(),
+            forwardTxHash: "0x1234",
+            execution: { txHash: "0x5678", commandId: "0xabcd" },
+            messageBytes: "fake-proof",
+          },
+        }),
+    };
+    const simulator = new RateLimitSimulator(provider);
+    const first = source.rows[0],
+      second = source.rows[1];
+    if (first === undefined || second === undefined)
+      throw new Error("missing simulator source fixtures");
+    simulator.simulateMalformed(BigInt(String(first.id)));
+    simulator.simulateTimeout("timeout", BigInt(String(second.id)));
+    const { logger } = capturingLogger();
+    await new RailPass({
+      route: 0,
+      client: simulator,
+      db,
+      logger,
+      batchSize: 3,
+      recheckAfterMs: 5000,
+      maxCheckFailures: 5,
+    }).tick(new AbortController().signal);
+    expect(simulator.callCount).toBe(3);
+    expect(
+      (await db.query("SELECT count(*)::int AS count FROM inbound_delivery")).rows[0]?.count,
+    ).toBe(0);
+    expect(
+      (
+        await db.query(
+          "SELECT count(*)::int AS count FROM rail_attestation WHERE status='delivered'",
+        )
+      ).rows[0]?.count,
+    ).toBe(0);
+    expect(
+      (
+        await db.query(
+          "SELECT count(*)::int AS count FROM rail_attestation WHERE retry_class='transient'",
+        )
+      ).rows[0]?.count,
+    ).toBe(2);
+    expect(
+      (
+        await db.query(
+          "SELECT id::text,nonce::text,gross_amount::text,fee::text,net_amount::text,origin_tx FROM outbound_transfer ORDER BY id",
+        )
+      ).rows,
+    ).toEqual(source.rows);
   });
 });

@@ -457,3 +457,11 @@ Each indexer build has a generated execution UUID shared by its source and rail 
 Migration `1793700000000_worker-run-correlation` adds the history table and nullable run references to Stellar scan journals, EVM scan provenance and rail transition history. `Database.transaction` binds the internal worker context with a parameterized, transaction-local setting; insert triggers record the reference in the same commit as the evidence. Rollback removes both evidence and links, and pooled connections clear the setting at transaction end. Existing records remain uncorrelated. Apply migrations and grant the API reader SELECT on `indexer_worker_run` before restarting a reader; no monetary precision, replay identity, delivery predicate or claim ownership changes.
 
 `/ready` and `/v1/metrics` expose at most 100 durable recent worker runs, safe UUIDs, partial/completed status, integer-string counters and correlated scan/verification-transition counts. Legacy heartbeats without a valid run UUID or an explicit caught-up observation remain unverified/partial. No provider URLs, raw metadata or credential-bearing IDs are included in this projection. Scheduled catch-up and process startup logs carry the execution UUID. Run the focused unit and dedicated PostgreSQL `worker-run-correlation.test.ts` suites plus the full check/build before deployment.
+
+The fault-only `RateLimitSimulator` in `test/helpers.ts` can queue Retry-After, timeout and
+malformed-response faults per transfer, or use injected deterministic randomness for repeatable
+campaigns. Optional bounded latency supports cancellation. Its reports always omit execution,
+forwarded transaction and payment-proof material; it cannot create delivered records. Real
+PostgreSQL rail tests verify overlapping workers claim separate rows, reopening pools retains
+retry deadlines, unrelated rails progress during provider cooldown, and faults leave source
+amounts and destination delivery records intact.
