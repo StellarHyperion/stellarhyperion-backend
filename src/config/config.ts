@@ -1028,7 +1028,7 @@ function buildProvenanceEntries(
         canonicalJson({
           address,
           decimals: token.decimals,
-          flowLimit: String(token.flowLimit),
+          flowLimit: token.flowLimit,
           routes: [...token.routes].sort(),
         }),
         "deployment",
