@@ -1,3 +1,4 @@
+import { describe, expect, it } from "vitest";
 import {
   emptyProofFailureCategories,
   normalizeProofFailureReason,
@@ -9,7 +10,9 @@ describe("proof failure categories", () => {
     expect(normalizeProofFailureReason("token manager differs")).toBe("token");
     expect(normalizeProofFailureReason("amount exceeds decimals")).toBe("amount");
     expect(normalizeProofFailureReason("receipt is not final")).toBe("finality");
-    expect(normalizeProofFailureReason("unexpected provider payload")).toBe("provider_inconsistency");
+    expect(normalizeProofFailureReason("unexpected provider payload")).toBe(
+      "provider_inconsistency",
+    );
   });
 
   it("always exposes every category, including zero counts", () => {
@@ -21,4 +24,15 @@ describe("proof failure categories", () => {
       provider_inconsistency: 0,
     });
   });
+});
+
+it.each([
+  ["receipt_reverted", "finality"],
+  ["non_canonical_receipt", "finality"],
+  ["fee_mismatch", "amount"],
+  ["source_adapter_mismatch", "token"],
+  ["recipient_mismatch", "recipient"],
+  ["message_already_delivered", "provider_inconsistency"],
+])("normalizes durable CCTP %s as %s", (reason, category) => {
+  expect(normalizeProofFailureReason(reason)).toBe(category);
 });
