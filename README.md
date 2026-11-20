@@ -396,6 +396,26 @@ The PostgreSQL upgrade fixture starts with representative full-width transfer an
 
 Transfer responses expose typed source and destination provenance with chain, transaction, canonical indexed block height and log index. Destination provenance is `unverified` until independent delivery is recorded. Rail references are explicitly labeled `candidate` and remain sanitized. Claim source provenance uses the exact source-transfer foreign key; ambiguous legacy deployment nonces return no source provenance. Combined transfer filters validate canonical account/address formats, the selected network, configured source asset/adapter support and direct destination rail support before issuing parameterized SQL. EVM recipients accept canonical20-byte or zero-padded32-byte addresses; direct CCTP/ITS destinations do not require a Hyperion EVM router.
 
+### Historical coverage metrics (#112)
+
+`GET /v1/metrics` retains `historyGaps` and adds version 1 `historicalCoverage`, separate from
+current cursor lag. One PostgreSQL statement reads unresolved counts, remaining ranges, and
+source observation status, so a concurrent backfill cannot mix an old count with a new range.
+Each `sources` entry reports its chain and family, unresolved range records, exact integer-string
+`oldestMissingStart`/`oldestMissingEnd`, and `unknown` status. A recent cursor cannot hide an older
+retention gap. Partial Stellar replay advances the first missing ledger; reconciliation removes
+the record. EVM queued/running/failed/cancelled declared backfill intervals remain missing from
+`next_block` through `to_block` until their range is fully scanned. Overlapping gap/job records
+are counted as records, not as a union of unique missing blocks.
+
+The retained `oldestMissingStartLedger` and `oldestMissingEndLedger` fields summarize Stellar
+ranges; EVM block ranges use the per-source fields. Global `unresolved` includes both families.
+`scope: recorded_ranges` means recorded watcher/backfill history, not universal blockchain
+coverage. No cursor, no committed scan provenance, an incomplete deployment replacement, or
+missing schema keeps historical coverage explicitly unknown. Schema-unavailable unresolved
+counts are null. Zero recorded gaps alone does not establish known history. These diagnostics
+are read-only and do not establish transfer delivery or activate an EVM router.
+
 ### Proof rejection metrics (#109)
 
 `GET /v1/metrics` exposes the fixed categories `recipient`, `token`, `amount`, `finality`, and
