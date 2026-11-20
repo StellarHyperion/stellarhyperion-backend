@@ -1250,7 +1250,7 @@ suite("rail pollers against real Postgres", () => {
     await seedRetry(31707n);
     await seedRetry(31708n);
     const source = await db.query(
-      "SELECT id::text,nonce::text,gross_amount::text,fee::text,net_amount::text,origin_tx FROM outbound_transfer ORDER BY id",
+      "SELECT id::text,nonce::text,gross_amount::text,fee::text,net_amount::text,origin_tx FROM outbound_transfer WHERE route=0 AND nonce IN (31706,31707,31708) ORDER BY id",
     );
     const provider: RailClient = {
       rail: "cctp",
@@ -1287,26 +1287,27 @@ suite("rail pollers against real Postgres", () => {
     }).tick(new AbortController().signal);
     expect(simulator.callCount).toBe(3);
     expect(
-      (await db.query("SELECT count(*)::int AS count FROM inbound_delivery")).rows[0]?.count,
+      (await db.query("SELECT count(*)::int AS count FROM inbound_delivery WHERE route=0")).rows[0]
+        ?.count,
     ).toBe(0);
     expect(
       (
         await db.query(
-          "SELECT count(*)::int AS count FROM rail_attestation WHERE status='delivered'",
+          "SELECT count(*)::int AS count FROM rail_attestation WHERE route=0 AND status='delivered'",
         )
       ).rows[0]?.count,
     ).toBe(0);
     expect(
       (
         await db.query(
-          "SELECT count(*)::int AS count FROM rail_attestation WHERE retry_class='transient'",
+          "SELECT count(*)::int AS count FROM rail_attestation WHERE route=0 AND retry_class='transient'",
         )
       ).rows[0]?.count,
     ).toBe(2);
     expect(
       (
         await db.query(
-          "SELECT id::text,nonce::text,gross_amount::text,fee::text,net_amount::text,origin_tx FROM outbound_transfer ORDER BY id",
+          "SELECT id::text,nonce::text,gross_amount::text,fee::text,net_amount::text,origin_tx FROM outbound_transfer WHERE route=0 AND nonce IN (31706,31707,31708) ORDER BY id",
         )
       ).rows,
     ).toEqual(source.rows);
