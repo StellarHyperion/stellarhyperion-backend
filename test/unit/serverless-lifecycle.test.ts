@@ -10,7 +10,18 @@ import handler, {
   initializeApp,
 } from "../../api/index.js";
 import { Database } from "../../src/db/pool.js";
+import { checkSchemaCompatibility } from "../../src/db/schema.js";
+import { checkDatabasePolicy } from "../../src/db/policy.js";
+import * as serverModule from "../../src/http/server.js";
+import { createApiRedis } from "../../src/http/rate-limit-redis.js";
 import { completeEnv } from "../helpers.js";
+
+vi.mock("../../src/http/rate-limit-redis.js", () => ({
+  createApiRedis: vi.fn(() => ({
+    ping: vi.fn().mockResolvedValue("PONG"),
+    disconnect: vi.fn(),
+  })),
+}));
 
 vi.mock("../../src/db/schema.js", () => ({
   checkSchemaCompatibility: vi.fn().mockResolvedValue(undefined),
@@ -32,7 +43,21 @@ class FakeDb {
 let activeDb: FakeDb | null = null;
 let lastOpenOptions: Record<string, unknown> | undefined = undefined;
 
-vi.spyOn(Database, "open").mockImplementation((_url, options) => {
+function deferred(): {
+  promise: Promise<void>;
+  resolve: () => void;
+  reject: (error: Error) => void;
+} {
+  let resolve: () => void = () => undefined;
+  let reject: (error: Error) => void = () => undefined;
+  const promise = new Promise<void>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
+let databaseOpen = vi.spyOn(Database, "open").mockImplementation((_url, options) => {
   lastOpenOptions = options as Record<string, unknown>;
   activeDb = new FakeDb(options);
   return activeDb as unknown as Database;
@@ -97,6 +122,8 @@ describe("Serverless Cold-Start Database Lifecycle", () => {
     }
     activeDb = null;
     lastOpenOptions = undefined;
+    vi.mocked(checkSchemaCompatibility).mockResolvedValue(undefined);
+    vi.mocked(checkDatabasePolicy).mockResolvedValue(undefined);
   });
 
   afterEach(async () => {
@@ -109,13 +136,20 @@ describe("Serverless Cold-Start Database Lifecycle", () => {
       }
     }
     vi.clearAllMocks();
+    vi.restoreAllMocks();
+    // Reinstall the database boundary after restoring per-test server spies.
+    databaseOpen = vi.spyOn(Database, "open").mockImplementation((_url, options) => {
+      lastOpenOptions = options as Record<string, unknown>;
+      activeDb = new FakeDb(options);
+      return activeDb as unknown as Database;
+    });
   });
 
-  it("limits connection pool size to max: 2 on cold start", async () => {
+  it("limits connection pool size to two on cold start", async () => {
     const app = await initializeApp();
     expect(app).toBeDefined();
     expect(lastOpenOptions).toBeDefined();
-    expect(lastOpenOptions?.max).toBe(2);
+    expect(lastOpenOptions?.maxConnections).toBe(2);
     expect(lastOpenOptions?.readOnly).toBe(true);
     expect(lastOpenOptions?.applicationName).toBe("hyperion-vercel-api");
   });
@@ -175,6 +209,151 @@ describe("Serverless Cold-Start Database Lifecycle", () => {
   it("checkAppHealth throws when called without an initialized app", async () => {
     await expect(checkAppHealth()).rejects.toThrow("Application not initialized");
   });
+
+  it("shares one app and fixed listeners across overlapping cold and warm invocations", async () => {
+    const originalBuild = serverModule.buildServer;
+    const gate = deferred();
+    let entered = false;
+    vi.spyOn(serverModule, "buildServer").mockImplementationOnce((deps) => {
+      const candidate = originalBuild(deps);
+      candidate.addHook("onReady", async () => {
+        entered = true;
+        await gate.promise;
+      });
+      return candidate;
+    });
+    const pending = Array.from({ length: 16 }, (_, index) =>
+      index % 2 === 0 ? initializeApp() : getApp(),
+    );
+    await vi.waitFor(() => {
+      expect(entered).toBe(true);
+    });
+    expect(databaseOpen).toHaveBeenCalledTimes(1);
+    gate.resolve();
+    const apps = await Promise.all(pending);
+    const app = apps[0];
+    expect(app).toBeDefined();
+    expect(new Set(apps).size).toBe(1);
+    const listeners = app?.server.listenerCount("request");
+    await Promise.all(Array.from({ length: 32 }, () => getApp()));
+    expect(databaseOpen).toHaveBeenCalledTimes(1);
+    expect(createApiRedis).toHaveBeenCalledTimes(1);
+    expect(app?.server.listenerCount("request")).toBe(listeners);
+    expect((await app?.inject({ method: "GET", url: "/health" }))?.statusCode).toBe(200);
+  });
+
+  it("waits for failed warm resources to close before creating a replacement", async () => {
+    const firstApp = await getApp();
+    const firstDb = activeDb;
+    if (firstDb === null) throw new Error("missing fixture database");
+    const ping = deferred();
+    const closing = deferred();
+    firstDb.ping.mockImplementationOnce(() => ping.promise);
+    firstDb.close.mockImplementationOnce(() => closing.promise);
+    const failure = getApp();
+    const failureAssertion = expect(failure).rejects.toThrow("failed old connection");
+    const replacement = getApp();
+    await vi.waitFor(() => {
+      expect(firstDb.ping).toHaveBeenCalledTimes(1);
+    });
+    ping.reject(new Error("failed old connection"));
+    await vi.waitFor(() => {
+      expect(firstDb.close).toHaveBeenCalledTimes(1);
+    });
+    expect(databaseOpen).toHaveBeenCalledTimes(1);
+    closing.resolve();
+    await failureAssertion;
+    const secondApp = await replacement;
+    expect(secondApp).not.toBe(firstApp);
+    expect(databaseOpen).toHaveBeenCalledTimes(2);
+    expect(activeDb).not.toBe(firstDb);
+    expect(firstDb.close).toHaveBeenCalledTimes(1);
+    expect(await getApp()).toBe(secondApp);
+  });
+
+  it("orders shutdown after pending initialization and closes each owned resource once", async () => {
+    const schema = deferred();
+    vi.mocked(checkSchemaCompatibility).mockImplementationOnce(() => schema.promise);
+    const startup = getApp();
+    const shutdown = closeApp();
+    await vi.waitFor(() => {
+      expect(databaseOpen).toHaveBeenCalledTimes(1);
+    });
+    const firstDb = activeDb;
+    expect(getDb()).toBeNull();
+    schema.resolve();
+    await startup;
+    await shutdown;
+    expect(firstDb?.close).toHaveBeenCalledTimes(1);
+    expect(getDb()).toBeNull();
+    const redis = vi.mocked(createApiRedis).mock.results[0]?.value;
+    expect(redis?.disconnect).toHaveBeenCalledTimes(1);
+    await Promise.all([closeApp(), closeApp()]);
+    expect(firstDb?.close).toHaveBeenCalledTimes(1);
+    await getApp();
+    expect(databaseOpen).toHaveBeenCalledTimes(2);
+  });
+
+  it("attempts all cleanup and preserves the original health failure when closers reject", async () => {
+    const app = await getApp();
+    const db = activeDb;
+    if (db === null) throw new Error("missing fixture database");
+    const failure = new Error("original database health failure");
+    db.ping.mockRejectedValueOnce(failure);
+    db.close.mockRejectedValueOnce(new Error("pool cleanup failed"));
+    vi.spyOn(app, "close").mockRejectedValueOnce(new Error("app cleanup failed"));
+    await expect(getApp()).rejects.toBe(failure);
+    expect(db.close).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(createApiRedis).mock.results[0]?.value.disconnect).toHaveBeenCalledTimes(1);
+    expect(getDb()).toBeNull();
+    expect(await getApp()).not.toBe(app);
+  });
+
+  it.each(["schema", "policy", "build", "ready"])(
+    "releases a failed %s initialization and retries cleanly",
+    async (stage) => {
+      const error = new Error("initialization failed");
+      if (stage === "schema") vi.mocked(checkSchemaCompatibility).mockRejectedValueOnce(error);
+      if (stage === "policy") vi.mocked(checkDatabasePolicy).mockRejectedValueOnce(error);
+      if (stage === "build")
+        vi.spyOn(serverModule, "buildServer").mockImplementationOnce(() => {
+          throw error;
+        });
+      if (stage === "ready") {
+        const originalBuild = serverModule.buildServer;
+        vi.spyOn(serverModule, "buildServer").mockImplementationOnce((deps) => {
+          const candidate = originalBuild(deps);
+          candidate.addHook("onReady", () => Promise.reject(error));
+          return candidate;
+        });
+      }
+      await expect(getApp()).rejects.toBe(error);
+      const failedDb = activeDb;
+      expect(failedDb?.close).toHaveBeenCalledTimes(1);
+      expect(getDb()).toBeNull();
+      if (stage === "build" || stage === "ready")
+        expect(vi.mocked(createApiRedis).mock.results[0]?.value.disconnect).toHaveBeenCalledTimes(
+          1,
+        );
+      await getApp();
+      expect(activeDb).not.toBe(failedDb);
+    },
+  );
+
+  it.each(["INDEXER_ENABLED", "RAILS_ENABLED", "KEEPER_ENABLED"])(
+    "refuses serverless background writer %s before opening resources",
+    async (key) => {
+      const previous = process.env[key];
+      process.env[key] = "true";
+      try {
+        await expect(getApp()).rejects.toThrow();
+        expect(databaseOpen).not.toHaveBeenCalled();
+        expect(createApiRedis).not.toHaveBeenCalled();
+      } finally {
+        process.env[key] = previous;
+      }
+    },
+  );
 
   it("handles HTTP handler requests and returns 500 when database fails", async () => {
     // Warm up the app
