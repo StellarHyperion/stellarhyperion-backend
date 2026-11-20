@@ -203,6 +203,42 @@ export class RecordingDb implements Transactional {
   backfillRow: Record<string, unknown> | null = null;
   readonly heartbeatRows: Record<string, unknown>[] = [];
   readonly workerRuns: Record<string, unknown>[] = [];
+  readonly outboundTransfers: {
+    id: bigint;
+    origin_chain: string;
+    origin_router: string;
+    route: number;
+    nonce: bigint;
+    sender: string;
+    token: string;
+    gross_amount: bigint;
+    fee: bigint;
+    net_amount: bigint;
+    destination_chain: string;
+    destination: string;
+    rail_ref: string | null;
+    origin_block: bigint;
+    origin_tx: string;
+    origin_log_index: number | null;
+    observed_at: Date;
+  }[] = [];
+  readonly railAttestations = new Map<
+    bigint,
+    {
+      transfer_id: bigint;
+      route: number;
+      status: string;
+      rail_status: string | null;
+      rail_reference: string | null;
+      attested_at: Date | null;
+      last_checked_at: Date | null;
+      check_failures: number;
+      last_error: string | null;
+      next_attempt_at: Date | null;
+      retry_class: string | null;
+      retry_attempts: number;
+    }
+  >();
   /** Set to make every statement inside the next transaction throw. */
   failInTransaction: Error | null = null;
   /** What the open ingestion rejection count reports, to exercise the boundary limit. */
@@ -679,7 +715,7 @@ export class RecordingDb implements Transactional {
         if (l1 === null && l2 !== null) return -1;
         if (l1 !== null && l2 === null) return 1;
         if (l1 !== null && l2 !== null && l1 !== l2) return l1 - l2;
-        return Number(t1.id - t2.id);
+        return t1.id < t2.id ? -1 : t1.id > t2.id ? 1 : 0;
       });
 
       const page = candidates.slice(0, limit);
