@@ -10,13 +10,19 @@ import { capturingLogger } from "../stellar-fakes.js";
 vi.mock("../../src/keeper/stellar.js", () => ({ submitStellar: vi.fn() }));
 class Db {
   calls: { sql: string; params: readonly unknown[] }[] = [];
+  constructor(
+    private readonly claims: readonly Record<string, unknown>[] = [
+      { claim_id: "1", settled: false },
+      { claim_id: "2", settled: false },
+    ],
+  ) {}
   query(sql: string, params: readonly unknown[] = []) {
     this.calls.push({ sql, params });
     return Promise.resolve({
       rows: sql.includes("INSERT INTO keeper_submission")
         ? [{ id: "9223372036854775000" }]
         : sql.includes("pending_claim")
-          ? [{ claim_id: "1" }, { claim_id: "2" }]
+          ? [...this.claims]
           : [{ nonce: "3" }],
       rowCount: 2,
     });
@@ -79,8 +85,48 @@ describe("Stellar keeper execution", () => {
     expect(result.settled).toBe(1);
     expect(result.attempted).toBe(2);
     expect(result.pending).toBe(1);
+    expect(result.claims).toEqual([
+      { claimId: "1", outcome: "confirmed", transactionHash: "settled-hash" },
+      { claimId: "2", outcome: "pending" },
+    ]);
     expect(db.calls[0]?.params[0]).toBe(config.indexer.stellar?.chain);
     expect(db.calls.some((call) => /INSERT|UPDATE/.test(call.sql))).toBe(false);
+  });
+
+  it("reports missing and already-settled claims individually without signing them", async () => {
+    const config = loadConfig({
+      env: completeEnv({ KEEPER_STELLAR_SECRET: Keypair.random().secret() }),
+    });
+    const db = new Db([{ claim_id: "18446744073709551615", settled: true }]);
+    const result = await processClaimSettlement(
+      { config, db, logger },
+      { claimIds: ["18446744073709551615", "9007199254740993"] },
+    );
+
+    expect(result.claims).toEqual([
+      { claimId: "18446744073709551615", outcome: "already_settled" },
+      { claimId: "9007199254740993", outcome: "missing" },
+    ]);
+    expect(result.settled).toBe(1);
+    expect(result.missing).toBe(1);
+    expect(result.attempted).toBe(0);
+    expect(submitStellar).not.toHaveBeenCalled();
+  });
+
+  it("bounds and validates claim settlement batches before querying or submitting", async () => {
+    const config = loadConfig({
+      env: completeEnv({ KEEPER_STELLAR_SECRET: Keypair.random().secret() }),
+    });
+    const db = new Db();
+
+    await expect(processClaimSettlement({ config, db, logger }, { limit: 21 })).rejects.toThrow(
+      "batch size",
+    );
+    await expect(
+      processClaimSettlement({ config, db, logger }, { claimIds: ["9007199254740993.5"] }),
+    ).rejects.toThrow("decimal strings");
+    expect(db.calls).toEqual([]);
+    expect(submitStellar).not.toHaveBeenCalled();
   });
   it("performs no claim submissions without a Stellar signer", async () => {
     const config = loadConfig({ env: completeEnv() });

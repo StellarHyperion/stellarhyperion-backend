@@ -354,6 +354,44 @@ describe("CCTP full message identity", () => {
       evm.getBlock.mockResolvedValue({ hash, timestamp: 1700000000n });
     });
 
+    it("retries the complete CCTP proof on the secondary destination RPC", async () => {
+      const withSecondary = {
+        ...config,
+        destinationVerification: {
+          ...config.destinationVerification,
+          evmRpcUrls: {
+            ...config.destinationVerification.evmRpcUrls,
+            sepolia: ["https://primary.example/private-key", "https://secondary.example/rpc"],
+          },
+        },
+      };
+      evm.getTransactionReceipt.mockRejectedValueOnce(new Error("primary unavailable"));
+
+      const result = await inspectCctpDelivery(withSecondary, database(stored), transfer, report);
+
+      expect(result.delivery).not.toBeNull();
+      expect(evm.getTransactionReceipt).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not produce CCTP delivery when all destination RPCs report another chain", async () => {
+      const withSecondary = {
+        ...config,
+        destinationVerification: {
+          ...config.destinationVerification,
+          evmRpcUrls: {
+            ...config.destinationVerification.evmRpcUrls,
+            sepolia: ["https://primary.example/rpc", "https://secondary.example/rpc"],
+          },
+        },
+      };
+      evm.getChainId.mockResolvedValue(1);
+
+      await expect(
+        inspectCctpDelivery(withSecondary, database(stored), transfer, report),
+      ).rejects.toMatchObject({ name: "DestinationVerificationRpcError" });
+      expect(evm.getTransactionReceipt).not.toHaveBeenCalled();
+    });
+
     it("records the full nonce and replays an exact repeat for the same transfer", async () => {
       const first = await inspectCctpDelivery(config, database(stored), transfer, report);
       expect(first.failure).toBeNull();

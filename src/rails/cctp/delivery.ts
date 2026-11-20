@@ -8,12 +8,18 @@ import {
   isStellarDeployment,
   toEvmAddress,
 } from "@hyperion/protocol";
-import { createPublicClient, http, type Hex } from "viem";
-import type { AppConfig } from "../../config/config.js";
+import type { Hex } from "viem";
+import type { Logger } from "pino";
+import { isDestinationVerificationChain, type AppConfig } from "../../config/config.js";
 import type { Queryable } from "../../db/pool.js";
 import { bigintOf, text, textOrNull } from "../../db/rows.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 import type { VerifiedDelivery } from "../axelar/delivery.js";
+import {
+  destinationVerificationViemClient,
+  withDestinationVerification,
+  type DestinationVerificationClientFactory,
+} from "../../chains/evm/client.js";
 import {
   cctpMessageIdentity,
   inspectCctpMessage,
@@ -44,6 +50,12 @@ export interface CctpDeliveryFailure {
 }
 
 export type CctpDeliveryResult = CctpDeliverySuccess | CctpDeliveryFailure;
+
+export interface DeliveryVerificationOptions {
+  readonly signal?: AbortSignal;
+  readonly logger?: Logger;
+  readonly clientForUrl?: DestinationVerificationClientFactory;
+}
 
 /**
  * Sanitized proof-check status for a pending CCTP transfer.
@@ -149,6 +161,7 @@ export async function inspectCctpDelivery(
   db: Queryable,
   transfer: PendingTransfer,
   report: RailReport,
+  options: DeliveryVerificationOptions = {},
 ): Promise<CctpDeliveryResult> {
   const noResult = (): CctpDeliveryResult => ({
     delivery: null,
@@ -160,13 +173,16 @@ export async function inspectCctpDelivery(
     failure,
     proofEvidence: null,
   });
+  const forwardTxHash = report.forwardTxHash;
   if (transfer.route !== RouteKind.Cctp || transfer.originChain !== "stellar-testnet")
     return noResult();
-  if (!report.forwardTxHash) return failed("forward_tx_missing");
+  if (!forwardTxHash) return failed("forward_tx_missing");
   if (!report.messageBytes) return failed("message_missing");
   if (report.messageBytes.length > 8192 || !/^0x(?:[0-9a-fA-F]{2})+$/.test(report.messageBytes))
     return failed("invalid_message");
   if (!isChainKey(transfer.destinationChain)) return failed("configuration_unavailable");
+  if (!isDestinationVerificationChain(transfer.destinationChain))
+    return failed("configuration_unavailable");
   const source = config.deployments.networks["stellar-testnet"];
   const destination = CHAINS[transfer.destinationChain];
   const contracts = RAIL_CONTRACTS[transfer.destinationChain]?.cctp;
@@ -231,62 +247,64 @@ export async function inspectCctpDelivery(
   );
   if (prior.some((row) => textOrNull(row, "source_transfer_id") !== String(transfer.transferId)))
     return failed("message_already_delivered");
-  const client = createPublicClient({
-    transport: http(destination.defaultRpcUrl, { timeout: 15000, retryCount: 0 }),
-  });
-  if ((await client.getChainId()) !== destination.chainId)
-    throw new Error("CCTP destination RPC chain mismatch.");
-  const receipt = await client.getTransactionReceipt({ hash: report.forwardTxHash });
-  if (receipt.status !== "success") return failed("receipt_reverted");
-  const head = await client.getBlockNumber();
-  if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations))
-    return failed("confirmations_pending");
-  const paymentResult = inspectCctpPayment(receipt.logs, raw, expected);
-  if (!paymentResult.payment) return failed(paymentResult.failure);
-  const payment = paymentResult.payment;
-  const block = await client.getBlock({ blockNumber: receipt.blockNumber });
-  if (block.hash !== receipt.blockHash) return failed("non_canonical_receipt");
+  return withDestinationVerification(
+    config.destinationVerification.evmRpcUrls[transfer.destinationChain],
+    destination.chainId,
+    options.clientForUrl ?? destinationVerificationViemClient,
+    async (client) => {
+      const receipt = await client.getTransactionReceipt({ hash: forwardTxHash });
+      if (receipt.status !== "success") return failed("receipt_reverted");
+      const head = await client.getBlockNumber();
+      if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations))
+        return failed("confirmations_pending");
+      const paymentResult = inspectCctpPayment(receipt.logs, raw, expected);
+      if (!paymentResult.payment) return failed(paymentResult.failure);
+      const payment = paymentResult.payment;
+      const block = await client.getBlock({
+        blockNumber: receipt.blockNumber,
+        includeTransactions: false,
+      });
+      if (block.hash !== receipt.blockHash) return failed("non_canonical_receipt");
 
-  // Canonical evidence: bounded public references only. No credential, adapter address, or
-  // raw provider value appears here. The mint amount is an integer string to avoid float
-  // imprecision on amounts that do not fit in a 53-bit mantissa.
-  const proofEvidence: CctpProofEvidence = {
-    txHash: receipt.transactionHash,
-    blockNumber: receipt.blockNumber.toString(),
-    blockHash: receipt.blockHash,
-    mintLogIndex: payment.logIndex,
-    messageNonce: identity.nonce,
-    messageDigest: identity.digest,
-    mintAmount: message.amount.toString(),
-    destinationChain: transfer.destinationChain,
-  };
-
-  const deliveryResult: CctpDeliverySuccess = {
-    failure: null,
-    proofEvidence,
-    delivery: {
-      at: {
-        chainKey: transfer.destinationChain,
-        block: receipt.blockNumber,
+      const proofEvidence: CctpProofEvidence = {
         txHash: receipt.transactionHash,
-        logIndex: payment.logIndex,
-        observedAt: new Date(Number(block.timestamp) * 1000),
-      },
-      row: {
-        sourceTransferId: transfer.transferId,
-        route: transfer.route,
-        sourceChain: transfer.originChain,
-        sourceNonce: transfer.nonce,
-        railMessageId: identity.nonce,
-        recipient: expected.recipient.toLowerCase(),
-        token: token.address.toLowerCase(),
-        amount: message.amount,
-        delivered: true,
-        claimId: null,
-      },
+        blockNumber: receipt.blockNumber.toString(),
+        blockHash: receipt.blockHash,
+        mintLogIndex: payment.logIndex,
+        messageNonce: identity.nonce,
+        messageDigest: identity.digest,
+        mintAmount: message.amount.toString(),
+        destinationChain: transfer.destinationChain,
+      };
+
+      return {
+        failure: null,
+        proofEvidence,
+        delivery: {
+          at: {
+            chainKey: transfer.destinationChain,
+            block: receipt.blockNumber,
+            txHash: receipt.transactionHash,
+            logIndex: payment.logIndex,
+            observedAt: new Date(Number(block.timestamp) * 1000),
+          },
+          row: {
+            sourceTransferId: transfer.transferId,
+            route: transfer.route,
+            sourceChain: transfer.originChain,
+            sourceNonce: transfer.nonce,
+            railMessageId: identity.nonce,
+            recipient: expected.recipient.toLowerCase(),
+            token: token.address.toLowerCase(),
+            amount: message.amount,
+            delivered: true,
+            claimId: null,
+          },
+        },
+      };
     },
-  };
-  return deliveryResult;
+    { ...options, chain: transfer.destinationChain },
+  );
 }
 
 /** Proof-only callers retain the established nullable verifier contract. */
@@ -295,6 +313,7 @@ export async function verifyCctpDelivery(
   db: Queryable,
   transfer: PendingTransfer,
   report: RailReport,
+  options: DeliveryVerificationOptions = {},
 ): Promise<VerifiedDelivery | null> {
-  return (await inspectCctpDelivery(config, db, transfer, report)).delivery;
+  return (await inspectCctpDelivery(config, db, transfer, report, options)).delivery;
 }

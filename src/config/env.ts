@@ -107,6 +107,11 @@ export class EnvReader {
     return raw !== undefined && raw.trim().length > 0;
   }
 
+  /** Whether the operator supplied a value, including an explicitly empty one. */
+  provided(name: string): boolean {
+    return this.source[name] !== undefined;
+  }
+
   string(spec: VarSpec): string {
     const raw = this.raw(spec);
     return raw ?? "";
@@ -178,14 +183,16 @@ export class EnvReader {
 
   urls(spec: VarSpec): string[] {
     const raw = this.raw(spec);
-    if (raw === null) return [];
+    if (raw === null) {
+      if (this.provided(spec.name)) {
+        this.record(spec, `expected a URL, ${this.expectation(spec)}`);
+      }
+      return [];
+    }
 
-    const items = raw
-      .split(",")
-      .map((item) => item.trim())
-      .filter((item) => item.length > 0);
+    const items = raw.split(",").map((item) => item.trim());
 
-    if (items.length === 0) {
+    if (items.length === 0 || items.some((item) => item.length === 0)) {
       this.record(spec, `expected a URL, ${this.expectation(spec)}`);
       return [];
     }
