@@ -108,6 +108,7 @@ export async function verifyCctpDelivery(
       amount: message.amount,
       delivered: true,
       claimId: null,
+      cctpFeeReconciliation: message.feeReconciliation,
     },
   });
 }

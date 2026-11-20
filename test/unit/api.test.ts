@@ -101,6 +101,71 @@ describe("REST API endpoints", () => {
     expect(body.rail.reference).toBe("iris-42");
   });
 
+  it("returns CCTP planned minimum and actual native-USDC payout in their base units", async () => {
+    const db = new MockDb({
+      outbound_transfer: [
+        {
+          id: "7",
+          origin_chain: "stellar-testnet",
+          origin_router: "",
+          route: 2,
+          nonce: "8",
+          sender: "GABC",
+          token: "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+          gross_amount: "1000000000",
+          fee: "3000000",
+          net_amount: "997000000",
+          destination_chain: "sepolia",
+          destination: `0x${"11".repeat(32)}`,
+          rail_ref: null,
+          origin_block: "100",
+          origin_tx: `0x${"22".repeat(32)}`,
+          observed_at: new Date("2026-10-07T12:00:00Z"),
+          attestation_status: "delivered",
+          rail_status: "complete",
+          verification_failure: null,
+          rail_reference: null,
+          attested_at: new Date("2026-10-07T12:01:00Z"),
+          last_error: null,
+          inbound_delivered: true,
+          destination_block: "200",
+          destination_tx: `0x${"33".repeat(32)}`,
+          received_token: "0x1c7d4b196cb0c7b01d743fbc6116a902379c7238",
+          received_amount: "99600000",
+          cctp_burned_amount_source_units: "997000000",
+          cctp_forwarding_budget_destination_units: "500000",
+          cctp_executed_deduction_destination_units: "100000",
+          cctp_actual_payout_destination_units: "99600000",
+          delivered_at: new Date("2026-10-07T12:02:00Z"),
+          claim_id: null,
+          claim_settled: false,
+        },
+      ],
+    });
+    const app = buildServer({
+      config,
+      logger,
+      db: db as unknown as Database,
+      readiness: [],
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/v1/transfers/stellar-testnet/8",
+    });
+
+    expect(res.statusCode).toBe(200);
+    const destination = res.json().destination;
+    expect(destination.amount).toBe("99600000");
+    expect(destination.cctpFeeReconciliation).toEqual({
+      burnedAmount: { amount: "997000000", unit: "USDC", decimals: 7 },
+      forwardingBudget: { amount: "500000", unit: "USDC", decimals: 6 },
+      executedDeduction: { amount: "100000", unit: "USDC", decimals: 6 },
+      actualPayout: { amount: "99600000", unit: "USDC", decimals: 6 },
+      plannedMinimum: { amount: "99700000", unit: "USDC", decimals: 6 },
+    });
+  });
+
   it("returns 404 when transfer is not found", async () => {
     const db = new MockDb({});
     const app = buildServer({

@@ -10,7 +10,7 @@ import {
 } from "@hyperion/protocol";
 import { decodeEventLog, parseAbi, type Hex } from "viem";
 import type { DeliveryLog } from "../axelar/events.js";
-import type { CctpVerificationFailure } from "../types.js";
+import type { CctpFeeReconciliation, CctpVerificationFailure } from "../types.js";
 
 // Source: circlefin/evm-cctp-contracts/src/v2/MessageTransmitterV2.sol.
 export const CCTP_RECEIPT_ABI = parseAbi([
@@ -34,12 +34,14 @@ export type CctpMessageVerification =
       readonly message: ReturnType<typeof parseCctpMessage>;
       readonly body: Uint8Array;
       readonly amount: bigint;
+      readonly feeReconciliation: CctpFeeReconciliation;
       readonly failure: null;
     }
   | {
       readonly message: null;
       readonly body: null;
       readonly amount: null;
+      readonly feeReconciliation: null;
       readonly failure: CctpVerificationFailure;
     };
 
@@ -80,10 +82,17 @@ export function inspectCctpMessage(
     if (burn.feeExecuted > burn.maxFee || burn.feeExecuted < 0n || burn.feeExecuted >= burn.amount)
       return invalidMessage("fee_mismatch");
     if (message.finalityThresholdExecuted < 2000) return invalidMessage("finality_mismatch");
+    const actualPayout = burn.amount - burn.feeExecuted;
     return {
       message,
       body,
-      amount: burn.amount - burn.feeExecuted,
+      amount: actualPayout,
+      feeReconciliation: {
+        burnedAmountSourceUnits: expected.sourceAmount,
+        forwardingBudgetDestinationUnits: burn.maxFee,
+        executedDeductionDestinationUnits: burn.feeExecuted,
+        actualPayoutDestinationUnits: actualPayout,
+      },
       failure: null,
     };
   } catch {
@@ -92,13 +101,18 @@ export function inspectCctpMessage(
 }
 
 function invalidMessage(failure: CctpVerificationFailure): CctpMessageVerification {
-  return { message: null, body: null, amount: null, failure };
+  return { message: null, body: null, amount: null, feeReconciliation: null, failure };
 }
 
 export function verifiedCctpMessage(raw: Hex, expected: ExpectedCctpTransfer) {
   const result = inspectCctpMessage(raw, expected);
   if (result.failure !== null) return null;
-  return { message: result.message, body: toHex(result.body), amount: result.amount };
+  return {
+    message: result.message,
+    body: toHex(result.body),
+    amount: result.amount,
+    feeReconciliation: result.feeReconciliation,
+  };
 }
 
 export function inspectCctpPayment<T extends DeliveryLog>(

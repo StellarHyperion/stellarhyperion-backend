@@ -20,7 +20,11 @@
  * this indexer first saw the row, and a reorg does not change that.
  */
 import type { Queryable } from "../db/pool.js";
-import type { CctpVerificationFailure, RailRetryClass } from "../rails/types.js";
+import type {
+  CctpFeeReconciliation,
+  CctpVerificationFailure,
+  RailRetryClass,
+} from "../rails/types.js";
 
 /** Where on a chain a row was observed. One shape for a ledger and for a block. */
 export interface Position {
@@ -71,6 +75,7 @@ export interface InboundRow {
   readonly delivered: boolean;
   /** Set when the delivery parked, null when it landed. The schema checks exactly that. */
   readonly claimId: bigint | null;
+  readonly cctpFeeReconciliation?: CctpFeeReconciliation;
 }
 
 export interface ClaimRow {
@@ -187,8 +192,11 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
     `INSERT INTO inbound_delivery
        (destination_chain, route, source_chain, source_nonce, rail_message_id, recipient, token,
         amount, delivered, claim_id, destination_block, destination_tx, destination_log_index,
-        observed_at, source_transfer_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        observed_at, source_transfer_id, cctp_burned_amount_source_units,
+        cctp_forwarding_budget_destination_units, cctp_executed_deduction_destination_units,
+        cctp_actual_payout_destination_units)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+             $16, $17, $18, $19)
      ON CONFLICT (destination_chain, route, source_chain, source_nonce, source_transfer_id) DO UPDATE
        SET rail_message_id = COALESCE(EXCLUDED.rail_message_id, inbound_delivery.rail_message_id),
            recipient = EXCLUDED.recipient,
@@ -198,7 +206,11 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
            claim_id = EXCLUDED.claim_id,
            destination_block = EXCLUDED.destination_block,
            destination_tx = EXCLUDED.destination_tx,
-           destination_log_index = EXCLUDED.destination_log_index`,
+           destination_log_index = EXCLUDED.destination_log_index,
+           cctp_burned_amount_source_units = EXCLUDED.cctp_burned_amount_source_units,
+           cctp_forwarding_budget_destination_units = EXCLUDED.cctp_forwarding_budget_destination_units,
+           cctp_executed_deduction_destination_units = EXCLUDED.cctp_executed_deduction_destination_units,
+           cctp_actual_payout_destination_units = EXCLUDED.cctp_actual_payout_destination_units`,
     [
       at.chainKey,
       row.route,
@@ -215,6 +227,10 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
       at.logIndex,
       at.observedAt,
       row.sourceTransferId?.toString() ?? null,
+      row.cctpFeeReconciliation?.burnedAmountSourceUnits.toString() ?? null,
+      row.cctpFeeReconciliation?.forwardingBudgetDestinationUnits.toString() ?? null,
+      row.cctpFeeReconciliation?.executedDeductionDestinationUnits.toString() ?? null,
+      row.cctpFeeReconciliation?.actualPayoutDestinationUnits.toString() ?? null,
     ],
   );
 }

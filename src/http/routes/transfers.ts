@@ -11,7 +11,14 @@ import type { AppConfig } from "../../config/config.js";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
-import { integer, integerOrNull, text, textOrNull, timestampOrNull } from "../../db/rows.js";
+import {
+  bigintOrNull,
+  integer,
+  integerOrNull,
+  text,
+  textOrNull,
+  timestampOrNull,
+} from "../../db/rows.js";
 import {
   LIST_CACHE_CONTROL,
   computeCanonicalETag,
@@ -59,6 +66,33 @@ export interface FormattedTransfer {
     readonly chain: string;
     readonly recipient: string;
     readonly delivered: boolean;
+    readonly cctpFeeReconciliation: {
+      readonly burnedAmount: {
+        readonly amount: string;
+        readonly unit: "USDC";
+        readonly decimals: 7;
+      };
+      readonly forwardingBudget: {
+        readonly amount: string;
+        readonly unit: "USDC";
+        readonly decimals: 6;
+      };
+      readonly executedDeduction: {
+        readonly amount: string;
+        readonly unit: "USDC";
+        readonly decimals: 6;
+      };
+      readonly actualPayout: {
+        readonly amount: string;
+        readonly unit: "USDC";
+        readonly decimals: 6;
+      };
+      readonly plannedMinimum: {
+        readonly amount: string;
+        readonly unit: "USDC";
+        readonly decimals: 6;
+      };
+    } | null;
     readonly block: string | null;
     readonly txHash: string | null;
     readonly deliveredAt: string | null;
@@ -138,6 +172,10 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
   const hasClaim = row.claim_id !== null && row.claim_id !== undefined;
   const claimSettled = row.claim_settled === true;
   const railStatus = textOrNull(row, "attestation_status");
+  const cctpFeeReconciliation = formatCctpFeeReconciliation(
+    row,
+    textOrNull(row, "received_amount"),
+  );
 
   const stage = deriveStage(delivered, hasClaim, claimSettled, railStatus);
   const originRouter = textOrNull(row, "origin_router");
@@ -166,6 +204,7 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
       amount: textOrNull(row, "received_amount"),
       symbol: receivedMetadata?.symbol ?? null,
       decimals: receivedMetadata?.decimals ?? null,
+      cctpFeeReconciliation,
       chain: destinationChain,
       recipient,
       delivered,
@@ -194,6 +233,48 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
           settled: claimSettled,
         }
       : null,
+  };
+}
+
+function formatCctpFeeReconciliation(row: Record<string, unknown>, receivedAmount: string | null) {
+  const burned = bigintOrNull(row, "cctp_burned_amount_source_units");
+  const budget = bigintOrNull(row, "cctp_forwarding_budget_destination_units");
+  const deduction = bigintOrNull(row, "cctp_executed_deduction_destination_units");
+  const payout = bigintOrNull(row, "cctp_actual_payout_destination_units");
+  const values = [burned, budget, deduction, payout];
+  if (values.every((value) => value === null)) return null;
+  if (values.some((value) => value === null))
+    throw new Error("CCTP fee reconciliation is incomplete.");
+  if (
+    burned === null ||
+    budget === null ||
+    deduction === null ||
+    payout === null ||
+    burned <= 0n ||
+    burned % 10n !== 0n ||
+    budget < 0n ||
+    deduction < 0n ||
+    deduction > budget ||
+    payout <= 0n ||
+    burned / 10n !== deduction + payout ||
+    receivedAmount !== payout.toString()
+  ) {
+    throw new Error("CCTP fee reconciliation does not match the delivered native-USDC amount.");
+  }
+  return {
+    burnedAmount: { amount: burned.toString(), unit: "USDC" as const, decimals: 7 as const },
+    forwardingBudget: { amount: budget.toString(), unit: "USDC" as const, decimals: 6 as const },
+    executedDeduction: {
+      amount: deduction.toString(),
+      unit: "USDC" as const,
+      decimals: 6 as const,
+    },
+    actualPayout: { amount: payout.toString(), unit: "USDC" as const, decimals: 6 as const },
+    plannedMinimum: {
+      amount: (burned / 10n).toString(),
+      unit: "USDC" as const,
+      decimals: 6 as const,
+    },
   };
 }
 
@@ -228,6 +309,10 @@ const TRANSFER_QUERY = `
          d.destination_log_index,
          d.token AS received_token,
          d.amount AS received_amount,
+         d.cctp_burned_amount_source_units,
+         d.cctp_forwarding_budget_destination_units,
+         d.cctp_executed_deduction_destination_units,
+         d.cctp_actual_payout_destination_units,
          d.observed_at AS delivered_at,
          c.claim_id,
          c.settled AS claim_settled,
