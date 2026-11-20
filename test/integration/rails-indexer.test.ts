@@ -897,6 +897,90 @@ suite("rail pollers against real Postgres", () => {
     await new RailPass(options).evaluateTransfer(id);
     expect(calls).toBe(1);
   });
+
+  it("fences stale workers and allows another replica to reclaim an expired lease", async () => {
+    await seedRetry(1203n);
+    const id = BigInt(
+      String((await db.query("SELECT id FROM outbound_transfer WHERE nonce = 1203")).rows[0]?.id),
+    );
+    const { logger } = capturingLogger();
+    let releaseFirstLookup!: (lookup: RailLookup) => void;
+    let signalFirstLookupStarted!: () => void;
+    const firstLookupStarted = new Promise<void>((resolve) => {
+      signalFirstLookupStarted = resolve;
+    });
+    const firstLookup = new Promise<RailLookup>((resolve) => {
+      releaseFirstLookup = resolve;
+    });
+    let firstCalls = 0;
+    let secondCalls = 0;
+    const first = new RailPass({
+      route: 0,
+      db,
+      logger,
+      batchSize: 1,
+      recheckAfterMs: 60_000,
+      maxCheckFailures: 5,
+      client: {
+        rail: "cctp",
+        look: (): Promise<RailLookup> => {
+          firstCalls += 1;
+          signalFirstLookupStarted();
+          return firstLookup;
+        },
+      },
+    });
+    const second = new RailPass({
+      route: 0,
+      db,
+      logger,
+      batchSize: 1,
+      recheckAfterMs: 60_000,
+      maxCheckFailures: 5,
+      client: {
+        rail: "cctp",
+        look: (): Promise<RailLookup> => {
+          secondCalls += 1;
+          return Promise.resolve({ kind: "missing" });
+        },
+      },
+    });
+
+    const firstTick = first.tick(new AbortController().signal);
+    await firstLookupStarted;
+    await second.tick(new AbortController().signal);
+    expect(secondCalls).toBe(0);
+
+    await db.query(
+      "UPDATE rail_work_lease SET lease_until = clock_timestamp() - interval '1 second' WHERE transfer_id = $1",
+      [id.toString()],
+    );
+    await second.tick(new AbortController().signal);
+    expect(secondCalls).toBe(1);
+
+    releaseFirstLookup({
+      kind: "found",
+      report: {
+        status: "attested",
+        railStatus: "complete",
+        reference: "stale-reference",
+        attestedAt: new Date(),
+      },
+    });
+    await firstTick;
+
+    const { rows } = await db.query(
+      "SELECT status, rail_status, rail_reference FROM rail_attestation WHERE transfer_id = $1",
+      [id.toString()],
+    );
+    expect(rows[0]).toMatchObject({
+      status: "pending",
+      rail_status: null,
+      rail_reference: null,
+    });
+    expect(firstCalls).toBe(1);
+  });
+
   it("reports missing proof stages and pages equal timestamps without changing lifecycle state", async () => {
     const { logger } = capturingLogger();
     const now = new Date();
