@@ -16,6 +16,7 @@ import { performance } from "node:perf_hooks";
 
 import { Client, Pool } from "pg";
 import type { PoolClient, PoolConfig } from "pg";
+import { currentWorkerRun } from "../runtime/worker-runs.js";
 import {
   computeHistoryDigest as computeRangeDigest,
   recordHistoryDigest as storeRangeDigest,
@@ -83,7 +84,7 @@ export interface OpenOptions {
 }
 
 export class Database implements Transactional {
-  private closed = false;
+  private closing: Promise<void> | null = null;
   private readonly telemetry: DbTelemetryCollector;
   private readonly maxConnections: number;
   private readonly slowQueryThresholdMs: number | undefined;
@@ -114,7 +115,16 @@ export class Database implements Transactional {
       // the connection does not help it.
       statement_timeout: options.statementTimeoutMs ?? 30_000,
     };
-    return new Database(new Pool(config), config, { ...options, maxConnections });
+    const pool = new Pool(config);
+    // pg emits idle-connection failures outside a query promise. Consume them so the pool can
+    // remove the dead client and reconnect; raw errors can contain credential-bearing details.
+    pool.on("error", () => {
+      options.logger?.warn?.(
+        { event: "database_idle_connection_error" },
+        "database idle connection failed",
+      );
+    });
+    return new Database(pool, config, { ...options, maxConnections });
   }
 
   async query(
@@ -144,6 +154,9 @@ export class Database implements Transactional {
     const client = await this.pool.connect();
     try {
       await this.measure("transaction", () => client.query("BEGIN"));
+      const run = currentWorkerRun();
+      if (run !== undefined)
+        await client.query("SELECT set_config('hyperion.worker_run_id',$1,true)", [run.runId]);
       const value = await work(this.wrapClient(client));
       await this.measure("transaction", () => client.query("COMMIT"));
       return value;
@@ -314,9 +327,8 @@ export class Database implements Transactional {
   }
 
   async close(): Promise<void> {
-    if (this.closed) return;
-    this.closed = true;
-    await this.pool.end();
+    this.closing ??= this.pool.end();
+    await this.closing;
   }
 }
 
