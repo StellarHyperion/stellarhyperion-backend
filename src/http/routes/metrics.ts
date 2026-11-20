@@ -14,6 +14,7 @@ import {
   type WorkerHeartbeatRecord,
 } from "../../runtime/readiness.js";
 import type { ServerDeps } from "../server.js";
+import { readProofRejectionMetrics } from "../proof-rejection-metrics.js";
 import { readKeeperSubmissionMetrics } from "../../keeper/outcomes.js";
 
 export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): void {
@@ -75,6 +76,8 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
         historyGaps[status] = count;
       }
     }
+
+    const proofRejections = await readProofRejectionMetrics(db);
 
     // 7. Persistent worker heartbeats & freshness (#107)
     let heartbeatRecords: WorkerHeartbeatRecord[] = [];
@@ -149,6 +152,10 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       railAttestations: railStatusCounts,
       cursors,
       historyGaps,
+      proofRejections: proofRejections.total,
+      proofRejectionsByRail: proofRejections.byRail,
+      proofRejectionIngestion: proofRejections.ingestion,
+      proofRejectionCoverage: proofRejections.coverage,
       freshnessSlo,
       database,
       deploymentMode: deps.config.deploymentMode,
