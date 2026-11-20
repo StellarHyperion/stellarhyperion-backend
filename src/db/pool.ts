@@ -14,7 +14,7 @@
  */
 import { performance } from "node:perf_hooks";
 
-import { Pool } from "pg";
+import { Client, Pool } from "pg";
 import type { PoolClient, PoolConfig } from "pg";
 import {
   computeHistoryDigest as computeRangeDigest,
@@ -48,7 +48,11 @@ export interface QueryResultRows {
 
 /** What both the pool and a transaction offer, so a repository never knows which it has. */
 export interface Queryable {
-  query(text: string, params?: readonly unknown[]): Promise<QueryResultRows>;
+  query(
+    text: string,
+    params?: readonly unknown[],
+    options?: QueryOptions,
+  ): Promise<QueryResultRows>;
 }
 
 /**
@@ -89,6 +93,7 @@ export class Database implements Transactional {
 
   private constructor(
     private readonly pool: Pool,
+    private readonly connectionConfig: PoolConfig,
     options: OpenOptions = {},
   ) {
     this.maxConnections = options.maxConnections ?? 10;
@@ -111,7 +116,7 @@ export class Database implements Transactional {
       // the connection does not help it.
       statement_timeout: options.statementTimeoutMs ?? 30_000,
     };
-    return new Database(new Pool(config), { ...options, maxConnections });
+    return new Database(new Pool(config), config, { ...options, maxConnections });
   }
 
   async query(
@@ -120,7 +125,14 @@ export class Database implements Transactional {
     options?: QueryOptions,
   ): Promise<QueryResultRows> {
     const workload = options?.workload ?? classifySqlWorkload(text);
-    return this.measure(workload, () => this.pool.query(text, params as unknown[]));
+    if (options?.signal === undefined)
+      return this.measure(workload, () => this.pool.query(text, params as unknown[]));
+    const client = await this.pool.connect();
+    try {
+      return await this.queryClient(client, text, params, options);
+    } finally {
+      client.release();
+    }
   }
 
   /**
@@ -172,11 +184,61 @@ export class Database implements Transactional {
 
   private wrapClient(client: PoolClient): Queryable {
     return {
-      query: (text: string, params: readonly unknown[] = []): Promise<QueryResultRows> => {
-        const workload = classifySqlWorkload(text);
-        return this.measure(workload, () => client.query(text, params as unknown[]));
-      },
+      query: (text: string, params: readonly unknown[] = [], options?: QueryOptions) =>
+        this.queryClient(client, text, params, options),
     };
+  }
+
+  private async queryClient(
+    client: PoolClient,
+    text: string,
+    params: readonly unknown[],
+    options?: QueryOptions,
+  ): Promise<QueryResultRows> {
+    const signal = options?.signal;
+    signal?.throwIfAborted();
+    // Cancellation uses PostgreSQL's supported function on a short-lived connection with the
+    // same role. Hold the borrowed client until cancellation completes so a late cancellation
+    // cannot target its next user's query. Parameters and connection details are never logged.
+    const pid =
+      signal === undefined
+        ? null
+        : (await client.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]?.pid;
+    signal?.throwIfAborted();
+    const cancellation: { promise?: Promise<void> } = {};
+    const cancel = () => {
+      if (pid === null || pid === undefined || cancellation.promise !== undefined) return;
+      cancellation.promise = (async () => {
+        const canceller = new Client({
+          ...this.connectionConfig,
+          application_name: "hyperion-public-cancel",
+        });
+        canceller.on("error", () => undefined);
+        try {
+          await canceller.connect();
+          await canceller.query("SELECT pg_cancel_backend($1)", [pid]);
+        } catch {
+          // The connection's existing statement timeout remains the final bound if cancellation
+          // transport is unavailable. Do not expose its connection error to public clients.
+        } finally {
+          await canceller.end();
+        }
+      })();
+    };
+    signal?.addEventListener("abort", cancel, { once: true });
+    try {
+      const result = await this.measure(options?.workload ?? classifySqlWorkload(text), () =>
+        client.query(text, params as unknown[]),
+      );
+      signal?.throwIfAborted();
+      return result;
+    } catch (error) {
+      signal?.throwIfAborted();
+      throw error;
+    } finally {
+      signal?.removeEventListener("abort", cancel);
+      if (cancellation.promise !== undefined) await cancellation.promise;
+    }
   }
 
   private async measure(

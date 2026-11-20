@@ -10,6 +10,8 @@
 import { ROUTE_KINDS } from "@hyperion/protocol";
 
 import type { Queryable } from "../../db/pool.js";
+import type { RawEvmLog } from "./client.js";
+import type { Hex } from "viem";
 import { bigintOf, boolean, integer, text, textOrNull, timestamp } from "../../db/rows.js";
 import type { Position } from "../writers.js";
 import {
@@ -55,6 +57,8 @@ export interface EvmLogQuarantine {
   readonly logIndex: number;
   readonly eventName: string;
   readonly reason: string;
+  readonly raw?: RawEvmLog;
+  readonly blockHash?: Hex;
 }
 
 /** Keep malformed ranges visible without allowing one bad provider response to fill the database. */
@@ -63,15 +67,30 @@ export async function quarantineEvmLog(
   entry: EvmLogQuarantine,
   observedAt: Date,
 ): Promise<void> {
+  const raw = entry.raw;
+  const validTopics =
+    raw !== undefined &&
+    raw.topics.length <= 4 &&
+    raw.topics.every((topic) => /^0x[0-9a-fA-F]{64}$/.test(topic));
+  const bounded =
+    raw !== undefined &&
+    validTopics &&
+    raw.data.length <= 131074 &&
+    /^0x([0-9a-fA-F]{2})*$/.test(raw.data);
   // Serialize retention with insertion so concurrent replicas keep the same database bound.
   await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
     "evm-quarantine:" + entry.chainKey,
   ]);
   await db.query(
     `INSERT INTO evm_log_quarantine
-       (chain_key, block_number, transaction_hash, log_index, event_name, reason, observed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
-     ON CONFLICT (chain_key, block_number, transaction_hash, log_index, reason) DO NOTHING`,
+       (chain_key, block_number, transaction_hash, log_index, event_name, reason, observed_at,contract,block_hash,signature,data,topics)
+     VALUES ($1, $2, $3, $4, $5, $6, $7,$8,$9,$10,$11,$12::jsonb)
+     ON CONFLICT (chain_key, block_number, transaction_hash, log_index, reason) DO UPDATE SET
+       contract=coalesce(evm_log_quarantine.contract,excluded.contract),
+       block_hash=coalesce(evm_log_quarantine.block_hash,excluded.block_hash),
+       signature=coalesce(evm_log_quarantine.signature,excluded.signature),
+       data=coalesce(evm_log_quarantine.data,excluded.data),
+       topics=coalesce(evm_log_quarantine.topics,excluded.topics)`,
     [
       entry.chainKey,
       entry.block.toString(),
@@ -80,6 +99,11 @@ export async function quarantineEvmLog(
       entry.eventName,
       entry.reason,
       observedAt,
+      raw?.address ?? null,
+      entry.blockHash ?? null,
+      validTopics ? (raw.topics[0] ?? null) : null,
+      bounded ? raw.data : null,
+      validTopics ? JSON.stringify(raw.topics) : null,
     ],
   );
   await db.query(
@@ -91,6 +115,52 @@ export async function quarantineEvmLog(
       )`,
     [entry.chainKey],
   );
+}
+
+export interface QuarantinedEvmLog {
+  readonly log: RawEvmLog;
+  readonly blockHash: Hex;
+}
+
+/** Replay reads are bounded and scoped to the configured chain AND router deployment. */
+export async function readQuarantinedEvmLogs(
+  db: Queryable,
+  chainKey: string,
+  contract: Hex,
+  limit = 100,
+): Promise<readonly QuarantinedEvmLog[]> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)
+    throw new RangeError("Quarantine replay limit must be 1 to 100.");
+  const result = await db.query(
+    `SELECT DISTINCT ON(block_number,transaction_hash,log_index)
+    block_number::text,transaction_hash,log_index,contract,block_hash,data,topics
+    FROM evm_log_quarantine WHERE chain_key=$1 AND lower(contract)=lower($2) AND data IS NOT NULL AND topics IS NOT NULL AND block_hash IS NOT NULL
+    ORDER BY block_number,transaction_hash,log_index,reason LIMIT $3`,
+    [chainKey, contract, limit],
+  );
+  return result.rows.map((row) => {
+    const topics = row.topics;
+    if (
+      !Array.isArray(topics) ||
+      topics.length > 4 ||
+      !topics.every(
+        (topic: unknown) => typeof topic === "string" && /^0x[0-9a-fA-F]{64}$/.test(topic),
+      )
+    )
+      throw new Error("Invalid quarantined event topics.");
+    return {
+      blockHash: text(row, "block_hash") as Hex,
+      log: {
+        address: text(row, "contract") as Hex,
+        blockNumber: bigintOf(row, "block_number"),
+        transactionHash: text(row, "transaction_hash") as Hex,
+        logIndex: integer(row, "log_index"),
+        data: text(row, "data") as Hex,
+        topics: topics as [] | [Hex, ...Hex[]],
+        removed: false,
+      },
+    };
+  });
 }
 
 /**

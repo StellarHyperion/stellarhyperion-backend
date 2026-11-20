@@ -25,7 +25,7 @@ import { bigintOf, text } from "../../db/rows.js";
 import type { InboundRow, Position } from "../../chains/writers.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 
-import { ITS_ABI, matchingPayment } from "./events.js";
+import { ITS_ABI, inspectPayment, type VerificationDiagnostic } from "./events.js";
 import type { AxelarDeliveryEvidenceRow } from "../../chains/writers.js";
 export interface VerifiedDelivery {
   readonly at: Position;
@@ -34,6 +34,18 @@ export interface VerifiedDelivery {
 
 export interface VerifiedItsDelivery extends VerifiedDelivery {
   readonly evidence: AxelarDeliveryEvidenceRow;
+}
+
+export interface VerificationFailure {
+  readonly state: "receipt_unavailable" | "payout_unverified";
+  readonly diagnostics: readonly VerificationDiagnostic[];
+}
+
+export type ItsVerificationState = "receipt_unavailable" | "payout_unverified" | "verified";
+
+export interface ItsVerificationResult {
+  readonly state: ItsVerificationState;
+  readonly delivery: VerifiedItsDelivery | null;
 }
 
 export interface AxelarCanonicalityClient {
@@ -125,6 +137,10 @@ export async function revalidateItsDeliveryProofs(
         String(row.id),
       ]);
       await tx.query(
+        "SELECT set_config('hyperion.rail_reconcile_transfer',$1,true), set_config('hyperion.rail_reconcile_reason','destination_proof_reorg',true)",
+        [String(row.transfer_id)],
+      );
+      await tx.query(
         `UPDATE rail_attestation SET status = 'attested', updated_at = now(),
             next_attempt_at = now(), retry_class = NULL
           WHERE transfer_id = $1 AND status = 'delivered'
@@ -153,7 +169,7 @@ export async function verifyItsDelivery(
   db: Queryable,
   transfer: PendingTransfer,
   report: RailReport,
-): Promise<VerifiedItsDelivery | null> {
+): Promise<VerifiedItsDelivery | VerificationFailure | null> {
   const execution = report.execution;
   const source = config.indexer.stellar;
   if (
@@ -168,7 +184,7 @@ export async function verifyItsDelivery(
   const its = RAIL_CONTRACTS[transfer.destinationChain]?.axelar?.interchainTokenService;
   if (!isEvmChain(destination) || !its?.startsWith("0x")) return null;
   const { rows } = await db.query(
-    "SELECT sender, token, net_amount, destination FROM outbound_transfer WHERE id = $1",
+    "SELECT origin_chain,origin_router,nonce,origin_tx,sender,token,net_amount,destination_chain,destination FROM outbound_transfer WHERE id = $1",
     [String(transfer.transferId)],
   );
   const stored = rows[0];
@@ -207,12 +223,30 @@ export async function verifyItsDelivery(
   });
   if ((await client.getChainId()) !== destination.chainId)
     throw new Error("Destination RPC chain mismatch.");
-  const receipt = await client.getTransactionReceipt({ hash: execution.txHash });
-  if (receipt.status !== "success") return null;
+  const receipt = await client.getTransactionReceipt({ hash: execution.txHash }).catch(() => null);
+  if (!receipt) return { state: "receipt_unavailable", diagnostics: [] };
+  if (receipt.status !== "success")
+    return {
+      state: "payout_unverified",
+      diagnostics: [
+        {
+          category: "payment_evidence",
+          expected: "successful destination receipt",
+          observed: "reverted",
+        },
+      ],
+    };
   const head = await client.getBlockNumber();
-  if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations)) return null;
+  if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations))
+    return { state: "receipt_unavailable", diagnostics: [] };
   const block = await client.getBlock({ blockNumber: receipt.blockNumber });
-  if (block.hash !== receipt.blockHash) return null;
+  if (block.hash !== receipt.blockHash)
+    return {
+      state: "payout_unverified",
+      diagnostics: [
+        { category: "payment_evidence", expected: block.hash, observed: receipt.blockHash },
+      ],
+    };
   const destinationToken = await client.readContract({
     address: its as `0x${string}`,
     abi: ITS_ABI,
@@ -232,7 +266,7 @@ export async function verifyItsDelivery(
   if (!adapterConfig.its) return null;
   const sourceName = await view(adapterConfig.its, "chain_name");
   if (typeof sourceName !== "string") return null;
-  const payment = matchingPayment(receipt.logs, {
+  const inspection = inspectPayment(receipt.logs, {
     its,
     token: destinationToken,
     tokenManager,
@@ -243,13 +277,14 @@ export async function verifyItsDelivery(
     recipient,
     amount,
   });
-  if (!payment) return null;
+  if (!inspection.payment)
+    return { state: "payout_unverified", diagnostics: inspection.diagnostics };
   return {
     at: {
       chainKey: transfer.destinationChain,
       block: receipt.blockNumber,
       txHash: receipt.transactionHash,
-      logIndex: payment.logIndex,
+      logIndex: inspection.payment.logIndex,
       observedAt: new Date(Number(block.timestamp) * 1000),
     },
     row: {
@@ -265,6 +300,17 @@ export async function verifyItsDelivery(
       claimId: null,
     },
     evidence: {
+      sourceBinding: {
+        chain: text(stored, "origin_chain"),
+        router: text(stored, "origin_router"),
+        nonce: bigintOf(stored, "nonce").toString(),
+        transaction: text(stored, "origin_tx"),
+        sender: text(stored, "sender"),
+        token,
+        amount: amount.toString(),
+        destinationChain: text(stored, "destination_chain"),
+        destination: text(stored, "destination"),
+      },
       transferId: transfer.transferId,
       destinationChain: transfer.destinationChain,
       commandId: execution.commandId,
@@ -277,7 +323,7 @@ export async function verifyItsDelivery(
       tokenManager,
       tokenManagerBlock: receipt.blockNumber,
       tokenManagerBlockHash: block.hash,
-      paymentLogIndex: payment.logIndex,
+      paymentLogIndex: inspection.payment.logIndex,
       paymentRecipient: recipient,
       paymentAmount: amount,
     },
