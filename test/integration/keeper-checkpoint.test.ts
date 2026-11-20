@@ -23,6 +23,8 @@ const connection = process.env.TEST_DATABASE_URL;
       db = Database.open(connection ?? "", { maxConnections: 3 });
     });
     afterAll(async () => {
+      await db.query("DELETE FROM keeper_spending_audit WHERE signer=$1", [signer.publicKey()]);
+      await db.query("DELETE FROM keeper_spending_window WHERE signer=$1", [signer.publicKey()]);
       await db.query("DELETE FROM keeper_checkpoint WHERE signer=$1", [signer.publicKey()]);
       await db.query("DELETE FROM keeper_signer_state WHERE chain_key=$1", [
         config.indexer.stellar.chain,
@@ -37,6 +39,7 @@ const connection = process.env.TEST_DATABASE_URL;
       let broadcasts = 0;
       let preparations = 0;
       const client = {
+        getLatestLedger: () => Promise.resolve({ sequence: 100 }),
         getNetwork: () => Promise.resolve({ passphrase: config.indexer.stellar.networkPassphrase }),
         getAccountEntry: () => Promise.resolve({ balance: 100000000n }),
         getAccount: () => Promise.resolve(new Account(signer.publicKey(), "1")),

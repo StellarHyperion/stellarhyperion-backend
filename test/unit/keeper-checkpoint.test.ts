@@ -23,6 +23,8 @@ function fixture() {
     if (sql.includes("INSERT INTO keeper_checkpoint"))
       pending = { hash: params[0], intent_key: params[5], phase: params[6] };
     if (sql.includes("UPDATE keeper_checkpoint")) pending = null;
+    if (sql.includes("INSERT INTO keeper_spending_window"))
+      return Promise.resolve({ rows: [{ window_key: params[3] }], rowCount: 1 });
     return Promise.resolve({
       rows: sql.includes("SELECT active_signer,network_passphrase")
         ? [
@@ -31,13 +33,23 @@ function fixture() {
               network_passphrase: config.indexer.stellar!.networkPassphrase,
             },
           ]
-        : sql.includes("state = 'submitted' ORDER BY") && pending
-          ? [pending]
-          : [],
+        : sql.includes("SELECT spent_stroops,cap_stroops")
+          ? [
+              {
+                spent_stroops: "0",
+                cap_stroops: "1000000",
+                override_stroops: null,
+                override_reason: null,
+              },
+            ]
+          : sql.includes("state = 'submitted' ORDER BY") && pending
+            ? [pending]
+            : [],
       rowCount: 1,
     });
   }
   const client = {
+    getLatestLedger: () => Promise.resolve({ sequence: 100 }),
     getNetwork: () => Promise.resolve({ passphrase: config.indexer.stellar!.networkPassphrase }),
     getAccountEntry: () => Promise.resolve({ balance: 100000000n }),
     getAccount: () => Promise.resolve(new Account(signer.publicKey(), "1")),

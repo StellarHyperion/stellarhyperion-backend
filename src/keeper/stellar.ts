@@ -11,6 +11,11 @@ import {
 } from "./signers.js";
 import { recordKeeperSubmission, updateKeeperSubmission } from "./outcomes.js";
 import { prepareWithRestore } from "./restore.js";
+import {
+  KeeperMaintenancePausedError,
+  KeeperSpendingCapReachedError,
+  reserveKeeperSpending,
+} from "./spending.js";
 
 export type KeeperOperation = "keep_alive" | "settle_claim";
 export interface StellarSubmissionOptions {
@@ -83,6 +88,10 @@ export function submitStellar(
     await lock.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
       keeperSignerLock(config),
     ]);
+    if (config.keeper.paused) {
+      const spending = await reserveKeeperSpending(config, db, chainKey, signer, 0n, client);
+      throw new KeeperMaintenancePausedError(spending.detail);
+    }
     await validateKeeperSigner(config, selectedSigner, client);
     await assertKeeperSignerOwnership(lock, config, selectedSigner);
 
@@ -162,6 +171,18 @@ export function submitStellar(
       prepared: Transaction,
       phase: "restore" | "invoke",
     ): Promise<string> => {
+      const spending = await reserveKeeperSpending(
+        config,
+        db,
+        chainKey,
+        signer,
+        BigInt(prepared.fee),
+        client,
+      );
+      if (!spending.allowed) {
+        if (spending.paused) throw new KeeperMaintenancePausedError(spending.detail);
+        throw new KeeperSpendingCapReachedError(spending.detail);
+      }
       prepared.sign(key);
       const hash = Buffer.from(prepared.hash()).toString("hex");
       await db.query(
@@ -226,7 +247,12 @@ export function submitStellar(
       prepared = await prepare(client, build, (transaction, phase) =>
         submitPrepared(transaction, phase),
       );
-    } catch {
+    } catch (error) {
+      if (
+        error instanceof KeeperMaintenancePausedError ||
+        error instanceof KeeperSpendingCapReachedError
+      )
+        throw error;
       const unresolved = await db.query(
         "SELECT hash FROM keeper_checkpoint WHERE chain_key=$1 AND signer=$2 AND state='submitted' LIMIT 1",
         [chainKey, signer],

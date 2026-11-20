@@ -2,6 +2,7 @@ import { Address, BASE_FEE, nativeToScVal } from "@stellar/stellar-sdk";
 import { bigintOf, text } from "../../db/rows.js";
 import { submitStellar } from "../stellar.js";
 import { recordKeeperSubmission } from "../outcomes.js";
+import { KeeperMaintenancePausedError, KeeperSpendingCapReachedError } from "../spending.js";
 import type {
   ClaimSettlementPayload,
   ClaimSettlementResult,
@@ -71,7 +72,9 @@ export async function processClaimSettlement(
   }
 
   let settled = 0;
+  let attempted = 0;
   for (const claim of claims) {
+    attempted += 1;
     try {
       const hash = await submitStellar(
         ctx.config,
@@ -89,15 +92,36 @@ export async function processClaimSettlement(
       );
       settled += 1;
     } catch (error) {
-      ctx.logger.warn(
-        { err: error, claimId: claim.id.toString() },
-        "claim is not ready for settlement",
-      );
+      if (
+        error instanceof KeeperMaintenancePausedError ||
+        error instanceof KeeperSpendingCapReachedError
+      ) {
+        const detail =
+          error instanceof KeeperMaintenancePausedError
+            ? "Keeper spending policy paused maintenance; remaining claims stay pending."
+            : "Keeper spending cap reached; remaining claims stay pending.";
+        ctx.logger.warn(
+          { claimId: claim.id.toString() },
+          "claim settlement deferred by keeper spending policy",
+        );
+        return {
+          settled,
+          attempted,
+          pending: claims.length - settled,
+          dryRun: settled === 0,
+          detail,
+          operations,
+          targetKeys,
+          estimatedFee: String(BigInt(BASE_FEE) * BigInt(attempted)),
+          unsigned: settled === 0,
+        };
+      }
+      ctx.logger.warn({ claimId: claim.id.toString() }, "claim is not ready for settlement");
     }
   }
   return {
     settled,
-    attempted: claims.length,
+    attempted,
     pending: claims.length - settled,
     dryRun: false,
     detail: `${settled} confirmed settlements of ${claims.length} attempts.`,

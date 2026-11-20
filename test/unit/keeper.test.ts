@@ -4,7 +4,10 @@ import { loadConfig } from "../../src/config/config.js";
 import { processTtlBump } from "../../src/keeper/jobs/ttl.js";
 import { processClaimSettlement } from "../../src/keeper/jobs/claims.js";
 import { submitStellar } from "../../src/keeper/stellar.js";
+import { KeeperMaintenancePausedError, reserveKeeperSpending } from "../../src/keeper/spending.js";
 import { KeeperWorker } from "../../src/keeper/worker.js";
+import type { rpc } from "@stellar/stellar-sdk";
+import type { Queryable } from "../../src/db/pool.js";
 import { completeEnv } from "../helpers.js";
 import { capturingLogger } from "../stellar-fakes.js";
 vi.mock("../../src/keeper/stellar.js", () => ({ submitStellar: vi.fn() }));
@@ -17,14 +20,47 @@ class Db {
         ? [{ id: "9223372036854775000" }]
         : sql.includes("pending_claim")
           ? [
-              { claim_id: "1", recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", amount: "90000000000000000001" },
-              { claim_id: "9223372036854775807", recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", amount: "42" },
+              {
+                claim_id: "1",
+                recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+                amount: "90000000000000000001",
+              },
+              {
+                claim_id: "9223372036854775807",
+                recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+                amount: "42",
+              },
             ]
           : [{ nonce: "9223372036854775808" }],
       rowCount: 2,
     });
   }
   transaction<T>(work: (db: Db) => Promise<T>) {
+    return work(this);
+  }
+}
+class SpendingDb implements Queryable {
+  calls: { sql: string; params: readonly unknown[] }[] = [];
+  constructor(private readonly spent = "0") {}
+  query(sql: string, params: readonly unknown[] = []) {
+    this.calls.push({ sql, params });
+    if (sql.includes("INSERT INTO keeper_spending_window"))
+      return Promise.resolve({ rows: [{ window_key: params[3] }], rowCount: 1 });
+    if (sql.includes("SELECT spent_stroops,cap_stroops"))
+      return Promise.resolve({
+        rows: [
+          {
+            spent_stroops: this.spent,
+            cap_stroops: "1000000",
+            override_stroops: null,
+            override_reason: null,
+          },
+        ],
+        rowCount: 1,
+      });
+    return Promise.resolve({ rows: [], rowCount: 1 });
+  }
+  transaction<T>(work: (tx: Queryable) => Promise<T>) {
     return work(this);
   }
 }
@@ -105,6 +141,71 @@ describe("Stellar keeper execution", () => {
     });
     expect(submitStellar).not.toHaveBeenCalled();
   });
+  it("leaves claims pending when maintenance is paused by spending policy", async () => {
+    const config = loadConfig({
+      env: completeEnv({ KEEPER_STELLAR_SECRET: Keypair.random().secret() }),
+    });
+    vi.mocked(submitStellar).mockRejectedValue(
+      new KeeperMaintenancePausedError("Keeper maintenance is paused."),
+    );
+    const db = new Db();
+    const result = await processClaimSettlement({ config, db, logger });
+    expect(result.settled).toBe(0);
+    expect(result.pending).toBe(2);
+    expect(result.dryRun).toBe(true);
+    expect(db.calls.some((call) => /UPDATE\s+pending_claim/i.test(call.sql))).toBe(false);
+  });
+  it("reserves full-width fee amounts atomically for both reset windows", async () => {
+    const config = loadConfig({
+      env: completeEnv({
+        KEEPER_SPENDING_OVERRIDE_STROOPS: "99999999999999999999",
+        KEEPER_SPENDING_OVERRIDE_REASON: "approved maintenance budget",
+      }),
+    });
+    const db = new SpendingDb();
+    const client = {
+      getLatestLedger: async () => ({ sequence: "9223372036854775808" }),
+    } as unknown as rpc.Server;
+    const amount = 9007199254740993123n;
+    const result = await reserveKeeperSpending(
+      config,
+      db,
+      "stellar-testnet",
+      Keypair.random().publicKey(),
+      amount,
+      client,
+    );
+    expect(result.allowed).toBe(true);
+    expect(
+      db.calls
+        .filter((call) => call.sql.includes("SET spent_stroops=spent_stroops+$5"))
+        .map((call) => call.params[4]),
+    ).toEqual([amount.toString(), amount.toString()]);
+    const expectedLedgerWindow = ((9223372036854775808n / 17280n) * 17280n).toString();
+    expect(db.calls.some((call) => call.params.includes(expectedLedgerWindow))).toBe(true);
+    expect(db.calls.filter((call) => call.sql.includes("'reset'"))).toHaveLength(2);
+    expect(db.calls.filter((call) => call.sql.includes("'override'"))).toHaveLength(2);
+  });
+  it("audits cap denial without charging an additional reservation", async () => {
+    const config = loadConfig({ env: completeEnv() });
+    const db = new SpendingDb("1000000");
+    const client = {
+      getLatestLedger: async () => ({ sequence: 100 }),
+    } as unknown as rpc.Server;
+    const result = await reserveKeeperSpending(
+      config,
+      db,
+      "stellar-testnet",
+      Keypair.random().publicKey(),
+      100n,
+      client,
+    );
+    expect(result.allowed).toBe(false);
+    expect(db.calls.some((call) => call.sql.includes("spending cap reached"))).toBe(true);
+    expect(db.calls.some((call) => call.sql.includes("SET spent_stroops=spent_stroops+$5"))).toBe(
+      false,
+    );
+  });
   it("reports disabled versus not-started worker states", () => {
     const config = loadConfig({ env: completeEnv() });
     expect(new KeeperWorker(config, new Db(), logger).readiness().state).toBe("degraded");
@@ -128,7 +229,9 @@ describe("Stellar keeper execution", () => {
       claimIds: ["1", "9223372036854775807"],
       transferIds: ["9223372036854775808"],
     });
-    expect(result.targetKeys).toContain("claim:" + config.indexer.stellar?.chain + ":9223372036854775807");
+    expect(result.targetKeys).toContain(
+      "claim:" + config.indexer.stellar?.chain + ":9223372036854775807",
+    );
     expect(JSON.stringify(result)).not.toContain(Keypair.random().secret());
   });
 });

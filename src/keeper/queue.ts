@@ -68,8 +68,11 @@ export async function startKeeperQueue(
     logger.info({ jobName: job.name, jobId: job.id, kind: result.kind }, "keeper job completed");
   });
 
-  worker.on("failed", (job, error) => {
-    logger.error({ jobName: job?.name, jobId: job?.id, err: error }, "keeper job failed");
+  worker.on("failed", (job) => {
+    logger.error(
+      { jobName: job?.name, jobId: job?.id },
+      "keeper job failed; details omitted to protect configured credentials",
+    );
   });
 
   // Schedule repeatable jobs for the two Stellar tasks
