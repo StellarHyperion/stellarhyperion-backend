@@ -329,6 +329,20 @@ or the local Git HEAD when available). URLs, nested authorization/signers and ot
 values are redacted. Output files are created exclusively with mode 0600; choose a new filename
 for each capture. No RPC polling, transactions or wallet operations are performed.
 
+### Backup and restore rehearsals
+
+`npm run rehearsal -- rehearse --output snapshot.json` exports the indexed history tables from
+`DATABASE_URL` (read-only), restores them into the dedicated database named by
+`HYPERION_REHEARSAL_DATABASE_URL`, and validates the result. `export`, `restore` and `validate`
+run the steps separately. Every value travels as PostgreSQL text, so full-width identifiers and
+integer-string amounts round-trip exactly. Validation recomputes row counts, the per-chain
+monetary history digests and a cursor/provenance join fingerprint, and fails on any difference
+or dangling link. The target must be migrated to the same schema version, must be empty, and
+must not be the source. A target provisioned as `production` or `preview` is refused unless both
+`--allow-protected-target` and `HYPERION_REHEARSAL_ALLOW_PROTECTED=true` are set. Snapshots
+hold rows and digests only, never connection strings, are capped at 100,000 rows per table, and
+carry a SHA-256 so a modified file is refused.
+
 ### Rail transition history and transfer cursors
 
 `rail_attestation_history` records actual committed lifecycle changes bound to the source transfer
