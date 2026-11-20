@@ -45,6 +45,22 @@ Before indexing shared cursors, a replica acquires an expiring lease per chain/r
 
 Run the watchers and rail pollers in a continuous process or in regular scheduled catch-up windows. Deploying only `api/index.ts` provides reads from an existing database; it does not run indexing in the background. Set the frontend's `NEXT_PUBLIC_HYPERION_API_URL` to this service's origin. Public API reads support cross-origin GET requests.
 
+### Destination verification RPCs
+
+`EVM_DELIVERY_RPC_URLS_SEPOLIA`, `EVM_DELIVERY_RPC_URLS_BASE_SEPOLIA`, and
+`EVM_DELIVERY_RPC_URLS_ARC_TESTNET` configure ordered, comma-separated RPC endpoints for CCTP
+and ITS destination proof checks. These are destination-only settings: they work without an EVM
+Hyperion router deployment and do not enable or configure an EVM source watcher. When unset, each
+chain's registry RPC remains the default. Each setting accepts at most three HTTP(S) endpoints.
+
+Verification checks the expected chain ID and runs the receipt, confirmation, canonical-block,
+and payment reads against one endpoint. If an RPC call fails, the whole proof restarts on the next
+endpoint; evidence from different endpoints is never combined. Each endpoint has a 15-second
+request timeout with no hidden transport retries. If every endpoint fails or reports another
+chain, the transfer remains unverified for the normal rail retry policy. Failover logs identify
+only the endpoint origin; URL credentials, paths, query parameters, and authorization headers are
+not logged.
+
 ## Deploy on Vercel
 
 The `hyperion-backend` Vercel project serves [stellarhyperion-backend.vercel.app](https://stellarhyperion-backend.vercel.app). Configure its production `DATABASE_URL` through Vercel environment variables with a managed PostgreSQL connection and TLS. Keep the value server-side. Redis and signing keys are unnecessary while `KEEPER_ENABLED=false`.

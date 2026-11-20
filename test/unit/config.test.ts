@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
+import { CHAINS } from "@hyperion/protocol";
 import { loadConfig } from "../../src/config/config.js";
 import { ConfigError } from "../../src/config/env.js";
 import { completeEnv, TESTNET_DEPLOYMENTS } from "../helpers.js";
@@ -208,6 +209,75 @@ describe("watch plan", () => {
       "https://sepolia1.example.invalid/v1",
       "https://sepolia2.example.invalid/v2",
     ]);
+  });
+
+  it("uses registry defaults for delivery verification without watcher RPC overrides", () => {
+    const config = loadConfig({ env: completeEnv({ INDEXER_ENABLED: "false" }) });
+
+    expect(config.destinationVerification.evmRpcUrls.sepolia).toEqual([
+      CHAINS.sepolia.defaultRpcUrl,
+    ]);
+    expect(config.destinationVerification.evmRpcUrls["base-sepolia"]).toEqual([
+      CHAINS["base-sepolia"].defaultRpcUrl,
+    ]);
+    expect(config.destinationVerification.evmRpcUrls["arc-testnet"]).toEqual([
+      CHAINS["arc-testnet"].defaultRpcUrl,
+    ]);
+  });
+
+  it("accepts ordered destination-only endpoints independently for each supported chain", () => {
+    const config = loadConfig({
+      env: completeEnv({
+        INDEXER_ENABLED: "false",
+        EVM_DELIVERY_RPC_URLS_SEPOLIA:
+          "https://private.example/rpc?key=one,https://backup.example/rpc?key=two",
+        EVM_DELIVERY_RPC_URLS_BASE_SEPOLIA: "https://base.example/rpc",
+        EVM_DELIVERY_RPC_URLS_ARC_TESTNET: "https://arc.example/rpc",
+      }),
+    });
+
+    expect(config.destinationVerification.evmRpcUrls.sepolia).toEqual([
+      "https://private.example/rpc?key=one",
+      "https://backup.example/rpc?key=two",
+    ]);
+    expect(config.destinationVerification.evmRpcUrls["base-sepolia"]).toEqual([
+      "https://base.example/rpc",
+    ]);
+    expect(config.destinationVerification.evmRpcUrls["arc-testnet"]).toEqual([
+      "https://arc.example/rpc",
+    ]);
+    expect(config.indexer.evm.find((entry) => entry.chain === "sepolia")?.rpcUrls).not.toContain(
+      "https://private.example/rpc?key=one",
+    );
+  });
+
+  it.each([
+    ["", "empty"],
+    ["https://first.example/rpc,,https://last.example/rpc", "empty endpoint"],
+    ["not a url", "malformed"],
+    [
+      "https://one.example/rpc,https://two.example/rpc,https://three.example/rpc,https://four.example/rpc",
+      "unbounded list",
+    ],
+  ])("rejects %s destination RPC overrides (%s)", (value) => {
+    expect(
+      faultNames(() =>
+        loadConfig({ env: completeEnv({ EVM_DELIVERY_RPC_URLS_SEPOLIA: value }) }),
+      ),
+    ).toContain("EVM_DELIVERY_RPC_URLS_SEPOLIA");
+  });
+
+  it("rejects destination overrides for chains unsupported by the selected network", () => {
+    expect(
+      faultNames(() =>
+        loadConfig({
+          env: completeEnv({
+            HYPERION_NETWORK: "mainnet",
+            EVM_DELIVERY_RPC_URLS_SEPOLIA: "https://sepolia.example/rpc",
+          }),
+        }),
+      ),
+    ).toContain("EVM_DELIVERY_RPC_URLS_SEPOLIA");
   });
 
   it("refuses an override that is not a URL instead of falling back to the public endpoint", () => {

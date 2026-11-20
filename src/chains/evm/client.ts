@@ -10,7 +10,193 @@
  */
 import type { Logger } from "pino";
 import { createPublicClient, fallback, http, shouldThrow } from "viem";
-import type { Hex } from "viem";
+import type { Hex, PublicClient } from "viem";
+
+export type DestinationVerificationViemClient = Pick<
+  PublicClient,
+  "getChainId" | "getBlockNumber" | "getTransactionReceipt" | "getBlock" | "readContract"
+>;
+
+export interface DestinationRpcClient {
+  getChainId(): Promise<number>;
+}
+
+export type DestinationVerificationClientFactory<
+  TClient extends DestinationRpcClient = DestinationVerificationViemClient,
+> = (url: string, signal?: AbortSignal) => TClient;
+
+export interface DestinationVerificationOptions {
+  readonly signal?: AbortSignal;
+  readonly logger?: Logger;
+  readonly chain: string;
+  readonly clientForUrl?: DestinationVerificationClientFactory;
+}
+
+const DESTINATION_RPC_ATTEMPT_TIMEOUT_MS = 45_000;
+
+export class DestinationVerificationRpcError extends Error {
+  constructor(readonly reason: "chain_mismatch" | "rpc_failure" | "inconsistent_evidence") {
+    super(
+      reason === "chain_mismatch"
+        ? "Destination verification RPC endpoints reported the wrong chain."
+        : reason === "inconsistent_evidence"
+          ? "Destination verification RPC endpoints returned inconsistent evidence."
+          : "Destination verification RPC endpoints are unavailable.",
+    );
+    this.name = "DestinationVerificationRpcError";
+  }
+}
+
+/** Create a bounded, cancellable HTTP RPC client for one destination endpoint. */
+export function destinationVerificationViemClient(
+  url: string,
+  signal?: AbortSignal,
+): DestinationVerificationViemClient {
+  const fetchFn: typeof globalThis.fetch | undefined =
+    signal === undefined
+      ? undefined
+      : (input, init) => {
+          const combinedSignal =
+            init?.signal === undefined ? signal : AbortSignal.any([signal, init.signal]);
+          return globalThis.fetch(input, { ...init, signal: combinedSignal });
+        };
+  return createPublicClient({
+    transport: http(url, {
+      timeout: 15_000,
+      retryCount: 0,
+      fetchFn,
+    }),
+  });
+}
+
+/**
+ * Keep an entire evidence check on one endpoint. If any request fails, restart the check against
+ * the next endpoint rather than combining a receipt from one RPC with a block or payment from
+ * another.
+ */
+export async function withDestinationVerification<TClient extends DestinationRpcClient, TResult>(
+  urls: readonly string[],
+  expectedChainId: number,
+  clientForUrl: DestinationVerificationClientFactory<TClient>,
+  verify: (client: TClient) => Promise<TResult>,
+  options: DestinationVerificationOptions,
+): Promise<TResult> {
+  let failure: DestinationVerificationRpcError["reason"] = "rpc_failure";
+  let result: TResult | undefined;
+  let hasResult = false;
+  const baselineReads: { readonly method: string; readonly args: unknown; readonly result: unknown }[] =
+    [];
+  for (let index = 0; index < urls.length; index += 1) {
+    const url = urls[index];
+    if (url === undefined) continue;
+    options.signal?.throwIfAborted();
+    const attemptSignal = AbortSignal.timeout(DESTINATION_RPC_ATTEMPT_TIMEOUT_MS);
+    const signal =
+      options.signal === undefined
+        ? attemptSignal
+        : AbortSignal.any([options.signal, attemptSignal]);
+    try {
+      const client = clientForUrl(url, signal);
+      if ((await client.getChainId()) !== expectedChainId) {
+        failure = "chain_mismatch";
+        throw new Error("Destination RPC chain mismatch.");
+      }
+      signal.throwIfAborted();
+      let readIndex = 0;
+      const trackedClient = new Proxy(client, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver) as unknown;
+          if (
+            typeof value !== "function" ||
+            !["getTransactionReceipt", "getBlock", "readContract"].includes(String(property))
+          )
+            return value;
+          return (...args: readonly unknown[]) =>
+            Promise.resolve(Reflect.apply(value, target, [...args])).then((observed) => {
+              const read = {
+                method: String(property),
+                args: canonicalEvidence(args),
+                result: canonicalEvidence(observed),
+              };
+              const previous = baselineReads[readIndex];
+              if (
+                previous !== undefined &&
+                (previous.method !== read.method ||
+                  JSON.stringify(previous.args) !== JSON.stringify(read.args) ||
+                  JSON.stringify(previous.result) !== JSON.stringify(read.result))
+              )
+                throw new DestinationVerificationRpcError("inconsistent_evidence");
+              if (previous === undefined) baselineReads.push(read);
+              readIndex += 1;
+              return observed;
+            });
+        },
+      });
+      const observedResult = await verify(trackedClient);
+      signal.throwIfAborted();
+      if (
+        hasResult &&
+        JSON.stringify(canonicalEvidence(result)) !== JSON.stringify(canonicalEvidence(observedResult))
+      )
+        throw new DestinationVerificationRpcError("inconsistent_evidence");
+      if (!hasResult) {
+        result = observedResult;
+        hasResult = true;
+      }
+    } catch (error) {
+      if (options.signal?.aborted) throw error;
+      if (
+        error instanceof DestinationVerificationRpcError &&
+        error.reason === "inconsistent_evidence"
+      )
+        throw error;
+      failure =
+        error instanceof Error && error.message === "Destination RPC chain mismatch."
+          ? "chain_mismatch"
+          : "rpc_failure";
+      const nextUrl = urls[index + 1];
+      if (nextUrl !== undefined) {
+        options.logger?.warn(
+          {
+            chain: options.chain,
+            failedEndpoint: safeRpcEndpointIdentity(url),
+            nextEndpoint: safeRpcEndpointIdentity(nextUrl),
+            failure,
+          },
+          "Destination verification RPC failed; retrying the complete proof on the next endpoint",
+        );
+      } else {
+        options.logger?.error(
+          {
+            chain: options.chain,
+            failedEndpoint: safeRpcEndpointIdentity(url),
+            failure,
+          },
+          "Destination verification RPC endpoints exhausted",
+        );
+      }
+    }
+  }
+  if (hasResult) return result as TResult;
+  throw new DestinationVerificationRpcError(failure);
+}
+
+function canonicalEvidence(value: unknown): unknown {
+  if (typeof value === "bigint") return { bigint: value.toString() };
+  if (Array.isArray(value)) return value.map(canonicalEvidence);
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => [key, canonicalEvidence(entry)]),
+  );
+}
+
+/** Endpoint identity omits URL credentials, path segments, query parameters, and fragments. */
+export function safeRpcEndpointIdentity(url: string): string {
+  const parsed = new URL(url);
+  return parsed.origin;
+}
 
 export interface RawEvmLog {
   readonly address: Hex;

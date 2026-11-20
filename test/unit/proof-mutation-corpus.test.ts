@@ -323,6 +323,71 @@ describe("independent real CCTP and ITS destination proof mutation corpus", () =
           },
         );
         expect(unavailable).toEqual({ state: "receipt_unavailable", diagnostics: [] });
+
+        const withSecondary = {
+          ...modifiedConfig,
+          destinationVerification: {
+            ...modifiedConfig.destinationVerification,
+            evmRpcUrls: {
+              ...modifiedConfig.destinationVerification.evmRpcUrls,
+              sepolia: ["https://primary.example/private-key", "https://secondary.example/rpc"],
+            },
+          },
+        };
+        evm.getTransactionReceipt.mockClear().mockResolvedValue({
+          status: "success",
+          blockNumber: 100n,
+          transactionHash: hash,
+          blockHash: candidate.blockHash,
+          logs: candidate.logs,
+        });
+        evm.getTransactionReceipt.mockRejectedValueOnce(new Error("primary unavailable"));
+        stellar
+          .mockReset()
+          .mockResolvedValueOnce(simulation(hexToBytes(its.expected.tokenId as Hex)))
+          .mockResolvedValueOnce(simulation({ its: cctp.expected.sourceAdapter }))
+          .mockResolvedValueOnce(simulation(its.expected.sourceChain));
+        const recovered = await verifyItsDelivery(
+          withSecondary,
+          db,
+          { ...transfer, route: RouteKind.AxelarIts },
+          report,
+        );
+        expect(recovered).not.toBeNull();
+        expect(recovered !== null && "diagnostics" in recovered ? recovered.state : "verified").toBe(
+          "verified",
+        );
+        expect(evm.getTransactionReceipt).toHaveBeenCalledTimes(2);
+
+        evm.getTransactionReceipt.mockClear().mockRejectedValue(new Error("all endpoints offline"));
+        stellar
+          .mockReset()
+          .mockResolvedValueOnce(simulation(hexToBytes(its.expected.tokenId as Hex)))
+          .mockResolvedValueOnce(simulation({ its: cctp.expected.sourceAdapter }))
+          .mockResolvedValueOnce(simulation(its.expected.sourceChain));
+        const exhausted = await verifyItsDelivery(
+          withSecondary,
+          db,
+          { ...transfer, route: RouteKind.AxelarIts },
+          report,
+        );
+        expect(exhausted).toEqual({ state: "receipt_unavailable", diagnostics: [] });
+
+        evm.getChainId.mockResolvedValue(1);
+        evm.getTransactionReceipt.mockClear();
+        stellar
+          .mockReset()
+          .mockResolvedValueOnce(simulation(hexToBytes(its.expected.tokenId as Hex)))
+          .mockResolvedValueOnce(simulation({ its: cctp.expected.sourceAdapter }))
+          .mockResolvedValueOnce(simulation(its.expected.sourceChain));
+        const wrongNetwork = await verifyItsDelivery(
+          withSecondary,
+          db,
+          { ...transfer, route: RouteKind.AxelarIts },
+          report,
+        );
+        expect(wrongNetwork).toEqual({ state: "receipt_unavailable", diagnostics: [] });
+        expect(evm.getTransactionReceipt).not.toHaveBeenCalled();
       }
       console.info("HYPERION_PROOF_MUTATION_CORPUS " + JSON.stringify({ rail, records }));
     },
