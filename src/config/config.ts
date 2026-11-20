@@ -17,7 +17,15 @@ import { EXPECTED_SCHEMA_VERSION } from "../db/schema.js";
 import { readFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 
-import type { Chain, ChainKey, DeploymentSet, Hex, NetworkMode } from "@hyperion/protocol";
+import type {
+  Chain,
+  ChainKey,
+  DeploymentSet,
+  Hex,
+  NetworkMode,
+  EvmTokenDeployment,
+  StellarTokenDeployment,
+} from "@hyperion/protocol";
 import {
   CHAINS,
   DeploymentFormatError,
@@ -1008,7 +1016,12 @@ function buildProvenanceEntries(
     revisions[chain] = deployment.commit.toLowerCase();
     add(`DEPLOYMENT_ROUTER_${envSuffixFor(chain)}`, deployment.router, "deployment");
     add(`DEPLOYMENT_REVISION_${envSuffixFor(chain)}`, revisions[chain], "deployment");
-    for (const token of Object.values(deployment.tokens)) {
+    const tokens: readonly (EvmTokenDeployment | StellarTokenDeployment)[] = isStellarDeployment(
+      deployment,
+    )
+      ? Object.values(deployment.tokens)
+      : Object.values(deployment.tokens);
+    for (const token of tokens) {
       const address = "sacId" in token ? token.sacId : token.address;
       add(
         `DEPLOYMENT_TOKEN_${envSuffixFor(chain)}_${address}`,
