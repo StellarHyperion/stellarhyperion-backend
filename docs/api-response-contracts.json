@@ -1,0 +1,171 @@
+{
+  "claim": {
+    "fields": {
+      "id": "string",
+      "chain": "string",
+      "claimId": "integer-string",
+      "recipient": "string",
+      "token": "string",
+      "amount": "integer-string",
+      "route": "number",
+      "sourceChain": "string",
+      "sourceNonce": "integer-string",
+      "settled": "boolean",
+      "createdAt": "string",
+      "observedAt": "string",
+      "provenance": {
+        "fields": {
+          "source": {
+            "nullable": {
+              "fields": {
+                "status": "string",
+                "chain": "string",
+                "txHash": "string",
+                "block": "integer-string",
+                "logIndex": {
+                  "nullable": "number"
+                }
+              }
+            }
+          },
+          "destination": {
+            "fields": {
+              "status": "string",
+              "chain": "string",
+              "txHash": {
+                "nullable": "string"
+              },
+              "block": {
+                "nullable": "integer-string"
+              },
+              "logIndex": {
+                "nullable": "number"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "transfer": {
+    "fields": {
+      "id": "string",
+      "stage": "string",
+      "route": "number",
+      "origin": {
+        "fields": {
+          "chain": "string",
+          "router": {
+            "nullable": "string"
+          },
+          "nonce": "integer-string",
+          "sender": "string",
+          "token": "string",
+          "symbol": {
+            "nullable": "string"
+          },
+          "decimals": {
+            "nullable": "number"
+          },
+          "grossAmount": "integer-string",
+          "fee": "integer-string",
+          "netAmount": "integer-string",
+          "block": "integer-string",
+          "txHash": "string",
+          "observedAt": "string",
+          "provenance": {
+            "fields": {
+              "status": "string",
+              "chain": "string",
+              "txHash": "string",
+              "block": "integer-string",
+              "logIndex": {
+                "nullable": "number"
+              }
+            }
+          }
+        }
+      },
+      "destination": {
+        "fields": {
+          "token": {
+            "nullable": "string"
+          },
+          "amount": {
+            "nullable": "integer-string"
+          },
+          "symbol": {
+            "nullable": "string"
+          },
+          "decimals": {
+            "nullable": "number"
+          },
+          "chain": "string",
+          "recipient": "string",
+          "delivered": "boolean",
+          "block": {
+            "nullable": "integer-string"
+          },
+          "txHash": {
+            "nullable": "string"
+          },
+          "deliveredAt": {
+            "nullable": "string"
+          },
+          "provenance": {
+            "fields": {
+              "status": "string",
+              "chain": "string",
+              "txHash": {
+                "nullable": "string"
+              },
+              "block": {
+                "nullable": "integer-string"
+              },
+              "logIndex": {
+                "nullable": "number"
+              }
+            }
+          }
+        }
+      },
+      "rail": {
+        "nullable": {
+          "fields": {
+            "status": {
+              "nullable": "string"
+            },
+            "railStatus": {
+              "nullable": "string"
+            },
+            "reference": {
+              "nullable": "string"
+            },
+            "attestedAt": {
+              "nullable": "string"
+            },
+            "lastError": {
+              "nullable": "string"
+            },
+            "provenance": {
+              "fields": {
+                "status": "string",
+                "reference": {
+                  "nullable": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "claim": {
+        "nullable": {
+          "fields": {
+            "id": "string",
+            "settled": "boolean"
+          }
+        }
+      }
+    }
+  }
+}

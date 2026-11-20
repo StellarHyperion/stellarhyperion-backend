@@ -13,9 +13,11 @@ class Db {
   query(sql: string, params: readonly unknown[] = []) {
     this.calls.push({ sql, params });
     return Promise.resolve({
-      rows: sql.includes("pending_claim")
-        ? [{ claim_id: "1" }, { claim_id: "2" }]
-        : [{ nonce: "3" }],
+      rows: sql.includes("INSERT INTO keeper_submission")
+        ? [{ id: "9223372036854775000" }]
+        : sql.includes("pending_claim")
+          ? [{ claim_id: "1" }, { claim_id: "2" }]
+          : [{ nonce: "3" }],
       rowCount: 2,
     });
   }
@@ -52,8 +54,9 @@ describe("Stellar keeper execution", () => {
     expect(result.dryRun).toBe(false);
     expect(result.bumpedClaims).toBe(2);
     expect(result.bumpedTransfers).toBe(1);
-    expect(vi.mocked(submitStellar).mock.calls[0]?.[2]).toBe("keep_alive");
-    expect(vi.mocked(submitStellar).mock.calls[0]?.[3]("ignored")).toHaveLength(4);
+    expect(vi.mocked(submitStellar).mock.calls[0]?.[4]).toBe("keep_alive");
+    expect(vi.mocked(submitStellar).mock.calls[0]?.[5]).toBe("keep_alive");
+    expect(vi.mocked(submitStellar).mock.calls[0]?.[6]("ignored")).toHaveLength(4);
   });
   it("does not claim upkeep succeeded if submission fails", async () => {
     const config = loadConfig({

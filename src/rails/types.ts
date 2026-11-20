@@ -44,6 +44,7 @@ export const CCTP_VERIFICATION_FAILURES = [
   "receipt_reverted",
   "confirmations_pending",
   "non_canonical_receipt",
+  "message_already_delivered",
 ] as const;
 export type CctpVerificationFailure = (typeof CCTP_VERIFICATION_FAILURES)[number];
 
@@ -65,6 +66,11 @@ export function isTerminal(status: AttestationStatus): boolean {
 export interface RailReport {
   readonly forwardTxHash?: `0x${string}`;
   readonly execution?: { readonly txHash: `0x${string}`; readonly commandId: `0x${string}` };
+  readonly quarantine?: {
+    readonly schema: string;
+    readonly providerReference: string | null;
+    readonly payload: unknown;
+  };
   readonly status: AttestationStatus;
   /**
    * The rail's own word for it, verbatim.
@@ -78,8 +84,24 @@ export interface RailReport {
   /** The identifier to quote at the rail's support. Circle's event nonce, Axelar's message id. */
   readonly reference: string | null;
   readonly attestedAt: Date | null;
+  /**
+   * A provider-side failure is evidence about the rail, not evidence that the destination
+   * receipt or payout is absent. Keeping the two separate prevents a provider error from being
+   * presented as a failed payment.
+   */
+  readonly providerFailure?: {
+    readonly kind: "recoverable" | "fatal";
+    readonly signals: readonly string[];
+  };
   readonly message?: string | null;
   readonly messageBytes?: string | null;
+  /**
+   * The full 32-byte CCTP nonce and keccak256 digest of `messageBytes`, bound when the provider
+   * record was read. A candidate identity only: delivery is still proven from the destination
+   * receipt, which must execute exactly this message.
+   */
+  readonly messageNonce?: string | null;
+  readonly messageDigest?: string | null;
   readonly attestation?: string | null;
   readonly attestationSignature?: string | null;
   readonly attestationTimestamp?: Date | null;

@@ -297,101 +297,16 @@ export async function recordQuarantinedEvent(
 }
 
 // --------------------------------------------------------------------------------------------
-// Expiring database leases (#31)
+// Expiring database leases (#31) — shared implementation in ../writers.ts
 // --------------------------------------------------------------------------------------------
 
-export class LeaseLostError extends Error {
-  constructor(
-    readonly chainKey: string,
-    readonly contract: string,
-    readonly ownerId: string,
-  ) {
-    super(`watcher lease lost for ${chainKey} (${contract}) held by ${ownerId}`);
-    this.name = "LeaseLostError";
-  }
-}
-
-export interface WatcherLease {
-  readonly chainKey: string;
-  readonly contract: string;
-  readonly ownerId: string;
-  readonly leaseUntil: Date;
-}
-
-export async function acquireLease(
-  db: Queryable,
-  params: {
-    readonly chainKey: string;
-    readonly contract: string;
-    readonly ownerId: string;
-    readonly ttlMs: number;
-  },
-): Promise<WatcherLease | null> {
-  const { rows, rowCount } = await db.query(
-    `INSERT INTO indexer_lease (chain_key, contract, owner_id, lease_until, updated_at)
-     VALUES ($1, $2, $3, now() + ($4 * interval '1 millisecond'), now())
-     ON CONFLICT (chain_key, contract) DO UPDATE
-       SET owner_id = EXCLUDED.owner_id,
-           lease_until = EXCLUDED.lease_until,
-           updated_at = now()
-       WHERE indexer_lease.lease_until <= now()
-          OR indexer_lease.owner_id = EXCLUDED.owner_id
-     RETURNING owner_id, lease_until`,
-    [params.chainKey, params.contract, params.ownerId, params.ttlMs],
-  );
-  const row = rows[0];
-  if (rowCount === 0 || row === undefined) return null;
-  return {
-    chainKey: params.chainKey,
-    contract: params.contract,
-    ownerId: text(row, "owner_id"),
-    leaseUntil: timestamp(row, "lease_until"),
-  };
-}
-
-export async function assertLeaseHeld(
-  db: Queryable,
-  params: {
-    readonly chainKey: string;
-    readonly contract: string;
-    readonly ownerId: string;
-    readonly ttlMs?: number;
-  },
-): Promise<void> {
-  const { rowCount } = await db.query(
-    `UPDATE indexer_lease
-        SET lease_until = CASE
-              WHEN $4::bigint IS NULL THEN lease_until
-              ELSE clock_timestamp() + ($4 * interval '1 millisecond')
-            END,
-            updated_at = clock_timestamp()
-      WHERE chain_key = $1
-        AND contract = $2
-        AND owner_id = $3
-        AND lease_until > clock_timestamp()
-     RETURNING owner_id`,
-    [params.chainKey, params.contract, params.ownerId, params.ttlMs ?? null],
-  );
-  if (rowCount === 0) {
-    throw new LeaseLostError(params.chainKey, params.contract, params.ownerId);
-  }
-}
-
-export async function releaseLease(
-  db: Queryable,
-  params: {
-    readonly chainKey: string;
-    readonly contract: string;
-    readonly ownerId: string;
-  },
-): Promise<boolean> {
-  const { rowCount } = await db.query(
-    `DELETE FROM indexer_lease
-      WHERE chain_key = $1 AND contract = $2 AND owner_id = $3`,
-    [params.chainKey, params.contract, params.ownerId],
-  );
-  return rowCount > 0;
-}
+export {
+  acquireLease,
+  assertLeaseHeld,
+  LeaseLostError,
+  releaseLease,
+  type WatcherLease,
+} from "../writers.js";
 
 // --------------------------------------------------------------------------------------------
 // Durable Stellar history-gap tracking (#29)
@@ -622,6 +537,8 @@ export interface EventContext {
   readonly ledger: number;
   readonly txHash: string;
   readonly closedAt: Date;
+  /** The immutable `source_event` the watcher recorded for this event, if any. */
+  readonly sourceEventId?: bigint;
 }
 
 function positionOf(context: EventContext): Position {
@@ -635,6 +552,7 @@ function positionOf(context: EventContext): Position {
     // read as if the two chains agreed about something they do not.
     logIndex: null,
     observedAt: context.closedAt,
+    ...(context.sourceEventId === undefined ? {} : { sourceEventId: context.sourceEventId }),
   };
 }
 

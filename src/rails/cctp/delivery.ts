@@ -11,13 +11,18 @@ import {
 import { createPublicClient, http, type Hex } from "viem";
 import type { AppConfig } from "../../config/config.js";
 import type { Queryable } from "../../db/pool.js";
-import { bigintOf, text } from "../../db/rows.js";
+import { bigintOf, text, textOrNull } from "../../db/rows.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 import type { VerifiedDelivery } from "../axelar/delivery.js";
-import { inspectCctpMessage, inspectCctpPayment, type ExpectedCctpTransfer } from "./events.js";
+import {
+  cctpMessageIdentity,
+  inspectCctpMessage,
+  inspectCctpPayment,
+  type ExpectedCctpTransfer,
+} from "./events.js";
 import type { CctpVerificationFailure } from "../types.js";
 
-export async function verifyCctpDelivery(
+export async function inspectCctpDelivery(
   config: AppConfig,
   db: Queryable,
   transfer: PendingTransfer,
@@ -53,12 +58,29 @@ export async function verifyCctpDelivery(
     destination.cctpDomain === null
   )
     return failed("configuration_unavailable");
+  const raw = report.messageBytes as Hex;
+  const identity = cctpMessageIdentity(raw);
+  if (
+    !identity ||
+    (report.messageNonce != null && report.messageNonce.toLowerCase() !== identity.nonce) ||
+    (report.messageDigest != null && report.messageDigest.toLowerCase() !== identity.digest)
+  )
+    return failed("invalid_message");
+  // Every burn binding the queue knows must hold on the stored source row, not only its id.
   const { rows } = await db.query(
-    "SELECT token, net_amount, destination FROM outbound_transfer WHERE id = $1",
-    [String(transfer.transferId)],
+    `SELECT origin_chain, nonce, origin_tx, destination_chain, token, net_amount, destination
+       FROM outbound_transfer WHERE id = $1 AND route = $2`,
+    [String(transfer.transferId), transfer.route],
   );
   const stored = rows[0];
-  if (!stored) return failed("source_transfer_missing");
+  if (
+    !stored ||
+    text(stored, "origin_chain") !== transfer.originChain ||
+    bigintOf(stored, "nonce") !== transfer.nonce ||
+    text(stored, "origin_tx") !== transfer.originTx ||
+    text(stored, "destination_chain") !== transfer.destinationChain
+  )
+    return failed("source_transfer_missing");
   if (text(stored, "token") !== sourceToken.sacId) return failed("token_mismatch");
   const expected: ExpectedCctpTransfer = {
     sourceToken: sourceToken.sacId,
@@ -71,9 +93,17 @@ export async function verifyCctpDelivery(
     recipient: toEvmAddress(text(stored, "destination") as Hex),
     sourceAmount: bigintOf(stored, "net_amount"),
   };
-  const raw = report.messageBytes as Hex;
   const message = inspectCctpMessage(raw, expected);
   if (message.failure !== null) return failed(message.failure);
+  // One message mints once. An exact repeat for this transfer is replayable and upserts the same
+  // row; the same full nonce already credited to a different transfer is never re-associated.
+  const { rows: prior } = await db.query(
+    `SELECT source_transfer_id FROM inbound_delivery
+      WHERE destination_chain = $1 AND route = $2 AND lower(rail_message_id) = $3`,
+    [transfer.destinationChain, transfer.route, identity.nonce],
+  );
+  if (prior.some((row) => textOrNull(row, "source_transfer_id") !== String(transfer.transferId)))
+    return failed("message_already_delivered");
   const client = createPublicClient({
     transport: http(destination.defaultRpcUrl, { timeout: 15000, retryCount: 0 }),
   });
@@ -102,7 +132,7 @@ export async function verifyCctpDelivery(
       route: transfer.route,
       sourceChain: transfer.originChain,
       sourceNonce: transfer.nonce,
-      railMessageId: message.message.nonce,
+      railMessageId: identity.nonce,
       recipient: expected.recipient.toLowerCase(),
       token: token.address.toLowerCase(),
       amount: message.amount,
@@ -111,4 +141,14 @@ export async function verifyCctpDelivery(
       cctpFeeReconciliation: message.feeReconciliation,
     },
   });
+}
+
+/** Proof-only callers retain the established nullable verifier contract. */
+export async function verifyCctpDelivery(
+  config: AppConfig,
+  db: Queryable,
+  transfer: PendingTransfer,
+  report: RailReport,
+): Promise<VerifiedDelivery | null> {
+  return (await inspectCctpDelivery(config, db, transfer, report)).delivery;
 }

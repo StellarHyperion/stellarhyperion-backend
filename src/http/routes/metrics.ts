@@ -1,3 +1,5 @@
+import { readHistoricalCoverage, type CoverageSource } from "../historical-coverage.js";
+import { evaluateFreshnessSlo } from "../../runtime/freshness.js";
 /**
  * Metrics REST API endpoint.
  *
@@ -7,7 +9,14 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { integer, text, textOrNull } from "../../db/rows.js";
+import {
+  evaluateHeartbeatFreshness,
+  readWorkerHeartbeats,
+  type WorkerHeartbeatRecord,
+} from "../../runtime/readiness.js";
 import type { ServerDeps } from "../server.js";
+import { readProofRejectionMetrics } from "../proof-rejection-metrics.js";
+import { readKeeperSubmissionMetrics } from "../../keeper/outcomes.js";
 
 export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
@@ -56,17 +65,79 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       updatedAt: new Date(row.updated_at as string | number | Date).toISOString(),
     }));
 
-    // 6. Durable Stellar history-gap reconciliation status (#29)
-    const gapResult = await db.query(
-      "SELECT status, count(*)::int AS count FROM stellar_history_gap GROUP BY status",
-    );
-    const historyGaps = { open: 0, reconciling: 0, reconciled: 0 };
-    for (const row of gapResult.rows) {
-      const status = text(row, "status");
-      const count = integer(row, "count");
-      if (status === "open" || status === "reconciling" || status === "reconciled") {
-        historyGaps[status] = count;
+    const configuredSources: CoverageSource[] = [];
+    const stellar = deps.config.indexer.stellar;
+    if (stellar !== null)
+      configuredSources.push({
+        chain: stellar.chain,
+        family: "stellar",
+        contract: stellar.routerContractId,
+      });
+    for (const evm of deps.config.indexer.evm)
+      configuredSources.push({ chain: evm.chain, family: "evm", contract: evm.routerAddress });
+    const { historyGaps, historicalCoverage } = await readHistoricalCoverage(db, configuredSources);
+
+    const proofRejections = await readProofRejectionMetrics(db);
+
+    // 7. Persistent worker heartbeats & freshness (#107)
+    let heartbeatRecords: WorkerHeartbeatRecord[] = [];
+    try {
+      heartbeatRecords = await readWorkerHeartbeats(db);
+    } catch (error) {
+      if (
+        typeof error !== "object" ||
+        error === null ||
+        !("code" in error) ||
+        (error as { code?: unknown }).code !== "42P01"
+      ) {
+        throw error;
       }
+    }
+
+    const now = new Date();
+    let staleWorkers = 0;
+    let degradedWorkers = 0;
+    let downWorkers = 0;
+    const workers = heartbeatRecords.map((hb) => {
+      const freshness = evaluateHeartbeatFreshness(hb, now);
+      if (freshness.stale) staleWorkers += 1;
+      if (freshness.report.state === "degraded") degradedWorkers += 1;
+      if (freshness.report.state === "down") downWorkers += 1;
+      return {
+        name: hb.workerName,
+        kind: hb.workerKind,
+        chain: hb.chainKey,
+        state: freshness.report.state,
+        detail: freshness.report.detail,
+        lastHeartbeatAt: hb.lastHeartbeatAt.toISOString(),
+        lastCompletedAt: hb.lastCompletedAt ? hb.lastCompletedAt.toISOString() : null,
+        lastCursorBlock: hb.lastCursorBlock,
+        consecutiveFailures: hb.consecutiveFailures,
+        lastError: hb.lastError,
+        stale: freshness.stale,
+        ageSeconds: freshness.ageSeconds,
+      };
+    });
+
+    const freshnessSlo = await evaluateFreshnessSlo(db, deps.config);
+    const database = typeof db.telemetrySnapshot === "function" ? db.telemetrySnapshot() : null;
+    let keeperSubmissions = {
+      simulated: 0,
+      submitted: 0,
+      pending: 0,
+      confirmed: 0,
+      failed: 0,
+    };
+    try {
+      keeperSubmissions = await readKeeperSubmissionMetrics(db);
+    } catch (error) {
+      if (!(
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        error.code === "42P01"
+      ))
+        throw error;
     }
 
     return reply.send({
@@ -81,6 +152,22 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       railAttestations: railStatusCounts,
       cursors,
       historyGaps,
+      historicalCoverage,
+      proofRejections: proofRejections.total,
+      proofRejectionsByRail: proofRejections.byRail,
+      proofRejectionIngestion: proofRejections.ingestion,
+      proofRejectionCoverage: proofRejections.coverage,
+      freshnessSlo,
+      database,
+      deploymentMode: deps.config.deploymentMode,
+      workers,
+      freshness: {
+        totalWorkers: workers.length,
+        staleWorkers,
+        degradedWorkers,
+        downWorkers,
+      },
+      keeperSubmissions,
     });
   });
 }

@@ -33,6 +33,7 @@ import type {
   AttestationStatus,
 } from "../types.js";
 import { RailError } from "../types.js";
+import { cctpMessageIdentity } from "./events.js";
 
 /** Circle's own status values. */
 const PENDING = "pending_confirmations";
@@ -52,6 +53,21 @@ const EXPIRED_STATUSES = new Set(["expired"]);
 
 /** What Circle asks for after a 429, which it does not put in a header. */
 const RATE_LIMIT_COOLDOWN_MS = 5 * 60_000;
+
+/** Keep an untrusted provider response from consuming unbounded worker memory. */
+export const MAX_IRIS_RESPONSE_BYTES = 2 * 1024 * 1024;
+/** CCTP messages are fixed-format and small; this leaves room for future v2 fields. */
+export const MAX_IRIS_MESSAGE_BYTES = 64 * 1024;
+/** Attestations are signatures, not arbitrary provider documents. */
+export const MAX_IRIS_ATTESTATION_BYTES = 128 * 1024;
+const MAX_IRIS_ERROR_BYTES = 16 * 1024;
+
+export class IrisResourceLimitError extends RailError {
+  readonly category = "provider_resource_limit";
+  constructor(detail: string) {
+    super("cctp", "permanent", `resource limit exceeded: ${detail}`);
+  }
+}
 
 export interface FastAttestationMetadata {
   readonly signature?: unknown;
@@ -261,8 +277,9 @@ export class IrisClient implements RailClient {
 
     let body: unknown;
     try {
-      body = await response.json();
+      body = await readJson(response, MAX_IRIS_RESPONSE_BYTES);
     } catch (cause) {
+      if (cause instanceof RailError) throw cause;
       throw new RailError(this.rail, "transient", `response was not json: ${describe(cause)}`);
     }
 
@@ -295,6 +312,11 @@ export class IrisClient implements RailClient {
     // A 200 with no messages is the same situation as a 404 and both happen. Reporting it as a
     // failure would be reporting the normal case.
     if (message === undefined) return { kind: "missing" };
+
+    const limit = messageLimitViolation(message);
+    if (limit !== null) {
+      throw new IrisResourceLimitError(limit);
+    }
 
     return { kind: "found", report: reportFor(message) };
   }
@@ -367,7 +389,20 @@ export function reportFor(message: IrisMessage): RailReport {
         : typeof message.rawMessage === "string"
           ? message.rawMessage
           : null;
-  const messageBytes = rawMessage !== null && rawMessage.length <= 8192 ? rawMessage : null;
+  const candidateBytes = rawMessage !== null && rawMessage.length <= 8192 ? rawMessage : null;
+  // Bind the provider record to the exact message it carries. A provider nonce that contradicts
+  // the message's own full nonce means the record cannot be trusted to describe that message, so
+  // the message is withheld rather than attributed to a reference it does not belong to.
+  const identity = candidateBytes === null ? null : cctpMessageIdentity(candidateBytes);
+  const eventNonce =
+    typeof message.eventNonce === "string"
+      ? safeReference(message.eventNonce)
+      : typeof message.eventNonce === "number" && Number.isSafeInteger(message.eventNonce)
+        ? String(message.eventNonce)
+        : null;
+  const consistent = identity === null || providerNonceMatches(eventNonce, identity.nonce);
+  const messageBytes = consistent ? candidateBytes : null;
+  const reference = identity !== null ? (consistent ? identity.nonce : null) : nonce;
 
   let attestationSignature: string | null = null;
   if (
@@ -436,15 +471,33 @@ export function reportFor(message: IrisMessage): RailReport {
       : {}),
     status: mapped,
     railStatus,
-    reference: nonce,
+    reference,
     attestedAt: attested ? (attestationTimestamp ?? new Date()) : null,
     message: messageBytes,
     messageBytes,
+    messageNonce: consistent ? (identity?.nonce ?? null) : null,
+    messageDigest: consistent ? (identity?.digest ?? null) : null,
     attestation: attestationSignature,
     attestationSignature,
     attestationTimestamp,
     fastTransfer: isFast,
   };
+}
+
+/**
+ * Whether Circle's displayed reference agrees with the message's full nonce.
+ *
+ * Iris may show the full word or only the bottom eight bytes in decimal. The shortened form is
+ * accepted as agreement but never used as an identity, because many full nonces share it.
+ */
+function providerNonceMatches(reference: string | null, fullNonce: string): boolean {
+  if (reference === null) return true;
+  if (/^0x[0-9a-fA-F]{64}$/.test(reference)) return reference.toLowerCase() === fullNonce;
+  if (/^\d{1,78}$/.test(reference)) {
+    const displayed = BigInt(`0x${fullNonce.slice(-16)}`);
+    return BigInt(reference) === displayed;
+  }
+  return false;
 }
 
 function safeRailPart(value: unknown): string | null {
@@ -555,15 +608,84 @@ export function domainFor(chainKey: string): number {
 
 async function describeError(response: Response): Promise<string> {
   try {
-    const body = (await response.json()) as { error?: unknown; message?: unknown };
+    const body = (await readJson(response, MAX_IRIS_ERROR_BYTES)) as {
+      error?: unknown;
+      message?: unknown;
+    };
     // Two shapes, both real: the reference documents `{code, message}` and the sandbox returns
     // `{error}`.
     if (typeof body.error === "string") return body.error;
     if (typeof body.message === "string") return body.message;
     return "no reason given";
-  } catch {
+  } catch (error) {
+    if (error instanceof IrisResourceLimitError) throw error;
     return "no reason given";
   }
+}
+
+async function readJson(response: Response, maxBytes: number): Promise<unknown> {
+  if (response.body === null) {
+    throw new SyntaxError("empty provider body");
+  }
+
+  const contentLength = response.headers.get("content-length");
+  if (contentLength !== null && /^\d+$/.test(contentLength) && Number(contentLength) > maxBytes) {
+    await response.body.cancel().catch(() => undefined);
+    throw new IrisResourceLimitError(`response exceeds ${maxBytes} bytes`);
+  }
+
+  const reader: ReadableStreamDefaultReader<unknown> = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!(value instanceof Uint8Array))
+        throw new RailError("cctp", "transient", "invalid provider byte stream");
+      size += value.byteLength;
+      if (size > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new IrisResourceLimitError(`response exceeds ${maxBytes} bytes`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+
+function messageLimitViolation(message: IrisMessage): string | null {
+  const messageFields = [message.message, message.messageBytes, message.rawMessage];
+  if (
+    messageFields.some(
+      (value) => typeof value === "string" && value.length > MAX_IRIS_MESSAGE_BYTES,
+    )
+  ) {
+    return `message exceeds ${MAX_IRIS_MESSAGE_BYTES} characters`;
+  }
+  const attestationFields = [
+    message.attestation,
+    message.signature,
+    message.attestationSignature,
+    message.fastAttestation?.attestation,
+    message.fastAttestation?.signature,
+  ];
+  if (
+    attestationFields.some(
+      (value) => typeof value === "string" && value.length > MAX_IRIS_ATTESTATION_BYTES,
+    )
+  ) {
+    return `attestation exceeds ${MAX_IRIS_ATTESTATION_BYTES} characters`;
+  }
+  return null;
 }
 
 function describe(cause: unknown): string {
