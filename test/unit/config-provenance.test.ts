@@ -6,7 +6,7 @@ import {
   computeConfigDigest,
   type ConfigProvenanceEntry,
 } from "../../src/config/config.js";
-import { completeEnv } from "../helpers.js";
+import { completeEnv, readFixture } from "../helpers.js";
 import { buildServer } from "../../src/http/server.js";
 import { createLogger } from "../../src/logging/logger.js";
 import type { Database } from "../../src/db/pool.js";
@@ -78,9 +78,9 @@ describe("configuration provenance and effective-setting reports", () => {
     expect(logLevelEntry?.source).toBe("default");
     expect(logLevelEntry?.value).toBe("info");
 
-    const hostEntry = config.configProvenance.find((e) => e.name === "HTTP_HOST");
-    expect(hostEntry?.source).toBe("default");
-    expect(hostEntry?.value).toBe("127.0.0.1");
+    const portEntry = config.configProvenance.find((e) => e.name === "HTTP_PORT");
+    expect(portEntry?.source).toBe("default");
+    expect(portEntry?.value).toBe("8080");
   });
 
   it("marks settings from environment overrides with source 'env'", () => {
@@ -116,7 +116,7 @@ describe("configuration provenance and effective-setting reports", () => {
     const config = loadConfig({
       env: completeEnv({
         STELLAR_START_LEDGER: "1500000",
-        DEPLOYMENT_REVISION: "custom-rev-1",
+        DEPLOYMENT_REVISION: "1111111111111111111111111111111111111111",
         EVM_RPC_URL_SEPOLIA: "https://sepolia.example.invalid/single",
         EVM_RPC_URLS_SEPOLIA: "https://sepolia.example.invalid/multi",
       }),
@@ -128,9 +128,9 @@ describe("configuration provenance and effective-setting reports", () => {
     expect(ledgerEntry?.conflict).toContain("overrides deployment record start ledger");
 
     const revisionEntry = config.configProvenance.find((e) => e.name === "DEPLOYMENT_REVISION");
-    expect(revisionEntry?.source).toBe("env");
-    expect(revisionEntry?.value).toBe("custom-rev-1");
-    expect(revisionEntry?.conflict).toContain("overrides deployment record revision");
+    expect(revisionEntry?.source).toBe("deployment");
+    expect(revisionEntry?.value).toBe("b302664f1d7a5c9e0348ab27dd51e6904f8c3a2b");
+    expect(revisionEntry?.conflict).toContain("expectation conflicts");
 
     const urlsEntry = config.configProvenance.find((e) => e.name === "EVM_RPC_URLS_SEPOLIA");
     expect(urlsEntry?.source).toBe("env");
@@ -138,7 +138,7 @@ describe("configuration provenance and effective-setting reports", () => {
 
     const urlEntry = config.configProvenance.find((e) => e.name === "EVM_RPC_URL_SEPOLIA");
     expect(urlEntry?.source).toBe("env");
-    expect(urlEntry?.conflict).toContain("overridden by EVM_RPC_URLS_SEPOLIA");
+    expect(urlEntry?.conflict).toContain("ignored because EVM_RPC_URLS_SEPOLIA is selected");
   });
 
   it("exports configProvenance helper accepting config or options", () => {
@@ -189,5 +189,150 @@ describe("configuration provenance and effective-setting reports", () => {
     expect(serializedHealth).not.toContain("STELLAR_HISTORICAL_RPC_URL");
 
     await app.close();
+  });
+  it("omits credential URLs, opaque host/path/owner strings and arbitrary lane keys from /health", async () => {
+    const marker = "private-credential-316";
+    const url = `https://user:${marker}@provider.invalid/${marker}?api_key=${marker}#${marker}`;
+    const config = loadConfig({
+      env: completeEnv({
+        STELLAR_RPC_URL: url,
+        EVM_RPC_URL_SEPOLIA: url,
+        EVM_RPC_URLS_SEPOLIA: url,
+        STELLAR_HISTORICAL_RPC_URL: url,
+        IRIS_API_URL: url,
+        AXELAR_API_URL: url,
+        HTTP_HOST: marker,
+        INDEXER_LEASE_OWNER_ID: marker,
+        HYPERION_DEPLOYMENTS_FILE: `/tmp/${marker}.json`,
+        FRESHNESS_LANE_TARGETS: JSON.stringify({ [marker]: { maxProofBacklogCount: 2 } }),
+      }),
+      readFile: () => readFixture("deployments-testnet.json"),
+    });
+    const app = buildServer({
+      config,
+      logger: createLogger(config),
+      db: new MockDb() as unknown as Database,
+      readiness: [],
+    });
+    try {
+      const res = await app.inject({ method: "GET", url: "/health" });
+      expect(res.statusCode).toBe(200);
+      expect(res.body).not.toContain(marker);
+      expect(res.body).not.toContain("provider.invalid");
+      expect(JSON.stringify(config.configProvenance)).not.toContain(marker);
+      expect(
+        config.configProvenance.find((entry) => entry.name === "EVM_RPC_URLS_SEPOLIA")?.value,
+      ).toBe("omitted");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("keeps the digest stable across equivalent defaults, paths, credentials, ignored overrides and target order", () => {
+    const targets = {
+      "sepolia->stellar-testnet": { maxProofBacklogCount: 3, maxProofBacklogAgeMs: 2000 },
+    };
+    const base = loadConfig({
+      env: completeEnv({
+        EVM_RPC_URLS_SEPOLIA: "https://one.invalid/key",
+        FRESHNESS_LANE_TARGETS: JSON.stringify(targets),
+      }),
+    });
+    const equivalent = loadConfig({
+      env: completeEnv({
+        LOG_LEVEL: "info",
+        HTTP_HOST: "different-host",
+        INDEXER_LEASE_OWNER_ID: "different-owner",
+        HYPERION_DEPLOYMENTS_FILE: "another-record.json",
+        DATABASE_URL: "postgres://other:password@127.0.0.1/db",
+        STELLAR_RPC_URL: "https://other.invalid/private",
+        EVM_RPC_URLS_SEPOLIA: "https://other.invalid/private",
+        EVM_RPC_URL_SEPOLIA: "ignored-invalid-value",
+        EVM_RPC_URL_ARC_TESTNET: "inactive-invalid-value",
+        DEPLOYMENT_REVISION: "1111111111111111111111111111111111111111",
+        FRESHNESS_LANE_TARGETS: JSON.stringify({
+          "sepolia->stellar-testnet": { maxProofBacklogAgeMs: 2000, maxProofBacklogCount: 3 },
+          "base-sepolia": { ...base.freshnessSlo.defaults },
+        }),
+      }),
+      readFile: () => readFixture("deployments-testnet.json"),
+    });
+    expect(equivalent.configDigest).toBe(base.configDigest);
+    expect(equivalent.configProvenance.find((entry) => entry.name === "LOG_LEVEL")?.source).toBe(
+      "env",
+    );
+  });
+
+  it("uses every selected deployment revision with stable ordering and detects changes beyond the first record", () => {
+    const fixture = JSON.parse(readFixture("deployments-testnet.json")) as {
+      networks: Record<string, { commit: string }>;
+    };
+    const sepolia = fixture.networks.sepolia;
+    if (sepolia === undefined) throw new Error("missing deployment fixture");
+    sepolia.commit = "1234567";
+    const changed = loadConfig({ env: completeEnv(), readFile: () => JSON.stringify(fixture) });
+    const reversed = {
+      ...fixture,
+      networks: Object.fromEntries(Object.entries(fixture.networks).reverse()),
+    };
+    const reordered = loadConfig({ env: completeEnv(), readFile: () => JSON.stringify(reversed) });
+    expect(changed.configDigest).toBe(reordered.configDigest);
+    expect(changed.configDigest).not.toBe(loadConfig({ env: completeEnv() }).configDigest);
+    expect(
+      changed.configProvenance.find((entry) => entry.name === "DEPLOYMENT_REVISION_SEPOLIA")?.value,
+    ).toBe("1234567");
+    expect(
+      changed.configProvenance.find((entry) => entry.name === "DEPLOYMENT_REVISION")?.value,
+    ).toContain("1234567");
+  });
+
+  it("rejects unsafe requested and selected revisions before a report escapes without echoing them", () => {
+    const unsafe = "https://user:private-revision@host.invalid";
+    expect(() => loadConfig({ env: completeEnv({ DEPLOYMENT_REVISION: unsafe }) })).toThrow(
+      "hexadecimal Git commit",
+    );
+    try {
+      loadConfig({ env: completeEnv({ DEPLOYMENT_REVISION: unsafe }) });
+    } catch (error) {
+      expect(String(error)).not.toContain(unsafe);
+    }
+    const fixture = JSON.parse(readFixture("deployments-testnet.json")) as {
+      networks: Record<string, { commit: string }>;
+    };
+    const sepolia = fixture.networks.sepolia;
+    if (sepolia === undefined) throw new Error("missing deployment fixture");
+    sepolia.commit = unsafe;
+    expect(() =>
+      loadConfig({ env: completeEnv(), readFile: () => JSON.stringify(fixture) }),
+    ).toThrow();
+  });
+
+  it("ignores worker tuning for disabled workers in the effective digest", () => {
+    const disabled = {
+      INDEXER_ENABLED: "false",
+      RAILS_ENABLED: "false",
+      KEEPER_ENABLED: "false",
+      CATCH_UP_ENABLED: "false",
+    };
+    const base = loadConfig({ env: completeEnv(disabled) });
+    const changed = loadConfig({
+      env: completeEnv({
+        ...disabled,
+        STELLAR_EVENT_PAGE_SIZE: "50",
+        EVM_LOG_RANGE: "100",
+        RAIL_BATCH_SIZE: "5",
+        KEEPER_CONCURRENCY: "2",
+        CATCH_UP_BUDGET_MS: "1000",
+      }),
+    });
+    expect(changed.configDigest).toBe(base.configDigest);
+  });
+  it("changes the digest when effective deployed token decimals change without a commit label change", () => {
+    const fixture = JSON.parse(readFixture("deployments-testnet.json")) as {
+      networks: { sepolia: { tokens: { USDC: { decimals: number } } } };
+    };
+    fixture.networks.sepolia.tokens.USDC.decimals = 18;
+    const changed = loadConfig({ env: completeEnv(), readFile: () => JSON.stringify(fixture) });
+    expect(changed.configDigest).not.toBe(loadConfig({ env: completeEnv() }).configDigest);
   });
 });
