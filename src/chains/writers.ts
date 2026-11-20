@@ -1,4 +1,4 @@
-import type { CctpVerificationFailure } from "../rails/types.js";
+import type { CctpFeeReconciliation, CctpVerificationFailure } from "../rails/types.js";
 import { bounded, safeString } from "../rails/axelar/gmp.js";
 /**
  * Every statement that writes an indexed row, in one file, for both chain families.
@@ -233,7 +233,11 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
            claim_id = EXCLUDED.claim_id,
            destination_block = EXCLUDED.destination_block,
            destination_tx = EXCLUDED.destination_tx,
-           destination_log_index = EXCLUDED.destination_log_index
+           destination_log_index = EXCLUDED.destination_log_index,
+           cctp_burned_amount_source_units = EXCLUDED.cctp_burned_amount_source_units,
+           cctp_forwarding_budget_destination_units = EXCLUDED.cctp_forwarding_budget_destination_units,
+           cctp_executed_deduction_destination_units = EXCLUDED.cctp_executed_deduction_destination_units,
+           cctp_actual_payout_destination_units = EXCLUDED.cctp_actual_payout_destination_units
      RETURNING id`,
     [
       at.chainKey,

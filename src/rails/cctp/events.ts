@@ -105,7 +105,13 @@ export function inspectCctpMessage(
       return invalidMessage("recipient_mismatch");
     if (expected.sourceAmount % 10n !== 0n || burn.amount !== expected.sourceAmount / 10n)
       return invalidMessage("amount_mismatch");
-    if (burn.feeExecuted > burn.maxFee || burn.feeExecuted < 0n || burn.feeExecuted >= burn.amount)
+    if (
+      burn.maxFee < 0n ||
+      burn.maxFee >= burn.amount ||
+      burn.feeExecuted > burn.maxFee ||
+      burn.feeExecuted < 0n ||
+      burn.feeExecuted >= burn.amount
+    )
       return invalidMessage("fee_mismatch");
     if (message.finalityThresholdExecuted < 2000) return invalidMessage("finality_mismatch");
     const actualPayout = burn.amount - burn.feeExecuted;

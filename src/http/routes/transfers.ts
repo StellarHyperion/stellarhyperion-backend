@@ -173,6 +173,48 @@ function deriveStage(
   return "initiated";
 }
 
+/** Publish only a complete, self-consistent canonical delivery accounting record. */
+function formatCctpFeeReconciliation(
+  row: Record<string, unknown>,
+  receivedAmount: string | null,
+): FormattedTransfer["destination"]["cctpFeeReconciliation"] {
+  if (row.inbound_delivered !== true || integer(row, "route") !== 0) return null;
+  const names = [
+    "cctp_burned_amount_source_units",
+    "cctp_forwarding_budget_destination_units",
+    "cctp_executed_deduction_destination_units",
+    "cctp_actual_payout_destination_units",
+  ] as const;
+  const values = names.map((name) => textOrNull(row, name));
+  if (receivedAmount === null || !/^[0-9]{1,78}$/.test(receivedAmount)) return null;
+  if (values.some((value) => value === null || !/^[0-9]{1,78}$/.test(value))) return null;
+  const [burned, budget, deduction, payout] = values.map((value) => BigInt(value ?? "0"));
+  if (
+    burned === undefined ||
+    budget === undefined ||
+    deduction === undefined ||
+    payout === undefined
+  )
+    return null;
+  if (
+    burned <= 0n ||
+    burned % 10n !== 0n ||
+    budget >= burned / 10n ||
+    deduction > budget ||
+    payout <= 0n ||
+    payout !== BigInt(receivedAmount) ||
+    burned / 10n !== deduction + payout
+  )
+    return null;
+  return {
+    burnedAmount: { amount: burned.toString(), unit: "USDC", decimals: 7 },
+    forwardingBudget: { amount: budget.toString(), unit: "USDC", decimals: 6 },
+    executedDeduction: { amount: deduction.toString(), unit: "USDC", decimals: 6 },
+    actualPayout: { amount: payout.toString(), unit: "USDC", decimals: 6 },
+    plannedMinimum: { amount: (burned / 10n - budget).toString(), unit: "USDC", decimals: 6 },
+  };
+}
+
 function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTransfer {
   const chain = text(row, "origin_chain");
   const token = text(row, "token");

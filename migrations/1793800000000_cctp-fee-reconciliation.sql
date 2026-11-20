@@ -21,7 +21,11 @@ ALTER TABLE inbound_delivery
     OR (
       cctp_burned_amount_source_units > 0
       AND cctp_burned_amount_source_units % 10 = 0
+      AND route = 0
+      AND delivered = true
+      AND source_transfer_id IS NOT NULL
       AND cctp_forwarding_budget_destination_units >= 0
+      AND cctp_forwarding_budget_destination_units < div(cctp_burned_amount_source_units, 10)
       AND cctp_executed_deduction_destination_units >= 0
       AND cctp_executed_deduction_destination_units
         <= cctp_forwarding_budget_destination_units

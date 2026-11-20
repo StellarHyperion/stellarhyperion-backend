@@ -131,6 +131,21 @@ describe("CCTP forwarded destination proof", () => {
       inspectCctpMessage(raw, { ...expected, sourceAmount: expected.sourceAmount + 10n }).failure,
     ).toBe("amount_mismatch");
   });
+  it.each([
+    [280, expected.sourceAmount / 10n],
+    [280, expected.sourceAmount / 10n + 1n],
+    [312, 500001n],
+    [312, expected.sourceAmount / 10n],
+  ])("rejects inconsistent fee accounting at message offset %i", (offset, value) => {
+    const changed = hexToBytes(raw);
+    changed.set(word(`0x${value.toString(16)}`), offset);
+    expect(inspectCctpMessage(toHex(changed), expected).failure).toBe("fee_mismatch");
+  });
+  it("rejects a seven-decimal burn that cannot be converted exactly", () => {
+    expect(
+      inspectCctpMessage(raw, { ...expected, sourceAmount: expected.sourceAmount + 1n }).failure,
+    ).toBe("amount_mismatch");
+  });
   it.each(["destinationMessenger", "recipient"] as const)("refuses a different %s", (field) => {
     expect(verifiedCctpMessage(raw, { ...expected, [field]: expected.token })).toBeNull();
   });
@@ -444,7 +459,7 @@ describe("CCTP full message identity", () => {
       },
       {
         sourceTransferId: 7n,
-        route: 2,
+        route: RouteKind.Cctp,
         sourceChain: "stellar-testnet",
         sourceNonce: 8n,
         railMessageId: nonce,

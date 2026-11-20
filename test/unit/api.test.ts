@@ -167,7 +167,7 @@ describe("REST API endpoints", () => {
           id: "7",
           origin_chain: "stellar-testnet",
           origin_router: "",
-          route: 2,
+          route: 0,
           nonce: "8",
           sender: "GABC",
           token: "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
@@ -221,7 +221,7 @@ describe("REST API endpoints", () => {
       forwardingBudget: { amount: "500000", unit: "USDC", decimals: 6 },
       executedDeduction: { amount: "100000", unit: "USDC", decimals: 6 },
       actualPayout: { amount: "99600000", unit: "USDC", decimals: 6 },
-      plannedMinimum: { amount: "99700000", unit: "USDC", decimals: 6 },
+      plannedMinimum: { amount: "99200000", unit: "USDC", decimals: 6 },
     });
   });
 
