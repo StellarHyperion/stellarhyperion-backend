@@ -9,12 +9,25 @@ export interface TtlBumpPayload {
 export interface ClaimSettlementPayload {
   readonly limit?: number;
 }
+export interface KeeperOperationPreview {
+  readonly kind: "keep_alive" | "settle_claim";
+  readonly contract: string;
+  readonly method: "keep_alive" | "settle_claim";
+  readonly targetKeys: readonly string[];
+  readonly args: Readonly<Record<string, unknown>>;
+  readonly estimatedFee: string;
+  readonly unsigned: true;
+}
 export interface TtlBumpResult {
   readonly bumpedTokens: number;
   readonly bumpedClaims: number;
   readonly bumpedTransfers: number;
   readonly dryRun: boolean;
   readonly detail: string;
+  readonly operations: readonly KeeperOperationPreview[];
+  readonly targetKeys: readonly string[];
+  readonly estimatedFee: string;
+  readonly unsigned: boolean;
 }
 export interface ClaimSettlementResult {
   readonly settled: number;
@@ -22,6 +35,10 @@ export interface ClaimSettlementResult {
   readonly pending: number;
   readonly dryRun: boolean;
   readonly detail: string;
+  readonly operations: readonly KeeperOperationPreview[];
+  readonly targetKeys: readonly string[];
+  readonly estimatedFee: string;
+  readonly unsigned: boolean;
 }
 export type KeeperJobResult =
   | { readonly kind: "ttl-bump"; readonly result: TtlBumpResult }

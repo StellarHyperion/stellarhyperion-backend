@@ -16,8 +16,11 @@ class Db {
       rows: sql.includes("INSERT INTO keeper_submission")
         ? [{ id: "9223372036854775000" }]
         : sql.includes("pending_claim")
-          ? [{ claim_id: "1" }, { claim_id: "2" }]
-          : [{ nonce: "3" }],
+          ? [
+              { claim_id: "1", recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", amount: "90000000000000000001" },
+              { claim_id: "9223372036854775807", recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", amount: "42" },
+            ]
+          : [{ nonce: "9223372036854775808" }],
       rowCount: 2,
     });
   }
@@ -87,6 +90,19 @@ describe("Stellar keeper execution", () => {
     const result = await processClaimSettlement({ config, db: new Db(), logger });
     expect(result.attempted).toBe(0);
     expect(result.settled).toBe(0);
+    expect(result.dryRun).toBe(true);
+    expect(result.unsigned).toBe(true);
+    expect(result.operations).toHaveLength(2);
+    expect(result.operations[0]?.args).toEqual({
+      claimId: "1",
+      recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+      amount: "90000000000000000001",
+    });
+    expect(result.operations[1]?.args).toEqual({
+      claimId: "9223372036854775807",
+      recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+      amount: "42",
+    });
     expect(submitStellar).not.toHaveBeenCalled();
   });
   it("reports disabled versus not-started worker states", () => {
@@ -94,5 +110,25 @@ describe("Stellar keeper execution", () => {
     expect(new KeeperWorker(config, new Db(), logger).readiness().state).toBe("degraded");
     const disabled = loadConfig({ env: completeEnv({ KEEPER_ENABLED: "false" }) });
     expect(new KeeperWorker(disabled, new Db(), logger).readiness().state).toBe("ready");
+  });
+  it("matches plan previews and handles full-width values", async () => {
+    const config = loadConfig({
+      env: completeEnv({ KEEPER_STELLAR_SECRET: Keypair.random().secret() }),
+    });
+    vi.mocked(submitStellar).mockResolvedValue("confirmed-hash");
+    const result = await processTtlBump({ config, db: new Db(), logger });
+    expect(result.dryRun).toBe(false);
+    expect(result.bumpedClaims).toBe(2);
+    expect(result.bumpedTransfers).toBe(1);
+    expect(result.unsigned).toBe(false);
+    expect(result.operations).toHaveLength(1);
+    expect(result.operations[0]?.args).toEqual({
+      tokens: [expect.any(String)],
+      routes: [0, 1, 2, 3],
+      claimIds: ["1", "9223372036854775807"],
+      transferIds: ["9223372036854775808"],
+    });
+    expect(result.targetKeys).toContain("claim:" + config.indexer.stellar?.chain + ":9223372036854775807");
+    expect(JSON.stringify(result)).not.toContain(Keypair.random().secret());
   });
 });
