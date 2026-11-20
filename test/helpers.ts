@@ -302,8 +302,10 @@ export class RateLimitSimulator implements RailClient {
       const status = lookup.report.status;
       if (status === "delivered" || (status !== "pending" && status !== "failed")) {
         // Strip delivery-only fields so the report is a valid "pending" RailReport.
-        // We destructure to omit rather than set to undefined (exactOptionalPropertyTypes).
-        const { forwardTxHash: _fwd, execution: _exec, ...rest } = lookup.report;
+        // We omit delivery fields rather than set to undefined (exactOptionalPropertyTypes).
+        const rest = { ...lookup.report };
+        delete (rest as { forwardTxHash?: unknown }).forwardTxHash;
+        delete (rest as { execution?: unknown }).execution;
         return {
           kind: "found",
           report: {
