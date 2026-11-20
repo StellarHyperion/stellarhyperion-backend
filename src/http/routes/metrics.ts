@@ -15,6 +15,7 @@ import {
 } from "../../runtime/readiness.js";
 import type { ServerDeps } from "../server.js";
 import { emptyProofFailureCategories, normalizeProofFailureReason } from "../proof-failure-categories.js";
+import { readKeeperSubmissionMetrics } from "../../keeper/outcomes.js";
 
 export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
@@ -134,6 +135,24 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
 
     const freshnessSlo = await evaluateFreshnessSlo(db, deps.config);
     const database = typeof db.telemetrySnapshot === "function" ? db.telemetrySnapshot() : null;
+    let keeperSubmissions = {
+      simulated: 0,
+      submitted: 0,
+      pending: 0,
+      confirmed: 0,
+      failed: 0,
+    };
+    try {
+      keeperSubmissions = await readKeeperSubmissionMetrics(db);
+    } catch (error) {
+      if (!(
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        error.code === "42P01"
+      ))
+        throw error;
+    }
 
     return reply.send({
       service: "hyperion-backend",
@@ -158,6 +177,7 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
         degradedWorkers,
         downWorkers,
       },
+      keeperSubmissions,
     });
   });
 }

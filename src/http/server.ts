@@ -15,11 +15,65 @@ import { registerHealthRoutes } from "./routes/health.js";
 import { registerMetricsRoutes } from "./routes/metrics.js";
 import { registerRouteHealthRoutes } from "./routes/routes.js";
 import { registerTransferRoutes } from "./routes/transfers.js";
+import { RequestBudgetExceededError } from "./request-budget.js";
 
 export const DEFAULT_RATE_LIMIT_MAX = 120;
 export const DEFAULT_STREAM_RATE_LIMIT_MAX = 20;
 export const DEFAULT_RATE_LIMIT_WINDOW_MS = 60_000;
 export const DEFAULT_RATE_LIMIT_CACHE_SIZE = 10_000;
+
+export type ApiErrorCode =
+  "bad_request" | "not_found" | "timeout" | "unavailable" | "internal_error" | "too_many_requests";
+
+export interface ApiErrorEnvelope {
+  readonly error: ApiErrorCode;
+  readonly code: ApiErrorCode;
+  readonly message: string;
+  readonly requestId?: string;
+  readonly retryAfterMs?: number;
+}
+
+function errorEnvelope(
+  error: ApiErrorCode,
+  message: string,
+  requestId?: string,
+  extra: Pick<ApiErrorEnvelope, "retryAfterMs"> = {},
+): ApiErrorEnvelope {
+  return {
+    error,
+    code: error,
+    message,
+    ...(requestId === undefined ? {} : { requestId }),
+    ...extra,
+  };
+}
+
+function errorCode(status: number): ApiErrorCode {
+  return status === 404
+    ? "not_found"
+    : status === 408 || status === 504
+      ? "timeout"
+      : status === 429
+        ? "too_many_requests"
+        : status === 503
+          ? "unavailable"
+          : status >= 500
+            ? "internal_error"
+            : "bad_request";
+}
+function publicErrorMessage(code: ApiErrorCode): string {
+  return code === "internal_error"
+    ? "the server could not complete that request"
+    : code === "timeout"
+      ? "the request timed out"
+      : code === "unavailable"
+        ? "the service is temporarily unavailable"
+        : code === "not_found"
+          ? "the requested resource was not found"
+          : code === "too_many_requests"
+            ? "rate limit exceeded; retry after the deployment request budget resets"
+            : "the request was invalid";
+}
 
 export interface RateLimitPolicyOptions {
   readonly enabled?: boolean;
@@ -75,6 +129,38 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     requestIdHeader: "x-request-id",
     logController: new LogController({ disableRequestLogging: deps.config.nodeEnv === "test" }),
     bodyLimit: 64 * 1024,
+  });
+
+  // Preserve legacy fields while adding a stable category and bounded public message.
+  app.addHook("onSend", (request, reply, payload, done) => {
+    if (reply.statusCode < 400 || typeof payload !== "string") {
+      done(null, payload);
+      return;
+    }
+    try {
+      const body: unknown = JSON.parse(payload);
+      if (body === null || typeof body !== "object" || Array.isArray(body)) {
+        done(null, payload);
+        return;
+      }
+      const existing = body as Record<string, unknown>;
+      const code = errorCode(reply.statusCode);
+      done(
+        null,
+        JSON.stringify({
+          ...existing,
+          error: typeof existing.error === "string" ? existing.error : code,
+          code,
+          message:
+            typeof existing.message === "string" ? existing.message : publicErrorMessage(code),
+          requestId: request.id,
+        }),
+      );
+      return;
+    } catch {
+      /* Non-JSON payloads, including SSE frames, pass through. */
+    }
+    done(null, payload);
   });
 
   // This API exposes public chain data and never accepts a signed transaction or a key.
@@ -143,6 +229,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     errorResponseBuilder: (_req, context) => ({
       statusCode: context.statusCode,
       error: "too_many_requests",
+      code: "too_many_requests",
       message:
         "rate limit exceeded; status endpoints must not be polled faster than the deployment budget",
       retryAfterMs: context.ttl,
@@ -160,18 +247,27 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   app.setNotFoundHandler((request, reply) => {
-    void reply.code(404).send({
-      error: "not_found",
-      message: `no route for ${request.method} ${request.url}`,
-    });
+    void reply
+      .code(404)
+      .send(errorEnvelope("not_found", "the requested resource was not found", request.id));
   });
 
   app.setErrorHandler((error: FastifyError, request, reply) => {
+    if (error instanceof RequestBudgetExceededError) {
+      void reply.code(504).send({
+        error: "request_budget_exceeded",
+        message: "The public read exceeded its request budget.",
+        requestId: request.id,
+      });
+      return;
+    }
     const status = error.statusCode ?? 500;
+    const code = errorCode(status);
     if (status === 429) {
       const seconds = Number(reply.getHeader("retry-after"));
       void reply.code(429).send({
         error: "too_many_requests",
+        code: "too_many_requests",
         message: "rate limit exceeded; retry after the deployment request budget resets",
         retryAfterMs: Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : timeWindow,
         requestId: request.id,
@@ -181,11 +277,8 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     // The log gets the error, the response does not. An internal error message is the kind of
     // thing that carries a table name, a file path or, on a bad day, a connection string.
     request.log.error({ err: error, status }, "request failed");
-    void reply.code(status).send({
-      error: status >= 500 ? "internal_error" : "bad_request",
-      message: status >= 500 ? "the server could not complete that request" : error.message,
-      requestId: request.id,
-    });
+    const message = publicErrorMessage(code);
+    void reply.code(status).send(errorEnvelope(code, message, request.id));
   });
 
   return app;
