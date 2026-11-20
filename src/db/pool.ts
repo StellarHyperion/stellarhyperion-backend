@@ -75,6 +75,11 @@ export interface OpenOptions {
   readonly maxConnections?: number;
   readonly connectionTimeoutMs?: number;
   readonly statementTimeoutMs?: number;
+  /** Maximum time a public statement may wait for a conflicting lock. */
+  readonly lockTimeoutMs?: number;
+  /** Longer bound for an atomic ingestion/maintenance transaction. */
+  readonly transactionStatementTimeoutMs?: number;
+  readonly transactionLockTimeoutMs?: number;
   readonly applicationName?: string;
   readonly maxLatencySamplesPerWorkload?: number;
   readonly slowQueryThresholdMs?: number;
@@ -89,6 +94,8 @@ export class Database implements Transactional {
   private readonly maxConnections: number;
   private readonly slowQueryThresholdMs: number | undefined;
   private readonly logger: OpenOptions["logger"];
+  private readonly transactionStatementTimeoutMs: number;
+  private readonly transactionLockTimeoutMs: number;
 
   private constructor(
     private readonly pool: Pool,
@@ -99,21 +106,30 @@ export class Database implements Transactional {
     this.telemetry = new DbTelemetryCollector(options.maxLatencySamplesPerWorkload);
     this.slowQueryThresholdMs = options.slowQueryThresholdMs;
     this.logger = options.logger;
+    this.transactionStatementTimeoutMs = options.transactionStatementTimeoutMs ?? 60_000;
+    this.transactionLockTimeoutMs = options.transactionLockTimeoutMs ?? 5_000;
   }
 
   static open(connectionString: string, options: OpenOptions = {}): Database {
     const maxConnections = options.maxConnections ?? 10;
+    const statementTimeoutMs = options.statementTimeoutMs ?? 30_000;
+    const lockTimeoutMs = options.lockTimeoutMs ?? 5_000;
+    const startupOptions = [
+      `-c statement_timeout=${statementTimeoutMs}`,
+      `-c lock_timeout=${lockTimeoutMs}`,
+      ...(options.readOnly ? ["-c default_transaction_read_only=on"] : []),
+    ];
     const config: PoolConfig = {
       connectionString,
       max: maxConnections,
-      ...(options.readOnly ? { options: "-c default_transaction_read_only=on" } : {}),
+      options: startupOptions.join(" "),
       connectionTimeoutMillis: options.connectionTimeoutMs ?? 10_000,
       // Named so `pg_stat_activity` says which process is holding a connection. During an
       // incident that is the difference between knowing and guessing.
       application_name: options.applicationName ?? "hyperion-backend",
       // A watcher query that has not finished in thirty seconds is wedged, not slow, and holding
       // the connection does not help it.
-      statement_timeout: options.statementTimeoutMs ?? 30_000,
+      statement_timeout: statementTimeoutMs,
     };
     const pool = new Pool(config);
     // pg emits idle-connection failures outside a query promise. Consume them so the pool can
@@ -155,6 +171,16 @@ export class Database implements Transactional {
     try {
       await this.measure("transaction", () => client.query("BEGIN"));
       const run = currentWorkerRun();
+      await this.measure("transaction", () =>
+        client.query("SELECT set_config('lock_timeout',$1,true)", [
+          `${this.transactionLockTimeoutMs}ms`,
+        ]),
+      );
+      await this.measure("transaction", () =>
+        client.query("SELECT set_config('statement_timeout',$1,true)", [
+          `${this.transactionStatementTimeoutMs}ms`,
+        ]),
+      );
       if (run !== undefined)
         await client.query("SELECT set_config('hyperion.worker_run_id',$1,true)", [run.runId]);
       const value = await work(this.wrapClient(client));
@@ -164,7 +190,7 @@ export class Database implements Transactional {
       // A rollback that itself fails means the connection is gone, in which case the server has
       // already rolled back and the original error is the one worth reporting.
       await this.measure("transaction", () => client.query("ROLLBACK")).catch(() => undefined);
-      throw error;
+      throw normalizeDatabaseError(error);
     } finally {
       client.release();
     }
@@ -245,7 +271,7 @@ export class Database implements Transactional {
       return result;
     } catch (error) {
       signal?.throwIfAborted();
-      throw error;
+      throw normalizeDatabaseError(error);
     } finally {
       signal?.removeEventListener("abort", cancel);
       if (cancellation.promise !== undefined) await cancellation.promise;
@@ -330,6 +356,22 @@ export class Database implements Transactional {
     this.closing ??= this.pool.end();
     await this.closing;
   }
+}
+
+export class DatabaseTimeoutError extends Error {
+  readonly code = "DATABASE_TIMEOUT";
+
+  constructor(kind: "statement" | "lock") {
+    super(kind === "lock" ? "Database lock wait exceeded the configured limit" : "Database operation exceeded the configured time limit");
+    this.name = "DatabaseTimeoutError";
+  }
+}
+
+function normalizeDatabaseError(error: unknown): unknown {
+  const code = (error as { code?: unknown })?.code;
+  if (code === "57014") return new DatabaseTimeoutError("statement");
+  if (code === "55P03") return new DatabaseTimeoutError("lock");
+  return error;
 }
 
 export interface MaintenanceTaskOptions {
