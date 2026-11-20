@@ -203,26 +203,30 @@ describe("independent real CCTP and ITS destination proof mutation corpus", () =
         expectedAccepted: true,
       });
       const db: Queryable = {
-        query: () =>
-          Promise.resolve({
-            rows: [
-              {
-                origin_chain: transfer.originChain,
-                origin_router: source.router,
-                nonce: transfer.nonce.toString(),
-                origin_tx: transfer.originTx,
-                destination_chain: transfer.destinationChain,
-                sender: "Gsource",
-                token: cctp.expected.sourceToken,
-                net_amount:
-                  rail === "CCTP"
-                    ? cctp.expected.sourceAmount.toString()
-                    : its.expected.amount.toString(),
-                destination: `0x${its.expected.recipient.slice(2).padStart(64, "0")}`,
-              },
-            ],
-            rowCount: 1,
-          }),
+        query: (sql: string) =>
+          Promise.resolve(
+            sql.includes("FROM inbound_delivery")
+              ? { rows: [], rowCount: 0 }
+              : {
+                  rows: [
+                    {
+                      origin_chain: transfer.originChain,
+                      origin_router: source.router,
+                      nonce: transfer.nonce.toString(),
+                      origin_tx: transfer.originTx,
+                      destination_chain: transfer.destinationChain,
+                      sender: "Gsource",
+                      token: cctp.expected.sourceToken,
+                      net_amount:
+                        rail === "CCTP"
+                          ? cctp.expected.sourceAmount.toString()
+                          : its.expected.amount.toString(),
+                      destination: `0x${its.expected.recipient.slice(2).padStart(64, "0")}`,
+                    },
+                  ],
+                  rowCount: 1,
+                },
+          ),
       };
       const stellar = vi.spyOn(rpc.Server.prototype, "simulateTransaction");
       const simulation = (value: unknown) => ({

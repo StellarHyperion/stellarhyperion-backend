@@ -8,7 +8,7 @@ import {
   toHex,
   toEvmAddress,
 } from "@hyperion/protocol";
-import { decodeEventLog, parseAbi, type Hex } from "viem";
+import { decodeEventLog, keccak256, parseAbi, type Hex } from "viem";
 import type { DeliveryLog } from "../axelar/events.js";
 import type { CctpVerificationFailure } from "../types.js";
 
@@ -27,6 +27,32 @@ export interface ExpectedCctpTransfer {
   token: string;
   recipient: string;
   sourceAmount: bigint;
+}
+
+/**
+ * The full-width identity of one exact CCTP message.
+ *
+ * The nonce is all thirty-two bytes Circle assigned, never the eight-byte `displayNonce` an
+ * explorer shows, and the digest is keccak256 over the exact message bytes. Two messages that
+ * share a displayed nonce therefore stay distinct, and a byte-for-byte repeat has one identity.
+ */
+export interface CctpMessageIdentity {
+  readonly nonce: Hex;
+  readonly digest: Hex;
+}
+
+export function cctpMessageIdentity(raw: string): CctpMessageIdentity | null {
+  if (raw.length > 8192 || !/^0x(?:[0-9a-fA-F]{2})+$/.test(raw)) return null;
+  try {
+    const message = parseCctpMessage(raw as Hex);
+    if (!/^0x[0-9a-fA-F]{64}$/.test(message.nonce)) return null;
+    return {
+      nonce: message.nonce.toLowerCase() as Hex,
+      digest: keccak256(raw.toLowerCase() as Hex),
+    };
+  } catch {
+    return null;
+  }
 }
 
 export type CctpMessageVerification =

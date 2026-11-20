@@ -80,6 +80,16 @@ and a separately provisioned worker credential. Keep migration privileges separa
 
 Vercel's installed Git integration publishes `main`. GitHub Actions runs validation and the scheduled indexer; it does not need a Vercel deployment token.
 
+### Serverless deployment (Vercel)
+
+Serverless invocations via `api/index.ts` reuse a cached Fastify application and database connection pool across warm invocations within an execution environment. To avoid exhausting connection limits across concurrent serverless instances, the database pool is restricted to a maximum of 2 connections (`max: 2`).
+
+Each warm invocation pings the database before handing off its HTTP request. Initialization, health checks and teardown share one serialized lifecycle, including direct harness calls, so concurrent invocations cannot create duplicate pools or let an old failure close a replacement. An idle PostgreSQL connection error removes that client from the pool without exposing its raw error; the next query can reconnect. If a health probe fails, that invocation receives the fixed, credential-free 500 response, and the app, owned Redis connection and pool are released before the next call attempts initialization. Startup failures at schema admission, privilege admission, server construction or readiness also release their owned resources.
+
+The cache belongs to one execution environment; separate serverless instances each have their own two-connection budget. `closeApp()` provides an explicit restart boundary for the harness and drains pending initialization before disposal. No platform shutdown callback is assumed. Run `npm run test -- test/unit/serverless-lifecycle.test.ts` for overlap/failure fixtures and, after migrating a dedicated local `TEST_DATABASE_URL`, `npm run test -- test/integration/serverless-lifecycle.test.ts` for repeated restart, pool limits, real read-only grants and terminated-idle-connection recovery.
+
+Background processes must be disabled in serverless functions: `INDEXER_ENABLED=false`, `RAILS_ENABLED=false`, and `KEEPER_ENABLED=false`. Furthermore, database credentials must use `HYPERION_DATABASE_ROLE=read-only`.
+
 ## What establishes status
 
 Stellar router events establish source transfers and claim changes. The EVM watcher indexes configured Hyperion routers with confirmation and reorg checks. The default record does not deploy an EVM Hyperion router.
@@ -329,6 +339,20 @@ or the local Git HEAD when available). URLs, nested authorization/signers and ot
 values are redacted. Output files are created exclusively with mode 0600; choose a new filename
 for each capture. No RPC polling, transactions or wallet operations are performed.
 
+### Backup and restore rehearsals
+
+`npm run rehearsal -- rehearse --output snapshot.json` exports the indexed history tables from
+`DATABASE_URL` (read-only), restores them into the dedicated database named by
+`HYPERION_REHEARSAL_DATABASE_URL`, and validates the result. `export`, `restore` and `validate`
+run the steps separately. Every value travels as PostgreSQL text, so full-width identifiers and
+integer-string amounts round-trip exactly. Validation recomputes row counts, the per-chain
+monetary history digests and a cursor/provenance join fingerprint, and fails on any difference,
+including a change in the number of dangling provenance links. The target must be migrated to the same schema version, must be empty, and
+must not be the source. A target provisioned as `production` or `preview` is refused unless both
+`--allow-protected-target` and `HYPERION_REHEARSAL_ALLOW_PROTECTED=true` are set. Snapshots
+hold rows and digests only, never connection strings, are capped at 100,000 rows per table, and
+carry a SHA-256 so a modified file is refused.
+
 ### Rail transition history and transfer cursors
 
 `rail_attestation_history` records actual committed lifecycle changes bound to the source transfer
@@ -377,3 +401,51 @@ Recoverable provider gas errors remain retryable and cannot by themselves establ
 JSON errors retain their existing `error`, status code and route-specific fields. The additive `code` is one stable category: `bad_request`, `not_found`, `timeout`, `unavailable`, `internal_error` or `too_many_requests`. Clients can migrate to `code` while existing clients continue reading `error`. Errors include a safe message and request ID; empty indexed history remains HTTP 200 with an empty page. SSE resync frames retain their existing event contract.
 
 ITS verification stores at most six bounded public mismatch categories and an independent `its_verification_state`: `receipt_unavailable` leaves verification retryable, `payout_unverified` records invalid receipt/payment evidence, and `verified` requires the exact canonical ITS event and matching ERC-20 payment. Unrelated events in the same transaction do not invalidate an exact pair. Diagnostics never establish delivery.
+
+The PostgreSQL upgrade fixture starts with representative full-width transfer and claim records in the initial schema, then checks identity, monetary constraints and exact source joins after every supported migration. Upgrades run in one transaction with recorded migration history. A simulated failing monetary step verifies both data and the history boundary roll back; after repairing that step, retry applies it once and repeated migration runs preserve the same rows. Inspect the migration history and failed step before retrying an interrupted production upgrade.
+
+Transfer responses expose typed source and destination provenance with chain, transaction, canonical indexed block height and log index. Destination provenance is `unverified` until independent delivery is recorded. Rail references are explicitly labeled `candidate` and remain sanitized. Claim source provenance uses the exact source-transfer foreign key; ambiguous legacy deployment nonces return no source provenance. Combined transfer filters validate canonical account/address formats, the selected network, configured source asset/adapter support and direct destination rail support before issuing parameterized SQL. EVM recipients accept canonical20-byte or zero-padded32-byte addresses; direct CCTP/ITS destinations do not require a Hyperion EVM router.
+
+### Historical coverage metrics (#112)
+
+`GET /v1/metrics` retains `historyGaps` and adds version 1 `historicalCoverage`, separate from
+current cursor lag. One PostgreSQL statement reads unresolved counts, remaining ranges, and
+source observation status, so a concurrent backfill cannot mix an old count with a new range.
+Each `sources` entry reports its chain and family, unresolved range records, exact integer-string
+`oldestMissingStart`/`oldestMissingEnd`, and `unknown` status. A recent cursor cannot hide an older
+retention gap. Partial Stellar replay advances the first missing ledger; reconciliation removes
+the record. EVM queued/running/failed/cancelled declared backfill intervals remain missing from
+`next_block` through `to_block` until their range is fully scanned. Overlapping gap/job records
+are counted as records, not as a union of unique missing blocks.
+
+The retained `oldestMissingStartLedger` and `oldestMissingEndLedger` fields summarize Stellar
+ranges; EVM block ranges use the per-source fields. Global `unresolved` includes both families.
+`scope: recorded_ranges` means recorded watcher/backfill history, not universal blockchain
+coverage. No cursor, no committed scan provenance, an incomplete deployment replacement, or
+missing schema keeps historical coverage explicitly unknown. Schema-unavailable unresolved
+counts are null. Zero recorded gaps alone does not establish known history. These diagnostics
+are read-only and do not establish transfer delivery or activate an EVM router.
+
+### Proof rejection metrics (#109)
+
+`GET /v1/metrics` exposes the fixed categories `recipient`, `token`, `amount`, `finality`, and
+`provider_inconsistency`. `proofRejections` sums current unresolved CCTP/ITS verification reasons
+and durable unreconciled ingestion records. `proofRejectionsByRail` uses the same vocabulary for
+both rails; `proofRejectionIngestion` separates structural decoder/ordering failures. These are
+current reason gauges, not successful delivery counts or monotonic attempt counters. One ITS
+transfer can contribute to several distinct mismatch categories, once per category. Rechecking
+an unchanged failure does not increment the gauge; canonical verified proof clears its reasons.
+
+CCTP recipient/destination-domain mismatches map to recipient, token/messenger/source-adapter
+mismatches to token, amount/fee mismatches to amount, and finality/receipt/confirmation failures
+to finality. Other identity/message/provider failures map to provider inconsistency. ITS retains
+recipient/token/amount diagnostics, maps unavailable receipts to finality, and maps missing
+payment/source/command evidence to provider inconsistency. Source decode/ordering rejections
+are provider inconsistency. Prunable raw quarantine rows are not counted again alongside their
+durable ingestion rejection. Provider success alone never establishes destination delivery.
+
+`proofRejectionCoverage` is version 1 and reports availability of each source. A missing table or
+column on an older deployment sets `known: false`, while retaining counts from available sources;
+zero counts with unknown coverage are not evidence of zero failures. Other database errors fail
+the request. SQL returns only bounded categories and exact safe counts; raw hashes, addresses,
+provider messages, expected/observed diagnostics, endpoints, and credentials never become labels.

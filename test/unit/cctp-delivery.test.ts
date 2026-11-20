@@ -1,9 +1,15 @@
 import { StrKey } from "@stellar/stellar-sdk";
-import { toHex } from "@hyperion/protocol";
-import { describe, expect, it } from "vitest";
+import { RouteKind, toHex } from "@hyperion/protocol";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { encodeAbiParameters, encodeEventTopics, hexToBytes, type Hex } from "viem";
+import type * as Viem from "viem";
+import { loadConfig } from "../../src/config/config.js";
+import { inspectCctpDelivery } from "../../src/rails/cctp/delivery.js";
+import type { PendingTransfer, RailReport } from "../../src/rails/types.js";
+import { completeEnv } from "../helpers.js";
 import {
   CCTP_RECEIPT_ABI,
+  cctpMessageIdentity,
   inspectCctpMessage,
   inspectCctpPayment,
   matchingCctpPayment,
@@ -205,5 +211,199 @@ describe("CCTP forwarded destination proof", () => {
     });
     expect(statement).toContain("verification_failure = EXCLUDED.verification_failure");
     expect(parameters[13]).toBe("recipient_mismatch");
+  });
+});
+
+const evm = vi.hoisted(() => ({
+  getChainId: vi.fn(),
+  getTransactionReceipt: vi.fn(),
+  getBlockNumber: vi.fn(),
+  getBlock: vi.fn(),
+}));
+vi.mock("viem", async (original) => ({
+  ...(await original<typeof Viem>()),
+  createPublicClient: () => evm,
+}));
+
+describe("CCTP full message identity", () => {
+  /** Same bottom eight bytes, so the same displayed nonce, but a different full 32-byte nonce. */
+  const sibling = (() => {
+    const changed = hexToBytes(raw);
+    changed[12] = 0x01;
+    return toHex(changed);
+  })();
+  const displayed = BigInt(`0x${nonce.slice(-16)}`).toString();
+
+  it("keeps two messages with the same displayed nonce distinct", () => {
+    const first = cctpMessageIdentity(raw);
+    const second = cctpMessageIdentity(sibling);
+    expect(first?.nonce).toBe(nonce);
+    expect(second?.nonce).not.toBe(first?.nonce);
+    expect(second?.digest).not.toBe(first?.digest);
+    expect(second?.nonce.slice(-16)).toBe(first?.nonce.slice(-16));
+
+    const a = reportFor({ status: "complete", eventNonce: displayed, message: raw });
+    const b = reportFor({ status: "complete", eventNonce: displayed, message: sibling });
+    expect(a.reference).toBe(first?.nonce);
+    expect(b.reference).toBe(second?.nonce);
+    expect(a.messageDigest).toBe(first?.digest);
+    expect(b.messageDigest).toBe(second?.digest);
+    expect(a.reference).not.toBe(displayed);
+  });
+
+  it("gives an exact repeated message one identity", () => {
+    expect(cctpMessageIdentity(raw)).toEqual(
+      cctpMessageIdentity(raw.toUpperCase().replace("0X", "0x")),
+    );
+  });
+
+  it("withholds a provider message whose nonce contradicts the provider reference", () => {
+    const fullMismatch = reportFor({
+      status: "complete",
+      eventNonce: `0x${"cd".repeat(32)}`,
+      message: raw,
+    });
+    expect(fullMismatch.messageBytes).toBeNull();
+    expect(fullMismatch.messageNonce).toBeNull();
+    expect(fullMismatch.reference).toBeNull();
+    const shortMismatch = reportFor({ status: "complete", eventNonce: "1", message: raw });
+    expect(shortMismatch.messageBytes).toBeNull();
+    expect(shortMismatch.reference).toBeNull();
+  });
+
+  describe("delivery association", () => {
+    const base = loadConfig({ env: completeEnv() });
+    const source = base.deployments.networks["stellar-testnet"];
+    if (source?.family !== "stellar") throw new Error("Expected Stellar source deployment.");
+    const config = {
+      ...base,
+      deployments: {
+        ...base.deployments,
+        networks: {
+          ...base.deployments.networks,
+          "stellar-testnet": {
+            ...source,
+            adapters: { ...source.adapters, [RouteKind.Cctp]: expected.sourceAdapter },
+            tokens: {
+              ...source.tokens,
+              USDC: { ...source.tokens.USDC!, sacId: expected.sourceToken },
+            },
+          },
+        },
+      },
+    };
+    const hash: Hex = `0x${"ef".repeat(32)}`;
+    const transfer: PendingTransfer = {
+      transferId: 41n,
+      route: RouteKind.Cctp,
+      originChain: "stellar-testnet",
+      destinationChain: "sepolia",
+      nonce: 9001n,
+      originTx: "source-burn-tx",
+      status: "attested",
+      checkFailures: 0,
+      retryAttempts: 0,
+      delivered: false,
+    };
+    const stored = {
+      origin_chain: transfer.originChain,
+      nonce: transfer.nonce.toString(),
+      origin_tx: transfer.originTx,
+      destination_chain: transfer.destinationChain,
+      token: expected.sourceToken,
+      net_amount: expected.sourceAmount.toString(),
+      destination: `0x${expected.recipient.slice(2).padStart(64, "0")}`,
+    };
+    const identity = cctpMessageIdentity(raw)!;
+    const report: RailReport = {
+      status: "attested",
+      railStatus: "complete",
+      reference: identity.nonce,
+      attestedAt: null,
+      forwardTxHash: hash,
+      messageBytes: raw,
+      messageNonce: identity.nonce,
+      messageDigest: identity.digest,
+    };
+    const database = (
+      source: Record<string, unknown> | null,
+      delivered: readonly Record<string, unknown>[] = [],
+    ): Queryable => ({
+      query: (sql: string) =>
+        Promise.resolve(
+          sql.includes("FROM inbound_delivery")
+            ? { rows: [...delivered], rowCount: delivered.length }
+            : { rows: source ? [source] : [], rowCount: source ? 1 : 0 },
+        ),
+    });
+
+    beforeEach(() => {
+      evm.getChainId.mockResolvedValue(11155111);
+      evm.getBlockNumber.mockResolvedValue(1000n);
+      evm.getTransactionReceipt.mockResolvedValue({
+        status: "success",
+        blockNumber: 100n,
+        transactionHash: hash,
+        blockHash: hash,
+        logs: [received, paid],
+      });
+      evm.getBlock.mockResolvedValue({ hash, timestamp: 1700000000n });
+    });
+
+    it("records the full nonce and replays an exact repeat for the same transfer", async () => {
+      const first = await inspectCctpDelivery(config, database(stored), transfer, report);
+      expect(first.failure).toBeNull();
+      expect(first.delivery?.row.railMessageId).toBe(identity.nonce);
+      const repeat = await inspectCctpDelivery(
+        config,
+        database(stored, [{ source_transfer_id: "41" }]),
+        transfer,
+        report,
+      );
+      expect(repeat.failure).toBeNull();
+      expect(repeat.delivery).toEqual(first.delivery);
+    });
+
+    it("never re-associates a message already delivered for another transfer", async () => {
+      const result = await inspectCctpDelivery(
+        config,
+        database(stored, [{ source_transfer_id: "40" }]),
+        transfer,
+        report,
+      );
+      expect(result).toEqual({ delivery: null, failure: "message_already_delivered" });
+    });
+
+    it("refuses a report whose bound digest or nonce differs from the message bytes", async () => {
+      for (const changed of [
+        { ...report, messageDigest: `0x${"00".repeat(32)}` },
+        { ...report, messageNonce: `0x${"00".repeat(32)}` },
+      ]) {
+        expect(
+          (await inspectCctpDelivery(config, database(stored), transfer, changed)).failure,
+        ).toBe("invalid_message");
+      }
+    });
+
+    it.each([
+      ["origin_chain", "ethereum"],
+      ["nonce", "9002"],
+      ["origin_tx", "another-burn-tx"],
+      ["destination_chain", "base-sepolia"],
+    ])("requires the stored %s burn binding", async (column, value) => {
+      const result = await inspectCctpDelivery(
+        config,
+        database({ ...stored, [column]: value }),
+        transfer,
+        report,
+      );
+      expect(result).toEqual({ delivery: null, failure: "source_transfer_missing" });
+    });
+
+    it("requires the source row to exist on the CCTP route", async () => {
+      expect((await inspectCctpDelivery(config, database(null), transfer, report)).failure).toBe(
+        "source_transfer_missing",
+      );
+    });
   });
 });

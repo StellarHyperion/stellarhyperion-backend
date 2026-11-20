@@ -19,6 +19,13 @@ import { Client } from "pg";
 import {
   auditTransferAndClaimInvariants,
   compactRouteHealthSamples,
+  pruneUnlinkedSourceEvents,
+  readOpenIngestionRejections,
+  readSourceProvenance,
+  reconcileIngestionRejection,
+  recordIngestionRejection,
+  recordSourceEvent,
+  writeClaim,
 } from "../../src/chains/writers.js";
 import { Database } from "../../src/db/pool.js";
 import { concurrencyBarrier, runConcurrent } from "../helpers.js";
@@ -72,10 +79,14 @@ suite("the schema", () => {
       "indexed_history_digest",
       "indexer_cursor",
       "indexer_worker_heartbeat",
+      "ingestion_rejection",
       "outbound_transfer",
       "pending_claim",
       "rail_attestation",
       "route_health",
+      "source_event",
+      "source_event_conflict",
+      "source_event_link",
     ]) {
       expect(names, `${table} is missing; has the migration run`).toContain(table);
     }
@@ -600,5 +611,164 @@ suite("maintenance and pruning", () => {
     expect(Array.isArray(report.claimLiabilityViolations)).toBe(true);
     expect(Array.isArray(report.deliverySettlementViolations)).toBe(true);
     expect(Array.isArray(report.unsettledLiabilities)).toBe(true);
+  });
+});
+
+suite("ingestion rejections", () => {
+  let db: Database;
+  const chainKey = `rejection-schema-${process.pid}`;
+  const source = {
+    chainKey,
+    family: "evm" as const,
+    contract: "0x00000000000000000000000000000000000000aa",
+    block: BigInt(U64_MAX),
+    txHash: `0x${"ab".repeat(32)}`,
+    position: 7,
+  };
+
+  beforeAll(() => {
+    db = Database.open(CONNECTION ?? "", { applicationName: "hyperion-schema-test" });
+  });
+
+  afterAll(async () => {
+    await db.query("DELETE FROM public.ingestion_rejection WHERE chain_key = $1", [chainKey]);
+    await db.close();
+  });
+
+  it("keeps full-width source references and reconciles only on successful replay", async () => {
+    await recordIngestionRejection(db, {
+      ...source,
+      errorClass: "unsupported_payload",
+      detail: "LogShapeError via https://rpc.example/key/abc123",
+    });
+    const [open] = await readOpenIngestionRejections(db, chainKey);
+    expect(open).toMatchObject({
+      block: BigInt(U64_MAX),
+      txHash: source.txHash,
+      position: "7",
+      errorClass: "unsupported_payload",
+      replayEligible: true,
+      detail: "LogShapeError via [redacted URL]",
+    });
+    expect(await reconcileIngestionRejection(db, source)).toBe(true);
+    expect(await readOpenIngestionRejections(db, chainKey)).toHaveLength(0);
+  });
+
+  it("rejects credential-bearing detail, unbounded payloads and unknown classes", async () => {
+    const insert = (detail: string, payload: string, errorClass = "decode_error") =>
+      db.query(
+        `INSERT INTO public.ingestion_rejection
+           (chain_key, family, contract, block_number, tx_hash, source_position, error_class,
+            replay_eligible, detail, payload)
+         VALUES ($1, 'evm', '0xrouter', 1, '0xtx', 'check', $2, true, $3, $4::jsonb)`,
+        [chainKey, errorClass, detail, payload],
+      );
+    // Thunks, so each insert starts only when awaited and no rejection goes unhandled.
+    for (const attempt of [
+      () => insert("postgresql://u:p@db/hyperion", "{}"),
+      () => insert("api_key=abc", "{}"),
+      () => insert("ok", JSON.stringify({ blob: "z".repeat(5000) })),
+      () => insert("ok", "[]"),
+      () => insert("ok", "{}", "provider_status"),
+    ]) {
+      await expect(attempt()).rejects.toSatisfy((error) => codeOf(error) === CHECK_VIOLATION);
+    }
+  });
+});
+
+suite("source event provenance", () => {
+  let db: Database;
+  const chainKey = `provenance-schema-${process.pid}`;
+  const identity = {
+    chainKey,
+    family: "evm" as const,
+    contract: "0x00000000000000000000000000000000000000bb",
+    block: BigInt(U64_MAX),
+    txHash: `0x${"ab".repeat(32)}`,
+    position: 4,
+    eventKind: "ClaimParked",
+    payloadDigest: "cd".repeat(32),
+  };
+
+  beforeAll(() => {
+    db = Database.open(CONNECTION ?? "", { applicationName: "hyperion-schema-test" });
+  });
+
+  afterAll(async () => {
+    await db.query(
+      "DELETE FROM public.source_event_link WHERE source_event_id IN (SELECT id FROM public.source_event WHERE chain_key = $1)",
+      [chainKey],
+    );
+    await db.query(
+      "DELETE FROM public.source_event_conflict WHERE source_event_id IN (SELECT id FROM public.source_event WHERE chain_key = $1)",
+      [chainKey],
+    );
+    await db.query("DELETE FROM public.source_event WHERE chain_key = $1", [chainKey]);
+    await db.query("DELETE FROM public.pending_claim WHERE chain = $1", [chainKey]);
+    await db.close();
+  });
+
+  it("links replays to one raw identity and keeps the original digest on conflict", async () => {
+    const first = await recordSourceEvent(db, identity);
+    const at = {
+      chainKey,
+      block: BigInt(U64_MAX),
+      txHash: identity.txHash,
+      logIndex: 4,
+      observedAt: new Date("2026-11-20T00:00:00Z"),
+      sourceEventId: first.id,
+    };
+    const claim = {
+      claimId: BigInt(U64_MAX),
+      recipient: "0xrecipient",
+      token: "0xtoken",
+      amount: BigInt(U256_MAX),
+      route: 0,
+      sourceChain: "stellar-testnet",
+      sourceNonce: 1n,
+      createdAt: at.observedAt,
+    };
+    await writeClaim(db, at, claim);
+    const replay = await recordSourceEvent(db, identity);
+    await writeClaim(db, { ...at, sourceEventId: replay.id }, claim);
+    expect(replay).toEqual({ kind: "replay", id: first.id });
+    const links = await readSourceProvenance(db, "pending_claim", `${chainKey}:${U64_MAX}`);
+    expect(links).toHaveLength(1);
+    expect(links[0]).toMatchObject({ block: BigInt(U64_MAX), replays: 1, conflicts: 0 });
+
+    expect(
+      (await recordSourceEvent(db, { ...identity, payloadDigest: "ef".repeat(32) })).kind,
+    ).toBe("conflict");
+    const stored = await db.query("SELECT payload_digest FROM public.source_event WHERE id = $1", [
+      first.id.toString(),
+    ]);
+    expect(stored.rows[0]?.payload_digest).toBe(identity.payloadDigest);
+    await expect(
+      db.query("UPDATE public.source_event SET payload_digest = $1 WHERE id = $2", [
+        "ef".repeat(32),
+        first.id.toString(),
+      ]),
+    ).rejects.toSatisfy((error) => codeOf(error) === CHECK_VIOLATION);
+    await expect(
+      db.query("DELETE FROM public.source_event WHERE id = $1", [first.id.toString()]),
+    ).rejects.toSatisfy(
+      // PostgreSQL 18 reports RESTRICT as 23001; older versions use 23503.
+      (error) =>
+        ["23001", "23503"].includes(codeOf(error) ?? "") &&
+        typeof error === "object" &&
+        error !== null &&
+        "constraint" in error &&
+        [
+          "source_event_conflict_source_event_id_fkey",
+          "source_event_link_source_event_id_fkey",
+        ].includes(String(error.constraint)),
+    );
+    expect(
+      await pruneUnlinkedSourceEvents(db, new Date(Date.now() + 60_000), 10),
+    ).toBeGreaterThanOrEqual(0);
+    expect(
+      (await db.query("SELECT 1 FROM public.source_event WHERE id = $1", [first.id.toString()]))
+        .rows,
+    ).toHaveLength(1);
   });
 });

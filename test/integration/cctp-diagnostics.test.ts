@@ -1,8 +1,10 @@
+import { readProofRejectionMetrics } from "../../src/http/proof-rejection-metrics.js";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as Viem from "viem";
 import { RouteKind } from "@hyperion/protocol";
 import { Database } from "../../src/db/pool.js";
-import { writeOutbound } from "../../src/chains/writers.js";
+import { writeInbound, writeOutbound } from "../../src/chains/writers.js";
+import { verifyCctpDelivery } from "../../src/rails/cctp/delivery.js";
 import { loadConfig } from "../../src/config/config.js";
 import { RailPass } from "../../src/rails/pass.js";
 import { pendingForRail } from "../../src/rails/queue.js";
@@ -50,7 +52,7 @@ const connection = process.env.TEST_DATABASE_URL;
   let now = new Date("2026-11-19T00:00:00Z");
   const clean = async () => {
     await db.query(
-      "DELETE FROM inbound_delivery WHERE source_chain='stellar-testnet' AND source_nonce=9998300",
+      "DELETE FROM inbound_delivery WHERE source_chain='stellar-testnet' AND source_nonce IN (9998300,9998301)",
     );
     await db.query(
       "DELETE FROM rail_attestation WHERE transfer_id IN (SELECT id FROM outbound_transfer WHERE origin_router='cctp-diagnostic-test')",
@@ -177,11 +179,21 @@ const connection = process.env.TEST_DATABASE_URL;
     },
   );
   it("persists a bounded mismatch and clears it only when canonical proof establishes delivery", async () => {
+    const baseline = await readProofRejectionMetrics(db);
     await db.query(
       "UPDATE outbound_transfer SET net_amount=net_amount+10,gross_amount=gross_amount+10 WHERE id=$1",
       [id],
     );
     expect((await tick(report))?.verification_failure).toBe("amount_mismatch");
+    const rejected = await readProofRejectionMetrics(db);
+    expect(rejected.byRail.cctp.amount).toBe(baseline.byRail.cctp.amount + 1);
+    expect(rejected.coverage.known).toBe(true);
+    expect(
+      (await db.query("SELECT 1 FROM inbound_delivery WHERE source_nonce=9998300")).rows,
+    ).toHaveLength(0);
+    expect(JSON.stringify(rejected)).not.toMatch(
+      /source_adapter|forwardTxHash|cctp-diagnostic-source/,
+    );
     await db.query(
       "UPDATE outbound_transfer SET net_amount=net_amount-10,gross_amount=gross_amount-10 WHERE id=$1",
       [id],
@@ -189,11 +201,94 @@ const connection = process.env.TEST_DATABASE_URL;
     const delivered = await tick(report);
     expect(delivered?.status).toBe("delivered");
     expect(delivered?.verification_failure).toBeNull();
+    const resolved = await readProofRejectionMetrics(db);
+    expect(resolved.byRail.cctp.amount).toBe(baseline.byRail.cctp.amount);
     await expect(
       db.query(
         "UPDATE rail_attestation SET verification_failure='token=private-provider-value' WHERE transfer_id=$1",
         [id],
       ),
     ).rejects.toMatchObject({ code: "23514" });
+  });
+  it("keeps one delivery per full message and refuses re-association to another transfer", async () => {
+    const fullNonce = `0x${"ab".repeat(32)}`;
+    expect((await tick(report))?.status).toBe("delivered");
+    expect(
+      (await db.query("SELECT rail_message_id FROM inbound_delivery WHERE source_nonce=9998300"))
+        .rows,
+    ).toEqual([{ rail_message_id: fullNonce }]);
+
+    // Exact replay of the verified row upserts in place instead of adding a second delivery.
+    const replay = await verifyCctpDelivery(
+      config,
+      db,
+      {
+        transferId: BigInt(id),
+        route: RouteKind.Cctp,
+        originChain: "stellar-testnet",
+        destinationChain: "sepolia",
+        nonce: 9998300n,
+        originTx: "cctp-diagnostic-source",
+        status: "attested",
+        checkFailures: 0,
+        retryAttempts: 0,
+        delivered: false,
+      },
+      report,
+    );
+    if (!replay) throw new Error("Expected the exact repeat to verify.");
+    await writeInbound(db, replay.at, replay.row);
+    await writeInbound(db, replay.at, replay.row);
+    expect(
+      (
+        await db.query("SELECT count(*)::int AS n FROM inbound_delivery WHERE rail_message_id=$1", [
+          fullNonce,
+        ])
+      ).rows[0]?.n,
+    ).toBe(1);
+
+    // A second burn with identical economics cannot claim the already-credited message.
+    await writeOutbound(
+      db,
+      {
+        chainKey: "stellar-testnet",
+        router: "cctp-diagnostic-test",
+        block: 2n,
+        txHash: "cctp-diagnostic-second",
+        logIndex: 0,
+        observedAt: now,
+      },
+      {
+        route: RouteKind.Cctp,
+        nonce: 9998301n,
+        sender: "Gsource",
+        token: fixture.expected.sourceToken,
+        grossAmount: fixture.expected.sourceAmount + 1000n,
+        fee: 1000n,
+        netAmount: fixture.expected.sourceAmount,
+        destinationChain: "sepolia",
+        destination: `0x${fixture.expected.recipient.slice(2).padStart(64, "0")}`,
+        railRef: "0x00",
+      },
+    );
+    const second = String(
+      (
+        await db.query(
+          "SELECT id FROM outbound_transfer WHERE nonce=9998301 AND origin_router='cctp-diagnostic-test'",
+        )
+      ).rows[0]!.id,
+    );
+    await tick(report);
+    expect(
+      (
+        await db.query(
+          "SELECT status,verification_failure FROM rail_attestation WHERE transfer_id=$1",
+          [second],
+        )
+      ).rows[0],
+    ).toEqual({ status: "pending", verification_failure: "message_already_delivered" });
+    expect(
+      (await db.query("SELECT 1 FROM inbound_delivery WHERE source_nonce=9998301")).rows,
+    ).toHaveLength(0);
   });
 });

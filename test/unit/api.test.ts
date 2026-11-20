@@ -20,6 +20,20 @@ class MockDb {
     text: string,
     params: readonly unknown[] = [],
   ): Promise<{ rows: readonly Record<string, unknown>[]; rowCount: number }> {
+    if (text.includes("/* historical_coverage_snapshot */"))
+      return Promise.resolve({
+        rows: [
+          {
+            snapshot: {
+              historyGaps: { open: "0", reconciling: "0", reconciled: "0" },
+              sources: [],
+            },
+          },
+        ],
+        rowCount: 1,
+      });
+    if (text.includes("/* proof_rejection_metrics */"))
+      return Promise.resolve({ rows: [], rowCount: 0 });
     for (const [key, rows] of Object.entries(this.queryMap)) {
       if (text.includes(key)) {
         if (text.includes("WHERE t.id = $1") && params.length > 0) {
