@@ -13,6 +13,10 @@ import { EvmWatcher } from "../../src/chains/evm/watcher.js";
 import { MAX_OPEN_INGESTION_REJECTIONS } from "../../src/chains/writers.js";
 import { viemClient, type EvmClient, type RawEvmLog } from "../../src/chains/evm/client.js";
 import {
+  EvmLogRangeLimitError,
+  fetchEvmLogsAdaptive,
+} from "../../src/chains/evm/logs.js";
+import {
   ANVIL_HISTORY,
   ANVIL_CHAIN_ID,
   ANVIL_ROUTER,
@@ -102,6 +106,43 @@ function cursorWrites(db: RecordingDb): { block: bigint; family: string; hash: s
 }
 
 describe("the line it will not read past", () => {
+  it("splits provider-limited ranges, returns deterministic unique logs, and reports minimum failures", async () => {
+    const sample = ANVIL_HISTORY[0];
+    if (!sample) throw new Error("Expected captured EVM log fixture.");
+    const queries: { fromBlock: bigint; toBlock: bigint }[] = [];
+    const client = {
+      logs: async (query: { fromBlock: bigint; toBlock: bigint }) => {
+        queries.push(query);
+        if (query.toBlock - query.fromBlock + 1n > 1n)
+          throw new Error("query returned more than the allowed number of results");
+        const log = { ...sample, blockNumber: query.fromBlock, logIndex: 1 };
+        return [log, log];
+      },
+    };
+
+    const logs = await fetchEvmLogsAdaptive(client, {
+      address: ANVIL_ROUTER,
+      fromBlock: 10n,
+      toBlock: 13n,
+    });
+
+    expect(logs.map((log) => log.blockNumber)).toEqual([10n, 11n, 12n, 13n]);
+    expect(logs).toHaveLength(4);
+    expect(queries.filter((query) => query.fromBlock !== query.toBlock)).toHaveLength(3);
+
+    await expect(
+      fetchEvmLogsAdaptive(
+        { logs: () => Promise.reject(new Error("block range too wide")) },
+        { address: ANVIL_ROUTER, fromBlock: 7n, toBlock: 7n },
+      ),
+    ).rejects.toMatchObject({
+      name: "EvmLogRangeLimitError",
+      fromBlock: 7n,
+      toBlock: 7n,
+      message: "EVM provider rejected the minimum log range 7-7.",
+    } satisfies Partial<EvmLogRangeLimitError>);
+  });
+
   it("records finalized-block evidence and stops at its boundary", async () => {
     class FinalizedClient extends FakeEvmClient {
       finalizedBlock() {
