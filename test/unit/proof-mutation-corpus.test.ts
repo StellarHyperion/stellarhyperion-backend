@@ -203,21 +203,30 @@ describe("independent real CCTP and ITS destination proof mutation corpus", () =
         expectedAccepted: true,
       });
       const db: Queryable = {
-        query: () =>
-          Promise.resolve({
-            rows: [
-              {
-                sender: "Gsource",
-                token: cctp.expected.sourceToken,
-                net_amount:
-                  rail === "CCTP"
-                    ? cctp.expected.sourceAmount.toString()
-                    : its.expected.amount.toString(),
-                destination: `0x${its.expected.recipient.slice(2).padStart(64, "0")}`,
-              },
-            ],
-            rowCount: 1,
-          }),
+        query: (sql: string) =>
+          Promise.resolve(
+            sql.includes("FROM inbound_delivery")
+              ? { rows: [], rowCount: 0 }
+              : {
+                  rows: [
+                    {
+                      origin_chain: transfer.originChain,
+                      origin_router: source.router,
+                      nonce: transfer.nonce.toString(),
+                      origin_tx: transfer.originTx,
+                      destination_chain: transfer.destinationChain,
+                      sender: "Gsource",
+                      token: cctp.expected.sourceToken,
+                      net_amount:
+                        rail === "CCTP"
+                          ? cctp.expected.sourceAmount.toString()
+                          : its.expected.amount.toString(),
+                      destination: `0x${its.expected.recipient.slice(2).padStart(64, "0")}`,
+                    },
+                  ],
+                  rowCount: 1,
+                },
+          ),
       };
       const stellar = vi.spyOn(rpc.Server.prototype, "simulateTransaction");
       const simulation = (value: unknown) => ({
@@ -261,14 +270,19 @@ describe("independent real CCTP and ITS destination proof mutation corpus", () =
           messageBytes: candidate.message,
           execution: { txHash: hash, commandId: its.expected.commandId as Hex },
         };
-        return rail === "CCTP"
-          ? verifyCctpDelivery(modifiedConfig, db, transfer, report)
-          : verifyItsDelivery(
-              modifiedConfig,
-              db,
-              { ...transfer, route: RouteKind.AxelarIts },
-              report,
-            );
+        if (rail === "CCTP") return verifyCctpDelivery(modifiedConfig, db, transfer, report);
+        const outcome = await verifyItsDelivery(
+          modifiedConfig,
+          db,
+          { ...transfer, route: RouteKind.AxelarIts },
+          report,
+        );
+        if (outcome !== null && "diagnostics" in outcome) {
+          expect(outcome.state).toBe("payout_unverified");
+          expect(outcome.diagnostics.length).toBeGreaterThan(0);
+          return null;
+        }
+        return outcome;
       });
       expect(
         records.every((record) => record.matchesExpectation),
@@ -289,6 +303,27 @@ describe("independent real CCTP and ITS destination proof mutation corpus", () =
       expect(RAIL_CONTRACTS.sepolia?.cctp?.tokenMessengerV2.toLowerCase()).toBe(
         cctp.expected.destinationMessenger.toLowerCase(),
       );
+      if (rail === "ITS") {
+        evm.getTransactionReceipt.mockRejectedValueOnce(
+          new Error("receipt temporarily unavailable"),
+        );
+        stellar
+          .mockReset()
+          .mockResolvedValueOnce(simulation(hexToBytes(its.expected.tokenId as Hex)));
+        const unavailable = await verifyItsDelivery(
+          modifiedConfig,
+          db,
+          { ...transfer, route: RouteKind.AxelarIts },
+          {
+            status: "attested",
+            railStatus: "executed",
+            reference: null,
+            attestedAt: null,
+            execution: { txHash: hash, commandId: its.expected.commandId as Hex },
+          },
+        );
+        expect(unavailable).toEqual({ state: "receipt_unavailable", diagnostics: [] });
+      }
       console.info("HYPERION_PROOF_MUTATION_CORPUS " + JSON.stringify({ rail, records }));
     },
   );

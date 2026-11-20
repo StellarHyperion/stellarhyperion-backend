@@ -1,3 +1,4 @@
+import type { CctpVerificationFailure } from "../rails/types.js";
 import { bounded, safeString } from "../rails/axelar/gmp.js";
 /**
  * Every statement that writes an indexed row, in one file, for both chain families.
@@ -23,7 +24,12 @@ import { bounded, safeString } from "../rails/axelar/gmp.js";
 import { createHash } from "node:crypto";
 import type { Queryable, Transactional } from "../db/pool.js";
 import {
+  normalizeVerificationDiagnostics,
+  type VerificationDiagnostic,
+} from "../rails/axelar/events.js";
+import {
   bigintOf,
+  bigintOrNull,
   boolean,
   integer,
   integerOrNull,
@@ -50,6 +56,8 @@ export interface Position {
   readonly logIndex: number | null;
   /** The chain's own timestamp, never ours. Lag measured against our clock hides a stall. */
   readonly observedAt: Date;
+  /** The immutable `source_event` this row comes from, when the watcher recorded one. */
+  readonly sourceEventId?: bigint;
 }
 
 export interface OutboundRow {
@@ -158,7 +166,7 @@ export async function writeOutbound(db: Queryable, at: Position, row: OutboundRo
       ],
     );
   }
-  await db.query(
+  const outbound = await db.query(
     `INSERT INTO outbound_transfer
        (origin_chain, origin_router, route, nonce, sender, token, gross_amount, fee, net_amount,
         destination_chain, destination, rail_ref, origin_block, origin_tx, origin_log_index,
@@ -176,7 +184,8 @@ export async function writeOutbound(db: Queryable, at: Position, row: OutboundRo
            rail_ref = COALESCE(EXCLUDED.rail_ref, outbound_transfer.rail_ref),
            origin_block = EXCLUDED.origin_block,
            origin_tx = EXCLUDED.origin_tx,
-           origin_log_index = EXCLUDED.origin_log_index`,
+           origin_log_index = EXCLUDED.origin_log_index
+     RETURNING id`,
     [
       at.chainKey,
       router,
@@ -196,10 +205,16 @@ export async function writeOutbound(db: Queryable, at: Position, row: OutboundRo
       at.observedAt,
     ],
   );
+  await linkFromPosition(
+    db,
+    at,
+    "outbound_transfer",
+    bigintOrNull(outbound.rows[0] ?? {}, "id")?.toString() ?? null,
+  );
 }
 
 export async function writeInbound(db: Queryable, at: Position, row: InboundRow): Promise<void> {
-  await db.query(
+  const inbound = await db.query(
     `INSERT INTO inbound_delivery
        (destination_chain, route, source_chain, source_nonce, rail_message_id, recipient, token,
         amount, delivered, claim_id, destination_block, destination_tx, destination_log_index,
@@ -214,7 +229,8 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
            claim_id = EXCLUDED.claim_id,
            destination_block = EXCLUDED.destination_block,
            destination_tx = EXCLUDED.destination_tx,
-           destination_log_index = EXCLUDED.destination_log_index`,
+           destination_log_index = EXCLUDED.destination_log_index
+     RETURNING id`,
     [
       at.chainKey,
       row.route,
@@ -232,6 +248,12 @@ export async function writeInbound(db: Queryable, at: Position, row: InboundRow)
       at.observedAt,
       row.sourceTransferId?.toString() ?? null,
     ],
+  );
+  await linkFromPosition(
+    db,
+    at,
+    "inbound_delivery",
+    bigintOrNull(inbound.rows[0] ?? {}, "id")?.toString() ?? null,
   );
 }
 
@@ -262,6 +284,7 @@ export async function writeClaim(db: Queryable, at: Position, row: ClaimRow): Pr
       at.observedAt,
     ],
   );
+  await linkFromPosition(db, at, "pending_claim", `${at.chainKey}:${row.claimId.toString()}`);
 }
 
 /**
@@ -284,6 +307,14 @@ export async function settleClaim(
       WHERE chain = $1 AND claim_id = $2 AND NOT settled`,
     [at.chainKey, claimId.toString(), at.observedAt, settledBy, at.txHash],
   );
+  if (rowCount > 0)
+    await linkFromPosition(
+      db,
+      at,
+      "pending_claim",
+      `${at.chainKey}:${claimId.toString()}`,
+      "settled",
+    );
   return rowCount > 0;
 }
 
@@ -317,6 +348,7 @@ export async function writeAction(db: Queryable, at: Position, row: ActionRow): 
       at.observedAt,
     ],
   );
+  await linkFromPosition(db, at, "admin_action", `${at.chainKey}:${row.actionId.toString()}`);
 }
 
 /**
@@ -339,6 +371,14 @@ export async function settleAction(
       WHERE chain = $1 AND action_id = $2 AND state = 'queued'`,
     [at.chainKey, actionId.toString(), state, at.observedAt, actor],
   );
+  if (rowCount > 0)
+    await linkFromPosition(
+      db,
+      at,
+      "admin_action",
+      `${at.chainKey}:${actionId.toString()}`,
+      "settled",
+    );
   return rowCount > 0;
 }
 
@@ -396,6 +436,9 @@ export interface AttestationRow {
   readonly retryAttempts: number;
   readonly nextAttemptAt: Date | null;
   readonly retryClass: RailRetryClass | null;
+  readonly diagnostics?: readonly VerificationDiagnostic[];
+  readonly itsVerificationState?: "receipt_unavailable" | "payout_unverified" | "verified" | null;
+  readonly verificationFailure?: CctpVerificationFailure | null;
 }
 
 export interface AxelarQuarantineRow {
@@ -406,7 +449,19 @@ export interface AxelarQuarantineRow {
   readonly payload: unknown;
 }
 
+export interface AxelarSourceBinding {
+  readonly chain: string;
+  readonly router: string;
+  readonly nonce: string;
+  readonly transaction: string;
+  readonly sender: string;
+  readonly token: string;
+  readonly amount: string;
+  readonly destinationChain: string;
+  readonly destination: string;
+}
 export interface AxelarDeliveryEvidenceRow {
+  readonly sourceBinding?: AxelarSourceBinding;
   readonly transferId: bigint;
   readonly destinationChain: string;
   readonly commandId: string;
@@ -452,6 +507,27 @@ export async function writeAxelarDeliveryEvidence(
   db: Queryable,
   row: AxelarDeliveryEvidenceRow,
 ): Promise<bigint> {
+  if (row.sourceBinding !== undefined) {
+    const source = (
+      await db.query(
+        "SELECT origin_chain,origin_router,nonce::text,origin_tx,sender,token,net_amount::text,destination_chain,destination FROM outbound_transfer WHERE id=$1 AND route=1 FOR UPDATE",
+        [row.transferId.toString()],
+      )
+    ).rows[0];
+    const expected = row.sourceBinding;
+    if (
+      source?.origin_chain !== expected.chain ||
+      source.origin_router !== expected.router ||
+      source.nonce !== expected.nonce ||
+      source.origin_tx !== expected.transaction ||
+      source.sender !== expected.sender ||
+      source.token !== expected.token ||
+      source.net_amount !== expected.amount ||
+      source.destination_chain !== expected.destinationChain ||
+      source.destination !== expected.destination
+    )
+      throw new Error("Axelar verified source binding changed before proof admission.");
+  }
   await db.query(
     `UPDATE axelar_delivery_evidence
         SET status = 'superseded'
@@ -465,9 +541,9 @@ export async function writeAxelarDeliveryEvidence(
        (transfer_id, destination_chain, status, command_id, execution_tx_hash, receipt_status,
         receipt_block, receipt_block_hash, its_address, token_id, registered_token, token_manager,
         token_manager_block, token_manager_block_hash, payment_log_index, payment_recipient,
-        payment_amount, last_revalidated_at)
+        payment_amount, last_revalidated_at,source_binding)
      VALUES ($1, $2, 'canonical', $3, $4, 'success', $5, $6, $7, $8, $9, $10, $11, $12,
-             $13, $14, $15, now())
+             $13, $14, $15, now(),$16::jsonb)
      ON CONFLICT (transfer_id, command_id, execution_tx_hash, payment_log_index) DO UPDATE
        SET status = 'canonical',
            destination_chain = EXCLUDED.destination_chain,
@@ -482,6 +558,7 @@ export async function writeAxelarDeliveryEvidence(
            token_manager_block_hash = EXCLUDED.token_manager_block_hash,
            payment_recipient = EXCLUDED.payment_recipient,
            payment_amount = EXCLUDED.payment_amount,
+           source_binding = EXCLUDED.source_binding,
            last_revalidated_at = now()
      RETURNING id`,
     [
@@ -500,6 +577,7 @@ export async function writeAxelarDeliveryEvidence(
       row.paymentLogIndex,
       row.paymentRecipient,
       row.paymentAmount.toString(),
+      row.sourceBinding === undefined ? null : JSON.stringify(row.sourceBinding),
     ],
   );
   const id = rows[0]?.id;
@@ -538,8 +616,8 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
   await db.query(
     `INSERT INTO rail_attestation
        (transfer_id, route, status, rail_status, rail_reference, attested_at, last_checked_at,
-        check_failures, last_error, next_attempt_at, retry_class, retry_attempts)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        check_failures, last_error, next_attempt_at, retry_class, retry_attempts, diagnostics, verification_failure, its_verification_state)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
      ON CONFLICT (transfer_id) DO UPDATE
        SET status = EXCLUDED.status,
            rail_status = COALESCE(EXCLUDED.rail_status, rail_attestation.rail_status),
@@ -554,6 +632,9 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
            retry_attempts = EXCLUDED.retry_attempts,
            next_attempt_at = EXCLUDED.next_attempt_at,
            retry_class = EXCLUDED.retry_class,
+           diagnostics = CASE WHEN EXCLUDED.its_verification_state IS NULL THEN rail_attestation.diagnostics ELSE EXCLUDED.diagnostics END,
+           its_verification_state = COALESCE(EXCLUDED.its_verification_state, rail_attestation.its_verification_state),
+           verification_failure = EXCLUDED.verification_failure,
            updated_at = now()`,
     [
       row.transferId.toString(),
@@ -568,6 +649,9 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
       row.nextAttemptAt,
       row.retryClass,
       row.retryAttempts,
+      JSON.stringify(normalizeVerificationDiagnostics(row.diagnostics ?? [])),
+      row.verificationFailure ?? null,
+      row.itsVerificationState ?? null,
     ],
   );
 }
@@ -1444,3 +1528,477 @@ export async function releaseLease(
 }
 
 export { textOrNull };
+
+// --------------------------------------------------------------------------------------------
+// Ingestion rejections (#62)
+// --------------------------------------------------------------------------------------------
+
+/** Normalized reasons a source record could not be applied. */
+export const INGESTION_ERROR_CLASSES = [
+  "decode_error",
+  "unknown_event",
+  "unsupported_payload",
+  "ordering_conflict",
+] as const;
+export type IngestionErrorClass = (typeof INGESTION_ERROR_CLASSES)[number];
+
+/**
+ * Whether a decoder or indexer upgrade can apply the record by replaying its source position.
+ * An ordering conflict depends on neighbouring logs, so it needs an operator rather than a replay.
+ */
+export function isReplayEligible(errorClass: IngestionErrorClass): boolean {
+  return errorClass !== "ordering_conflict";
+}
+
+/** Open rejections a chain may hold before ingestion stops instead of advancing past more. */
+export const MAX_OPEN_INGESTION_REJECTIONS = 10_000;
+const MAX_REJECTION_ATTEMPTS = 1_000_000;
+const MAX_REJECTION_DETAIL = 256;
+const MAX_REJECTION_PAYLOAD_BYTES = 4096;
+
+export class IngestionRejectionLimitError extends Error {
+  constructor(readonly chainKey: string) {
+    super(
+      `${chainKey} has ${String(MAX_OPEN_INGESTION_REJECTIONS)} unreconciled ingestion rejections; refusing to advance past another`,
+    );
+    this.name = "IngestionRejectionLimitError";
+  }
+}
+
+export interface IngestionSource {
+  readonly chainKey: string;
+  readonly family: "stellar" | "evm";
+  readonly contract: string;
+  readonly deploymentRevision?: number;
+  readonly block: bigint;
+  readonly txHash: string;
+  /** Stellar event id, or the EVM log index. */
+  readonly position: string | number;
+}
+
+export interface IngestionRejection extends IngestionSource {
+  readonly errorClass: IngestionErrorClass;
+  readonly detail?: string | null;
+  readonly payload?: Readonly<Record<string, unknown>>;
+}
+
+export interface StoredIngestionRejection {
+  readonly id: bigint;
+  readonly chainKey: string;
+  readonly family: "stellar" | "evm";
+  readonly contract: string;
+  readonly deploymentRevision: number;
+  readonly block: bigint;
+  readonly txHash: string;
+  readonly position: string;
+  readonly errorClass: IngestionErrorClass;
+  readonly replayEligible: boolean;
+  readonly detail: string | null;
+  readonly payload: unknown;
+  readonly attempts: number;
+  readonly firstSeenAt: Date;
+  readonly lastSeenAt: Date;
+  readonly reconciledAt: Date | null;
+}
+
+const CREDENTIAL_KEY = /secret|password|authorization|credential|private.?key|token|api.?key/i;
+
+/** Keep a diagnostic category only: no URLs, no credential assignments, no raw provider text. */
+export function boundRejectionDetail(detail: string | null | undefined): string | null {
+  if (detail === null || detail === undefined) return null;
+  const cleaned = detail
+    .replace(/\b(?:https?|postgres(?:ql)?|rediss?):\/\/\S+/gi, "[redacted URL]")
+    .replace(/\b(Bearer|Basic)\s+\S+/gi, "$1 [redacted]")
+    .replace(
+      /\b(?:authorization|password|secret|api[_-]?key|token)\s*[:=]\s*\S+/gi,
+      "[redacted credential]",
+    )
+    .replace(/[^A-Za-z0-9 _.,()[\]/-]/g, "?")
+    .slice(0, MAX_REJECTION_DETAIL)
+    .trim();
+  return cleaned.length > 0 ? cleaned : null;
+}
+
+/** Scalars only, credential-like keys removed, and the whole object capped in bytes. */
+export function boundRejectionPayload(
+  payload: Readonly<Record<string, unknown>> | undefined,
+): string {
+  const out: Record<string, string | number | boolean | null> = {};
+  for (const [key, value] of Object.entries(payload ?? {}).slice(0, 16)) {
+    if (CREDENTIAL_KEY.test(key) || !/^[A-Za-z0-9_]{1,64}$/.test(key)) continue;
+    if (typeof value === "string") out[key] = boundRejectionDetail(value);
+    else if (typeof value === "bigint") out[key] = value.toString();
+    else if (typeof value === "number" && Number.isFinite(value)) out[key] = value;
+    else if (typeof value === "boolean" || value === null) out[key] = value;
+  }
+  const serialized = JSON.stringify(out);
+  return Buffer.byteLength(serialized, "utf8") <= MAX_REJECTION_PAYLOAD_BYTES
+    ? serialized
+    : JSON.stringify({ truncated: true });
+}
+
+function sourcePosition(position: string | number): string {
+  const value = String(position);
+  if (!/^[0-9A-Za-z_-]{1,64}$/.test(value))
+    throw new RangeError("Invalid ingestion source position.");
+  return value;
+}
+
+function sourceKey(source: Omit<IngestionSource, "family">): readonly unknown[] {
+  return [
+    source.chainKey,
+    source.contract,
+    source.deploymentRevision ?? 1,
+    source.block.toString(),
+    source.txHash,
+    sourcePosition(source.position),
+  ];
+}
+
+/**
+ * Record that a source record was not applied, in the caller's transaction.
+ *
+ * Call it in the same transaction as the cursor advance that passes the record: if this write
+ * fails, or the chain already holds too many open rejections, the transaction aborts and the
+ * committed boundary stays where it was. A repeat failure for the same source reopens and counts
+ * it instead of adding a row.
+ */
+export async function recordIngestionRejection(
+  db: Queryable,
+  rejection: IngestionRejection,
+): Promise<void> {
+  const key = sourceKey(rejection);
+  const { rows: existing } = await db.query(
+    `SELECT reconciled_at FROM ingestion_rejection
+      WHERE chain_key = $1 AND contract = $2 AND deployment_revision = $3
+        AND block_number = $4 AND tx_hash = $5 AND source_position = $6`,
+    key,
+  );
+  const reopens = existing.length === 0 || existing[0]?.reconciled_at != null;
+  if (reopens) {
+    const { rows } = await db.query(
+      `SELECT count(*)::int AS open FROM ingestion_rejection
+        WHERE chain_key = $1 AND reconciled_at IS NULL`,
+      [rejection.chainKey],
+    );
+    if (integer(one(rows, "open rejection count"), "open") >= MAX_OPEN_INGESTION_REJECTIONS)
+      throw new IngestionRejectionLimitError(rejection.chainKey);
+  }
+  await db.query(
+    `INSERT INTO ingestion_rejection
+       (chain_key, contract, deployment_revision, block_number, tx_hash, source_position,
+        family, error_class, replay_eligible, detail, payload)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+     ON CONFLICT ON CONSTRAINT ingestion_rejection_source DO UPDATE
+       SET error_class = EXCLUDED.error_class,
+           replay_eligible = EXCLUDED.replay_eligible,
+           detail = EXCLUDED.detail,
+           payload = EXCLUDED.payload,
+           attempts = LEAST(ingestion_rejection.attempts + 1, ${String(MAX_REJECTION_ATTEMPTS)}),
+           last_seen_at = GREATEST(clock_timestamp(), ingestion_rejection.first_seen_at),
+           reconciled_at = NULL`,
+    [
+      ...key,
+      rejection.family,
+      rejection.errorClass,
+      isReplayEligible(rejection.errorClass),
+      boundRejectionDetail(rejection.detail),
+      boundRejectionPayload(rejection.payload),
+    ],
+  );
+}
+
+/** Mark a source record's open rejection reconciled after it applied. Returns whether one was. */
+export async function reconcileIngestionRejection(
+  db: Queryable,
+  source: Omit<IngestionSource, "family">,
+): Promise<boolean> {
+  const { rowCount } = await db.query(
+    `UPDATE ingestion_rejection
+        SET reconciled_at = GREATEST(clock_timestamp(), first_seen_at)
+      WHERE chain_key = $1 AND contract = $2 AND deployment_revision = $3
+        AND block_number = $4 AND tx_hash = $5 AND source_position = $6
+        AND reconciled_at IS NULL`,
+    sourceKey(source),
+  );
+  return rowCount > 0;
+}
+
+export async function readOpenIngestionRejections(
+  db: Queryable,
+  chainKey: string,
+  limit = 100,
+): Promise<readonly StoredIngestionRejection[]> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000)
+    throw new RangeError("Ingestion rejection limit must be 1 to 1000.");
+  const { rows } = await db.query(
+    `SELECT id, chain_key, family, contract, deployment_revision, block_number, tx_hash,
+            source_position, error_class, replay_eligible, detail, payload, attempts,
+            first_seen_at, last_seen_at, reconciled_at
+       FROM ingestion_rejection
+      WHERE chain_key = $1 AND reconciled_at IS NULL
+      ORDER BY block_number, id LIMIT $2`,
+    [chainKey, limit],
+  );
+  return rows.map((row) => ({
+    id: bigintOf(row, "id"),
+    chainKey: text(row, "chain_key"),
+    family: text(row, "family") === "evm" ? "evm" : "stellar",
+    contract: text(row, "contract"),
+    deploymentRevision: integer(row, "deployment_revision"),
+    block: bigintOf(row, "block_number"),
+    txHash: text(row, "tx_hash"),
+    position: text(row, "source_position"),
+    errorClass: text(row, "error_class") as IngestionErrorClass,
+    replayEligible: boolean(row, "replay_eligible"),
+    detail: textOrNull(row, "detail"),
+    payload: json(row, "payload"),
+    attempts: integer(row, "attempts"),
+    firstSeenAt: timestamp(row, "first_seen_at"),
+    lastSeenAt: timestamp(row, "last_seen_at"),
+    reconciledAt: timestampOrNull(row, "reconciled_at"),
+  }));
+}
+
+/** Bounded maintenance: delete only reconciled rows older than the cutoff, a batch at a time. */
+export async function pruneReconciledIngestionRejections(
+  db: Queryable,
+  olderThan: Date,
+  limit = 1000,
+): Promise<number> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000)
+    throw new RangeError("Ingestion rejection prune batch must be 1 to 10000.");
+  const { rowCount } = await db.query(
+    `DELETE FROM ingestion_rejection WHERE id IN (
+       SELECT id FROM ingestion_rejection
+        WHERE reconciled_at IS NOT NULL AND reconciled_at < $1
+        ORDER BY reconciled_at LIMIT $2)`,
+    [olderThan, limit],
+  );
+  return rowCount;
+}
+
+// --------------------------------------------------------------------------------------------
+// Source event provenance (#54)
+// --------------------------------------------------------------------------------------------
+
+export const SOURCE_RECORD_KINDS = [
+  "outbound_transfer",
+  "inbound_delivery",
+  "pending_claim",
+  "admin_action",
+] as const;
+export type SourceRecordKind = (typeof SOURCE_RECORD_KINDS)[number];
+
+/** Most links a provenance read returns for one materialized record. */
+export const MAX_SOURCE_LINKS_PER_RECORD = 100;
+const MAX_SOURCE_REPLAYS = 1_000_000;
+
+export interface SourceEventIdentity {
+  readonly chainKey: string;
+  readonly family: "stellar" | "evm";
+  readonly contract: string;
+  readonly deploymentRevision?: number;
+  readonly block: bigint;
+  readonly txHash: string;
+  /** Stellar event id, or the EVM log index. */
+  readonly position: string | number;
+  readonly eventKind: string;
+  /** SHA-256 of the canonical payload, as 64 lowercase hex characters. */
+  readonly payloadDigest: string;
+}
+
+export type SourceEventObservation =
+  /** First time this identity was seen; its digest is now the provenance of record. */
+  | { readonly kind: "new"; readonly id: bigint }
+  /** Same identity and digest again: a replay, linked to the original and adding no facts. */
+  | { readonly kind: "replay"; readonly id: bigint }
+  /** Same identity, different payload. The original is kept and the incoming one is evidence. */
+  | {
+      readonly kind: "conflict";
+      readonly id: bigint;
+      readonly originalDigest: string;
+      readonly incomingDigest: string;
+    };
+
+function eventKindOf(value: string): string {
+  const kind = value.replace(/[^A-Za-z0-9_]/g, "_").slice(0, 64);
+  return kind.length > 0 ? kind : "unknown";
+}
+
+function payloadDigestOf(value: string): string {
+  const digest = value.toLowerCase().replace(/^0x/, "");
+  if (!/^[0-9a-f]{64}$/.test(digest)) throw new RangeError("Invalid source payload digest.");
+  return digest;
+}
+
+/**
+ * Record one raw source event, in the caller's transaction, before its facts are materialized.
+ *
+ * The identity row is inserted once and never updated except to count replays. A replay with the
+ * same digest resolves to the same id. A different digest for the same identity is recorded as a
+ * conflict and the caller must not apply it: the original provenance cannot be replaced.
+ */
+export async function recordSourceEvent(
+  db: Queryable,
+  event: SourceEventIdentity,
+): Promise<SourceEventObservation> {
+  const digest = payloadDigestOf(event.payloadDigest);
+  const eventKind = eventKindOf(event.eventKind);
+  const key = [
+    event.chainKey,
+    event.contract,
+    event.deploymentRevision ?? 1,
+    event.block.toString(),
+    event.txHash,
+    sourcePosition(event.position),
+  ];
+  const inserted = await db.query(
+    `INSERT INTO source_event
+       (chain_key, contract, deployment_revision, block_number, tx_hash, event_position,
+        family, event_kind, payload_digest)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     ON CONFLICT ON CONSTRAINT source_event_identity DO NOTHING
+     RETURNING id`,
+    [...key, event.family, eventKind, digest],
+  );
+  const created = inserted.rows[0];
+  if (created) return { kind: "new", id: bigintOf(created, "id") };
+  const existing = one(
+    (
+      await db.query(
+        `SELECT id, payload_digest FROM source_event
+          WHERE chain_key = $1 AND contract = $2 AND deployment_revision = $3
+            AND block_number = $4 AND tx_hash = $5 AND event_position = $6
+          FOR UPDATE`,
+        key,
+      )
+    ).rows,
+    "source event",
+  );
+  const id = bigintOf(existing, "id");
+  const original = text(existing, "payload_digest");
+  if (original === digest) {
+    await db.query(
+      `UPDATE source_event
+          SET replays = LEAST(replays + 1, ${String(MAX_SOURCE_REPLAYS)}),
+              last_seen_at = GREATEST(clock_timestamp(), first_seen_at)
+        WHERE id = $1`,
+      [id.toString()],
+    );
+    return { kind: "replay", id };
+  }
+  await db.query(
+    `INSERT INTO source_event_conflict (source_event_id, incoming_digest, incoming_kind)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (source_event_id, incoming_digest) DO UPDATE
+       SET occurrences = LEAST(source_event_conflict.occurrences + 1, ${String(MAX_SOURCE_REPLAYS)}),
+           last_seen_at = GREATEST(clock_timestamp(), source_event_conflict.first_seen_at)`,
+    [id.toString(), digest, eventKind],
+  );
+  return { kind: "conflict", id, originalDigest: original, incomingDigest: digest };
+}
+
+/** Link a materialized record to the source event that created or settled it. Idempotent. */
+export async function linkSourceEvent(
+  db: Queryable,
+  sourceEventId: bigint,
+  recordKind: SourceRecordKind,
+  recordKey: string,
+  role: "created" | "settled" = "created",
+): Promise<void> {
+  await db.query(
+    `INSERT INTO source_event_link (source_event_id, record_kind, record_key, role)
+     VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
+    [sourceEventId.toString(), recordKind, recordKey, role],
+  );
+}
+
+async function linkFromPosition(
+  db: Queryable,
+  at: Position,
+  recordKind: SourceRecordKind,
+  recordKey: string | null,
+  role: "created" | "settled" = "created",
+): Promise<void> {
+  if (at.sourceEventId === undefined || recordKey === null) return;
+  await linkSourceEvent(db, at.sourceEventId, recordKind, recordKey, role);
+}
+
+export interface SourceProvenance {
+  readonly sourceEventId: bigint;
+  readonly role: "created" | "settled";
+  readonly chainKey: string;
+  readonly family: "stellar" | "evm";
+  readonly contract: string;
+  readonly deploymentRevision: number;
+  readonly block: bigint;
+  readonly txHash: string;
+  readonly position: string;
+  readonly eventKind: string;
+  readonly payloadDigest: string;
+  readonly replays: number;
+  readonly conflicts: number;
+}
+
+/** The raw events behind one materialized record, oldest first, bounded. */
+export async function readSourceProvenance(
+  db: Queryable,
+  recordKind: SourceRecordKind,
+  recordKey: string,
+  limit = MAX_SOURCE_LINKS_PER_RECORD,
+): Promise<readonly SourceProvenance[]> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_SOURCE_LINKS_PER_RECORD)
+    throw new RangeError(
+      `Source provenance limit must be 1 to ${String(MAX_SOURCE_LINKS_PER_RECORD)}.`,
+    );
+  const { rows } = await db.query(
+    `SELECT e.id, l.role, e.chain_key, e.family, e.contract, e.deployment_revision,
+            e.block_number, e.tx_hash, e.event_position, e.event_kind, e.payload_digest,
+            e.replays,
+            (SELECT count(*)::int FROM source_event_conflict c WHERE c.source_event_id = e.id)
+              AS conflicts
+       FROM source_event_link l JOIN source_event e ON e.id = l.source_event_id
+      WHERE l.record_kind = $1 AND l.record_key = $2
+      ORDER BY e.block_number, e.id, l.role LIMIT $3`,
+    [recordKind, recordKey, limit],
+  );
+  return rows.map((row) => ({
+    sourceEventId: bigintOf(row, "id"),
+    role: text(row, "role") === "settled" ? "settled" : "created",
+    chainKey: text(row, "chain_key"),
+    family: text(row, "family") === "evm" ? "evm" : "stellar",
+    contract: text(row, "contract"),
+    deploymentRevision: integer(row, "deployment_revision"),
+    block: bigintOf(row, "block_number"),
+    txHash: text(row, "tx_hash"),
+    position: text(row, "event_position"),
+    eventKind: text(row, "event_kind"),
+    payloadDigest: text(row, "payload_digest"),
+    replays: integer(row, "replays"),
+    conflicts: integer(row, "conflicts"),
+  }));
+}
+
+/**
+ * Bounded retention: delete source events that materialized nothing and carry no conflict
+ * evidence, older than the cutoff. Linked or conflicted provenance is never pruned.
+ */
+export async function pruneUnlinkedSourceEvents(
+  db: Queryable,
+  olderThan: Date,
+  limit = 1000,
+): Promise<number> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000)
+    throw new RangeError("Source event prune batch must be 1 to 10000.");
+  const { rowCount } = await db.query(
+    `DELETE FROM source_event WHERE id IN (
+       SELECT e.id FROM source_event e
+        WHERE e.last_seen_at < $1
+          AND NOT EXISTS (SELECT 1 FROM source_event_link l WHERE l.source_event_id = e.id)
+          AND NOT EXISTS (SELECT 1 FROM source_event_conflict c WHERE c.source_event_id = e.id)
+        ORDER BY e.id LIMIT $2)`,
+    [olderThan, limit],
+  );
+  return rowCount;
+}

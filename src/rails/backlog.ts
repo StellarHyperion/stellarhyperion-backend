@@ -5,15 +5,18 @@ import { createHash } from "node:crypto";
 
 import type { Transactional } from "../db/pool.js";
 import { bigintOf, integer, text, textOrNull, timestamp, timestampOrNull } from "../db/rows.js";
+import { CCTP_VERIFICATION_FAILURES } from "./types.js";
 import type {
   AttestationStatus,
   BacklogCandidate,
   BacklogDelayBreakdown,
   BacklogInspectionReport,
   BacklogRetryState,
+  CctpVerificationFailure,
   MissingProofStage,
   RailRetryClass,
 } from "./types.js";
+import { sanitizeRailDiagnostic } from "./diagnostics.js";
 
 const STAGES: readonly MissingProofStage[] = [
   "provider_discovery",
@@ -94,6 +97,7 @@ const CLASSIFIED = `
            to_char(t.observed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS observed_at_cursor,
            a.status AS attestation_status,
            a.rail_status,
+           a.verification_failure,
            a.rail_reference,
            a.attested_at,
            a.last_checked_at,
@@ -350,7 +354,7 @@ export async function inspectRailBacklog(
       `${CLASSIFIED}
        SELECT id::text AS id_text, route, origin_chain, destination_chain, nonce_text,
               gross_amount_text, fee_text, net_amount_text, origin_block_text, origin_tx,
-              observed_at, observed_at_cursor, attestation_status, rail_status, rail_reference,
+              observed_at, observed_at_cursor, attestation_status, rail_status, verification_failure, rail_reference,
               attested_at, last_checked_at, attestation_updated_at, check_failures, retry_attempts, retry_class,
               next_attempt_at, retry_state, last_error, missing_proof_stage, overdue
          FROM filtered
@@ -446,6 +450,7 @@ function mapCandidate(
     observedAt: observedAt.toISOString(),
     attestationStatus: attestationStatusText === null ? null : statusValue(attestationStatusText),
     railStatus: sanitizeRailDiagnostic(textOrNull(row, "rail_status")),
+    verificationFailure: cctpFailureValue(textOrNull(row, "verification_failure")),
     railReference: sanitizeRailDiagnostic(textOrNull(row, "rail_reference")),
     attestedAt: attestedAt?.toISOString() ?? null,
     lastCheckedAt: lastCheckedAt?.toISOString() ?? null,
@@ -460,20 +465,8 @@ function mapCandidate(
   };
 }
 
-export function sanitizeRailDiagnostic(value: string | null): string | null {
-  if (value === null) return null;
-  return value
-    .replace(/\bhttps?:\/\/[^\s"'<>]+/gi, "[REDACTED_URL]")
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
-    .replace(
-      /\b(api[_-]?key|token|secret|password|authorization)\s*[:=]\s*[^,\s;]+/gi,
-      "$1=[REDACTED]",
-    )
-    .replace(
-      /([?&](?:api[_-]?key|apikey|token|secret|password|auth|access_token)=)[^&\s]+/gi,
-      "$1[REDACTED]",
-    )
-    .replace(/\bS[A-Z2-7]{55}\b/g, "[REDACTED_STELLAR_SECRET]");
+function cctpFailureValue(value: string | null): CctpVerificationFailure | null {
+  return CCTP_VERIFICATION_FAILURES.find((failure) => failure === value) ?? null;
 }
 
 function digestFilters(input: {
