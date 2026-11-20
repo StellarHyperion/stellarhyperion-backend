@@ -615,8 +615,10 @@ async function describeError(response: Response): Promise<string> {
     };
     // Two shapes, both real: the reference documents `{code, message}` and the sandbox returns
     // `{error}`. Redact any sensitive details or credentials from provider responses.
-    if (typeof body.error === "string") return sanitizeRailDiagnostic(body.error) ?? "no reason given";
-    if (typeof body.message === "string") return sanitizeRailDiagnostic(body.message) ?? "no reason given";
+    if (typeof body.error === "string")
+      return sanitizeRailDiagnostic(body.error) ?? "no reason given";
+    if (typeof body.message === "string")
+      return sanitizeRailDiagnostic(body.message) ?? "no reason given";
     return "no reason given";
   } catch (error) {
     if (error instanceof IrisResourceLimitError) throw error;

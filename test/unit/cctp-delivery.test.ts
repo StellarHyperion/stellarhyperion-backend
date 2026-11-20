@@ -554,10 +554,7 @@ describe("CCTP proof check summary (describeCctpProofChecks)", () => {
     );
     expect(oversized.hasMessageBytes).toBe(false);
 
-    const malformed = describeCctpProofChecks(
-      { ...baseReport, messageBytes: "not-hex" },
-      null,
-    );
+    const malformed = describeCctpProofChecks({ ...baseReport, messageBytes: "not-hex" }, null);
     expect(malformed.hasMessageBytes).toBe(false);
   });
 

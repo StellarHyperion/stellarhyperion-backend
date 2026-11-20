@@ -115,8 +115,8 @@ export function describeCctpProofChecks(
   const hasForwardTxHash = Boolean(report.forwardTxHash);
   const hasMessageBytes = Boolean(
     report.messageBytes &&
-      report.messageBytes.length <= 8192 &&
-      /^0x(?:[0-9a-fA-F]{2})+$/.test(report.messageBytes),
+    report.messageBytes.length <= 8192 &&
+    /^0x(?:[0-9a-fA-F]{2})+$/.test(report.messageBytes),
   );
   const hasMessageIdentity = Boolean(
     hasMessageBytes && report.messageNonce && report.messageDigest,
@@ -150,7 +150,11 @@ export async function inspectCctpDelivery(
   transfer: PendingTransfer,
   report: RailReport,
 ): Promise<CctpDeliveryResult> {
-  const noResult = (): CctpDeliveryResult => ({ delivery: null, failure: null, proofEvidence: null });
+  const noResult = (): CctpDeliveryResult => ({
+    delivery: null,
+    failure: null,
+    proofEvidence: null,
+  });
   const failed = (failure: CctpVerificationFailure): CctpDeliveryResult => ({
     delivery: null,
     failure,
