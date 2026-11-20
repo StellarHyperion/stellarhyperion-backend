@@ -1,3 +1,4 @@
+import { readHistoricalCoverage, type CoverageSource } from "../historical-coverage.js";
 import { evaluateFreshnessSlo } from "../../runtime/freshness.js";
 /**
  * Metrics REST API endpoint.
@@ -63,32 +64,13 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       updatedAt: new Date(row.updated_at as string | number | Date).toISOString(),
     }));
 
-    // 6. Durable Stellar history-gap reconciliation status (#29)
-    const gapResult = await db.query(
-      "SELECT status, count(*)::int AS count FROM stellar_history_gap GROUP BY status",
-    );
-    const historyGaps = { open: 0, reconciling: 0, reconciled: 0 };
-    for (const row of gapResult.rows) {
-      const status = text(row, "status");
-      const count = integer(row, "count");
-      if (status === "open" || status === "reconciling" || status === "reconciled") {
-        historyGaps[status] = count;
-      }
-    }
-    const oldestGapResult = await db.query(
-      `SELECT start_ledger, end_ledger
-         FROM stellar_history_gap
-        WHERE status <> 'reconciled'
-        ORDER BY start_ledger ASC
-        LIMIT 1`,
-    );
-    const oldestGap = oldestGapResult.rows[0];
-    const historicalCoverage = {
-      unresolved: historyGaps.open + historyGaps.reconciling,
-      oldestMissingStartLedger: oldestGap ? text(oldestGap, "start_ledger") : null,
-      oldestMissingEndLedger: oldestGap ? text(oldestGap, "end_ledger") : null,
-      unknown: oldestGap === undefined && historyGaps.open + historyGaps.reconciling > 0,
-    };
+    const configuredSources: CoverageSource[] = [];
+    const stellar = deps.config.indexer.stellar;
+    if (stellar !== null)
+      configuredSources.push({ chain: stellar.chain, family: "stellar", contract: stellar.router });
+    for (const evm of deps.config.indexer.evm)
+      configuredSources.push({ chain: evm.chain, family: "evm", contract: evm.router });
+    const { historyGaps, historicalCoverage } = await readHistoricalCoverage(db, configuredSources);
 
     // 7. Persistent worker heartbeats & freshness (#107)
     let heartbeatRecords: WorkerHeartbeatRecord[] = [];
