@@ -159,6 +159,20 @@ export interface PendingTransfer {
   readonly delivered: boolean;
 }
 
+/** A bounded claim on one transfer, fenced by a unique token on every acquisition. */
+export interface RailWorkLease {
+  readonly transferId: bigint;
+  readonly ownerId: string;
+  readonly token: string;
+}
+
+export class RailLeaseLostError extends Error {
+  constructor(readonly transferId: bigint) {
+    super(`rail work lease lost for transfer ${transferId.toString()}`);
+    this.name = "RailLeaseLostError";
+  }
+}
+
 /** An operator's review, required before a terminal transfer can re-enter the rail queue. */
 export interface RailRequeueRequest {
   readonly transferId: bigint;

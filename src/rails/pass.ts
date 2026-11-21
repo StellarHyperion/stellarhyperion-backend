@@ -20,6 +20,8 @@ import type { AxelarDeliveryEvidenceRow } from "../chains/writers.js";
  * the pass records a cooldown and returns without asking anything until it passes. Doubling from a
  * second would spend those five minutes refreshing the block.
  */
+import { randomUUID } from "node:crypto";
+
 import type { AppConfig } from "../config/config.js";
 import { abortable, combinedSignal } from "./cancellation.js";
 import { revalidateItsDeliveryProofs, verifyItsDelivery } from "./axelar/delivery.js";
@@ -39,13 +41,16 @@ import {
   writeAxelarQuarantine,
 } from "../chains/writers.js";
 import {
+  claimPendingForRail,
   inspectRailBacklog,
   outstandingForRail,
-  pendingForRail,
-  pendingTransferById,
+  releaseRailWorkLease,
+  releaseRailWorkLeases,
+  renewRailWorkLease,
   type InspectRailBacklogOptions,
 } from "./queue.js";
 import {
+  RailLeaseLostError,
   RailError,
   isTerminal,
   type BacklogInspectionReport,
@@ -53,6 +58,7 @@ import {
   type RailClient,
   type RailLookup,
   type RailRetryClass,
+  type RailWorkLease,
   type CctpVerificationFailure,
   type RailCancellationOptions,
 } from "./types.js";
@@ -66,6 +72,11 @@ import {
  */
 const BACKLOG_MULTIPLE_BEFORE_DEGRADED = 3;
 const MAX_RETRY_DELAY_MS = 60 * 60 * 1000;
+const RAIL_WORK_LEASE_MS = 60_000;
+
+type TransferOutcome =
+  | { readonly kind: "processed"; readonly settled: boolean }
+  | { readonly kind: "failed"; readonly rateLimitedError: RailError | null };
 
 export interface RailPassOptions extends RailCancellationOptions {
   readonly route: number;
@@ -95,6 +106,7 @@ export class RailPass {
   private lastProgress: RailProgress | null = null;
   private cooldownUntil: Date | null = null;
   private readonly circuits: ProviderCircuitBreaker;
+  private readonly ownerId = randomUUID();
 
   constructor(private readonly options: RailPassOptions) {
     this.circuits =
@@ -186,6 +198,11 @@ export class RailPass {
     };
   }
 
+  /** Release any remaining claims during graceful shutdown; crashes rely on lease expiration. */
+  async release(): Promise<void> {
+    await releaseRailWorkLeases(this.options.db, this.ownerId);
+  }
+
   /** One pass. Returns true when it filled a batch, which means there is more behind it. */
   async tick(signal: AbortSignal): Promise<boolean> {
     const { db, logger, batchSize, client } = this.options;
@@ -210,48 +227,60 @@ export class RailPass {
     let stoppedForCooldown = false;
     const seen: bigint[] = [];
 
-    // One locked transfer per transaction: replicas skip active work and cannot commit stale
-    // schedules. A crash rolls back the claim; no process-local ownership survives a restart.
-    while (
-      selected < batchSize &&
-      !effective.aborted &&
-      !this.circuits.isPaused(this.discoveryCircuitKey)
-    ) {
-      const outcome = await db.transaction(async (tx) => {
-        const queue = await pendingForRail(tx, {
-          route: this.options.route,
-          limit: 1,
-          now: this.now(),
-          notCheckedSince: new Date(this.now().getTime() - this.options.recheckAfterMs),
-          maxCheckFailures: this.options.maxCheckFailures,
-          lock: true,
-          excludedTransferIds: seen,
-          signal: effective,
-        });
-        const transfer = queue[0];
-        if (!transfer) return "empty";
-        selected += 1;
-        seen.push(transfer.transferId);
-        try {
-          if (await this.handle(transfer, tx, effective)) settled += 1;
+    // The short claim transaction commits the lease before provider I/O. A crashed worker's claim
+    // becomes available again after its bounded expiry.
+    while (selected < batchSize && !effective.aborted && !this.circuits.isPaused(this.discoveryCircuitKey)) {
+      const claimed = await db.transaction((tx) =>
+        claimPendingForRail(
+          tx,
+          {
+            route: this.options.route,
+            limit: 1,
+            now: this.now(),
+            notCheckedSince: new Date(this.now().getTime() - this.options.recheckAfterMs),
+            maxCheckFailures: this.options.maxCheckFailures,
+            excludedTransferIds: seen,
+            signal: effective,
+          },
+          this.ownerId,
+          RAIL_WORK_LEASE_MS,
+        ),
+      );
+      if (claimed === null) break;
+      const { transfer, lease } = claimed;
+      selected += 1;
+      seen.push(transfer.transferId);
+
+      try {
+        const outcome = await this.processTransfer(transfer, lease, effective);
+        if (outcome.kind === "processed") {
           checked += 1;
-        } catch (error) {
-          effective.throwIfAborted();
+          if (outcome.settled) settled += 1;
+        } else {
           failures += 1;
-          await this.recordFailure(transfer, error, tx);
-          if (error instanceof RailError && error.kind === "rateLimited") {
-            this.cooldownUntil = this.failureRetryAt(this.now(), transfer.retryAttempts + 1, error);
+          if (outcome.rateLimitedError !== null) {
+            this.cooldownUntil = this.failureRetryAt(
+              this.now(),
+              transfer.retryAttempts + 1,
+              outcome.rateLimitedError,
+            );
             logger.warn(
               { rail: client.rail, until: this.cooldownUntil.toISOString() },
               "the rail rate limited us, holding off rather than retrying",
             );
-            return "cooldown";
+            stoppedForCooldown = true;
           }
         }
-        return "processed";
-      });
-      if (outcome === "cooldown") stoppedForCooldown = true;
-      if (outcome !== "processed") break;
+      } catch (error) {
+        if (!(error instanceof RailLeaseLostError)) throw error;
+        logger.warn(
+          { rail: client.rail, transferId: transfer.transferId.toString() },
+          "rail work lease expired before the verification decision could be committed",
+        );
+      } finally {
+        await releaseRailWorkLease(db, lease);
+      }
+      if (stoppedForCooldown) break;
     }
 
     effective.throwIfAborted();
@@ -279,24 +308,58 @@ export class RailPass {
     const cooldown = this.cooldownUntil;
     if (cooldown !== null && cooldown > this.now()) return false;
     if (this.circuits.isPaused(this.discoveryCircuitKey)) return false;
-    return this.options.db.transaction(async (tx) => {
-      const transfer = await pendingTransferById(
+    const claimed = await this.options.db.transaction((tx) =>
+      claimPendingForRail(
         tx,
-        this.options.route,
-        transferId,
-        this.options.maxCheckFailures,
-        effective,
-      );
-      if (transfer === null) return false;
+        {
+          route: this.options.route,
+          limit: 1,
+          now: this.now(),
+          notCheckedSince: this.now(),
+          maxCheckFailures: this.options.maxCheckFailures,
+          onlyTransferId: transferId,
+          signal: effective,
+        },
+        this.ownerId,
+        RAIL_WORK_LEASE_MS,
+      ),
+    );
+    if (claimed === null) return false;
+    try {
+      const outcome = await this.processTransfer(claimed.transfer, claimed.lease, effective);
+      if (outcome.kind === "failed" && outcome.rateLimitedError !== null) {
+        this.cooldownUntil = this.failureRetryAt(
+          this.now(),
+          claimed.transfer.retryAttempts + 1,
+          outcome.rateLimitedError,
+        );
+      }
+      return outcome.kind === "processed" && outcome.settled;
+    } catch (error) {
+      if (effective.aborted || error instanceof RailLeaseLostError) return false;
+      throw error;
+    } finally {
+      await releaseRailWorkLease(this.options.db, claimed.lease);
+    }
+  }
+
+  private async processTransfer(
+    transfer: PendingTransfer,
+    lease: RailWorkLease,
+    signal: AbortSignal,
+  ): Promise<TransferOutcome> {
+    return this.options.db.transaction(async (tx) => {
       try {
-        return await this.handle(transfer, tx, effective);
+        return { kind: "processed", settled: await this.handle(transfer, tx, signal, lease) };
       } catch (error) {
-        if (effective.aborted) return false;
-        await this.recordFailure(transfer, error, tx);
-        if (error instanceof RailError && error.kind === "rateLimited") {
-          this.cooldownUntil = this.failureRetryAt(this.now(), transfer.retryAttempts + 1, error);
-        }
-        return false;
+        signal.throwIfAborted();
+        if (error instanceof RailLeaseLostError) throw error;
+        await this.recordFailure(transfer, error, tx, lease);
+        return {
+          kind: "failed",
+          rateLimitedError:
+            error instanceof RailError && error.kind === "rateLimited" ? error : null,
+        };
       }
     });
   }
@@ -306,13 +369,14 @@ export class RailPass {
     transfer: PendingTransfer,
     db: Queryable,
     signal: AbortSignal,
+    lease: RailWorkLease,
   ): Promise<boolean> {
     const at = this.now();
 
     if (transfer.delivered) {
       // Our own inbound index already says the money arrived, which outranks anything the rail
       // would tell us. No request, and the transfer leaves the queue for good.
-      await this.write(db, transfer, {
+      await this.write(db, transfer, lease, {
         status: "delivered",
         railStatus: null,
         reference: null,
@@ -344,7 +408,7 @@ export class RailPass {
     signal.throwIfAborted();
     if (lookup.kind === "missing") {
       // Normal. The rail has not indexed the burn yet, which is where every transfer starts.
-      await this.write(db, transfer, {
+      await this.write(db, transfer, lease, {
         status: transfer.status ?? "pending",
         railStatus: null,
         reference: null,
@@ -401,7 +465,7 @@ export class RailPass {
               await writeInbound(db, verified.at, verified.row);
               await linkAxelarDeliveryEvidence(db, evidence, evidenceId);
             } else await writeInbound(db, verified.at, verified.row);
-            await this.write(db, transfer, {
+            await this.write(db, transfer, lease, {
               status: "delivered",
               railStatus: report.railStatus,
               reference: report.reference,
@@ -442,7 +506,7 @@ export class RailPass {
         ? "attested"
         : candidateStatus;
     signal.throwIfAborted();
-    await this.write(db, transfer, {
+    await this.write(db, transfer, lease, {
       status,
       railStatus: report.railStatus,
       reference: report.reference,
@@ -464,6 +528,7 @@ export class RailPass {
     transfer: PendingTransfer,
     error: unknown,
     db: Queryable,
+    lease: RailWorkLease,
   ): Promise<void> {
     const retryable = error instanceof RailError && error.kind !== "permanent";
     const failures = retryable ? transfer.checkFailures : transfer.checkFailures + 1;
@@ -495,7 +560,7 @@ export class RailPass {
       );
     }
 
-    await this.write(db, transfer, {
+    await this.write(db, transfer, lease, {
       // Still pending, not failed. A transfer we cannot ask about is not a transfer that failed,
       // and writing `failed` here would claim the money did not move on the strength of our own
       // inability to get an answer.
@@ -519,6 +584,7 @@ export class RailPass {
   private async write(
     db: Queryable,
     transfer: PendingTransfer,
+    lease: RailWorkLease,
     fields: {
       readonly status: string;
       readonly railStatus: string | null;
@@ -536,6 +602,7 @@ export class RailPass {
       readonly verificationFailure: CctpVerificationFailure | null;
     },
   ): Promise<void> {
+    await renewRailWorkLease(db, lease, RAIL_WORK_LEASE_MS);
     await writeAttestation(db, {
       transferId: transfer.transferId,
       route: transfer.route,

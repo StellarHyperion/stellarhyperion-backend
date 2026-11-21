@@ -12,9 +12,16 @@
  * and that is a stronger claim than any rail's opinion about whether it will. A transfer that has
  * arrived is settled without spending a request on it, which on a busy day is most of them.
  */
+import { randomUUID } from "node:crypto";
+
 import type { Queryable } from "../db/pool.js";
 import { bigintOf, integer, text, textOrNull } from "../db/rows.js";
-import type { AttestationStatus, PendingTransfer } from "./types.js";
+import {
+  RailLeaseLostError,
+  type AttestationStatus,
+  type PendingTransfer,
+  type RailWorkLease,
+} from "./types.js";
 
 export {
   BacklogValidationError,
@@ -45,6 +52,80 @@ export interface QueueQuery {
   /** Give up on a transfer after this many consecutive failures, and stop polling it. */
   readonly maxCheckFailures: number;
   readonly signal?: AbortSignal;
+}
+
+export interface ClaimedRailTransfer {
+  readonly transfer: PendingTransfer;
+  readonly lease: RailWorkLease;
+}
+
+/** Select and claim one due transfer. The caller must run this inside a transaction. */
+export async function claimPendingForRail(
+  db: Queryable,
+  query: QueueQuery,
+  ownerId: string,
+  leaseDurationMs: number,
+): Promise<ClaimedRailTransfer | null> {
+  const transfer = (
+    await pendingForRail(db, {
+      ...query,
+      limit: 1,
+      lock: true,
+    })
+  )[0];
+  if (transfer === undefined) return null;
+
+  const lease: RailWorkLease = {
+    transferId: transfer.transferId,
+    ownerId,
+    token: randomUUID(),
+  };
+  const { rowCount } = await db.query(
+    `INSERT INTO rail_work_lease
+       (transfer_id, owner_id, lease_token, lease_until, updated_at)
+     VALUES ($1, $2, $3, clock_timestamp() + ($4 * INTERVAL '1 millisecond'), clock_timestamp())
+     ON CONFLICT (transfer_id) DO UPDATE
+       SET owner_id = EXCLUDED.owner_id,
+           lease_token = EXCLUDED.lease_token,
+           lease_until = EXCLUDED.lease_until,
+           updated_at = EXCLUDED.updated_at
+       WHERE rail_work_lease.lease_until <= clock_timestamp()
+     RETURNING transfer_id`,
+    [transfer.transferId.toString(), lease.ownerId, lease.token, leaseDurationMs],
+  );
+  return rowCount === 0 ? null : { transfer, lease };
+}
+
+/** Extend a still-live claim. The row lock fences competing claims until the caller commits. */
+export async function renewRailWorkLease(
+  db: Queryable,
+  lease: RailWorkLease,
+  leaseDurationMs: number,
+): Promise<void> {
+  const { rowCount } = await db.query(
+    `UPDATE rail_work_lease
+        SET lease_until = clock_timestamp() + ($4 * INTERVAL '1 millisecond'),
+            updated_at = clock_timestamp()
+      WHERE transfer_id = $1
+        AND owner_id = $2
+        AND lease_token = $3
+        AND lease_until > clock_timestamp()
+     RETURNING transfer_id`,
+    [lease.transferId.toString(), lease.ownerId, lease.token, leaseDurationMs],
+  );
+  if (rowCount === 0) throw new RailLeaseLostError(lease.transferId);
+}
+
+export async function releaseRailWorkLease(db: Queryable, lease: RailWorkLease): Promise<void> {
+  await db.query(
+    `DELETE FROM rail_work_lease
+      WHERE transfer_id = $1 AND owner_id = $2 AND lease_token = $3`,
+    [lease.transferId.toString(), lease.ownerId, lease.token],
+  );
+}
+
+export async function releaseRailWorkLeases(db: Queryable, ownerId: string): Promise<void> {
+  await db.query("DELETE FROM rail_work_lease WHERE owner_id = $1", [ownerId]);
 }
 
 export async function pendingForRail(
@@ -83,6 +164,11 @@ export async function pendingForRail(
        FROM outbound_transfer t
        LEFT JOIN rail_attestation a ON a.transfer_id = t.id
       WHERE t.route = $1
+        AND NOT EXISTS (
+          SELECT 1 FROM rail_work_lease l
+           WHERE l.transfer_id = t.id
+             AND l.lease_until > clock_timestamp()
+        )
         AND NOT (t.id = ANY($6::bigint[]))
         AND ($7::bigint IS NULL OR t.id = $7)
         AND (a.transfer_id IS NULL OR a.status IN ('pending', 'attested'))
