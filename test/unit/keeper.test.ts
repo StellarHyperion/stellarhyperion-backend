@@ -3,10 +3,7 @@ import { Keypair } from "@stellar/stellar-sdk";
 import { loadConfig } from "../../src/config/config.js";
 import { processTtlBump } from "../../src/keeper/jobs/ttl.js";
 import { processClaimSettlement } from "../../src/keeper/jobs/claims.js";
-import {
-  reconcileKeeperCheckpointsBeforeRetry,
-  submitStellar,
-} from "../../src/keeper/stellar.js";
+import { reconcileKeeperCheckpointsBeforeRetry, submitStellar } from "../../src/keeper/stellar.js";
 import { requeueFailedKeeperJob } from "../../src/keeper/queue.js";
 import type { Queue } from "bullmq";
 import { KeeperMaintenancePausedError, reserveKeeperSpending } from "../../src/keeper/spending.js";
@@ -23,8 +20,18 @@ class Db {
   calls: { sql: string; params: readonly unknown[] }[] = [];
   constructor(
     private readonly claims: readonly Record<string, unknown>[] = [
-      { claim_id: "1", settled: false, recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", amount: "90000000000000000001" },
-      { claim_id: "2", settled: false, recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF", amount: "42" },
+      {
+        claim_id: "1",
+        settled: false,
+        recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        amount: "90000000000000000001",
+      },
+      {
+        claim_id: "2",
+        settled: false,
+        recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        amount: "42",
+      },
     ],
   ) {}
   query(sql: string, params: readonly unknown[] = []) {
@@ -245,7 +252,15 @@ describe("Stellar keeper execution", () => {
       client,
     );
     expect(result.allowed).toBe(false);
-    expect(db.calls.some((call) => call.sql.includes("spending cap reached"))).toBe(true);
+    expect(
+      db.calls.some(
+        (call) =>
+          call.sql.includes("INSERT INTO keeper_spending_audit") &&
+          call.params.some(
+            (value) => typeof value === "string" && value.startsWith("spending cap reached:"),
+          ),
+      ),
+    ).toBe(true);
     expect(db.calls.some((call) => call.sql.includes("SET spent_stroops=spent_stroops+$5"))).toBe(
       false,
     );
@@ -325,9 +340,7 @@ describe("Stellar keeper execution", () => {
       claimIds: ["1", "2"],
       transferIds: ["9223372036854775808"],
     });
-    expect(result.targetKeys).toContain(
-      "claim:" + config.indexer.stellar?.chain + ":2",
-    );
+    expect(result.targetKeys).toContain("claim:" + config.indexer.stellar?.chain + ":2");
     expect(JSON.stringify(result)).not.toContain(Keypair.random().secret());
   });
 });

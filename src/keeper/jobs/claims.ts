@@ -92,7 +92,11 @@ export async function processClaimSettlement(
       };
     });
   const targetKeys = operations.flatMap((operation) => operation.targetKeys);
-  const preview = { operations, targetKeys, estimatedFee: String(BigInt(BASE_FEE) * BigInt(operations.length)) };
+  const preview = {
+    operations,
+    targetKeys,
+    estimatedFee: String(BigInt(BASE_FEE) * BigInt(operations.length)),
+  };
   if (ctx.config.keeper.stellarSecrets.length === 0) {
     await recordKeeperSubmission(ctx.db, {
       jobName: "claim-settlement",
@@ -134,9 +138,15 @@ export async function processClaimSettlement(
       );
       outcomes[index] = { claimId: claim.claimId, outcome: "confirmed", transactionHash: hash };
     } catch (error) {
-      if (error instanceof KeeperMaintenancePausedError || error instanceof KeeperSpendingCapReachedError) {
+      if (
+        error instanceof KeeperMaintenancePausedError ||
+        error instanceof KeeperSpendingCapReachedError
+      ) {
         paused = true;
-        ctx.logger.warn({ claimId: claim.claimId }, "claim settlement deferred by keeper spending policy");
+        ctx.logger.warn(
+          { claimId: claim.claimId },
+          "claim settlement deferred by keeper spending policy",
+        );
         break;
       }
       const reason = sanitizeDiagnosticText(error instanceof Error ? error.message : String(error));

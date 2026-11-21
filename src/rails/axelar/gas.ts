@@ -87,12 +87,16 @@ export async function ingestAxelarGasEvidence(
     try {
       receipt = await client.getTransactionReceipt({ hash: originTx as Hex });
     } catch {
+      options.signal?.throwIfAborted();
       report.failed += 1;
       continue;
     }
+    options.signal?.throwIfAborted();
     const records = inspectAxelarGasEvidence(receipt.logs, gasService, originTx, targets);
     await db.transaction(async (tx) => {
+      options.signal?.throwIfAborted();
       for (const record of records) {
+        options.signal?.throwIfAborted();
         await writeAxelarGasEvidence(tx, {
           transferId: record.transferId,
           originChain: chain,
@@ -112,6 +116,7 @@ export async function ingestAxelarGasEvidence(
           payload: record.payload,
         });
       }
+      options.signal?.throwIfAborted();
       await recordAxelarGasScan(tx, {
         originChain: chain,
         originTx,

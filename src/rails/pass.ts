@@ -215,9 +215,15 @@ export class RailPass {
 
     if (this.options.config && client.rail === "axelar") {
       if (this.options.route === RouteKind.AxelarIts || this.options.route === RouteKind.AxelarGmp)
-        await abortable(ingestAxelarGasEvidence(this.options.config, db, batchSize, { signal: effective }), effective);
+        await abortable(
+          ingestAxelarGasEvidence(this.options.config, db, batchSize, { signal: effective }),
+          effective,
+        );
       if (this.options.route === RouteKind.AxelarIts)
-        await abortable(revalidateItsDeliveryProofs(this.options.config, db, batchSize, { signal: effective }), effective);
+        await abortable(
+          revalidateItsDeliveryProofs(this.options.config, db, batchSize, { signal: effective }),
+          effective,
+        );
     }
 
     let checked = 0;
@@ -229,7 +235,11 @@ export class RailPass {
 
     // The short claim transaction commits the lease before provider I/O. A crashed worker's claim
     // becomes available again after its bounded expiry.
-    while (selected < batchSize && !effective.aborted && !this.circuits.isPaused(this.discoveryCircuitKey)) {
+    while (
+      selected < batchSize &&
+      !effective.aborted &&
+      !this.circuits.isPaused(this.discoveryCircuitKey)
+    ) {
       const claimed = await db.transaction((tx) =>
         claimPendingForRail(
           tx,
@@ -444,7 +454,10 @@ export class RailPass {
         try {
           const its =
             report.execution || report.forwardTxHash
-              ? await abortable(verifyItsDelivery(this.options.config, db, transfer, report, verificationOptions), signal)
+              ? await abortable(
+                  verifyItsDelivery(this.options.config, db, transfer, report, verificationOptions),
+                  signal,
+                )
               : null;
           diagnostics = its !== null && "diagnostics" in its ? its.diagnostics : [];
           itsVerificationState =
@@ -452,7 +465,10 @@ export class RailPass {
           let verified: VerifiedDelivery | null =
             its !== null && !("diagnostics" in its) ? its : null;
           if (!verified) {
-            const cctp = await abortable(inspectCctpDelivery(this.options.config, db, transfer, report, verificationOptions), signal);
+            const cctp = await abortable(
+              inspectCctpDelivery(this.options.config, db, transfer, report, verificationOptions),
+              signal,
+            );
             verified = cctp.delivery;
             verificationFailure = cctp.failure;
           }
