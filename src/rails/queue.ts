@@ -44,12 +44,14 @@ export interface QueueQuery {
   readonly notCheckedSince: Date;
   /** Give up on a transfer after this many consecutive failures, and stop polling it. */
   readonly maxCheckFailures: number;
+  readonly signal?: AbortSignal;
 }
 
 export async function pendingForRail(
   db: Queryable,
   query: QueueQuery,
 ): Promise<readonly PendingTransfer[]> {
+  query.signal?.throwIfAborted();
   const { rows } = await db.query(
     `SELECT t.id,
             t.route,
@@ -105,6 +107,7 @@ export async function pendingForRail(
       (query.excludedTransferIds ?? []).map(String),
       query.onlyTransferId?.toString() ?? null,
     ],
+    { workload: "rails", ...(query.signal === undefined ? {} : { signal: query.signal }) },
   );
 
   return rows.map((row) => mapPendingRow(row));
@@ -116,6 +119,7 @@ export async function pendingTransferById(
   route: number,
   transferId: bigint,
   maxCheckFailures = 5,
+  signal?: AbortSignal,
 ): Promise<PendingTransfer | null> {
   const now = new Date();
   const rows = await pendingForRail(db, {
@@ -126,6 +130,7 @@ export async function pendingTransferById(
     maxCheckFailures,
     onlyTransferId: transferId,
     lock: true,
+    ...(signal === undefined ? {} : { signal }),
   });
   return rows[0] ?? null;
 }

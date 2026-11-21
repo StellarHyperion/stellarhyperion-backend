@@ -263,7 +263,15 @@ export interface BuildIndexerDeps {
 export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   const { config, logger, db } = deps;
   const executionId = randomUUID();
-  const passes = buildRailPasses(config.rails, config.network, db, logger, config);
+  const railShutdown = new AbortController();
+  const passes = buildRailPasses(
+    config.rails,
+    config.network,
+    db,
+    logger,
+    config,
+    railShutdown.signal,
+  );
   const inspectBacklog = (
     options: InspectRailBacklogOptions = {},
   ): Promise<BacklogInspectionReport> =>
@@ -381,6 +389,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
       }
     },
     stop: async () => {
+      railShutdown.abort();
       // In parallel. Each watcher stops after its own current tick, and they share no state, so
       // serialising them would only make shutdown take as long as the slowest chain times the
       // number of chains.
@@ -404,6 +413,7 @@ export function buildRailPasses(
   db: Transactional,
   logger: Logger,
   appConfig: AppConfig,
+  shutdownSignal?: AbortSignal,
 ): readonly RailPass[] {
   const clients: readonly { readonly route: RouteKind; readonly client: RailClient }[] = [
     {
@@ -438,6 +448,7 @@ export function buildRailPasses(
       batchSize: config.batchSize,
       recheckAfterMs: config.recheckAfterMs,
       maxCheckFailures: config.maxCheckFailures,
+      ...(shutdownSignal === undefined ? {} : { shutdownSignal }),
     });
   });
 }
