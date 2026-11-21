@@ -781,8 +781,6 @@ export class RecordingDb implements Transactional {
     const identities = new Map(this.identities);
     const conflicts = new Map(this.conflicts);
     const journals = [...this.journals];
-    const outboundTransfers = this.outboundTransfers.map((t) => ({ ...t }));
-    const railAttestations = new Map(this.railAttestations);
     try {
       const value = await work(this);
       this.commits.push(id);
@@ -791,10 +789,6 @@ export class RecordingDb implements Transactional {
       this.identities = identities;
       this.conflicts = conflicts;
       this.journals = journals;
-      this.outboundTransfers.length = 0;
-      this.outboundTransfers.push(...outboundTransfers);
-      this.railAttestations.clear();
-      for (const [k, v] of railAttestations) this.railAttestations.set(k, v);
       this.rollbacks.push(id);
       throw error;
     } finally {
@@ -836,41 +830,4 @@ export function capturingLogger(): { logger: Logger; lines: CapturedLog[] } {
     },
   );
   return { logger, lines };
-}
-
-export function seedOutboundTransfer(
-  db: RecordingDb,
-  fields: {
-    readonly id?: bigint;
-    readonly route?: number;
-    readonly originChain?: string;
-    readonly destinationChain?: string;
-    readonly nonce?: bigint;
-    readonly originTx?: string;
-    readonly destination?: string;
-    readonly sender?: string;
-    readonly token?: string;
-  } = {},
-): bigint {
-  const id = fields.id ?? BigInt(db.outboundTransfers.length + 1);
-  db.outboundTransfers.push({
-    id,
-    origin_chain: fields.originChain ?? "sepolia",
-    origin_router: "router-1",
-    route: fields.route ?? 0,
-    nonce: fields.nonce ?? id,
-    sender: fields.sender ?? "0x1111111111111111111111111111111111111111",
-    token: fields.token ?? "0x3333333333333333333333333333333333333333",
-    gross_amount: 1000000n,
-    fee: 1000n,
-    net_amount: 999000n,
-    destination_chain: fields.destinationChain ?? "stellar-testnet",
-    destination: fields.destination ?? "0x2222222222222222222222222222222222222222",
-    rail_ref: "0x0000",
-    origin_block: 1000n,
-    origin_tx: fields.originTx ?? `0x${id.toString(16).padStart(64, "0")}`,
-    origin_log_index: 0,
-    observed_at: new Date(),
-  });
-  return id;
 }

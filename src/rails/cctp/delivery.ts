@@ -299,6 +299,7 @@ export async function inspectCctpDelivery(
             amount: message.amount,
             delivered: true,
             claimId: null,
+            cctpFeeReconciliation: message.feeReconciliation,
           },
         },
       };

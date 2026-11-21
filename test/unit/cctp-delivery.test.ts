@@ -22,7 +22,7 @@ import {
 } from "../../src/rails/cctp/events.js";
 import type { DeliveryLog } from "../../src/rails/axelar/events.js";
 import { reportFor } from "../../src/rails/cctp/iris.js";
-import { writeAttestation } from "../../src/chains/writers.js";
+import { writeAttestation, writeInbound } from "../../src/chains/writers.js";
 import type { Queryable } from "../../src/db/pool.js";
 
 const expected: ExpectedCctpTransfer = {
@@ -87,11 +87,27 @@ const paid: DeliveryLog = {
 describe("CCTP forwarded destination proof", () => {
   it("requires the exact attested message and an actual native-USDC mint after fees", () => {
     expect(verified.amount).toBe(99600000n);
+    expect(verified.feeReconciliation).toEqual({
+      burnedAmountSourceUnits: 997000000n,
+      forwardingBudgetDestinationUnits: 500000n,
+      executedDeductionDestinationUnits: 100000n,
+      actualPayoutDestinationUnits: 99600000n,
+    });
     expect(matchingCctpPayment([paid, received], raw, expected)).toBe(paid);
     expect(matchingCctpPayment([received], raw, expected)).toBeNull();
     expect(matchingCctpPayment([paid], raw, expected)).toBeNull();
     expect(inspectCctpPayment([received], raw, expected).failure).toBe("mint_missing");
     expect(inspectCctpPayment([paid], raw, expected).failure).toBe("receipt_missing");
+    expect(
+      inspectCctpPayment(
+        [
+          { ...paid, data: encodeAbiParameters([{ type: "uint256" }], [verified.amount + 1n]) },
+          received,
+        ],
+        raw,
+        expected,
+      ).failure,
+    ).toBe("amount_mismatch");
   });
   it.each(["sourceToken", "sourceAdapter", "sourceMessenger"] as const)(
     "binds the %s to the indexed source deployment",
@@ -117,6 +133,21 @@ describe("CCTP forwarded destination proof", () => {
     );
     expect(
       inspectCctpMessage(raw, { ...expected, sourceAmount: expected.sourceAmount + 10n }).failure,
+    ).toBe("amount_mismatch");
+  });
+  it.each([
+    [280, expected.sourceAmount / 10n],
+    [280, expected.sourceAmount / 10n + 1n],
+    [312, 500001n],
+    [312, expected.sourceAmount / 10n],
+  ])("rejects inconsistent fee accounting at message offset %i", (offset, value) => {
+    const changed = hexToBytes(raw);
+    changed.set(word(`0x${value.toString(16)}`), offset);
+    expect(inspectCctpMessage(toHex(changed), expected).failure).toBe("fee_mismatch");
+  });
+  it("rejects a seven-decimal burn that cannot be converted exactly", () => {
+    expect(
+      inspectCctpMessage(raw, { ...expected, sourceAmount: expected.sourceAmount + 1n }).failure,
     ).toBe("amount_mismatch");
   });
   it.each(["destinationMessenger", "recipient"] as const)("refuses a different %s", (field) => {
@@ -164,6 +195,7 @@ describe("CCTP forwarded destination proof", () => {
     const changed = hexToBytes(raw);
     changed.set(word(`0x${600000n.toString(16)}`), 312);
     expect(verifiedCctpMessage(toHex(changed), expected)).toBeNull();
+    expect(inspectCctpMessage(toHex(changed), expected).failure).toBe("fee_mismatch");
     const slow = hexToBytes(raw);
     new DataView(slow.buffer).setUint32(144, 1000);
     expect(verifiedCctpMessage(toHex(slow), expected)).toBeNull();
@@ -675,5 +707,41 @@ describe("CCTP pending transfer proof check regression", () => {
     // because confirming delivery requires inspectCctpDelivery with an EVM receipt.
     expect(summary.missingChecks).toHaveLength(0);
     expect(summary.evidence).toBeNull();
+  });
+  it("persists the CCTP fee reconciliation as integer base units with the indexed delivery", async () => {
+    let statement = "";
+    let parameters: readonly unknown[] = [];
+    const db: Queryable = {
+      query(sql, values = []) {
+        statement = sql;
+        parameters = values;
+        return Promise.resolve({ rows: [], rowCount: 1 });
+      },
+    };
+    await writeInbound(
+      db,
+      {
+        chainKey: "sepolia",
+        block: 100n,
+        txHash: `0x${"11".repeat(32)}`,
+        logIndex: 4,
+        observedAt: new Date("2026-11-19T09:00:00Z"),
+      },
+      {
+        sourceTransferId: 7n,
+        route: RouteKind.Cctp,
+        sourceChain: "stellar-testnet",
+        sourceNonce: 8n,
+        railMessageId: nonce,
+        recipient: expected.recipient,
+        token: expected.token,
+        amount: 99600000n,
+        delivered: true,
+        claimId: null,
+        cctpFeeReconciliation: verified.feeReconciliation,
+      },
+    );
+    expect(statement).toContain("cctp_actual_payout_destination_units");
+    expect(parameters.slice(15)).toEqual(["997000000", "500000", "100000", "99600000"]);
   });
 });

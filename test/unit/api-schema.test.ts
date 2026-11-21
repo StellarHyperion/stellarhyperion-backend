@@ -69,7 +69,15 @@ beforeAll(async () => {
     "1792600000000_keeper-checkpoints.sql",
     "1792800000000_cctp-verification-failure-reasons.sql",
     "1792900000000_rail-transition-history.sql",
+    "1793000000000_evm-quarantine-raw-replay.sql",
+    "1793100000000_keeper-submission-outcomes.sql",
+    "1793200000000_axelar-source-proof-binding.sql",
+    "1793300000000_attestation-diagnostics.sql",
+    "1793400000000_cctp-message-identity.sql",
+    "1793500000000_ingestion-rejections.sql",
+    "1793600000000_source-event-provenance.sql",
     "1793700000000_worker-run-correlation.sql",
+    "1793800000000_cctp-fee-reconciliation.sql",
   ]) {
     const sql = readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8").split(
       "-- Down Migration",
