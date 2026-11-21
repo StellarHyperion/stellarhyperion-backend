@@ -24,6 +24,7 @@
     "migrate:up": "npm run migrate -- up",
     "migrate:down": "npm run migrate -- down",
     "rail:requeue": "node --env-file-if-exists=.env dist/rails/requeue-cli.js",
+    "keeper:requeue": "node --env-file-if-exists=.env dist/keeper/requeue-cli.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",

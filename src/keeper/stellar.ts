@@ -31,6 +31,80 @@ export interface StellarSubmissionOptions {
   ) => Promise<Transaction>;
 }
 
+/** Reconcile every unresolved public hash before an operator retries a failed BullMQ job. */
+export async function reconcileKeeperCheckpointsBeforeRetry(
+  config: AppConfig,
+  db: Transactional,
+  suppliedClient?: rpc.Server,
+): Promise<void> {
+  const chain = config.indexer.stellar;
+  if (!chain) throw new Error("A Stellar deployment is required for keeper recovery.");
+  const client = suppliedClient ?? new rpc.Server(chain.rpcUrl, { timeout: 15_000 });
+
+  let network;
+  try {
+    network = await client.getNetwork();
+  } catch {
+    throw new Error("Keeper RPC network could not be verified before job recovery.");
+  }
+  if (network.passphrase !== chain.networkPassphrase)
+    throw new Error("Keeper RPC network mismatch; failed job recovery is blocked.");
+
+  await db.transaction(async (tx) => {
+    await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+      keeperSignerLock(config),
+    ]);
+    const { rows } = await tx.query(
+      "SELECT hash FROM keeper_checkpoint WHERE chain_key=$1 AND state='submitted' ORDER BY created_at,hash LIMIT 101",
+      [chain.chain],
+    );
+    if (rows.length > 100)
+      throw new Error("Keeper recovery exceeds its public transaction reconciliation budget.");
+
+    for (const row of rows) {
+      const hash = String(row.hash);
+      if (!/^[0-9a-f]{64}$/.test(hash))
+        throw new Error("Keeper checkpoint contains an invalid public hash.");
+      let result;
+      try {
+        result = await client.getTransaction(hash);
+      } catch {
+        throw new Error(
+          "Keeper transaction outcome is unknown; failed job recovery must wait for reconciliation.",
+        );
+      }
+      const state =
+        result.status === rpc.Api.GetTransactionStatus.SUCCESS
+          ? "confirmed"
+          : result.status === rpc.Api.GetTransactionStatus.FAILED
+            ? "failed"
+            : null;
+      if (state === null)
+        throw new Error(
+          "Keeper transaction outcome is not terminal; failed job recovery is blocked.",
+        );
+      await tx.query(
+        `UPDATE keeper_checkpoint SET state=$2,
+          confirmed_at=CASE WHEN $2='confirmed' THEN now() ELSE NULL END,
+          detail='reconciled before reviewed job recovery'
+          WHERE hash=$1 AND state='submitted'`,
+        [hash, state],
+      );
+      await tx.query(
+        "UPDATE keeper_submission SET stage=$2,error_detail=NULL,updated_at=now() WHERE transaction_hash=$1 AND stage IN ('submitted','pending')",
+        [hash, state],
+      );
+    }
+    const unexplained = await tx.query(
+      `SELECT 1 FROM keeper_submission s LEFT JOIN keeper_checkpoint c
+        ON c.hash=s.transaction_hash
+       WHERE s.stage IN ('submitted','pending') AND c.hash IS NULL LIMIT 1`,
+    );
+    if (unexplained.rows.length)
+      throw new Error("Unresolved keeper submission evidence blocks failed job recovery.");
+  });
+}
+
 /** A signer lock lives on one dedicated transaction connection. Checkpoints use db.query on
  * another connection, so the public hash is COMMITTED before broadcast and survives rollback,
  * lost responses and process crashes. Every unknown hash blocks fresh envelopes for that signer. */
@@ -155,7 +229,7 @@ export function submitStellar(
       "SELECT hash FROM keeper_checkpoint WHERE chain_key = $1 AND signer = $2 AND intent_key = $3 AND phase = 'invoke' AND state = 'confirmed' ORDER BY created_at DESC LIMIT 1",
       [chainKey, signer, intent],
     );
-    if (known.rows[0] && operation === "settle_claim") return String(known.rows[0].hash);
+    if (known.rows[0]) return String(known.rows[0].hash);
 
     const build = async (): Promise<Transaction> => {
       const account = await client.getAccount(signer);

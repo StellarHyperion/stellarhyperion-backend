@@ -1,7 +1,10 @@
 import { Account, Keypair, SorobanDataBuilder, rpc, xdr } from "@stellar/stellar-sdk";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../../src/config/config.js";
-import { submitStellar } from "../../src/keeper/stellar.js";
+import {
+  reconcileKeeperCheckpointsBeforeRetry,
+  submitStellar,
+} from "../../src/keeper/stellar.js";
 import { BudgetTracker, runBudgetedCatchUp } from "../../src/runtime/budget.js";
 import { checkSchemaCompatibility, EXPECTED_SCHEMA_VERSION } from "../../src/db/schema.js";
 import { completeEnv } from "../helpers.js";
@@ -108,6 +111,40 @@ function fixture() {
 }
 
 describe("durable keeper admission and recovery", () => {
+  it("reconciles every submitted hash before recovery without changing delivery records", async () => {
+    const config = loadConfig({ env: completeEnv() });
+    const hash = "ab".repeat(32);
+    const calls: { sql: string; params: readonly unknown[] }[] = [];
+    const query = (sql: string, params: readonly unknown[] = []) => {
+      calls.push({ sql, params });
+      return Promise.resolve({
+        rows: sql.includes("SELECT hash FROM keeper_checkpoint") ? [{ hash }] : [],
+        rowCount: sql.includes("SELECT hash FROM keeper_checkpoint") ? 1 : 0,
+      });
+    };
+    const db = {
+      query,
+      transaction: async <T>(work: (tx: { query: typeof query }) => Promise<T>) =>
+        work({ query }),
+    };
+    const client = {
+      getNetwork: () => Promise.resolve({ passphrase: config.indexer.stellar!.networkPassphrase }),
+      getTransaction: (requested: string) => {
+        expect(requested).toBe(hash);
+        return Promise.resolve({ status: rpc.Api.GetTransactionStatus.SUCCESS });
+      },
+    } as unknown as rpc.Server;
+    await reconcileKeeperCheckpointsBeforeRetry(config, db, client);
+    expect(
+      calls.some(
+        (call) =>
+          call.sql.includes("UPDATE keeper_checkpoint") &&
+          call.params[0] === hash &&
+          call.params[1] === "confirmed",
+      ),
+    ).toBe(true);
+    expect(calls.some((call) => call.sql.includes("UPDATE pending_claim"))).toBe(false);
+  });
   it("commits a64hex public hash before sending and acquires a cross-replica signer lock", async () => {
     const f = fixture();
     const hash = await f.submit();

@@ -3,14 +3,22 @@ import { Keypair } from "@stellar/stellar-sdk";
 import { loadConfig } from "../../src/config/config.js";
 import { processTtlBump } from "../../src/keeper/jobs/ttl.js";
 import { processClaimSettlement } from "../../src/keeper/jobs/claims.js";
-import { submitStellar } from "../../src/keeper/stellar.js";
+import {
+  reconcileKeeperCheckpointsBeforeRetry,
+  submitStellar,
+} from "../../src/keeper/stellar.js";
+import { requeueFailedKeeperJob } from "../../src/keeper/queue.js";
+import type { Queue } from "bullmq";
 import { KeeperMaintenancePausedError, reserveKeeperSpending } from "../../src/keeper/spending.js";
 import { KeeperWorker } from "../../src/keeper/worker.js";
 import type { rpc } from "@stellar/stellar-sdk";
 import type { Queryable } from "../../src/db/pool.js";
 import { completeEnv } from "../helpers.js";
 import { capturingLogger } from "../stellar-fakes.js";
-vi.mock("../../src/keeper/stellar.js", () => ({ submitStellar: vi.fn() }));
+vi.mock("../../src/keeper/stellar.js", () => ({
+  reconcileKeeperCheckpointsBeforeRetry: vi.fn(),
+  submitStellar: vi.fn(),
+}));
 class Db {
   calls: { sql: string; params: readonly unknown[] }[] = [];
   query(sql: string, params: readonly unknown[] = []) {
@@ -67,6 +75,7 @@ class SpendingDb implements Queryable {
 const { logger } = capturingLogger();
 beforeEach(() => {
   vi.mocked(submitStellar).mockReset();
+  vi.mocked(reconcileKeeperCheckpointsBeforeRetry).mockReset().mockResolvedValue(undefined);
 });
 describe("Stellar keeper execution", () => {
   it("reports zero completed maintenance when there is no signer", async () => {
@@ -211,6 +220,58 @@ describe("Stellar keeper execution", () => {
     expect(new KeeperWorker(config, new Db(), logger).readiness().state).toBe("degraded");
     const disabled = loadConfig({ env: completeEnv({ KEEPER_ENABLED: "false" }) });
     expect(new KeeperWorker(disabled, new Db(), logger).readiness().state).toBe("ready");
+  });
+  it("reconciles public checkpoints before a reviewed failed-job retry", async () => {
+    const config = loadConfig({ env: completeEnv() });
+    const events: string[] = [];
+    vi.mocked(reconcileKeeperCheckpointsBeforeRetry).mockImplementationOnce(async () => {
+      events.push("reconcile");
+    });
+    let state = "failed";
+    const job = {
+      name: "claim-settlement",
+      getState: vi.fn(async () => state),
+      retry: vi.fn(async () => {
+        events.push("retry");
+        state = "waiting";
+      }),
+    };
+    const queue = {
+      getJob: vi.fn(async () => job),
+    } as unknown as Queue;
+    await requeueFailedKeeperJob(
+      queue,
+      new Db(),
+      config,
+      "failed-job-1",
+      "operator",
+      "reviewed after checking the chain",
+    );
+    expect(reconcileKeeperCheckpointsBeforeRetry).toHaveBeenCalledOnce();
+    expect(job.retry).toHaveBeenCalledOnce();
+    expect(events).toEqual(["reconcile", "retry"]);
+  });
+  it("does not requeue a failed job while a public transaction is unresolved", async () => {
+    const config = loadConfig({ env: completeEnv() });
+    const job = {
+      name: "ttl-bump",
+      getState: vi.fn(async () => "failed"),
+      retry: vi.fn(),
+    };
+    vi.mocked(reconcileKeeperCheckpointsBeforeRetry).mockRejectedValue(
+      new Error("public hash is unresolved"),
+    );
+    await expect(
+      requeueFailedKeeperJob(
+        { getJob: vi.fn(async () => job) } as unknown as Queue,
+        new Db(),
+        config,
+        "failed-job-2",
+        "operator",
+        "reviewed",
+      ),
+    ).rejects.toThrow("public hash is unresolved");
+    expect(job.retry).not.toHaveBeenCalled();
   });
   it("matches plan previews and handles full-width values", async () => {
     const config = loadConfig({

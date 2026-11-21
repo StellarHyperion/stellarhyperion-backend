@@ -384,6 +384,13 @@ in `keeper_submission`. `/v1/metrics` returns aggregate counts without transacti
 public hashes are retained for recovery. API readers require SELECT on `keeper_submission`
 and `keeper_checkpoint` after migration179310. Dry runs never count as confirmed maintenance.
 
+BullMQ removes completed history after seven days (or 1,000 retained jobs) and failed history
+after 30 days (or 5,000 failed jobs). A failed job is not retried automatically. Review and retry
+one retained failed job with `npm run keeper:requeue -- --job-id <id> --reviewed-by <operator>
+--reason "<reason>"`. Recovery first reconciles every pending public Stellar hash; unknown or
+nonterminal outcomes block the retry. Reviews are recorded in `keeper_requeue_audit`. Database
+submission checkpoints are retained independently of BullMQ history.
+
 Configure `KEEPER_STELLAR_SECRETS` as the comma-separated local signer secret sources and
 `KEEPER_STELLAR_ACTIVE_SIGNER` as one configured public key. Startup verifies the account's
 Stellar network and positive balance, then reconciles up to100 old pending public hashes before
