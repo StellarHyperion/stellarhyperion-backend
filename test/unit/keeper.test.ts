@@ -232,7 +232,7 @@ describe("Stellar keeper execution", () => {
     });
     const db = new SpendingDb();
     const client = {
-      getLatestLedger: async () => ({ sequence: "9223372036854775808" }),
+      getLatestLedger: () => Promise.resolve({ sequence: "9223372036854775808" }),
     } as unknown as rpc.Server;
     const amount = 9007199254740993123n;
     const result = await reserveKeeperSpending(
@@ -258,7 +258,7 @@ describe("Stellar keeper execution", () => {
     const config = loadConfig({ env: completeEnv() });
     const db = new SpendingDb("1000000");
     const client = {
-      getLatestLedger: async () => ({ sequence: 100 }),
+      getLatestLedger: () => Promise.resolve({ sequence: 100 }),
     } as unknown as rpc.Server;
     const result = await reserveKeeperSpending(
       config,
@@ -291,20 +291,22 @@ describe("Stellar keeper execution", () => {
   it("reconciles public checkpoints before a reviewed failed-job retry", async () => {
     const config = loadConfig({ env: completeEnv() });
     const events: string[] = [];
-    vi.mocked(reconcileKeeperCheckpointsBeforeRetry).mockImplementationOnce(async () => {
+    vi.mocked(reconcileKeeperCheckpointsBeforeRetry).mockImplementationOnce(() => {
       events.push("reconcile");
+      return Promise.resolve(undefined);
     });
     let state = "failed";
     const job = {
       name: "claim-settlement",
-      getState: vi.fn(async () => state),
-      retry: vi.fn(async () => {
+      getState: vi.fn(() => Promise.resolve(state)),
+      retry: vi.fn(() => {
         events.push("retry");
         state = "waiting";
+        return Promise.resolve(undefined);
       }),
     };
     const queue = {
-      getJob: vi.fn(async () => job),
+      getJob: vi.fn(() => Promise.resolve(job)),
     } as unknown as Queue;
     await requeueFailedKeeperJob(
       queue,
@@ -322,7 +324,7 @@ describe("Stellar keeper execution", () => {
     const config = loadConfig({ env: completeEnv() });
     const job = {
       name: "ttl-bump",
-      getState: vi.fn(async () => "failed"),
+      getState: vi.fn(() => Promise.resolve("failed")),
       retry: vi.fn(),
     };
     vi.mocked(reconcileKeeperCheckpointsBeforeRetry).mockRejectedValue(
@@ -330,7 +332,7 @@ describe("Stellar keeper execution", () => {
     );
     await expect(
       requeueFailedKeeperJob(
-        { getJob: vi.fn(async () => job) } as unknown as Queue,
+        { getJob: vi.fn(() => Promise.resolve(job)) } as unknown as Queue,
         new Db(),
         config,
         "failed-job-2",
@@ -375,7 +377,7 @@ describe("Stellar keeper execution", () => {
       transferIds: ["9223372036854775808"],
     });
     expect(result.targetKeys).toContain(
-      "claim:" + config.indexer.stellar?.chain + ":9223372036854775807",
+      `claim:${config.indexer.stellar?.chain ?? "missing"}:9223372036854775807`,
     );
     expect(JSON.stringify(result)).not.toContain(Keypair.random().secret());
   });

@@ -68,9 +68,9 @@ if (typeof gasService !== "string") throw new Error("arc-testnet Axelar gas serv
       ingestAxelarGasEvidence(config, db, 1, {
         signal: controller.signal,
         clientForChain: () => ({
-          getTransactionReceipt: async () => {
+          getTransactionReceipt: () => {
             controller.abort(new Error("rail shutdown"));
-            return { logs: [] };
+            return Promise.resolve({ logs: [] });
           },
         }),
       }),

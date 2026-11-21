@@ -75,7 +75,8 @@ export async function processClaimSettlement(
   const operations: readonly KeeperOperationPreview[] = outcomes
     .filter((claim) => claim.outcome === "pending")
     .map((claim) => {
-      const row = claims.get(claim.claimId)!;
+      const row = claims.get(claim.claimId);
+      if (row === undefined) throw new Error("Pending claim preview has no indexed row.");
       const targetKeys = [`claim:${chain.chain}:${claim.claimId}`];
       return {
         kind: "settle_claim",
@@ -87,7 +88,7 @@ export async function processClaimSettlement(
           recipient: text(row, "recipient"),
           amount: bigintOf(row, "amount").toString(),
         },
-        estimatedFee: String(BASE_FEE),
+        estimatedFee: BASE_FEE,
         unsigned: true,
       };
     });

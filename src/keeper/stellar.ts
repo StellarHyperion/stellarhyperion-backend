@@ -224,12 +224,12 @@ export function submitStellar(
       if (outcome === "failed" && pending.intent_key === intent)
         throw new Error("Previous keeper transaction failed on chain.");
     }
-    // A confirmed same intent must not be signed again while chain indexing is catching up.
+    // Confirmed claim settlement waits for indexing; recurring keep_alive must renew TTL again.
     const known = await db.query(
       "SELECT hash FROM keeper_checkpoint WHERE chain_key = $1 AND signer = $2 AND intent_key = $3 AND phase = 'invoke' AND state = 'confirmed' ORDER BY created_at DESC LIMIT 1",
       [chainKey, signer, intent],
     );
-    if (known.rows[0]) return String(known.rows[0].hash);
+    if (known.rows[0] && operation === "settle_claim") return String(known.rows[0].hash);
 
     const build = async (): Promise<Transaction> => {
       const account = await client.getAccount(signer);

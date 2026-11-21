@@ -372,7 +372,8 @@ export class DatabaseTimeoutError extends Error {
 }
 
 function normalizeDatabaseError(error: unknown): unknown {
-  const code = (error as { code?: unknown })?.code;
+  const code =
+    typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
   if (code === "57014") return new DatabaseTimeoutError("statement");
   if (code === "55P03") return new DatabaseTimeoutError("lock");
   return error;

@@ -142,7 +142,7 @@ export async function requeueFailedKeeperJob(
       `keeper-requeue:${jobId}`,
     ]);
     const job = await queue.getJob(jobId);
-    if (!job || job.name !== initialJob.name || (await job.getState()) !== "failed")
+    if (job?.name !== initialJob.name || (await job.getState()) !== "failed")
       throw new Error("Keeper queue job is no longer failed and cannot be recovered.");
 
     await tx.query(

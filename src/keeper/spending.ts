@@ -1,5 +1,6 @@
 import type { rpc } from "@stellar/stellar-sdk";
 import type { AppConfig } from "../config/config.js";
+import { textOrNull } from "../db/rows.js";
 import type { Transactional } from "../db/pool.js";
 
 export class KeeperMaintenancePausedError extends Error {
@@ -62,13 +63,13 @@ export async function reserveKeeperSpending(
   ];
 
   return db.transaction(async (tx) => {
-    const active: Array<{
+    const active: {
       readonly window: SpendingWindow;
       readonly spent: bigint;
       readonly cap: bigint;
       readonly override: string | null;
       readonly reason: string | null;
-    }> = [];
+    }[] = [];
     for (const window of windows) {
       const inserted = await tx.query(
         `INSERT INTO keeper_spending_window
@@ -110,14 +111,8 @@ export async function reserveKeeperSpending(
       );
       const row = result.rows[0];
       if (row === undefined) throw new Error("Keeper spending window could not be established.");
-      const previousOverride =
-        row.override_stroops === null || row.override_stroops === undefined
-          ? null
-          : String(row.override_stroops);
-      const previousReason =
-        row.override_reason === null || row.override_reason === undefined
-          ? null
-          : String(row.override_reason);
+      const previousOverride = textOrNull(row, "override_stroops");
+      const previousReason = textOrNull(row, "override_reason");
       const effectiveCap = config.keeper.overrideStroops ?? window.cap;
       if (
         previousOverride !== config.keeper.overrideStroops ||

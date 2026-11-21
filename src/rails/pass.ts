@@ -346,7 +346,7 @@ export class RailPass {
       }
       return outcome.kind === "processed" && outcome.settled;
     } catch (error) {
-      if (effective.aborted || error instanceof RailLeaseLostError) return false;
+      if (this.effectiveSignal(signal).aborted || error instanceof RailLeaseLostError) return false;
       throw error;
     } finally {
       await releaseRailWorkLease(this.options.db, claimed.lease);

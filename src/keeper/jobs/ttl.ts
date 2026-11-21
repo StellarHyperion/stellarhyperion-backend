@@ -21,7 +21,7 @@ export async function processTtlBump(
     detail,
     operations: [],
     targetKeys: [],
-    estimatedFee: String(BASE_FEE),
+    estimatedFee: BASE_FEE,
     unsigned: true,
   });
   if (!chain) return empty("No Stellar deployment configured.");
@@ -59,7 +59,7 @@ export async function processTtlBump(
       claimIds: claims.map((claim) => claim.toString()),
       transferIds: transfers.map((transfer) => transfer.toString()),
     },
-    estimatedFee: String(BASE_FEE),
+    estimatedFee: BASE_FEE,
     unsigned: true,
   };
 
@@ -78,7 +78,7 @@ export async function processTtlBump(
       detail: `Unsigned plan: ${tokens.length} tokens, ${claims.length} claims, ${transfers.length} transfers need maintenance.`,
       operations: [operation],
       targetKeys,
-      estimatedFee: String(BASE_FEE),
+      estimatedFee: BASE_FEE,
       unsigned: true,
     };
   }
@@ -108,7 +108,7 @@ export async function processTtlBump(
     detail: `Confirmed router maintenance: ${hash}`,
     operations: [operation],
     targetKeys,
-    estimatedFee: String(BASE_FEE),
+    estimatedFee: BASE_FEE,
     unsigned: false,
   };
 }
