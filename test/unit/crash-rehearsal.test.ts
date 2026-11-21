@@ -17,7 +17,23 @@ describe("deterministic indexer crash rehearsal", () => {
     async (crashAt) => {
       const db = new RecordingDb();
       const rpc = new FakeRpc({
-        events: [syntheticEvent({ ledger: START_LEDGER })],
+        events: [
+          syntheticEvent({
+            ledger: START_LEDGER,
+            topicJson: [{ symbol: "hyperion" }, { symbol: "queued" }],
+            valueJson: {
+              map: [
+                {
+                  key: { symbol: "action" },
+                  val: { vec: [{ symbol: "EnableRoute" }, { u32: 1 }] },
+                },
+                { key: { symbol: "eta" }, val: { u64: "1790860267" } },
+                { key: { symbol: "expires_at" }, val: { u64: "1791465067" } },
+                { key: { symbol: "id" }, val: { u64: "7" } },
+              ],
+            },
+          }),
+        ],
         latestLedger: START_LEDGER + 1,
       });
       const first = () => {
@@ -36,6 +52,9 @@ describe("deterministic indexer crash rehearsal", () => {
       db.crashAt = crashAt;
       await expect(first().tick(AbortSignal.timeout(5_000))).rejects.toThrow("injected crash");
       expect(db.rollbacks).toHaveLength(1);
+      // The crashed process no longer renews its lease. Advance the fake clock
+      // past the lease expiry before the replacement worker takes over.
+      if (db.leaseRow !== null) db.leaseRow.lease_until = new Date(0);
 
       await first().tick(AbortSignal.timeout(5_000));
       expect(db.sourceEvents).toBe(1);
