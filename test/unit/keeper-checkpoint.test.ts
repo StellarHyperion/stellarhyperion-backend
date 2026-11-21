@@ -1,10 +1,7 @@
 import { Account, Keypair, SorobanDataBuilder, rpc, xdr } from "@stellar/stellar-sdk";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../../src/config/config.js";
-import {
-  reconcileKeeperCheckpointsBeforeRetry,
-  submitStellar,
-} from "../../src/keeper/stellar.js";
+import { reconcileKeeperCheckpointsBeforeRetry, submitStellar } from "../../src/keeper/stellar.js";
 import { BudgetTracker, runBudgetedCatchUp } from "../../src/runtime/budget.js";
 import { checkSchemaCompatibility, EXPECTED_SCHEMA_VERSION } from "../../src/db/schema.js";
 import { completeEnv } from "../helpers.js";
@@ -124,8 +121,7 @@ describe("durable keeper admission and recovery", () => {
     };
     const db = {
       query,
-      transaction: async <T>(work: (tx: { query: typeof query }) => Promise<T>) =>
-        work({ query }),
+      transaction: async <T>(work: (tx: { query: typeof query }) => Promise<T>) => work({ query }),
     };
     const client = {
       getNetwork: () => Promise.resolve({ passphrase: config.indexer.stellar!.networkPassphrase }),

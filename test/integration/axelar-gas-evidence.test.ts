@@ -61,6 +61,28 @@ if (typeof gasService !== "string") throw new Error("arc-testnet Axelar gas serv
     await db.close();
   });
 
+  it("does not persist a receipt returned after cancellation", async () => {
+    const controller = new AbortController();
+    const config = loadConfig({ env: completeEnv() });
+    await expect(
+      ingestAxelarGasEvidence(config, db, 1, {
+        signal: controller.signal,
+        clientForChain: () => ({
+          getTransactionReceipt: async () => {
+            controller.abort(new Error("rail shutdown"));
+            return { logs: [] };
+          },
+        }),
+      }),
+    ).rejects.toThrow("rail shutdown");
+    expect(
+      (await db.query("SELECT * FROM axelar_gas_scan WHERE origin_chain = $1", [chain])).rows,
+    ).toEqual([]);
+    expect(
+      (await db.query("SELECT * FROM axelar_gas_evidence WHERE origin_chain = $1", [chain])).rows,
+    ).toEqual([]);
+  });
+
   it("indexes public gas events as evidence without advancing delivery and replays idempotently", async () => {
     const logs: readonly DeliveryLog[] = [
       {

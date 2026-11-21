@@ -174,7 +174,24 @@ describe("Stellar keeper execution", () => {
   });
   it("performs no claim submissions without a Stellar signer", async () => {
     const config = loadConfig({ env: completeEnv() });
-    const result = await processClaimSettlement({ config, db: new Db(), logger });
+    const result = await processClaimSettlement({
+      config,
+      db: new Db([
+        {
+          claim_id: "1",
+          settled: false,
+          recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          amount: "90000000000000000001",
+        },
+        {
+          claim_id: "9223372036854775807",
+          settled: false,
+          recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          amount: "42",
+        },
+      ]),
+      logger,
+    });
     expect(result.attempted).toBe(0);
     expect(result.settled).toBe(0);
     expect(result.dryRun).toBe(true);
@@ -186,7 +203,7 @@ describe("Stellar keeper execution", () => {
       amount: "90000000000000000001",
     });
     expect(result.operations[1]?.args).toEqual({
-      claimId: "2",
+      claimId: "9223372036854775807",
       recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
       amount: "42",
     });
@@ -328,7 +345,24 @@ describe("Stellar keeper execution", () => {
       env: completeEnv({ KEEPER_STELLAR_SECRET: Keypair.random().secret() }),
     });
     vi.mocked(submitStellar).mockResolvedValue("confirmed-hash");
-    const result = await processTtlBump({ config, db: new Db(), logger });
+    const result = await processTtlBump({
+      config,
+      db: new Db([
+        {
+          claim_id: "1",
+          settled: false,
+          recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          amount: "90000000000000000001",
+        },
+        {
+          claim_id: "9223372036854775807",
+          settled: false,
+          recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          amount: "42",
+        },
+      ]),
+      logger,
+    });
     expect(result.dryRun).toBe(false);
     expect(result.bumpedClaims).toBe(2);
     expect(result.bumpedTransfers).toBe(1);
@@ -337,10 +371,12 @@ describe("Stellar keeper execution", () => {
     expect(result.operations[0]?.args).toEqual({
       tokens: [expect.any(String)],
       routes: [0, 1, 2, 3],
-      claimIds: ["1", "2"],
+      claimIds: ["1", "9223372036854775807"],
       transferIds: ["9223372036854775808"],
     });
-    expect(result.targetKeys).toContain("claim:" + config.indexer.stellar?.chain + ":2");
+    expect(result.targetKeys).toContain(
+      "claim:" + config.indexer.stellar?.chain + ":9223372036854775807",
+    );
     expect(JSON.stringify(result)).not.toContain(Keypair.random().secret());
   });
 });

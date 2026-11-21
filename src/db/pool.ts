@@ -362,7 +362,11 @@ export class DatabaseTimeoutError extends Error {
   readonly code = "DATABASE_TIMEOUT";
 
   constructor(kind: "statement" | "lock") {
-    super(kind === "lock" ? "Database lock wait exceeded the configured limit" : "Database operation exceeded the configured time limit");
+    super(
+      kind === "lock"
+        ? "Database lock wait exceeded the configured limit"
+        : "Database operation exceeded the configured time limit",
+    );
     this.name = "DatabaseTimeoutError";
   }
 }
