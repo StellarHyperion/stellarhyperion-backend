@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
@@ -39,23 +39,9 @@ const U256_LARGE = "115792089237316195423570985008687907853269984665640564039457
 
 describe("indexed-history integrity digests (#63)", () => {
   beforeAll(async () => {
-    for (const name of [
-      "1790900000000_initial-schema.sql",
-      "1791000000000_cursor-block-hash.sql",
-      "1791100000000_cursor-autovacuum-tuning.sql",
-      "1791300000000_stellar-durable-scan-evidence.sql",
-      "1791400000000_stellar-cursor-cas-leases-gaps.sql",
-      "1791500000000_stellar-revisions-and-quarantine.sql",
-      "1791600000000_durable-rail-retry-schedules.sql",
-      "1791700000000_rail-requeue-audit.sql",
-      "1791800000000_outbound-router-identity.sql",
-      "1791900000000_evm-log-quarantine.sql",
-      "1792000000000_evm-backfill-jobs.sql",
-      "1792100000000_route-health-compaction-and-audits.sql",
-      "1792200000000_evm-scan-provenance.sql",
-      "1792300000000_indexed-history-digests.sql",
-      "1792400000000_indexer-worker-heartbeat.sql",
-    ]) {
+    for (const name of readdirSync(new URL("../../migrations/", import.meta.url))
+      .filter((file) => file.endsWith(".sql"))
+      .sort()) {
       const sql = readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8").split(
         "-- Down Migration",
       )[0]!;

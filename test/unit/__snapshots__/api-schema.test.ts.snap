@@ -6,6 +6,7 @@ exports[`HTTP queries against the migrated PostgreSQL schema > negotiates API sc
   "destination": {
     "amount": "897000",
     "block": "400",
+    "cctpFeeReconciliation": null,
     "chain": "sepolia",
     "decimals": 6,
     "delivered": true,
@@ -62,6 +63,7 @@ exports[`HTTP queries against the migrated PostgreSQL schema > negotiates API sc
   "destination": {
     "amount": "897000",
     "block": "400",
+    "cctpFeeReconciliation": null,
     "chain": "sepolia",
     "decimals": 6,
     "delivered": true,

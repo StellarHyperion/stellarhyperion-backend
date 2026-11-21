@@ -175,7 +175,7 @@ describe("REST API endpoints", () => {
           fee: "3000000",
           net_amount: "997000000",
           destination_chain: "sepolia",
-          destination: `0x${"11".repeat(32)}`,
+          destination: `0x${"00".repeat(12)}${"11".repeat(20)}`,
           rail_ref: null,
           origin_block: "100",
           origin_tx: `0x${"22".repeat(32)}`,
