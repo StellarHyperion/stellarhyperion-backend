@@ -381,6 +381,34 @@ must not be the source. A target provisioned as `production` or `preview` is ref
 hold rows and digests only, never connection strings, are capped at 100,000 rows per table, and
 carry a SHA-256 so a modified file is refused.
 
+### Local multi-service recovery rehearsal
+
+Use the checked-in isolated compose file when exercising restart and provider-fault recovery:
+
+```bash
+docker compose -f docker-compose.rehearsal.yml up -d --build postgres
+docker compose -f docker-compose.rehearsal.yml run --rm api npm run migrate:up
+docker compose -f docker-compose.rehearsal.yml up -d api indexer
+curl --fail http://127.0.0.1:58080/health
+```
+
+The rehearsal uses a dedicated PostgreSQL volume, loopback-only ports, local-only credentials and
+the read-only API/indexer split. Stop and restart `indexer` while its configured RPC is unavailable,
+then restore the provider and start it again. Confirm that `/health` remains available through the
+API service and that the cursor and event counts do not regress or duplicate:
+
+```bash
+docker compose -f docker-compose.rehearsal.yml restart indexer
+docker compose -f docker-compose.rehearsal.yml logs --no-log-prefix indexer
+curl --fail http://127.0.0.1:58080/v1/metrics
+```
+
+Provider faults are intentionally injected by pointing the rehearsal's non-secret RPC override at
+a disposable test endpoint; never put a production URL or credential in this file. The focused
+watcher tests cover the same failure boundary without network access: a failed provider pass leaves
+the cursor unchanged, and a fresh watcher resumes from the persisted cursor without duplicating
+records. Run `npm run test -- test/unit/stellar-watcher.test.ts` before a rehearsal.
+
 ### Rail transition history and transfer cursors
 
 `rail_attestation_history` records actual committed lifecycle changes bound to the source transfer
