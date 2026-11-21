@@ -45,6 +45,22 @@ suite("rail pollers against real Postgres", () => {
 
   beforeEach(clean);
 
+  const settleWithin = async <T>(work: Promise<T>, ms: number): Promise<T | "timeout"> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        work,
+        new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => {
+            resolve("timeout");
+          }, ms);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
+
   afterAll(async () => {
     await clean();
     await db.close();
@@ -471,7 +487,7 @@ suite("rail pollers against real Postgres", () => {
         tx,
         {
           chainKey: ORIGIN_CHAIN,
-          block: nonce,
+          block: 1_010n,
           txHash: `0xretry${nonce}`,
           logIndex: 0,
           observedAt: new Date(),
@@ -484,6 +500,60 @@ suite("rail pollers against real Postgres", () => {
           grossAmount: 1001000n,
           fee: 1000n,
           netAmount: 1000000n,
+          destinationChain: DESTINATION_CHAIN,
+          destination: "0x2222222222222222222222222222222222222222",
+          railRef: "0x0000",
+        },
+      );
+    });
+  }
+
+  async function seedCircuitTransfer(nonce: bigint, route: number): Promise<void> {
+    await db.transaction(async (tx) => {
+      await writeOutbound(
+        tx,
+        {
+          chainKey: ORIGIN_CHAIN,
+          block: nonce,
+          txHash: `0xcircuit${route}${nonce}`,
+          logIndex: 0,
+          observedAt: new Date(),
+        },
+        {
+          route,
+          nonce,
+          sender: "0x1111111111111111111111111111111111111111",
+          token: "0x3333333333333333333333333333333333333333",
+          grossAmount: 1001000n,
+          fee: 1000n,
+          netAmount: 1000000n,
+          destinationChain: DESTINATION_CHAIN,
+          destination: "0x2222222222222222222222222222222222222222",
+          railRef: "0x0000",
+        },
+      );
+    });
+  }
+
+  async function seedWideTransfer(nonce: bigint, netAmount: bigint): Promise<void> {
+    await db.transaction(async (tx) => {
+      await writeOutbound(
+        tx,
+        {
+          chainKey: ORIGIN_CHAIN,
+          block: 1_009n,
+          txHash: `0xwide${nonce.toString(16)}`,
+          logIndex: 0,
+          observedAt: new Date(),
+        },
+        {
+          route: 0,
+          nonce,
+          sender: "0x1111111111111111111111111111111111111111",
+          token: "0x3333333333333333333333333333333333333333",
+          grossAmount: netAmount + 1_000n,
+          fee: 1_000n,
+          netAmount,
           destinationChain: DESTINATION_CHAIN,
           destination: "0x2222222222222222222222222222222222222222",
           railRef: "0x0000",
@@ -604,6 +674,303 @@ suite("rail pollers against real Postgres", () => {
         maxCheckFailures: 5,
       }),
     ).toHaveLength(1);
+  });
+
+  it("isolates a failing provider so another rail keeps polling", async () => {
+    await seedCircuitTransfer(1201n, 0);
+    await seedCircuitTransfer(1202n, 1);
+    const { logger } = capturingLogger();
+    let now = new Date("2026-11-19T00:00:00.000Z");
+    let downCalls = 0;
+    const downPass = new RailPass({
+      route: 0,
+      client: {
+        rail: "cctp",
+        providerId: "https://cctp-down.invalid",
+        look: () => {
+          downCalls += 1;
+          return Promise.reject(new RailError("cctp", "transient", "Bearer secret", 0));
+        },
+      },
+      db,
+      logger,
+      batchSize: 10,
+      recheckAfterMs: 1_000,
+      maxCheckFailures: 5,
+      circuitFailureThreshold: 2,
+      circuitCooldownMs: 60_000,
+      now: () => now,
+    });
+
+    await downPass.tick(new AbortController().signal);
+    now = new Date(now.getTime() + 2_000);
+    await downPass.tick(new AbortController().signal);
+    expect(downPass.circuitState()[0]).toMatchObject({
+      key: "discovery:https://cctp-down.invalid",
+      state: "open",
+      failures: 2,
+    });
+    expect(downPass.readiness().state).toBe("degraded");
+    expect(downPass.readiness().detail).toContain("no delivery claim");
+
+    now = new Date(now.getTime() + 1_000);
+    await downPass.tick(new AbortController().signal);
+    expect(downCalls).toBe(2);
+
+    let healthyCalls = 0;
+    const healthyPass = new RailPass({
+      route: 1,
+      client: {
+        rail: "axelar",
+        providerId: "https://axelar-ok.invalid",
+        look: () => {
+          healthyCalls += 1;
+          return Promise.resolve({
+            kind: "found",
+            report: {
+              status: "attested",
+              railStatus: "complete",
+              reference: "healthy-ref",
+              attestedAt: new Date("2026-11-19T01:00:00.000Z"),
+            },
+          });
+        },
+      },
+      db,
+      logger,
+      batchSize: 10,
+      recheckAfterMs: 0,
+      maxCheckFailures: 5,
+      now: () => now,
+    });
+    await healthyPass.tick(new AbortController().signal);
+    expect(healthyCalls).toBe(1);
+    expect(healthyPass.circuitState()).toEqual([]);
+
+    const attestations = await db.query(
+      `SELECT route, status, rail_reference
+         FROM rail_attestation
+        ORDER BY route`,
+    );
+    expect(attestations.rows).toEqual([
+      { route: 0, status: "pending", rail_reference: null },
+      { route: 1, status: "attested", rail_reference: "healthy-ref" },
+    ]);
+    const inbound = await db.query(
+      "SELECT count(*)::int AS n FROM inbound_delivery WHERE route IN (0, 1)",
+    );
+    expect(inbound.rows[0]?.n).toBe(0);
+  });
+
+  it("resumes after a circuit probe without resetting stored evidence", async () => {
+    await seedCircuitTransfer(1203n, 0);
+    const { logger } = capturingLogger();
+    let now = new Date("2026-11-19T00:00:00.000Z");
+    let failing = false;
+    let lookCount = 0;
+    const pass = new RailPass({
+      route: 0,
+      client: {
+        rail: "cctp",
+        providerId: "https://cctp-probe.invalid",
+        look: () => {
+          lookCount += 1;
+          if (failing) return Promise.reject(new RailError("cctp", "transient", "private", 0));
+          return Promise.resolve({
+            kind: "found",
+            report: {
+              status: "attested",
+              railStatus: "complete",
+              reference: lookCount >= 3 ? "iris-recovered" : "iris-initial",
+              attestedAt: now,
+            },
+          });
+        },
+      },
+      db,
+      logger,
+      batchSize: 10,
+      recheckAfterMs: 0,
+      maxCheckFailures: 5,
+      circuitFailureThreshold: 1,
+      circuitCooldownMs: 1_000,
+      now: () => now,
+    });
+
+    await pass.tick(new AbortController().signal);
+    const initial = await db.query(
+      `SELECT evidence_reference
+         FROM rail_attestation_history
+        ORDER BY id`,
+    );
+    expect(initial.rows).toEqual([{ evidence_reference: "iris-initial" }]);
+    expect(pass.circuitState()).toEqual([]);
+
+    failing = true;
+    await pass.tick(new AbortController().signal);
+    expect(pass.circuitState()[0]?.state).toBe("open");
+
+    failing = false;
+    now = new Date(now.getTime() + 2_000);
+    await pass.tick(new AbortController().signal);
+    expect(pass.circuitState()).toEqual([]);
+
+    const current = await db.query(
+      "SELECT status, rail_reference FROM rail_attestation WHERE route = 0",
+    );
+    expect(current.rows).toEqual([{ status: "attested", rail_reference: "iris-recovered" }]);
+    const history = await db.query(
+      `SELECT evidence_reference
+         FROM rail_attestation_history
+        ORDER BY id`,
+    );
+    expect(history.rows.map((row) => row.evidence_reference)).toEqual([
+      "iris-initial",
+      "iris-initial",
+      "iris-recovered",
+    ]);
+    const inbound = await db.query("SELECT count(*)::int AS n FROM inbound_delivery");
+    expect(inbound.rows[0]?.n).toBe(0);
+  });
+
+  it("bounds a provider read that ignores the signal and leaves the transfer for a fresh pass", async () => {
+    const nonce = 2n ** 64n + 11n;
+    const netAmount = 2n ** 80n + 2n;
+    await seedWideTransfer(nonce, netAmount);
+    const { logger } = capturingLogger();
+    const controller = new AbortController();
+    let started!: () => void;
+    const startedPromise = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let calls = 0;
+    const tick = new RailPass({
+      route: 0,
+      client: {
+        rail: "cctp",
+        look: (): Promise<RailLookup> => {
+          calls += 1;
+          started();
+          return new Promise<RailLookup>(() => undefined);
+        },
+      },
+      db,
+      logger,
+      batchSize: 1,
+      recheckAfterMs: 60_000,
+      maxCheckFailures: 5,
+    }).tick(controller.signal);
+    await startedPromise;
+    controller.abort();
+
+    const outcome = await settleWithin(
+      tick.then(
+        () => "resolved" as const,
+        () => "rejected" as const,
+      ),
+      2_000,
+    );
+    expect(outcome).toBe("rejected");
+    expect(calls).toBe(1);
+    expect((await db.query("SELECT * FROM rail_attestation")).rows).toHaveLength(0);
+
+    const seen: bigint[] = [];
+    await new RailPass({
+      route: 0,
+      client: {
+        rail: "cctp",
+        look: (transfer: PendingTransfer): Promise<RailLookup> => {
+          seen.push(transfer.nonce);
+          return Promise.resolve({ kind: "missing" });
+        },
+      },
+      db,
+      logger,
+      batchSize: 1,
+      recheckAfterMs: 60_000,
+      maxCheckFailures: 5,
+    }).tick(new AbortController().signal);
+    expect(seen).toEqual([nonce]);
+
+    const { rows } = await db.query(
+      `SELECT a.status, a.retry_class, t.nonce, t.net_amount::text AS net_amount
+         FROM rail_attestation a
+         JOIN outbound_transfer t ON t.id = a.transfer_id
+        WHERE t.route = 0`,
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.status).toBe("pending");
+    expect(rows[0]?.retry_class).toBeNull();
+    expect(rows[0]?.nonce).toBe(nonce.toString());
+    expect(rows[0]?.net_amount).toBe(netAmount.toString());
+  });
+
+  it("stops immediate evaluation on shutdown without recording a failure", async () => {
+    const nonce = 2n ** 64n + 12n;
+    await seedRetry(nonce);
+    const { logger } = capturingLogger();
+    const shutdown = new AbortController();
+    const pending = await pendingForRail(db, {
+      route: 0,
+      limit: 1,
+      now: new Date(),
+      notCheckedSince: new Date(0),
+      maxCheckFailures: 5,
+    });
+    const transfer = pending.find((candidate) => candidate.nonce === nonce);
+    expect(transfer).toBeDefined();
+    if (transfer === undefined) return;
+
+    let started!: () => void;
+    const startedPromise = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const evaluating = new RailPass({
+      route: 0,
+      client: {
+        rail: "cctp",
+        look: (): Promise<RailLookup> => {
+          started();
+          return new Promise<RailLookup>(() => undefined);
+        },
+      },
+      db,
+      logger,
+      batchSize: 1,
+      recheckAfterMs: 60_000,
+      maxCheckFailures: 5,
+      shutdownSignal: shutdown.signal,
+    }).evaluateTransfer(transfer.transferId);
+    await startedPromise;
+    shutdown.abort();
+
+    const outcome = await settleWithin(
+      evaluating.then(
+        () => "resolved" as const,
+        () => "rejected" as const,
+      ),
+      2_000,
+    );
+    expect(outcome).toBe("resolved");
+    expect((await db.query("SELECT * FROM rail_attestation")).rows).toHaveLength(0);
+
+    const seen: bigint[] = [];
+    await new RailPass({
+      route: 0,
+      client: {
+        rail: "cctp",
+        look: (candidate: PendingTransfer): Promise<RailLookup> => {
+          seen.push(candidate.nonce);
+          return Promise.resolve({ kind: "missing" });
+        },
+      },
+      db,
+      logger,
+      batchSize: 1,
+      recheckAfterMs: 60_000,
+      maxCheckFailures: 5,
+    }).tick(new AbortController().signal);
+    expect(seen).toEqual([nonce]);
   });
 
   it("does not settle a parked or wrong-recipient destination event", async () => {
@@ -923,6 +1290,90 @@ suite("rail pollers against real Postgres", () => {
     await new RailPass(options).evaluateTransfer(id);
     expect(calls).toBe(1);
   });
+
+  it("fences stale workers and allows another replica to reclaim an expired lease", async () => {
+    await seedRetry(1203n);
+    const id = BigInt(
+      String((await db.query("SELECT id FROM outbound_transfer WHERE nonce = 1203")).rows[0]?.id),
+    );
+    const { logger } = capturingLogger();
+    let releaseFirstLookup!: (lookup: RailLookup) => void;
+    let signalFirstLookupStarted!: () => void;
+    const firstLookupStarted = new Promise<void>((resolve) => {
+      signalFirstLookupStarted = resolve;
+    });
+    const firstLookup = new Promise<RailLookup>((resolve) => {
+      releaseFirstLookup = resolve;
+    });
+    let firstCalls = 0;
+    let secondCalls = 0;
+    const first = new RailPass({
+      route: 0,
+      db,
+      logger,
+      batchSize: 1,
+      recheckAfterMs: 60_000,
+      maxCheckFailures: 5,
+      client: {
+        rail: "cctp",
+        look: (): Promise<RailLookup> => {
+          firstCalls += 1;
+          signalFirstLookupStarted();
+          return firstLookup;
+        },
+      },
+    });
+    const second = new RailPass({
+      route: 0,
+      db,
+      logger,
+      batchSize: 1,
+      recheckAfterMs: 60_000,
+      maxCheckFailures: 5,
+      client: {
+        rail: "cctp",
+        look: (): Promise<RailLookup> => {
+          secondCalls += 1;
+          return Promise.resolve({ kind: "missing" });
+        },
+      },
+    });
+
+    const firstTick = first.tick(new AbortController().signal);
+    await firstLookupStarted;
+    await second.tick(new AbortController().signal);
+    expect(secondCalls).toBe(0);
+
+    await db.query(
+      "UPDATE rail_work_lease SET lease_until = clock_timestamp() - interval '1 second' WHERE transfer_id = $1",
+      [id.toString()],
+    );
+    await second.tick(new AbortController().signal);
+    expect(secondCalls).toBe(1);
+
+    releaseFirstLookup({
+      kind: "found",
+      report: {
+        status: "attested",
+        railStatus: "complete",
+        reference: "stale-reference",
+        attestedAt: new Date(),
+      },
+    });
+    await firstTick;
+
+    const { rows } = await db.query(
+      "SELECT status, rail_status, rail_reference FROM rail_attestation WHERE transfer_id = $1",
+      [id.toString()],
+    );
+    expect(rows[0]).toMatchObject({
+      status: "pending",
+      rail_status: null,
+      rail_reference: null,
+    });
+    expect(firstCalls).toBe(1);
+  });
+
   it("reports missing proof stages and pages equal timestamps without changing lifecycle state", async () => {
     const { logger } = capturingLogger();
     const now = new Date();

@@ -36,6 +36,7 @@ import { RouteKind } from "@hyperion/protocol";
 import { AxelarGmpClient } from "../rails/axelar/gmp.js";
 import { inspectRailBacklog, type InspectRailBacklogOptions } from "../rails/backlog.js";
 import { IrisClient } from "../rails/cctp/iris.js";
+import { safeCircuitKey } from "../rails/circuit.js";
 import { RailPass, type RailProgress } from "../rails/pass.js";
 import { requeueTerminalTransfer } from "../rails/requeue.js";
 import type {
@@ -89,6 +90,7 @@ interface Pass extends ReadinessSource {
   tick(signal: AbortSignal): Promise<boolean>;
   release?(): Promise<unknown>;
   readonly progress?: { readonly block?: bigint; readonly ledger?: number } | RailProgress | null;
+  circuitState?(): unknown;
 }
 
 export interface PolledWorkerOptions {
@@ -207,6 +209,7 @@ export class PolledWorker implements Worker {
         caughtUp: this.runState === "caught_up",
         ticks: stats.ticks + (completed ? 1 : 0),
         running: stats.running,
+        ...(this.pass.circuitState === undefined ? {} : { circuits: this.pass.circuitState() }),
       },
     });
   }
@@ -260,7 +263,15 @@ export interface BuildIndexerDeps {
 export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   const { config, logger, db } = deps;
   const executionId = randomUUID();
-  const passes = buildRailPasses(config.rails, config.network, db, logger, config);
+  const railShutdown = new AbortController();
+  const passes = buildRailPasses(
+    config.rails,
+    config.network,
+    db,
+    logger,
+    config,
+    railShutdown.signal,
+  );
   const inspectBacklog = (
     options: InspectRailBacklogOptions = {},
   ): Promise<BacklogInspectionReport> =>
@@ -378,6 +389,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
       }
     },
     stop: async () => {
+      railShutdown.abort();
       // In parallel. Each watcher stops after its own current tick, and they share no state, so
       // serialising them would only make shutdown take as long as the slowest chain times the
       // number of chains.
@@ -401,15 +413,20 @@ export function buildRailPasses(
   db: Transactional,
   logger: Logger,
   appConfig: AppConfig,
+  shutdownSignal?: AbortSignal,
 ): readonly RailPass[] {
   const clients: readonly { readonly route: RouteKind; readonly client: RailClient }[] = [
     {
       route: RouteKind.Cctp,
-      client: new IrisClient(network, { baseUrl: config.irisUrl }),
+      client: new IrisClient(network, {
+        baseUrl: config.irisUrl,
+        providerId: safeCircuitKey(config.irisUrl),
+      }),
     },
     {
       route: RouteKind.AxelarIts,
       client: new AxelarGmpClient(config.axelarUrl, {
+        providerId: safeCircuitKey(config.axelarUrl),
         onUnknownStatus: (status) => {
           logger.warn(
             { rail: "axelar", status },
@@ -431,6 +448,7 @@ export function buildRailPasses(
       batchSize: config.batchSize,
       recheckAfterMs: config.recheckAfterMs,
       maxCheckFailures: config.maxCheckFailures,
+      ...(shutdownSignal === undefined ? {} : { shutdownSignal }),
     });
   });
 }

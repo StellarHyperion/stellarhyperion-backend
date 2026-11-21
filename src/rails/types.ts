@@ -159,6 +159,20 @@ export interface PendingTransfer {
   readonly delivered: boolean;
 }
 
+/** A bounded claim on one transfer, fenced by a unique token on every acquisition. */
+export interface RailWorkLease {
+  readonly transferId: bigint;
+  readonly ownerId: string;
+  readonly token: string;
+}
+
+export class RailLeaseLostError extends Error {
+  constructor(readonly transferId: bigint) {
+    super(`rail work lease lost for transfer ${transferId.toString()}`);
+    this.name = "RailLeaseLostError";
+  }
+}
+
 /** An operator's review, required before a terminal transfer can re-enter the rail queue. */
 export interface RailRequeueRequest {
   readonly transferId: bigint;
@@ -176,8 +190,14 @@ export interface RailRequeueResult {
 /** What a rail client has to offer the pass that polls it. */
 export interface RailClient {
   readonly rail: string;
+  /** Stable, already-redacted provider identity used to isolate circuit breakers. */
+  readonly providerId?: string | undefined;
   /** Throws `RailError`; returns `missing` rather than throwing for a transfer not yet indexed. */
   look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup>;
+}
+
+export interface RailCancellationOptions {
+  readonly shutdownSignal?: AbortSignal;
 }
 
 export type MissingProofStage =

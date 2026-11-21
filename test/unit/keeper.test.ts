@@ -3,17 +3,35 @@ import { Keypair } from "@stellar/stellar-sdk";
 import { loadConfig } from "../../src/config/config.js";
 import { processTtlBump } from "../../src/keeper/jobs/ttl.js";
 import { processClaimSettlement } from "../../src/keeper/jobs/claims.js";
-import { submitStellar } from "../../src/keeper/stellar.js";
+import { reconcileKeeperCheckpointsBeforeRetry, submitStellar } from "../../src/keeper/stellar.js";
+import { requeueFailedKeeperJob } from "../../src/keeper/queue.js";
+import type { Queue } from "bullmq";
+import { KeeperMaintenancePausedError, reserveKeeperSpending } from "../../src/keeper/spending.js";
 import { KeeperWorker } from "../../src/keeper/worker.js";
+import type { rpc } from "@stellar/stellar-sdk";
+import type { Queryable } from "../../src/db/pool.js";
 import { completeEnv } from "../helpers.js";
 import { capturingLogger } from "../stellar-fakes.js";
-vi.mock("../../src/keeper/stellar.js", () => ({ submitStellar: vi.fn() }));
+vi.mock("../../src/keeper/stellar.js", () => ({
+  reconcileKeeperCheckpointsBeforeRetry: vi.fn(),
+  submitStellar: vi.fn(),
+}));
 class Db {
   calls: { sql: string; params: readonly unknown[] }[] = [];
   constructor(
     private readonly claims: readonly Record<string, unknown>[] = [
-      { claim_id: "1", settled: false },
-      { claim_id: "2", settled: false },
+      {
+        claim_id: "1",
+        settled: false,
+        recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        amount: "90000000000000000001",
+      },
+      {
+        claim_id: "2",
+        settled: false,
+        recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        amount: "42",
+      },
     ],
   ) {}
   query(sql: string, params: readonly unknown[] = []) {
@@ -23,7 +41,7 @@ class Db {
         ? [{ id: "9223372036854775000" }]
         : sql.includes("pending_claim")
           ? [...this.claims]
-          : [{ nonce: "3" }],
+          : [{ nonce: "9223372036854775808" }],
       rowCount: 2,
     });
   }
@@ -31,9 +49,35 @@ class Db {
     return work(this);
   }
 }
+class SpendingDb implements Queryable {
+  calls: { sql: string; params: readonly unknown[] }[] = [];
+  constructor(private readonly spent = "0") {}
+  query(sql: string, params: readonly unknown[] = []) {
+    this.calls.push({ sql, params });
+    if (sql.includes("INSERT INTO keeper_spending_window"))
+      return Promise.resolve({ rows: [{ window_key: params[3] }], rowCount: 1 });
+    if (sql.includes("SELECT spent_stroops,cap_stroops"))
+      return Promise.resolve({
+        rows: [
+          {
+            spent_stroops: this.spent,
+            cap_stroops: "1000000",
+            override_stroops: null,
+            override_reason: null,
+          },
+        ],
+        rowCount: 1,
+      });
+    return Promise.resolve({ rows: [], rowCount: 1 });
+  }
+  transaction<T>(work: (tx: Queryable) => Promise<T>) {
+    return work(this);
+  }
+}
 const { logger } = capturingLogger();
 beforeEach(() => {
   vi.mocked(submitStellar).mockReset();
+  vi.mocked(reconcileKeeperCheckpointsBeforeRetry).mockReset().mockResolvedValue(undefined);
 });
 describe("Stellar keeper execution", () => {
   it("reports zero completed maintenance when there is no signer", async () => {
@@ -130,15 +174,211 @@ describe("Stellar keeper execution", () => {
   });
   it("performs no claim submissions without a Stellar signer", async () => {
     const config = loadConfig({ env: completeEnv() });
-    const result = await processClaimSettlement({ config, db: new Db(), logger });
+    const result = await processClaimSettlement({
+      config,
+      db: new Db([
+        {
+          claim_id: "1",
+          settled: false,
+          recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          amount: "90000000000000000001",
+        },
+        {
+          claim_id: "9223372036854775807",
+          settled: false,
+          recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          amount: "42",
+        },
+      ]),
+      logger,
+    });
     expect(result.attempted).toBe(0);
     expect(result.settled).toBe(0);
+    expect(result.dryRun).toBe(true);
+    expect(result.unsigned).toBe(true);
+    expect(result.operations).toHaveLength(2);
+    expect(result.operations[0]?.args).toEqual({
+      claimId: "1",
+      recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+      amount: "90000000000000000001",
+    });
+    expect(result.operations[1]?.args).toEqual({
+      claimId: "9223372036854775807",
+      recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+      amount: "42",
+    });
     expect(submitStellar).not.toHaveBeenCalled();
+  });
+  it("leaves claims pending when maintenance is paused by spending policy", async () => {
+    const config = loadConfig({
+      env: completeEnv({ KEEPER_STELLAR_SECRET: Keypair.random().secret() }),
+    });
+    vi.mocked(submitStellar).mockRejectedValue(
+      new KeeperMaintenancePausedError("Keeper maintenance is paused."),
+    );
+    const db = new Db();
+    const result = await processClaimSettlement({ config, db, logger });
+    expect(result.settled).toBe(0);
+    expect(result.pending).toBe(2);
+    expect(result.dryRun).toBe(true);
+    expect(db.calls.some((call) => /UPDATE\s+pending_claim/i.test(call.sql))).toBe(false);
+  });
+  it("reserves full-width fee amounts atomically for both reset windows", async () => {
+    const config = loadConfig({
+      env: completeEnv({
+        KEEPER_SPENDING_OVERRIDE_STROOPS: "99999999999999999999",
+        KEEPER_SPENDING_OVERRIDE_REASON: "approved maintenance budget",
+      }),
+    });
+    const db = new SpendingDb();
+    const client = {
+      getLatestLedger: () => Promise.resolve({ sequence: "9223372036854775808" }),
+    } as unknown as rpc.Server;
+    const amount = 9007199254740993123n;
+    const result = await reserveKeeperSpending(
+      config,
+      db,
+      "stellar-testnet",
+      Keypair.random().publicKey(),
+      amount,
+      client,
+    );
+    expect(result.allowed).toBe(true);
+    expect(
+      db.calls
+        .filter((call) => call.sql.includes("SET spent_stroops=spent_stroops+$5"))
+        .map((call) => call.params[4]),
+    ).toEqual([amount.toString(), amount.toString()]);
+    const expectedLedgerWindow = ((9223372036854775808n / 17280n) * 17280n).toString();
+    expect(db.calls.some((call) => call.params.includes(expectedLedgerWindow))).toBe(true);
+    expect(db.calls.filter((call) => call.sql.includes("'reset'"))).toHaveLength(2);
+    expect(db.calls.filter((call) => call.sql.includes("'override'"))).toHaveLength(2);
+  });
+  it("audits cap denial without charging an additional reservation", async () => {
+    const config = loadConfig({ env: completeEnv() });
+    const db = new SpendingDb("1000000");
+    const client = {
+      getLatestLedger: () => Promise.resolve({ sequence: 100 }),
+    } as unknown as rpc.Server;
+    const result = await reserveKeeperSpending(
+      config,
+      db,
+      "stellar-testnet",
+      Keypair.random().publicKey(),
+      100n,
+      client,
+    );
+    expect(result.allowed).toBe(false);
+    expect(
+      db.calls.some(
+        (call) =>
+          call.sql.includes("INSERT INTO keeper_spending_audit") &&
+          call.params.some(
+            (value) => typeof value === "string" && value.startsWith("spending cap reached:"),
+          ),
+      ),
+    ).toBe(true);
+    expect(db.calls.some((call) => call.sql.includes("SET spent_stroops=spent_stroops+$5"))).toBe(
+      false,
+    );
   });
   it("reports disabled versus not-started worker states", () => {
     const config = loadConfig({ env: completeEnv() });
     expect(new KeeperWorker(config, new Db(), logger).readiness().state).toBe("degraded");
     const disabled = loadConfig({ env: completeEnv({ KEEPER_ENABLED: "false" }) });
     expect(new KeeperWorker(disabled, new Db(), logger).readiness().state).toBe("ready");
+  });
+  it("reconciles public checkpoints before a reviewed failed-job retry", async () => {
+    const config = loadConfig({ env: completeEnv() });
+    const events: string[] = [];
+    vi.mocked(reconcileKeeperCheckpointsBeforeRetry).mockImplementationOnce(() => {
+      events.push("reconcile");
+      return Promise.resolve(undefined);
+    });
+    let state = "failed";
+    const job = {
+      name: "claim-settlement",
+      getState: vi.fn(() => Promise.resolve(state)),
+      retry: vi.fn(() => {
+        events.push("retry");
+        state = "waiting";
+        return Promise.resolve(undefined);
+      }),
+    };
+    const queue = {
+      getJob: vi.fn(() => Promise.resolve(job)),
+    } as unknown as Queue;
+    await requeueFailedKeeperJob(
+      queue,
+      new Db(),
+      config,
+      "failed-job-1",
+      "operator",
+      "reviewed after checking the chain",
+    );
+    expect(reconcileKeeperCheckpointsBeforeRetry).toHaveBeenCalledOnce();
+    expect(job.retry).toHaveBeenCalledOnce();
+    expect(events).toEqual(["reconcile", "retry"]);
+  });
+  it("does not requeue a failed job while a public transaction is unresolved", async () => {
+    const config = loadConfig({ env: completeEnv() });
+    const job = {
+      name: "ttl-bump",
+      getState: vi.fn(() => Promise.resolve("failed")),
+      retry: vi.fn(),
+    };
+    vi.mocked(reconcileKeeperCheckpointsBeforeRetry).mockRejectedValue(
+      new Error("public hash is unresolved"),
+    );
+    await expect(
+      requeueFailedKeeperJob(
+        { getJob: vi.fn(() => Promise.resolve(job)) } as unknown as Queue,
+        new Db(),
+        config,
+        "failed-job-2",
+        "operator",
+        "reviewed",
+      ),
+    ).rejects.toThrow("public hash is unresolved");
+    expect(job.retry).not.toHaveBeenCalled();
+  });
+  it("matches plan previews and handles full-width values", async () => {
+    const config = loadConfig({
+      env: completeEnv({ KEEPER_STELLAR_SECRET: Keypair.random().secret() }),
+    });
+    vi.mocked(submitStellar).mockResolvedValue("confirmed-hash");
+    const result = await processTtlBump({
+      config,
+      db: new Db([
+        {
+          claim_id: "1",
+          settled: false,
+          recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          amount: "90000000000000000001",
+        },
+        {
+          claim_id: "9223372036854775807",
+          settled: false,
+          recipient: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+          amount: "42",
+        },
+      ]),
+      logger,
+    });
+    expect(result.dryRun).toBe(false);
+    expect(result.bumpedClaims).toBe(2);
+    expect(result.bumpedTransfers).toBe(1);
+    expect(result.unsigned).toBe(false);
+    expect(result.operations).toHaveLength(1);
+    expect(result.operations[0]?.args).toEqual({
+      tokens: [expect.any(String)],
+      routes: [0, 1, 2, 3],
+      claimIds: ["1", "9223372036854775807"],
+      transferIds: ["9223372036854775808"],
+    });
+    expect(result.targetKeys).toContain(
+      `claim:${config.indexer.stellar?.chain ?? "missing"}:9223372036854775807`,
+    );
+    expect(JSON.stringify(result)).not.toContain(Keypair.random().secret());
   });
 });

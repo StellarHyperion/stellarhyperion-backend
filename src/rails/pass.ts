@@ -20,14 +20,19 @@ import type { AxelarDeliveryEvidenceRow } from "../chains/writers.js";
  * the pass records a cooldown and returns without asking anything until it passes. Doubling from a
  * second would spend those five minutes refreshing the block.
  */
+import { randomUUID } from "node:crypto";
+
 import type { AppConfig } from "../config/config.js";
+import { abortable, combinedSignal } from "./cancellation.js";
 import { revalidateItsDeliveryProofs, verifyItsDelivery } from "./axelar/delivery.js";
+import { ingestAxelarGasEvidence } from "./axelar/gas.js";
 import type { VerificationDiagnostic } from "./axelar/events.js";
 import { inspectCctpDelivery } from "./cctp/delivery.js";
 import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
 import type { ReadinessReport } from "../runtime/readiness.js";
+import { ProviderCircuitBreaker, safeCircuitKey, type ProviderCircuitSnapshot } from "./circuit.js";
 import {
   writeInbound,
   writeAttestation,
@@ -36,20 +41,26 @@ import {
   writeAxelarQuarantine,
 } from "../chains/writers.js";
 import {
+  claimPendingForRail,
   inspectRailBacklog,
   outstandingForRail,
-  pendingForRail,
-  pendingTransferById,
+  releaseRailWorkLease,
+  releaseRailWorkLeases,
+  renewRailWorkLease,
   type InspectRailBacklogOptions,
 } from "./queue.js";
 import {
+  RailLeaseLostError,
   RailError,
   isTerminal,
   type BacklogInspectionReport,
   type PendingTransfer,
   type RailClient,
+  type RailLookup,
   type RailRetryClass,
+  type RailWorkLease,
   type CctpVerificationFailure,
+  type RailCancellationOptions,
 } from "./types.js";
 
 /**
@@ -61,8 +72,13 @@ import {
  */
 const BACKLOG_MULTIPLE_BEFORE_DEGRADED = 3;
 const MAX_RETRY_DELAY_MS = 60 * 60 * 1000;
+const RAIL_WORK_LEASE_MS = 60_000;
 
-export interface RailPassOptions {
+type TransferOutcome =
+  | { readonly kind: "processed"; readonly settled: boolean }
+  | { readonly kind: "failed"; readonly rateLimitedError: RailError | null };
+
+export interface RailPassOptions extends RailCancellationOptions {
   readonly route: number;
   readonly client: RailClient;
   readonly db: Transactional;
@@ -73,6 +89,9 @@ export interface RailPassOptions {
   readonly maxCheckFailures: number;
   readonly now?: () => Date;
   readonly config?: AppConfig;
+  readonly circuits?: ProviderCircuitBreaker;
+  readonly circuitFailureThreshold?: number;
+  readonly circuitCooldownMs?: number;
 }
 
 export interface RailProgress {
@@ -86,8 +105,22 @@ export interface RailProgress {
 export class RailPass {
   private lastProgress: RailProgress | null = null;
   private cooldownUntil: Date | null = null;
+  private readonly circuits: ProviderCircuitBreaker;
+  private readonly ownerId = randomUUID();
 
-  constructor(private readonly options: RailPassOptions) {}
+  constructor(private readonly options: RailPassOptions) {
+    this.circuits =
+      options.circuits ??
+      new ProviderCircuitBreaker({
+        ...(options.circuitFailureThreshold === undefined
+          ? {}
+          : { failureThreshold: options.circuitFailureThreshold }),
+        ...(options.circuitCooldownMs === undefined
+          ? {}
+          : { cooldownMs: options.circuitCooldownMs }),
+        now: () => this.now(),
+      });
+  }
 
   get name(): string {
     return `rail:${this.options.client.rail}`;
@@ -103,6 +136,10 @@ export class RailPass {
 
   get progress(): RailProgress | null {
     return this.lastProgress;
+  }
+
+  circuitState(): readonly ProviderCircuitSnapshot[] {
+    return this.circuits.snapshot();
   }
 
   /** Inspect this rail's backlog without polling providers or mutating pass state. */
@@ -126,6 +163,14 @@ export class RailPass {
         name: this.name,
         state: "degraded",
         detail: `rate limited by the rail until ${cooldown.toISOString()}, so no transfer status is moving`,
+      };
+    }
+    const paused = this.circuitState();
+    if (paused.length > 0) {
+      return {
+        name: this.name,
+        state: "degraded",
+        detail: `provider discovery or destination proof verification is paused for ${paused.map((circuit) => circuit.key).join(", ")}; no delivery claim is made`,
       };
     }
     if (progress === null) {
@@ -153,20 +198,33 @@ export class RailPass {
     };
   }
 
+  /** Release any remaining claims during graceful shutdown; crashes rely on lease expiration. */
+  async release(): Promise<void> {
+    await releaseRailWorkLeases(this.options.db, this.ownerId);
+  }
+
   /** One pass. Returns true when it filled a batch, which means there is more behind it. */
   async tick(signal: AbortSignal): Promise<boolean> {
     const { db, logger, batchSize, client } = this.options;
+    const effective = this.effectiveSignal(signal);
+    effective.throwIfAborted();
 
     const cooldown = this.cooldownUntil;
     if (cooldown !== null && cooldown > this.now()) return false;
     this.cooldownUntil = null;
 
-    if (
-      this.options.config &&
-      this.options.route === RouteKind.AxelarIts &&
-      client.rail === "axelar"
-    )
-      await revalidateItsDeliveryProofs(this.options.config, db, batchSize, { signal });
+    if (this.options.config && client.rail === "axelar") {
+      if (this.options.route === RouteKind.AxelarIts || this.options.route === RouteKind.AxelarGmp)
+        await abortable(
+          ingestAxelarGasEvidence(this.options.config, db, batchSize, { signal: effective }),
+          effective,
+        );
+      if (this.options.route === RouteKind.AxelarIts)
+        await abortable(
+          revalidateItsDeliveryProofs(this.options.config, db, batchSize, { signal: effective }),
+          effective,
+        );
+    }
 
     let checked = 0;
     let settled = 0;
@@ -175,45 +233,67 @@ export class RailPass {
     let stoppedForCooldown = false;
     const seen: bigint[] = [];
 
-    // One locked transfer per transaction: replicas skip active work and cannot commit stale
-    // schedules. A crash rolls back the claim; no process-local ownership survives a restart.
-    while (selected < batchSize && !signal.aborted) {
-      const outcome = await db.transaction(async (tx) => {
-        const queue = await pendingForRail(tx, {
-          route: this.options.route,
-          limit: 1,
-          now: this.now(),
-          notCheckedSince: new Date(this.now().getTime() - this.options.recheckAfterMs),
-          maxCheckFailures: this.options.maxCheckFailures,
-          lock: true,
-          excludedTransferIds: seen,
-        });
-        const transfer = queue[0];
-        if (!transfer) return "empty";
-        selected += 1;
-        seen.push(transfer.transferId);
-        try {
-          if (await this.handle(transfer, tx, signal)) settled += 1;
+    // The short claim transaction commits the lease before provider I/O. A crashed worker's claim
+    // becomes available again after its bounded expiry.
+    while (
+      selected < batchSize &&
+      !effective.aborted &&
+      !this.circuits.isPaused(this.discoveryCircuitKey)
+    ) {
+      const claimed = await db.transaction((tx) =>
+        claimPendingForRail(
+          tx,
+          {
+            route: this.options.route,
+            limit: 1,
+            now: this.now(),
+            notCheckedSince: new Date(this.now().getTime() - this.options.recheckAfterMs),
+            maxCheckFailures: this.options.maxCheckFailures,
+            excludedTransferIds: seen,
+            signal: effective,
+          },
+          this.ownerId,
+          RAIL_WORK_LEASE_MS,
+        ),
+      );
+      if (claimed === null) break;
+      const { transfer, lease } = claimed;
+      selected += 1;
+      seen.push(transfer.transferId);
+
+      try {
+        const outcome = await this.processTransfer(transfer, lease, effective);
+        if (outcome.kind === "processed") {
           checked += 1;
-        } catch (error) {
-          signal.throwIfAborted();
+          if (outcome.settled) settled += 1;
+        } else {
           failures += 1;
-          await this.recordFailure(transfer, error, tx);
-          if (error instanceof RailError && error.kind === "rateLimited") {
-            this.cooldownUntil = this.failureRetryAt(this.now(), transfer.retryAttempts + 1, error);
+          if (outcome.rateLimitedError !== null) {
+            this.cooldownUntil = this.failureRetryAt(
+              this.now(),
+              transfer.retryAttempts + 1,
+              outcome.rateLimitedError,
+            );
             logger.warn(
               { rail: client.rail, until: this.cooldownUntil.toISOString() },
               "the rail rate limited us, holding off rather than retrying",
             );
-            return "cooldown";
+            stoppedForCooldown = true;
           }
         }
-        return "processed";
-      });
-      if (outcome === "cooldown") stoppedForCooldown = true;
-      if (outcome !== "processed") break;
+      } catch (error) {
+        if (!(error instanceof RailLeaseLostError)) throw error;
+        logger.warn(
+          { rail: client.rail, transferId: transfer.transferId.toString() },
+          "rail work lease expired before the verification decision could be committed",
+        );
+      } finally {
+        await releaseRailWorkLease(db, lease);
+      }
+      if (stoppedForCooldown) break;
     }
 
+    effective.throwIfAborted();
     const outstanding = await outstandingForRail(db, this.options.route);
     this.lastProgress = { checked, settled, failures, outstanding, at: this.now() };
 
@@ -225,7 +305,7 @@ export class RailPass {
     }
 
     // A full batch means the queue is longer than one pass, so come straight back.
-    return selected >= batchSize && !stoppedForCooldown;
+    return selected >= batchSize && !stoppedForCooldown && !effective.aborted;
   }
 
   /** Re-evaluate one reopened transfer immediately, without changing its source identity. */
@@ -233,26 +313,63 @@ export class RailPass {
     transferId: bigint,
     signal: AbortSignal = new AbortController().signal,
   ): Promise<boolean> {
-    if (signal.aborted) return false;
+    const effective = this.effectiveSignal(signal);
+    if (effective.aborted) return false;
     const cooldown = this.cooldownUntil;
     if (cooldown !== null && cooldown > this.now()) return false;
-    return this.options.db.transaction(async (tx) => {
-      const transfer = await pendingTransferById(
+    if (this.circuits.isPaused(this.discoveryCircuitKey)) return false;
+    const claimed = await this.options.db.transaction((tx) =>
+      claimPendingForRail(
         tx,
-        this.options.route,
-        transferId,
-        this.options.maxCheckFailures,
-      );
-      if (transfer === null) return false;
+        {
+          route: this.options.route,
+          limit: 1,
+          now: this.now(),
+          notCheckedSince: this.now(),
+          maxCheckFailures: this.options.maxCheckFailures,
+          onlyTransferId: transferId,
+          signal: effective,
+        },
+        this.ownerId,
+        RAIL_WORK_LEASE_MS,
+      ),
+    );
+    if (claimed === null) return false;
+    try {
+      const outcome = await this.processTransfer(claimed.transfer, claimed.lease, effective);
+      if (outcome.kind === "failed" && outcome.rateLimitedError !== null) {
+        this.cooldownUntil = this.failureRetryAt(
+          this.now(),
+          claimed.transfer.retryAttempts + 1,
+          outcome.rateLimitedError,
+        );
+      }
+      return outcome.kind === "processed" && outcome.settled;
+    } catch (error) {
+      if (this.effectiveSignal(signal).aborted || error instanceof RailLeaseLostError) return false;
+      throw error;
+    } finally {
+      await releaseRailWorkLease(this.options.db, claimed.lease);
+    }
+  }
+
+  private async processTransfer(
+    transfer: PendingTransfer,
+    lease: RailWorkLease,
+    signal: AbortSignal,
+  ): Promise<TransferOutcome> {
+    return this.options.db.transaction(async (tx) => {
       try {
-        return await this.handle(transfer, tx, signal);
+        return { kind: "processed", settled: await this.handle(transfer, tx, signal, lease) };
       } catch (error) {
         signal.throwIfAborted();
-        await this.recordFailure(transfer, error, tx);
-        if (error instanceof RailError && error.kind === "rateLimited") {
-          this.cooldownUntil = this.failureRetryAt(this.now(), transfer.retryAttempts + 1, error);
-        }
-        return false;
+        if (error instanceof RailLeaseLostError) throw error;
+        await this.recordFailure(transfer, error, tx, lease);
+        return {
+          kind: "failed",
+          rateLimitedError:
+            error instanceof RailError && error.kind === "rateLimited" ? error : null,
+        };
       }
     });
   }
@@ -262,13 +379,14 @@ export class RailPass {
     transfer: PendingTransfer,
     db: Queryable,
     signal: AbortSignal,
+    lease: RailWorkLease,
   ): Promise<boolean> {
     const at = this.now();
 
     if (transfer.delivered) {
       // Our own inbound index already says the money arrived, which outranks anything the rail
       // would tell us. No request, and the transfer leaves the queue for good.
-      await this.write(db, transfer, {
+      await this.write(db, transfer, lease, {
         status: "delivered",
         railStatus: null,
         reference: null,
@@ -284,11 +402,23 @@ export class RailPass {
       return true;
     }
 
-    const lookup = await this.options.client.look(transfer, signal);
+    if (!this.circuits.allow(this.discoveryCircuitKey)) return false;
+    let lookup: RailLookup;
+    try {
+      lookup = await abortable(this.options.client.look(transfer, signal), signal);
+    } catch (error) {
+      signal.throwIfAborted();
+      this.circuits.recordFailure(
+        this.discoveryCircuitKey,
+        circuitReason(error, this.options.client.rail),
+      );
+      throw error;
+    }
+    this.circuits.recordSuccess(this.discoveryCircuitKey);
     signal.throwIfAborted();
     if (lookup.kind === "missing") {
       // Normal. The rail has not indexed the burn yet, which is where every transfer starts.
-      await this.write(db, transfer, {
+      await this.write(db, transfer, lease, {
         status: transfer.status ?? "pending",
         railStatus: null,
         reference: null,
@@ -319,48 +449,63 @@ export class RailPass {
     let verificationFailure: CctpVerificationFailure | null = null;
     if (this.options.config) {
       const verificationOptions = { signal, logger: this.options.logger };
-      const its =
-        report.execution || report.forwardTxHash
-          ? await verifyItsDelivery(this.options.config, db, transfer, report, verificationOptions)
-          : null;
-      diagnostics = its !== null && "diagnostics" in its ? its.diagnostics : [];
-      itsVerificationState = its === null ? null : "diagnostics" in its ? its.state : "verified";
-      let verified: VerifiedDelivery | null = its !== null && !("diagnostics" in its) ? its : null;
-      if (!verified) {
-        const cctp = await inspectCctpDelivery(
-          this.options.config,
-          db,
-          transfer,
-          report,
-          verificationOptions,
-        );
-        verified = cctp.delivery;
-        verificationFailure = cctp.failure;
-      }
-      if (verified) {
-        signal.throwIfAborted();
-        if (transfer.route === RouteKind.AxelarIts && "evidence" in verified) {
-          const evidence = verified.evidence as AxelarDeliveryEvidenceRow;
-          const evidenceId = await writeAxelarDeliveryEvidence(db, evidence);
-          await writeInbound(db, verified.at, verified.row);
-          await linkAxelarDeliveryEvidence(db, evidence, evidenceId);
-        } else await writeInbound(db, verified.at, verified.row);
-        await this.write(db, transfer, {
-          status: "delivered",
-          railStatus: report.railStatus,
-          reference: report.reference,
-          attestedAt: report.attestedAt,
-          checkedAt: at,
-          failures: 0,
-          retryAttempts: 0,
-          error: null,
-          nextAttemptAt: null,
-          retryClass: null,
-          diagnostics,
-          itsVerificationState,
-          verificationFailure: null,
-        });
-        return true;
+      const verificationKey = this.verificationCircuitKey(transfer.destinationChain);
+      if (this.circuits.allow(verificationKey)) {
+        try {
+          const its =
+            report.execution || report.forwardTxHash
+              ? await abortable(
+                  verifyItsDelivery(this.options.config, db, transfer, report, verificationOptions),
+                  signal,
+                )
+              : null;
+          diagnostics = its !== null && "diagnostics" in its ? its.diagnostics : [];
+          itsVerificationState =
+            its === null ? null : "diagnostics" in its ? its.state : "verified";
+          let verified: VerifiedDelivery | null =
+            its !== null && !("diagnostics" in its) ? its : null;
+          if (!verified) {
+            const cctp = await abortable(
+              inspectCctpDelivery(this.options.config, db, transfer, report, verificationOptions),
+              signal,
+            );
+            verified = cctp.delivery;
+            verificationFailure = cctp.failure;
+          }
+          this.circuits.recordSuccess(verificationKey);
+          if (verified) {
+            signal.throwIfAborted();
+            if (transfer.route === RouteKind.AxelarIts && "evidence" in verified) {
+              const evidence = verified.evidence as AxelarDeliveryEvidenceRow;
+              const evidenceId = await writeAxelarDeliveryEvidence(db, evidence);
+              await writeInbound(db, verified.at, verified.row);
+              await linkAxelarDeliveryEvidence(db, evidence, evidenceId);
+            } else await writeInbound(db, verified.at, verified.row);
+            await this.write(db, transfer, lease, {
+              status: "delivered",
+              railStatus: report.railStatus,
+              reference: report.reference,
+              attestedAt: report.attestedAt,
+              checkedAt: at,
+              failures: 0,
+              retryAttempts: 0,
+              error: null,
+              nextAttemptAt: null,
+              retryClass: null,
+              diagnostics,
+              itsVerificationState,
+              verificationFailure: null,
+            });
+            return true;
+          }
+        } catch (error) {
+          signal.throwIfAborted();
+          this.circuits.recordFailure(
+            verificationKey,
+            circuitReason(error, this.options.client.rail),
+          );
+          throw error;
+        }
       }
     }
     const candidateStatus =
@@ -376,7 +521,8 @@ export class RailPass {
       transfer.status === "attested" && candidateStatus === "pending"
         ? "attested"
         : candidateStatus;
-    await this.write(db, transfer, {
+    signal.throwIfAborted();
+    await this.write(db, transfer, lease, {
       status,
       railStatus: report.railStatus,
       reference: report.reference,
@@ -398,6 +544,7 @@ export class RailPass {
     transfer: PendingTransfer,
     error: unknown,
     db: Queryable,
+    lease: RailWorkLease,
   ): Promise<void> {
     const retryable = error instanceof RailError && error.kind !== "permanent";
     const failures = retryable ? transfer.checkFailures : transfer.checkFailures + 1;
@@ -429,7 +576,7 @@ export class RailPass {
       );
     }
 
-    await this.write(db, transfer, {
+    await this.write(db, transfer, lease, {
       // Still pending, not failed. A transfer we cannot ask about is not a transfer that failed,
       // and writing `failed` here would claim the money did not move on the strength of our own
       // inability to get an answer.
@@ -453,6 +600,7 @@ export class RailPass {
   private async write(
     db: Queryable,
     transfer: PendingTransfer,
+    lease: RailWorkLease,
     fields: {
       readonly status: string;
       readonly railStatus: string | null;
@@ -470,6 +618,7 @@ export class RailPass {
       readonly verificationFailure: CctpVerificationFailure | null;
     },
   ): Promise<void> {
+    await renewRailWorkLease(db, lease, RAIL_WORK_LEASE_MS);
     await writeAttestation(db, {
       transferId: transfer.transferId,
       route: transfer.route,
@@ -487,6 +636,18 @@ export class RailPass {
       itsVerificationState: fields.itsVerificationState ?? null,
       verificationFailure: fields.verificationFailure,
     });
+  }
+
+  private get providerCircuitIdentity(): string {
+    return safeCircuitKey(this.options.client.providerId ?? this.options.client.rail);
+  }
+
+  private get discoveryCircuitKey(): string {
+    return `discovery:${this.providerCircuitIdentity}`;
+  }
+
+  private verificationCircuitKey(destinationChain: string): string {
+    return `proof:${this.providerCircuitIdentity}:${safeCircuitKey(destinationChain)}`;
   }
 
   private nextCheckAt(at: Date): Date {
@@ -507,9 +668,20 @@ export class RailPass {
     return new Date(at.getTime() + delay);
   }
 
+  private effectiveSignal(signal: AbortSignal): AbortSignal {
+    return combinedSignal(signal, this.options.shutdownSignal);
+  }
+
   private now(): Date {
     return this.options.now?.() ?? new Date();
   }
+}
+
+function circuitReason(error: unknown, rail: string): string {
+  if (error instanceof RailError) {
+    return `${rail}: ${error.kind === "rateLimited" ? "rate_limited" : error.kind}`;
+  }
+  return `${rail}: transient`;
 }
 
 function safeFailureReason(error: unknown): string {

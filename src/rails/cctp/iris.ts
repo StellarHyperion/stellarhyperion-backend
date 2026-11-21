@@ -231,6 +231,7 @@ export interface IrisOptions {
   readonly fetch?: typeof globalThis.fetch;
   readonly page?: number;
   readonly pageSize?: number;
+  readonly providerId?: string;
 }
 
 export class IrisClient implements RailClient {
@@ -246,6 +247,10 @@ export class IrisClient implements RailClient {
     // Circle lives and the backend is not allowed its own opinion about it.
     this.baseUrl = (options.baseUrl ?? IRIS_API[network]).replace(/\/+$/, "");
     this.request = options.fetch ?? globalThis.fetch;
+  }
+
+  get providerId(): string | undefined {
+    return this.options.providerId;
   }
 
   async look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup> {

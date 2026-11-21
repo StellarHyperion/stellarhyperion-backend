@@ -1,13 +1,15 @@
-import { Address, nativeToScVal } from "@stellar/stellar-sdk";
-import { bigintOf } from "../../db/rows.js";
+import { Address, BASE_FEE, nativeToScVal } from "@stellar/stellar-sdk";
+import { bigintOf, text } from "../../db/rows.js";
 import { sanitizeDiagnosticText } from "../../logging/logger.js";
 import { submitStellar } from "../stellar.js";
 import { recordKeeperSubmission } from "../outcomes.js";
+import { KeeperMaintenancePausedError, KeeperSpendingCapReachedError } from "../spending.js";
 import type {
   ClaimSettlementItemResult,
   ClaimSettlementPayload,
   ClaimSettlementResult,
   KeeperContext,
+  KeeperOperationPreview,
 } from "../types.js";
 
 const MAX_CLAIM_SETTLEMENT_BATCH_SIZE = 20;
@@ -43,17 +45,21 @@ export async function processClaimSettlement(
       pending: 0,
       missing: 0,
       claims: [],
+      operations: [],
+      targetKeys: [],
+      estimatedFee: "0",
+      unsigned: true,
       dryRun: true,
       detail: "No Stellar deployment configured.",
     };
   const { rows } =
     requestedIds === undefined
       ? await ctx.db.query(
-          "SELECT claim_id, settled FROM pending_claim WHERE chain = $1 AND NOT settled ORDER BY claim_id ASC LIMIT $2",
+          "SELECT claim_id, recipient, amount, settled FROM pending_claim WHERE chain = $1 AND NOT settled ORDER BY claim_id ASC LIMIT $2",
           [chain.chain, limit],
         )
       : await ctx.db.query(
-          "SELECT claim_id, settled FROM pending_claim WHERE chain = $1 AND claim_id = ANY($2::bigint[]) ORDER BY claim_id ASC",
+          "SELECT claim_id, recipient, amount, settled FROM pending_claim WHERE chain = $1 AND claim_id::numeric = ANY($2::numeric[]) ORDER BY claim_id ASC",
           [chain.chain, requestedIds.map(String)],
         );
   const claims = new Map(rows.map((row) => [bigintOf(row, "claim_id").toString(), row]));
@@ -66,6 +72,32 @@ export async function processClaimSettlement(
       return { claimId, outcome: "already_settled" };
     return { claimId, outcome: "pending" };
   });
+  const operations: readonly KeeperOperationPreview[] = outcomes
+    .filter((claim) => claim.outcome === "pending")
+    .map((claim) => {
+      const row = claims.get(claim.claimId);
+      if (row === undefined) throw new Error("Pending claim preview has no indexed row.");
+      const targetKeys = [`claim:${chain.chain}:${claim.claimId}`];
+      return {
+        kind: "settle_claim",
+        contract: chain.routerContractId,
+        method: "settle_claim",
+        targetKeys,
+        args: {
+          claimId: claim.claimId,
+          recipient: text(row, "recipient"),
+          amount: bigintOf(row, "amount").toString(),
+        },
+        estimatedFee: BASE_FEE,
+        unsigned: true,
+      };
+    });
+  const targetKeys = operations.flatMap((operation) => operation.targetKeys);
+  const preview = {
+    operations,
+    targetKeys,
+    estimatedFee: String(BigInt(BASE_FEE) * BigInt(operations.length)),
+  };
   if (ctx.config.keeper.stellarSecrets.length === 0) {
     await recordKeeperSubmission(ctx.db, {
       jobName: "claim-settlement",
@@ -78,11 +110,14 @@ export async function processClaimSettlement(
       pending: outcomes.filter((claim) => claim.outcome === "pending").length,
       missing: outcomes.filter((claim) => claim.outcome === "missing").length,
       claims: outcomes,
+      ...preview,
+      unsigned: true,
       dryRun: true,
       detail: "No signer configured; no settlement was attempted.",
     };
   }
   let attempted = 0;
+  let paused = false;
   for (let index = 0; index < outcomes.length; index += 1) {
     const claim = outcomes[index];
     if (claim?.outcome !== "pending") continue;
@@ -104,6 +139,17 @@ export async function processClaimSettlement(
       );
       outcomes[index] = { claimId: claim.claimId, outcome: "confirmed", transactionHash: hash };
     } catch (error) {
+      if (
+        error instanceof KeeperMaintenancePausedError ||
+        error instanceof KeeperSpendingCapReachedError
+      ) {
+        paused = true;
+        ctx.logger.warn(
+          { claimId: claim.claimId },
+          "claim settlement deferred by keeper spending policy",
+        );
+        break;
+      }
       const reason = sanitizeDiagnosticText(error instanceof Error ? error.message : String(error));
       ctx.logger.warn({ reason, claimId: claim.claimId }, "claim settlement remains unverified");
     }
@@ -120,7 +166,9 @@ export async function processClaimSettlement(
     pending,
     missing,
     claims: outcomes,
-    dryRun: false,
+    ...preview,
+    unsigned: attempted === 0,
+    dryRun: paused && attempted === 0,
     detail: `${settled} settled, ${missing} missing, and ${pending} pending across ${attempted} attempted claims.`,
   };
 }

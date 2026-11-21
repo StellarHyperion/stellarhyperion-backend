@@ -76,11 +76,13 @@ export class KeeperWorker implements ReadinessSource {
         this.starting = false;
         this.logger.info("keeper BullMQ worker and queue ready");
       })
-      .catch((err: unknown) => {
+      .catch(() => {
         this.starting = false;
         this.failedError =
           "signer ownership, balance, network or queue readiness could not be verified";
-        this.logger.error({ err }, "failed to start keeper queue");
+        this.logger.error(
+          "failed to start keeper queue; details omitted to protect configured credentials",
+        );
       });
   }
 

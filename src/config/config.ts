@@ -145,6 +145,12 @@ export interface KeeperConfig {
   readonly stellarSecret: string | null;
   readonly stellarSecrets: readonly string[];
   readonly activeSigner: string | null;
+  readonly paused: boolean;
+  readonly dailyCapStroops: string;
+  readonly ledgerCapStroops: string;
+  readonly ledgerWindowLedgers: number;
+  readonly overrideStroops: string | null;
+  readonly overrideReason: string | null;
 }
 
 export type ConfigSource = "default" | "env" | "deployment";
@@ -432,6 +438,60 @@ const KEEPER_CONCURRENCY: VarSpec = {
   max: 10,
   printable: true,
   purpose: "Max concurrent jobs the keeper runs.",
+};
+
+const KEEPER_PAUSED: VarSpec = {
+  name: "KEEPER_PAUSED",
+  kind: "boolean",
+  required: false,
+  fallback: "false",
+  printable: true,
+  purpose: "Stops signed keeper maintenance without changing claim state.",
+};
+
+const KEEPER_DAILY_CAP_STROOPS: VarSpec = {
+  name: "KEEPER_DAILY_CAP_STROOPS",
+  kind: "string",
+  required: false,
+  fallback: "1000000",
+  printable: true,
+  purpose: "Maximum reserved Stellar transaction fees per signer and UTC day, in stroops.",
+};
+
+const KEEPER_LEDGER_CAP_STROOPS: VarSpec = {
+  name: "KEEPER_LEDGER_CAP_STROOPS",
+  kind: "string",
+  required: false,
+  fallback: "100000",
+  printable: true,
+  purpose: "Maximum reserved Stellar transaction fees per signer and ledger window, in stroops.",
+};
+
+const KEEPER_LEDGER_WINDOW_LEDGERS: VarSpec = {
+  name: "KEEPER_LEDGER_WINDOW_LEDGERS",
+  kind: "integer",
+  required: false,
+  fallback: "17280",
+  min: 1,
+  max: 2_147_483_647,
+  printable: true,
+  purpose: "Number of ledger sequences in each keeper spending window.",
+};
+
+const KEEPER_SPENDING_OVERRIDE_STROOPS: VarSpec = {
+  name: "KEEPER_SPENDING_OVERRIDE_STROOPS",
+  kind: "string",
+  required: false,
+  printable: true,
+  purpose: "Explicitly replaces both keeper spending caps, in stroops; requires an audit reason.",
+};
+
+const KEEPER_SPENDING_OVERRIDE_REASON: VarSpec = {
+  name: "KEEPER_SPENDING_OVERRIDE_REASON",
+  kind: "string",
+  required: false,
+  printable: false,
+  purpose: "Operator reason required when overriding the keeper spending caps.",
 };
 
 const KEEPER_STELLAR_SECRET: VarSpec = {
@@ -809,6 +869,33 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
 
   const keeperPollIntervalMs = reader.integer(KEEPER_POLL_INTERVAL_MS);
   const keeperConcurrency = reader.integer(KEEPER_CONCURRENCY);
+  const keeperPaused = reader.boolean(KEEPER_PAUSED);
+  const keeperDailyCapStroops = reader.string(KEEPER_DAILY_CAP_STROOPS);
+  const keeperLedgerCapStroops = reader.string(KEEPER_LEDGER_CAP_STROOPS);
+  const keeperLedgerWindowLedgers = reader.integer(KEEPER_LEDGER_WINDOW_LEDGERS);
+  const keeperOverrideStroops = reader.has(KEEPER_SPENDING_OVERRIDE_STROOPS.name)
+    ? reader.string(KEEPER_SPENDING_OVERRIDE_STROOPS)
+    : null;
+  const keeperOverrideReason = reader.has(KEEPER_SPENDING_OVERRIDE_REASON.name)
+    ? reader.string(KEEPER_SPENDING_OVERRIDE_REASON)
+    : null;
+  for (const [spec, amount] of [
+    [KEEPER_DAILY_CAP_STROOPS, keeperDailyCapStroops],
+    [KEEPER_LEDGER_CAP_STROOPS, keeperLedgerCapStroops],
+    ...(keeperOverrideStroops === null
+      ? []
+      : [[KEEPER_SPENDING_OVERRIDE_STROOPS, keeperOverrideStroops] as const]),
+  ] as const) {
+    if (!/^(0|[1-9]\d{0,19})$/.test(amount))
+      reader.reject(spec, "must be a non-negative integer string with at most 20 digits");
+  }
+  if ((keeperOverrideStroops === null) !== (keeperOverrideReason === null))
+    reader.reject(
+      KEEPER_SPENDING_OVERRIDE_REASON,
+      "must be set together with KEEPER_SPENDING_OVERRIDE_STROOPS",
+    );
+  if (keeperOverrideReason !== null && keeperOverrideReason.length > 200)
+    reader.reject(KEEPER_SPENDING_OVERRIDE_REASON, "must be at most 200 characters");
   const keeperStellarSecret = reader.has(KEEPER_STELLAR_SECRET.name)
     ? reader.string(KEEPER_STELLAR_SECRET)
     : null;
@@ -933,6 +1020,12 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       stellarSecret: keeperStellarSecret,
       stellarSecrets: keeperStellarSecrets,
       activeSigner: keeperActiveSigner,
+      paused: keeperPaused,
+      dailyCapStroops: keeperDailyCapStroops,
+      ledgerCapStroops: keeperLedgerCapStroops,
+      ledgerWindowLedgers: keeperLedgerWindowLedgers,
+      overrideStroops: keeperOverrideStroops,
+      overrideReason: keeperOverrideReason,
     },
     deploymentMode,
     readinessPolicy,
