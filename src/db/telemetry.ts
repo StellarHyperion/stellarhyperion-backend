@@ -32,6 +32,10 @@ export interface PoolSaturationSnapshot {
   readonly idleConnections: number;
   readonly activeConnections: number;
   readonly waitingRequests: number;
+  /** Requests waiting in the bounded admission queue (not only pg's internal queue). */
+  readonly queuedRequests: number;
+  readonly queuedBackgroundRequests: number;
+  readonly activeWorkloads: Readonly<Record<string, number>>;
   readonly utilizationRatio: number;
   readonly saturated: boolean;
 }
@@ -59,6 +63,9 @@ export interface PoolStatsSource {
   readonly idleCount: number;
   readonly waitingCount: number;
   readonly maxConnections: number;
+  readonly queuedRequests?: number;
+  readonly queuedBackgroundRequests?: number;
+  readonly activeWorkloads?: Readonly<Record<string, number>>;
 }
 
 export const DEFAULT_MAX_SAMPLES_PER_WORKLOAD = 256;
@@ -230,7 +237,9 @@ export class DbTelemetryCollector {
     const totalConnections = Math.max(0, source.totalCount);
     const idleConnections = Math.max(0, source.idleCount);
     const activeConnections = Math.max(0, totalConnections - idleConnections);
-    const waitingRequests = Math.max(0, source.waitingCount);
+    const waitingRequests = Math.max(0, source.waitingCount, source.queuedRequests ?? 0);
+    const queuedRequests = Math.max(0, source.queuedRequests ?? waitingRequests);
+    const queuedBackgroundRequests = Math.max(0, source.queuedBackgroundRequests ?? 0);
     const utilizationRatio =
       maxConnections > 0 ? Math.round((activeConnections / maxConnections) * 10_000) / 10_000 : 0;
     const saturated =
@@ -242,6 +251,9 @@ export class DbTelemetryCollector {
       idleConnections,
       activeConnections,
       waitingRequests,
+      queuedRequests,
+      queuedBackgroundRequests,
+      activeWorkloads: source.activeWorkloads ?? {},
       utilizationRatio,
       saturated,
     };
