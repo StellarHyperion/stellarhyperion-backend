@@ -77,6 +77,19 @@ export class ConfigError extends Error {
   }
 }
 
+/** A safe failure from live network admission, keyed by configuration field path. */
+export class NetworkAdmissionError extends Error {
+  constructor(readonly faults: readonly ConfigFault[]) {
+    super(
+      [
+        "Hyperion backend cannot start: network admission failed.",
+        ...faults.map((fault) => `  ${fault.name}: ${fault.problem}`),
+      ].join("\n"),
+    );
+    this.name = "NetworkAdmissionError";
+  }
+}
+
 function renderFaults(faults: readonly ConfigFault[]): string {
   const lines = faults.map((fault) => `  ${fault.name}: ${fault.problem}\n      ${fault.purpose}`);
   const count =

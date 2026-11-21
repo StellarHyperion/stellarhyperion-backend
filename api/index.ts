@@ -1,6 +1,5 @@
 import { checkDatabasePolicy } from "../src/db/policy.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { resolve as resolvePath } from "node:path";
 import type { FastifyInstance } from "fastify";
 import type { Redis } from "ioredis";
 import { loadConfig } from "../src/config/config.js";
@@ -72,8 +71,6 @@ export function getDb(): Database | null {
 
 async function createApp(): Promise<AppResources> {
   process.env.VERCEL_ENV ??= "production";
-  process.env.HYPERION_NETWORK ??= "testnet";
-  process.env.HYPERION_DEPLOYMENTS_FILE ??= resolvePath(process.cwd(), "deployments/testnet.json");
   process.env.INDEXER_ENABLED ??= "false";
   process.env.RAILS_ENABLED ??= "false";
   process.env.KEEPER_ENABLED ??= "false";

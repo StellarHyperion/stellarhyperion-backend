@@ -67,6 +67,19 @@ describe("loadConfig", () => {
     ).toThrow(/HYPERION_DATABASE_ENV/);
   });
 
+  it("rejects a deployment mode that disagrees with enabled components", () => {
+    expect(() =>
+      loadConfig({
+        env: completeEnv({
+          INDEXER_ENABLED: "false",
+          RAILS_ENABLED: "false",
+          KEEPER_ENABLED: "false",
+          DEPLOYMENT_MODE: "all-in-one",
+        }),
+      }),
+    ).toThrow(/DEPLOYMENT_MODE/);
+  });
+
   it("rejects write-capable components with a read-only database role", () => {
     expect(() =>
       loadConfig({
@@ -362,5 +375,15 @@ describe("watch plan", () => {
       return;
     }
     throw new Error("expected a ConfigError");
+  });
+
+  it("refuses a record whose Stellar passphrase disagrees with the registry", () => {
+    const env = completeEnv();
+    const record = readFileSync(TESTNET_DEPLOYMENTS, "utf8").replace(
+      "Test SDF Network ; September 2015",
+      "Mainnet passphrase",
+    );
+
+    expect(() => loadConfig({ env, readFile: () => record })).toThrow(/HYPERION_DEPLOYMENTS_FILE/);
   });
 });

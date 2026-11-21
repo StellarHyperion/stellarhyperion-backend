@@ -13,6 +13,8 @@ Indexes Hyperion contract events, serves public transfer/claim history, polls ra
 ## Run
 
 Use Node 22.13 or newer. PostgreSQL is required. Redis is used only when the keeper is enabled.
+Set `HYPERION_NETWORK` and `HYPERION_DEPLOYMENTS_FILE` explicitly for every deployment; the
+container and serverless entrypoint do not silently select testnet.
 
 ```bash
 npm ci
@@ -53,6 +55,15 @@ and ITS destination proof checks. These are destination-only settings: they work
 Hyperion router deployment and do not enable or configure an EVM source watcher. When unset, each
 chain's registry RPC remains the default. Each setting accepts at most three HTTP(S) endpoints.
 
+Before the continuous process opens its database or constructs workers, network admission checks
+the live Stellar passphrase, each selected EVM RPC chain ID and the deployed bytecode for the
+routers and rail contracts used by active lanes in the deployment record. Destination providers
+are selected from the record's active lane metadata, so destination-only verification does not
+require an EVM Hyperion router. Admission errors identify configuration field paths and never print
+provider URLs, credentials, or raw provider errors. Axelar ITS uses the active record's `peerChain`;
+CCTP uses `activation.cctp.destinations`. A provider's rail status still cannot establish delivery;
+the canonical receipt and matching payment checks remain authoritative.
+
 Verification checks the expected chain ID and runs the receipt, confirmation, canonical-block,
 and payment reads against one endpoint. If an RPC call fails, the whole proof restarts on the next
 endpoint; evidence from different endpoints is never combined. Each endpoint has a 15-second
@@ -63,7 +74,7 @@ not logged.
 
 ## Deploy on Vercel
 
-The `hyperion-backend` Vercel project serves [stellarhyperion-backend.vercel.app](https://stellarhyperion-backend.vercel.app). Configure its production `DATABASE_URL` through Vercel environment variables with a managed PostgreSQL connection and TLS. Keep the value server-side. Redis and signing keys are unnecessary while `KEEPER_ENABLED=false`.
+The `hyperion-backend` Vercel project serves [stellarhyperion-backend.vercel.app](https://stellarhyperion-backend.vercel.app). Configure its production `DATABASE_URL` through Vercel environment variables with a managed PostgreSQL connection and TLS. Keep the value server-side. Set `HYPERION_NETWORK` and `HYPERION_DEPLOYMENTS_FILE` explicitly to the intended network and deployment record. Redis and signing keys are unnecessary while `KEEPER_ENABLED=false`.
 
 `vercel.json` includes the deployment metadata in the API function. Production indexing runs in [the testnet indexer workflow](.github/workflows/indexer.yml), independently of requests to the API. Store the same database connection as the repository Actions secret `HYPERION_DATABASE_URL`. Each run applies pending SQL migrations and runs the real indexer and bridge pollers for 150 seconds, with graceful shutdown and a persisted PostgreSQL cursor. The concurrency group prevents overlapping hosted jobs. No signer is configured.
 
@@ -342,7 +353,8 @@ Lane keys use `origin->destination`, with `maxSourceScanLagMs`, `maxProofBacklog
 `maxProofBacklogAgeMs`. The strictest configured lane scan target applies to its origin.
 
 `DEPLOYMENT_MODE` accepts `all-in-one`, `api-only`, `indexer-only`, `keeper-only` or `custom`;
-component flags determine the default mode. `READINESS_DB_POLICY`, `READINESS_INDEXER_POLICY`,
+component flags determine the default mode, and an explicit non-custom mode must match those flags.
+Use `custom` only when the component combination is intentional. `READINESS_DB_POLICY`, `READINESS_INDEXER_POLICY`,
 `READINESS_RAILS_POLICY` and `READINESS_KEEPER_POLICY` accept `required`, `optional` or
 `disabled`. Required dependencies without readiness evidence are down. Required down
 returns 503; stale/degraded evidence remains visible as degraded. Optional down degrades

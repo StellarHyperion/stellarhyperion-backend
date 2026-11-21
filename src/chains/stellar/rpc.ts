@@ -97,6 +97,15 @@ export class StellarRpc {
     private readonly options: StellarRpcOptions = {},
   ) {}
 
+  async getNetwork(signal?: AbortSignal): Promise<{ readonly passphrase: string }> {
+    const result = await this.call("getNetwork", {}, signal);
+    const body = result as { passphrase?: unknown };
+    if (typeof body.passphrase !== "string" || body.passphrase.length === 0) {
+      throw new StellarRpcError("getNetwork", "no network passphrase in the response", true);
+    }
+    return { passphrase: body.passphrase };
+  }
+
   async latestLedger(signal?: AbortSignal): Promise<LatestLedger> {
     const result = await this.call("getLatestLedger", {}, signal);
     const body = result as { sequence?: unknown; closeTime?: unknown; protocolVersion?: unknown };

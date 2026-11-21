@@ -7,8 +7,9 @@
  * JSON with the whole explanation escaped inside one field.
  */
 import { buildIndexer } from "./chains/runner.js";
+import { admitNetworkEnvironment } from "./config/admission.js";
 import { loadConfig } from "./config/config.js";
-import { ConfigError } from "./config/env.js";
+import { ConfigError, NetworkAdmissionError } from "./config/env.js";
 import { checkDatabasePolicy } from "./db/policy.js";
 import { checkSchemaCompatibility } from "./db/schema.js";
 import { runBudgetedCatchUp } from "./runtime/budget.js";
@@ -32,6 +33,16 @@ async function main(): Promise<void> {
       throw error;
     }
   })();
+
+  try {
+    await admitNetworkEnvironment(config);
+  } catch (error) {
+    if (error instanceof NetworkAdmissionError) {
+      process.stderr.write(`\n${error.message}\n\n`);
+      process.exit(78);
+    }
+    throw error;
+  }
 
   const logger = createLogger(config);
   const shutdown = new Shutdown(logger, config.shutdownTimeoutMs);
