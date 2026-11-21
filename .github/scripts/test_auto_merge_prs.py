@@ -4,6 +4,7 @@ import base64
 import copy
 from pathlib import Path
 import unittest
+import re
 from unittest.mock import Mock, patch
 import urllib.error
 
@@ -41,6 +42,7 @@ class FakeGitHub:
         self.comments, self.reviews, self.statuses, self.checks = [], [], [], []
         self.resolved, self.branch = True, BASE
         self.writes, self.reads = [], []
+        self.extra_runs, self.extra_jobs = {}, {}
 
     def linked_issues(self, number):
         return self.refs
@@ -52,6 +54,13 @@ class FakeGitHub:
             if path.endswith("/merge"):
                 return {"merged": True}
             return {"id": 1}
+        if path.startswith(PREFIX + "actions/runs/"):
+            match = re.fullmatch(re.escape(PREFIX) + r"actions/runs/(\d+)", path)
+            if match and int(match[1]) in self.extra_runs:
+                return copy.deepcopy(self.extra_runs[int(match[1])])
+            match = re.match(re.escape(PREFIX) + r"actions/runs/(\d+)/attempts/(\d+)/jobs\?", path)
+            if match and (int(match[1]), int(match[2])) in self.extra_jobs:
+                return {"jobs": copy.deepcopy(self.extra_jobs[(int(match[1]), int(match[2]))])}
         if path == PREFIX + "pulls/1":
             return copy.deepcopy(self.pr)
         if path == PREFIX + "actions/runs/12":
@@ -203,6 +212,111 @@ class AutoMergeTests(unittest.TestCase):
         self.api.checks = []
         self.api.statuses = [{"context": "deploy", "state": "failure"}]
         self.assert_wait("deploy")
+
+    def add_action_run(self, run_id, checks, workflow_id=200, attempt=1, app_id=10):
+        self.api.extra_runs[run_id] = {
+            "id": run_id, "workflow_id": workflow_id, "run_attempt": attempt,
+            "repository": {"full_name": REPO}, "head_sha": HEAD,
+            "status": "completed", "conclusion": "success"}
+        records = [{"id": check_id, "name": "matrix test", "head_sha": HEAD,
+                    "app": {"id": app_id, "slug": "github-actions"},
+                    "details_url": f"https://github.com/{REPO}/actions/runs/{run_id}/job/{check_id + 5000}",
+                    "status": "completed", "conclusion": conclusion}
+                   for check_id, conclusion in checks]
+        self.api.checks.extend(records)
+        # A job ID is deliberately different from its check ID.
+        self.api.extra_jobs[(run_id, attempt)] = [
+            {"id": check["id"] + 5000, "name": check["name"],
+             "head_sha": HEAD, "status": check["status"], "conclusion": check["conclusion"],
+             "check_run_url": f"https://api.github.com/repos/{REPO}/check-runs/{check['id']}"}
+            for check in records]
+        return records
+
+    def test_new_workflow_run_supersedes_failed_suite_even_with_larger_old_check_id(self):
+        self.add_action_run(100, [(900, "failure")])
+        self.add_action_run(101, [(200, "success")])
+        self.assertEqual(self.bot.checks(pr()), [])
+
+    def test_duplicate_matrix_names_in_latest_attempt_preserve_every_failure(self):
+        self.add_action_run(101, [(200, "failure"), (201, "success")])
+        self.assert_wait("matrix test")
+
+    def test_previous_attempt_failure_is_replaced_using_check_urls_not_job_ids(self):
+        records = self.add_action_run(101, [(200, "failure"), (201, "success")], attempt=2)
+        self.api.extra_jobs[(101, 2)] = self.api.extra_jobs[(101, 2)][1:]
+        self.assertEqual(self.bot.checks(pr()), [])
+        self.assertNotEqual(records[1]["id"], self.api.extra_jobs[(101, 2)][0]["id"])
+
+    def test_different_workflow_or_app_with_same_check_name_keeps_failure(self):
+        for app_id, workflow_id in [(10, 201), (11, 200)]:
+            with self.subTest(app_id=app_id, workflow_id=workflow_id):
+                self.setUp()
+                self.add_action_run(100, [(200, "failure")])
+                self.add_action_run(101, [(201, "success")], app_id=app_id, workflow_id=workflow_id)
+                self.assertTrue(self.bot.checks(pr()))
+
+    def test_external_app_replacements_do_not_hide_other_app_failures(self):
+        def check(check_id, app_id, conclusion):
+            return {"id": check_id, "app": {"id": app_id, "slug": "external"},
+                    "name": "external", "status": "completed", "conclusion": conclusion}
+        self.api.checks = [check(1, 1, "failure"), check(2, 1, "success")]
+        self.assertEqual(self.bot.checks(pr()), [])
+        self.api.checks.append(check(3, 2, "failure"))
+        self.assertTrue(self.bot.checks(pr()))
+
+    def test_unverified_old_workflow_failure_cannot_be_hidden(self):
+        for change in [{"id": 999}, {"id": True}, {"head_sha": BASE},
+                       {"repository": {"full_name": "attacker/example"}}, {"workflow_id": False}]:
+            with self.subTest(change=change):
+                self.setUp()
+                self.add_action_run(100, [(200, "failure")])
+                self.add_action_run(101, [(201, "success")])
+                self.api.extra_runs[100].update(change)
+                self.assertTrue(self.bot.checks(pr()))
+
+    def test_untrusted_check_url_or_wrong_check_head_does_not_hide_failure(self):
+        for field, value in [("details_url", "https://evil.example/actions/runs/100/job/200"),
+                             ("details_url", f"https://github.com/{REPO}/actions/runs/100/job/200?fake=1"),
+                             ("head_sha", BASE)]:
+            with self.subTest(field=field, value=value):
+                self.setUp()
+                rows = self.add_action_run(100, [(200, "failure")])
+                self.add_action_run(101, [(201, "success")])
+                rows[0][field] = value
+                self.assertTrue(self.bot.checks(pr()))
+
+    def test_missing_checks_listing_cannot_hide_current_job_failure(self):
+        self.add_action_run(101, [(200, "success"), (201, "failure")])
+        self.api.checks.pop()
+        self.assertTrue(self.bot.checks(pr()))
+
+    def test_lagging_successful_check_cannot_hide_current_job_failure(self):
+        self.add_action_run(101, [(200, "failure")])
+        self.api.checks[0]["conclusion"] = "success"
+        self.assertTrue(self.bot.checks(pr()))
+
+    def test_empty_or_unverifiable_latest_attempt_cannot_merge(self):
+        self.add_action_run(101, [(200, "success")])
+        for jobs in [[], [{"name": "test", "status": "completed", "conclusion": "success",
+                           "check_run_url": "https://evil.example/check-runs/200"}]]:
+            with self.subTest(jobs=jobs):
+                self.api.extra_jobs[(101, 1)] = jobs
+                with self.assertRaises(ValueError):
+                    self.bot.process(1)
+                self.assertEqual(self.api.writes, [])
+
+    def test_latest_pending_workflow_or_new_attempt_is_refetched_and_blocks(self):
+        self.add_action_run(101, [(200, "success")])
+        self.assertEqual(self.bot.checks(pr()), [])
+        self.api.extra_runs[101]["status"] = "in_progress"
+        self.api.extra_runs[101]["conclusion"] = None
+        self.assertTrue(self.bot.checks(pr()))
+        self.api.extra_runs[101]["run_attempt"] = 2
+        self.api.extra_jobs[(101, 2)] = [{"id": 999, "name": "pending rerun", "status": "queued",
+                                        "conclusion": None,
+                                        "check_run_url": f"https://api.github.com/repos/{REPO}/check-runs/201"}]
+        self.assertTrue(self.bot.checks(pr()))
+        self.assertEqual(self.api.reads.count(PREFIX + "actions/runs/101"), 3)
 
     def test_new_status_supersedes_old_failure(self):
         self.api.statuses = [{"context": "deploy", "state": state} for state in ["success", "failure"]]

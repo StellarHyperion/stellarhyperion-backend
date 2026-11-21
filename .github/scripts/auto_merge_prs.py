@@ -158,6 +158,67 @@ class AutoMerge:
             return ["Address the requested changes, then ask the reviewer to approve or dismiss their change request."]
         return []
 
+    def latest_checks(self, sha):
+        # "latest" is per suite. Select the latest workflow run and attempt explicitly,
+        # retaining every job (including matrix jobs with identical display names).
+        selected, unidentified, workflows, action_groups = {}, [], {}, {}
+        for check in self.items(f"commits/{sha}/check-runs?filter=all", "check_runs"):
+            app = check.get("app") or {}
+            app_id, check_id, name = app.get("id"), check.get("id"), check.get("name")
+            if (type(app_id) is not int or app_id <= 0 or type(check_id) is not int
+                    or check_id <= 0 or not isinstance(name, str) or not name):
+                unidentified.append(check)
+                continue
+            key = (app_id, name)
+            if app.get("slug") != "github-actions":
+                previous = selected.get(key)
+                if previous is None or check_id > previous["id"]:
+                    selected[key] = check
+                continue
+            match = re.fullmatch(
+                r"https://github\.com/" + re.escape(self.github.repository)
+                + r"/actions/runs/([1-9][0-9]*)(?:/job/[1-9][0-9]*)?",
+                check.get("details_url") or "", re.IGNORECASE)
+            if not match:
+                unidentified.append(check)
+                continue
+            run_id = int(match[1])
+            if run_id not in workflows:
+                workflows[run_id] = self.github.request(self.prefix + f"actions/runs/{run_id}")
+            run = workflows[run_id]
+            workflow_id, attempt = run.get("workflow_id"), run.get("run_attempt")
+            if (type(run.get("id")) is not int or run.get("id") != run_id or check.get("head_sha") != sha
+                    or run.get("repository", {}).get("full_name", "").lower() != self.github.repository.lower()
+                    or run.get("head_sha") != sha or type(workflow_id) is not int or workflow_id <= 0
+                    or type(attempt) is not int or attempt <= 0):
+                unidentified.append(check)
+                continue
+            # A different workflow using the same job name must not hide a failure.
+            action_groups.setdefault((app_id, workflow_id), {}).setdefault(run_id, []).append(check)
+        result = unidentified + list(selected.values())
+        for runs in action_groups.values():
+            run_id = max(runs)
+            run = workflows[run_id]
+            jobs = list(self.items(f"actions/runs/{run_id}/attempts/{run['run_attempt']}/jobs", "jobs"))
+            if not jobs:
+                raise ValueError("Latest workflow attempt has no verifiable jobs")
+            ids = set()
+            for job in jobs:
+                match = re.fullmatch(
+                    r"https://api\.github\.com/repos/" + re.escape(self.github.repository)
+                    + r"/check-runs/([1-9][0-9]*)", job.get("check_run_url") or "", re.IGNORECASE)
+                if not match:
+                    raise ValueError("Latest workflow job has no verifiable check identity")
+                ids.add(int(match[1]))
+            # Job results cover checks not yet listed by the Checks API. Keep raw checks
+            # from this attempt too, and preserve any newer unaccounted-for check.
+            result.extend(jobs)
+            result.extend(check for check in runs[run_id]
+                          if check["id"] in ids or run["run_attempt"] == 1 or check["id"] > max(ids))
+            result.append({"name": f"Workflow {run.get('name') or run_id}",
+                           "status": run.get("status"), "conclusion": run.get("conclusion")})
+        return result
+
     def checks(self, pr):
         reasons = []
         revisions = {pr["head"]["sha"]}
@@ -165,8 +226,7 @@ class AutoMerge:
         if isinstance(merge_sha, str) and SHA.fullmatch(merge_sha):
             revisions.add(merge_sha)
         for sha in sorted(revisions):
-            # filter=latest prevents superseded rerun failures from blocking forever.
-            for check in self.items(f"commits/{sha}/check-runs?filter=latest", "check_runs"):
+            for check in self.latest_checks(sha):
                 if check.get("status") != "completed" or check.get("conclusion") != "success":
                     reasons.append(f"Check {check.get('name', 'unknown')} is {check.get('conclusion') or check.get('status', 'pending')}. All checks must report success.")
             # Status API ordering is newest first; superseded statuses are ignored by context.
