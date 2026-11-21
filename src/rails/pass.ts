@@ -481,6 +481,7 @@ export class RailPass {
               await writeInbound(db, verified.at, verified.row);
               await linkAxelarDeliveryEvidence(db, evidence, evidenceId);
             } else await writeInbound(db, verified.at, verified.row);
+            signal.throwIfAborted();
             await this.write(db, transfer, lease, {
               status: "delivered",
               railStatus: report.railStatus,
