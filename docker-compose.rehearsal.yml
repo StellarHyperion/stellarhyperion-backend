@@ -1,0 +1,65 @@
+# Isolated recovery rehearsal. This file deliberately has its own project-scoped volumes and
+# loopback-only ports; it must never point at a deployment database or a hosted RPC credential.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: hyperion_rehearsal
+      POSTGRES_PASSWORD: hyperion_rehearsal_local_only
+      POSTGRES_DB: hyperion_rehearsal
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - hyperion-rehearsal-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hyperion_rehearsal -d hyperion_rehearsal"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      VERCEL_ENV: development
+      HYPERION_NETWORK: testnet
+      HYPERION_DEPLOYMENTS_FILE: ./deployments/testnet.json
+      DATABASE_URL: postgres://hyperion_rehearsal:hyperion_rehearsal_local_only@postgres:5432/hyperion_rehearsal
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: 8080
+      INDEXER_ENABLED: "false"
+      RAILS_ENABLED: "false"
+      KEEPER_ENABLED: "false"
+      HYPERION_DATABASE_ROLE: read-only
+    ports:
+      - "127.0.0.1:58080:8080"
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  indexer:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      VERCEL_ENV: development
+      HYPERION_NETWORK: testnet
+      HYPERION_DEPLOYMENTS_FILE: ./deployments/testnet.json
+      DATABASE_URL: postgres://hyperion_rehearsal:hyperion_rehearsal_local_only@postgres:5432/hyperion_rehearsal
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: 8080
+      INDEXER_ENABLED: "true"
+      RAILS_ENABLED: "false"
+      KEEPER_ENABLED: "false"
+    restart: on-failure
+
+volumes:
+  hyperion-rehearsal-pgdata:
