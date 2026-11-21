@@ -176,6 +176,8 @@ export interface RailRequeueResult {
 /** What a rail client has to offer the pass that polls it. */
 export interface RailClient {
   readonly rail: string;
+  /** Stable, already-redacted provider identity used to isolate circuit breakers. */
+  readonly providerId?: string | undefined;
   /** Throws `RailError`; returns `missing` rather than throwing for a transfer not yet indexed. */
   look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup>;
 }

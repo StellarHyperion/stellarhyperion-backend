@@ -52,6 +52,7 @@ export interface GmpOptions {
   readonly timeoutMs?: number;
   readonly fetch?: typeof globalThis.fetch;
   readonly onUnknownStatus?: (status: string) => void;
+  readonly providerId?: string;
 }
 const SECRET_KEY =
   /(?:authorization|password|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|credential|signer|seed|mnemonic|private[_-]?key|cookie)/i;
@@ -71,6 +72,11 @@ export class AxelarGmpClient implements RailClient {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
     this.request = options.fetch ?? globalThis.fetch;
   }
+
+  get providerId(): string | undefined {
+    return this.options.providerId;
+  }
+
   async look(transfer: PendingTransfer, signal?: AbortSignal): Promise<RailLookup> {
     const rows = await this.rowsFor(transfer.originTx, signal);
     const hash = normalized(transfer.originTx);
