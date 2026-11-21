@@ -109,6 +109,7 @@ export interface EvmWatchConfig {
   readonly routerAddress: Hex;
   /** The block the router was deployed in, from the deployment record. */
   readonly startBlock: bigint;
+  readonly deploymentRevision?: number;
   /** From the chain registry. How many blocks before a log is believed. */
   readonly confirmations: number;
   readonly finalityMode?: "confirmations" | "finalized";
@@ -767,6 +768,20 @@ export function envSuffixFor(chain: ChainKey): string {
   return chain.toUpperCase().replaceAll("-", "_");
 }
 
+function evmDeploymentRevisionSpec(chain: ChainKey): VarSpec {
+  return {
+    name: `EVM_DEPLOYMENT_REVISION_${envSuffixFor(chain)}`,
+    kind: "integer",
+    required: false,
+    fallback: "1",
+    min: 1,
+    max: 2147483647,
+    printable: true,
+    purpose:
+      "Monotonic EVM router activation revision; increase explicitly when changing router deployments.",
+  };
+}
+
 function rpcOverrideSpec(chain: ChainKey): VarSpec {
   return {
     name: `EVM_RPC_URL_${envSuffixFor(chain)}`,
@@ -1214,6 +1229,11 @@ function buildProvenanceEntries(
       endpoint(single, "env", `ignored because ${multiple} is selected`);
     if (config.indexer.enabled) {
       add(`EVM_START_BLOCK_${suffix}`, String(watch.startBlock), "deployment");
+      add(
+        `EVM_DEPLOYMENT_REVISION_${suffix}`,
+        watch.deploymentRevision ?? 1,
+        reader.has(`EVM_DEPLOYMENT_REVISION_${suffix}`) ? "env" : "default",
+      );
       add(`EVM_CONFIRMATIONS_${suffix}`, watch.confirmations, "default");
       add(
         `EVM_REORG_DEPTH_BLOCKS_${suffix}`,
@@ -1584,6 +1604,7 @@ function planIndexer(reader: EnvReader, input: PlanInput): IndexerConfig {
         rpcUrls,
         routerAddress: deployment.router,
         startBlock: BigInt(deployment.deployedAt.blockNumber),
+        deploymentRevision: reader.integer(evmDeploymentRevisionSpec(chainKey)),
         confirmations: chain.confirmations,
         finalityMode: input.evmFinalityMode,
         allowFinalityFallback: input.evmFinalityAllowFallback,

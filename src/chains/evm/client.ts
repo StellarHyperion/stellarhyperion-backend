@@ -109,7 +109,13 @@ export async function withDestinationVerification<TClient extends DestinationRpc
           const value = Reflect.get(target, property, receiver) as unknown;
           if (
             typeof value !== "function" ||
-            !["getTransactionReceipt", "getBlock", "readContract"].includes(String(property))
+            ![
+              "getTransactionReceipt",
+              "getBlock",
+              "readContract",
+              "getCode",
+              "getStorageAt",
+            ].includes(String(property))
           )
             return value;
           return (...args: readonly unknown[]): Promise<unknown> =>

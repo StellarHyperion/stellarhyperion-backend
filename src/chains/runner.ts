@@ -47,7 +47,7 @@ import type {
 } from "../rails/types.js";
 import { KeeperWorker } from "../keeper/worker.js";
 import { viemClient } from "./evm/client.js";
-import { EvmWatcher } from "./evm/watcher.js";
+import { EvmWatcher, type EvmProgress } from "./evm/watcher.js";
 import { StellarRpc } from "./stellar/rpc.js";
 import { StellarWatcher } from "./stellar/watcher.js";
 
@@ -90,7 +90,29 @@ interface Pass extends ReadinessSource {
   tick(signal: AbortSignal): Promise<boolean>;
   release?(): Promise<unknown>;
   readonly progress?: { readonly block?: bigint; readonly ledger?: number } | RailProgress | null;
+  readonly recoveryPending?: boolean;
   circuitState?(): unknown;
+}
+
+function isEvmProgress(progress: Pass["progress"]): progress is EvmProgress {
+  return (
+    progress !== null &&
+    progress !== undefined &&
+    typeof progress === "object" &&
+    "reorgs" in progress &&
+    typeof progress.reorgs === "number" &&
+    Number.isSafeInteger(progress.reorgs) &&
+    "policy" in progress &&
+    typeof progress.policy === "object" &&
+    progress.policy !== null &&
+    "reorgDepth" in progress.policy &&
+    typeof progress.policy.reorgDepth === "number" &&
+    Number.isSafeInteger(progress.policy.reorgDepth) &&
+    "head" in progress &&
+    typeof progress.head === "bigint" &&
+    "behind" in progress &&
+    typeof progress.behind === "number"
+  );
 }
 
 export interface PolledWorkerOptions {
@@ -187,6 +209,14 @@ export class PolledWorker implements Worker {
     const report = await (completed ? this.pass.readiness() : this.readiness());
     const progress = this.pass.progress;
     const consecutiveFailures = completed ? 0 : stats.consecutiveFailures + 1;
+    const recoveryMetadata = isEvmProgress(progress)
+      ? {
+          reorgs: progress.reorgs,
+          rewindDepth: progress.policy.reorgDepth,
+          headBlock: progress.head.toString(),
+          blocksBehind: progress.behind,
+        }
+      : {};
     await recordWorkerHeartbeat(this.db, {
       workerName: this.name,
       workerKind: this.workerKind,
@@ -209,6 +239,10 @@ export class PolledWorker implements Worker {
         caughtUp: this.runState === "caught_up",
         ticks: stats.ticks + (completed ? 1 : 0),
         running: stats.running,
+        ...recoveryMetadata,
+        ...(this.pass.recoveryPending === undefined
+          ? {}
+          : { reorgRecoveryPending: this.pass.recoveryPending }),
         ...(this.pass.circuitState === undefined ? {} : { circuits: this.pass.circuitState() }),
       },
     });
@@ -487,6 +521,9 @@ function evmWorker(
     router: config.routerAddress,
     chainId: config.chainId,
     startBlock: config.startBlock,
+    ...(config.deploymentRevision === undefined
+      ? {}
+      : { deploymentRevision: config.deploymentRevision }),
     confirmations: config.confirmations,
     finalityMode: config.finalityMode ?? "confirmations",
     allowFinalityFallback: config.allowFinalityFallback ?? false,

@@ -30,6 +30,79 @@ import {
 } from "../writers.js";
 
 export { acquireLease, assertLeaseHeld, LeaseLostError, releaseLease, type WatcherLease };
+
+/** Record an EVM router deployment boundary without rewriting the previous deployment. */
+export async function recordEvmDeploymentRevision(
+  db: Queryable,
+  entry: {
+    readonly chainKey: string;
+    readonly chainId: number;
+    readonly deploymentRevision: number;
+    readonly contract: string;
+    readonly startBlock: bigint;
+    readonly previousRevision: number | null;
+    readonly previousContract: string | null;
+    readonly previousCursor: bigint | null;
+    readonly previousCursorHash: string | null;
+  },
+): Promise<void> {
+  if (entry.previousRevision !== null) {
+    // Legacy cursors predate this history table: retain their identity and retirement boundary
+    // without inventing an activation block that was never persisted.
+    const previous = await db.query(
+      `INSERT INTO evm_deployment_revision
+      (chain_key, chain_id, deployment_revision, contract, start_block)
+      VALUES ($1,$2,$3,$4,NULL) ON CONFLICT (chain_key,deployment_revision) DO UPDATE SET chain_key = EXCLUDED.chain_key
+        WHERE evm_deployment_revision.chain_id = EXCLUDED.chain_id
+          AND evm_deployment_revision.contract = EXCLUDED.contract RETURNING chain_key`,
+      [
+        entry.chainKey,
+        entry.chainId,
+        entry.previousRevision,
+        entry.previousContract?.toLowerCase(),
+      ],
+    );
+    if (previous.rowCount !== 1) throw new Error("conflicting previous EVM deployment revision");
+  }
+  const inserted = await db.query(
+    `INSERT INTO evm_deployment_revision
+       (chain_key, chain_id, deployment_revision, contract, start_block,
+        previous_revision, previous_contract, previous_cursor, previous_cursor_hash)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     ON CONFLICT (chain_key, deployment_revision) DO UPDATE SET chain_key = EXCLUDED.chain_key
+       WHERE evm_deployment_revision.chain_id = EXCLUDED.chain_id
+         AND evm_deployment_revision.contract = EXCLUDED.contract
+         AND evm_deployment_revision.start_block IS NOT DISTINCT FROM EXCLUDED.start_block
+         AND evm_deployment_revision.previous_revision IS NOT DISTINCT FROM EXCLUDED.previous_revision
+         AND evm_deployment_revision.previous_contract IS NOT DISTINCT FROM EXCLUDED.previous_contract
+     RETURNING chain_key`,
+    [
+      entry.chainKey,
+      entry.chainId,
+      entry.deploymentRevision,
+      entry.contract.toLowerCase(),
+      entry.startBlock.toString(),
+      entry.previousRevision,
+      entry.previousContract?.toLowerCase() ?? null,
+      entry.previousCursor?.toString() ?? null,
+      entry.previousCursorHash,
+    ],
+  );
+  if (inserted.rowCount !== 1) throw new Error("conflicting immutable EVM deployment revision");
+  if (entry.previousRevision !== null) {
+    await db.query(
+      `UPDATE evm_deployment_revision
+          SET retired_block = $3, retired_block_hash = $4, retired_at = now()
+        WHERE chain_key = $1 AND deployment_revision = $2 AND retired_block IS NULL`,
+      [
+        entry.chainKey,
+        entry.previousRevision,
+        entry.previousCursor?.toString() ?? null,
+        entry.previousCursorHash,
+      ],
+    );
+  }
+}
 import {
   type DecodedLog,
   requireAddress,
@@ -41,6 +114,131 @@ import {
   secondsOrNull,
   wordOrNull,
 } from "./logs.js";
+
+/**
+ * Remove materialized state produced at or after an EVM reorg rewind point.
+ *
+ * This runs in the same transaction as the replacement range and keys cleanup through source
+ * provenance. A replacement log can reuse the old position with a different payload, so leaving
+ * the old source event in place would turn it into a provenance conflict. Settlements are reversed
+ * when their creating event remains canonical; records whose creating event was orphaned are
+ * deleted and let their foreign keys remove dependent evidence.
+ */
+export async function rewindEvmEvents(
+  db: Queryable,
+  chainKey: string,
+  contract: string,
+  fromBlock: bigint,
+  deploymentRevision = 1,
+): Promise<void> {
+  const source = await db.query(
+    `SELECT id FROM source_event
+      WHERE chain_key = $1 AND family = 'evm' AND lower(contract) = lower($2)
+        AND block_number >= $3 AND deployment_revision = $4`,
+    [chainKey, contract, fromBlock.toString(), deploymentRevision],
+  );
+  const sourceIds = source.rows.map((row) => String(row.id));
+
+  if (sourceIds.length > 0) {
+    const links = await db.query(
+      `SELECT record_kind, record_key, role FROM source_event_link
+        WHERE source_event_id = ANY($1::bigint[])`,
+      [sourceIds],
+    );
+    const created = new Map<string, Set<string>>();
+    const settled = new Map<string, Set<string>>();
+    for (const row of links.rows) {
+      const target = row.role === "settled" ? settled : created;
+      const keys = target.get(String(row.record_kind)) ?? new Set<string>();
+      keys.add(String(row.record_key));
+      target.set(String(row.record_kind), keys);
+    }
+
+    const createdInbound = [...(created.get("inbound_delivery") ?? [])];
+    if (createdInbound.length > 0)
+      await db.query(`DELETE FROM inbound_delivery WHERE id = ANY($1::bigint[])`, [createdInbound]);
+    const createdClaims = [...(created.get("pending_claim") ?? [])];
+    if (createdClaims.length > 0)
+      await db.query(
+        `DELETE FROM pending_claim WHERE (chain, claim_id) IN (
+           SELECT split_part(value, ':', 1), split_part(value, ':', 2)::numeric
+             FROM unnest($1::text[]) AS value)`,
+        [createdClaims],
+      );
+    const createdActions = [...(created.get("admin_action") ?? [])];
+    if (createdActions.length > 0)
+      await db.query(
+        `DELETE FROM admin_action WHERE (chain, action_id) IN (
+           SELECT split_part(value, ':', 1), split_part(value, ':', 2)::numeric
+             FROM unnest($1::text[]) AS value)`,
+        [createdActions],
+      );
+    const createdOutbound = [...(created.get("outbound_transfer") ?? [])];
+    if (createdOutbound.length > 0)
+      await db.query(`DELETE FROM outbound_transfer WHERE id = ANY($1::bigint[])`, [
+        createdOutbound,
+      ]);
+
+    const settledClaims = [...(settled.get("pending_claim") ?? [])].filter(
+      (key) => !createdClaims.includes(key),
+    );
+    if (settledClaims.length > 0)
+      await db.query(
+        `UPDATE pending_claim
+            SET settled = false, settled_at = NULL, settled_by = NULL, settled_tx = NULL
+          WHERE (chain, claim_id) IN (
+            SELECT split_part(value, ':', 1), split_part(value, ':', 2)::numeric
+              FROM unnest($1::text[]) AS value)`,
+        [settledClaims],
+      );
+    const settledActions = [...(settled.get("admin_action") ?? [])].filter(
+      (key) => !createdActions.includes(key),
+    );
+    if (settledActions.length > 0)
+      await db.query(
+        `UPDATE admin_action
+            SET state = 'queued', settled_at = NULL, actor = NULL
+          WHERE (chain, action_id) IN (
+            SELECT split_part(value, ':', 1), split_part(value, ':', 2)::numeric
+              FROM unnest($1::text[]) AS value)`,
+        [settledActions],
+      );
+
+    await db.query(`DELETE FROM source_event_link WHERE source_event_id = ANY($1::bigint[])`, [
+      sourceIds,
+    ]);
+  }
+
+  await db.query(
+    `DELETE FROM source_event_conflict WHERE source_event_id IN (
+       SELECT id FROM source_event
+        WHERE chain_key = $1 AND family = 'evm' AND lower(contract) = lower($2)
+          AND block_number >= $3 AND deployment_revision = $4)`,
+    [chainKey, contract, fromBlock.toString(), deploymentRevision],
+  );
+  await db.query(
+    `DELETE FROM source_event
+      WHERE chain_key = $1 AND family = 'evm' AND lower(contract) = lower($2)
+        AND block_number >= $3 AND deployment_revision = $4`,
+    [chainKey, contract, fromBlock.toString(), deploymentRevision],
+  );
+  await db.query(
+    `DELETE FROM evm_applied_event
+      WHERE chain_key = $1 AND lower(contract) = lower($2) AND block_number >= $3`,
+    [chainKey, contract, fromBlock.toString()],
+  );
+  await db.query(
+    `DELETE FROM ingestion_rejection
+      WHERE chain_key = $1 AND family = 'evm' AND lower(contract) = lower($2)
+        AND block_number >= $3 AND deployment_revision = $4`,
+    [chainKey, contract, fromBlock.toString(), deploymentRevision],
+  );
+  await db.query(
+    `DELETE FROM evm_log_quarantine
+      WHERE chain_key = $1 AND lower(contract) = lower($2) AND block_number >= $3`,
+    [chainKey, contract, fromBlock.toString()],
+  );
+}
 
 /** How a log was applied, so the watcher can count and report rather than guess. */
 export type Applied =

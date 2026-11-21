@@ -18,6 +18,7 @@ import type { ServerDeps } from "../server.js";
 import { readProofRejectionMetrics } from "../proof-rejection-metrics.js";
 import { readKeeperSubmissionMetrics } from "../../keeper/outcomes.js";
 import { readWorkerRuns } from "../../runtime/worker-runs.js";
+import { readCommittedReorgRecovery, reorgRecoveryState } from "../reorg-recovery.js";
 
 export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
@@ -99,6 +100,8 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
     let staleWorkers = 0;
     let degradedWorkers = 0;
     let downWorkers = 0;
+    const recoveryJournal = await readCommittedReorgRecovery(db);
+    const recoveryByChain = new Map(recoveryJournal.map((entry) => [entry.chain, entry]));
     const workers = heartbeatRecords.map((hb) => {
       const freshness = evaluateHeartbeatFreshness(hb, now);
       if (freshness.stale) staleWorkers += 1;
@@ -108,6 +111,12 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
         typeof hb.metadata.ticks === "number" && Number.isSafeInteger(hb.metadata.ticks)
           ? hb.metadata.ticks
           : 0;
+      const reorgs = hb.chainKey === null ? 0 : (recoveryByChain.get(hb.chainKey)?.reorgs ?? 0);
+      const rewindDepth =
+        typeof hb.metadata.rewindDepth === "number" && Number.isSafeInteger(hb.metadata.rewindDepth)
+          ? hb.metadata.rewindDepth
+          : null;
+      const recoveryPending = hb.metadata.reorgRecoveryPending === true;
       return {
         name: hb.workerName,
         kind: hb.workerKind,
@@ -123,10 +132,43 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
         ageSeconds: freshness.ageSeconds,
         runId: hb.runId ?? null,
         completedTicks,
+        reorgs,
+        reorgDepth: null,
+        rewindDepth,
+        recoveryPending,
+        recoveryState: reorgRecoveryState({
+          committedRecoveries: reorgs,
+          pending: recoveryPending,
+          stale: freshness.stale,
+          failures: hb.consecutiveFailures,
+          state: freshness.report.state,
+        }),
       };
     });
-
     const freshnessSlo = await evaluateFreshnessSlo(db, deps.config);
+    const reorgWorkers = workers.filter((worker) => worker.reorgs > 0 || worker.recoveryPending);
+    const reorgRecovery = {
+      detected: recoveryJournal.reduce((total, entry) => total + entry.reorgs, 0),
+      journal: recoveryJournal,
+      pendingRecoveryWorkers: reorgWorkers.filter((worker) => worker.recoveryPending).length,
+      automaticWorkers: reorgWorkers.filter((worker) => worker.recoveryState === "automatic")
+        .length,
+      operatorInterventionWorkers: reorgWorkers.filter(
+        (worker) => worker.recoveryState === "operator_intervention",
+      ).length,
+      workers: reorgWorkers.map((worker) => ({
+        name: worker.name,
+        chain: worker.chain,
+        reorgs: worker.reorgs,
+        reorgDepth: worker.reorgDepth,
+        rewindDepth: worker.rewindDepth,
+        recoveryPending: worker.recoveryPending,
+        state: worker.state,
+        recoveryState: worker.recoveryState,
+      })),
+      reconciliation: freshnessSlo,
+      canonicalProofCounts: proofRejections.coverage,
+    };
     const database = typeof db.telemetrySnapshot === "function" ? db.telemetrySnapshot() : null;
     let keeperSubmissions = {
       simulated: 0,
@@ -168,6 +210,7 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       database,
       deploymentMode: deps.config.deploymentMode,
       workers,
+      reorgRecovery,
       workerRuns: await readWorkerRuns(db),
       freshness: {
         totalWorkers: workers.length,

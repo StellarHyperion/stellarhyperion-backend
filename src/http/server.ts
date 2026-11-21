@@ -6,7 +6,7 @@ import rateLimit from "@fastify/rate-limit";
 import type { Redis } from "ioredis";
 
 import type { AppConfig } from "../config/config.js";
-import type { Database } from "../db/pool.js";
+import { DatabaseBackpressureError, type Database } from "../db/pool.js";
 import type { BullMQWorkerState, RedisPingable, ReadinessSource } from "../runtime/readiness.js";
 import { registerClaimRoutes } from "./routes/claims.js";
 import { registerAxelarEvidenceRoutes } from "./routes/axelar-evidence.js";
@@ -253,6 +253,20 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   });
 
   app.setErrorHandler((error: FastifyError, request, reply) => {
+    if (error instanceof DatabaseBackpressureError) {
+      reply.header("Retry-After", Math.max(1, Math.ceil(error.retryAfterMs / 1000)));
+      void reply
+        .code(error.statusCode)
+        .send(
+          errorEnvelope(
+            "unavailable",
+            "the database is temporarily busy; retry shortly",
+            request.id,
+            { retryAfterMs: error.retryAfterMs },
+          ),
+        );
+      return;
+    }
     if (error instanceof RequestBudgetExceededError) {
       void reply.code(504).send({
         error: "request_budget_exceeded",

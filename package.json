@@ -23,6 +23,7 @@
     "migrate": "node-pg-migrate --envPath .env --migrations-dir migrations --migrations-table pgmigrations --advisory-lock-mode wait",
     "migrate:up": "npm run migrate -- up",
     "migrate:down": "npm run migrate -- down",
+    "migration:report": "node --env-file-if-exists=.env dist/cli/migration-report.js",
     "rail:requeue": "node --env-file-if-exists=.env dist/rails/requeue-cli.js",
     "keeper:requeue": "node --env-file-if-exists=.env dist/keeper/requeue-cli.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",

@@ -18,6 +18,15 @@ function faultNames(run: () => unknown): string[] {
 }
 
 describe("loadConfig", () => {
+  it("loads an explicit bounded EVM activation revision", () => {
+    const config = loadConfig({ env: completeEnv({ EVM_DEPLOYMENT_REVISION_SEPOLIA: "2" }) });
+    expect(config.indexer.evm.find((watch) => watch.chain === "sepolia")?.deploymentRevision).toBe(
+      2,
+    );
+    expect(() =>
+      loadConfig({ env: completeEnv({ EVM_DEPLOYMENT_REVISION_SEPOLIA: "0" }) }),
+    ).toThrow("EVM_DEPLOYMENT_REVISION_SEPOLIA");
+  });
   it("does not require Redis for a disabled keeper", () => {
     const env = completeEnv({ KEEPER_ENABLED: "false" });
     delete env.REDIS_URL;

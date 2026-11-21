@@ -42,6 +42,7 @@ function harness(
     readonly client?: FakeEvmClient;
     readonly finalityMode?: "confirmations" | "finalized";
     readonly allowFinalityFallback?: boolean;
+    readonly deploymentRevision?: number;
   } = {},
 ): Harness {
   const db = new RecordingDb();
@@ -58,6 +59,9 @@ function harness(
     allowFinalityFallback: options.allowFinalityFallback ?? false,
     reorgDepth: options.reorgDepth ?? 5,
     logRange: options.logRange ?? 2_000,
+    ...(options.deploymentRevision === undefined
+      ? {}
+      : { deploymentRevision: options.deploymentRevision }),
     client,
     db,
     logger,
@@ -285,6 +289,52 @@ describe("when the chain changes its mind", () => {
 
     expect(client.logQueries[0]?.fromBlock).toBe(36n);
     expect(lines.some((line) => line.message.includes("is gone from this node"))).toBe(true);
+  });
+
+  it("keeps a failed reorg pending until the replacement range commits", async () => {
+    const { watcher, db } = harness({ head: 60n });
+    db.cursorRow = cursorRow(40n, "0xdeadbeef");
+    db.failInTransaction = new Error("replacement write failed");
+    await expect(watcher.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+      "replacement write failed",
+    );
+    expect(watcher.recoveryPending).toBe(true);
+    expect(watcher.readiness()).toMatchObject({ state: "degraded" });
+    expect(db.commits).toHaveLength(0);
+    expect(db.cursorRow.last_processed).toBe("40");
+    db.failInTransaction = null;
+    await watcher.tick(AbortSignal.timeout(5_000));
+    expect(watcher.recoveryPending).toBe(false);
+    expect(watcher.progress?.reorgs).toBe(1);
+    expect(watcher.readiness()).toMatchObject({ state: "ready" });
+  });
+
+  it("permits explicit newer router activation and refuses stale workers switching back", async () => {
+    const { watcher, db } = harness({ head: 60n, deploymentRevision: 2 });
+    const retired = "0x0000000000000000000000000000000000000001";
+    db.cursorRow = { ...cursorRow(40n, "0xabc", retired), deployment_revision: 1 };
+    await watcher.tick(AbortSignal.timeout(5_000));
+    expect(db.cursorRow.contract).toBe(ANVIL_ROUTER);
+    expect(db.cursorRow.deployment_revision).toBe(2);
+    const { logger } = capturingLogger();
+    const stale = new EvmWatcher({
+      chainKey: CHAIN,
+      router: retired,
+      chainId: ANVIL_CHAIN_ID,
+      startBlock: ANVIL_START_BLOCK,
+      deploymentRevision: 1,
+      confirmations: 3,
+      reorgDepth: 5,
+      logRange: 2000,
+      client: new FakeEvmClient({ head: 60n }),
+      db,
+      logger,
+    });
+    if (db.leaseRow !== null) db.leaseRow.lease_until = new Date(0);
+    await expect(stale.tick(AbortSignal.timeout(5_000))).rejects.toThrow(
+      "explicit newer deployment revision",
+    );
+    expect(db.cursorRow.deployment_revision).toBe(2);
   });
 
   it("carries on quietly when the hash still matches", async () => {

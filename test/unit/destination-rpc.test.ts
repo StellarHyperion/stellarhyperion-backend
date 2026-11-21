@@ -104,4 +104,27 @@ describe("destination verification RPC failover", () => {
       safeRpcEndpointIdentity("https://user:password@rpc.example/private/api-key?token=secret"),
     ).toBe("https://rpc.example");
   });
+
+  it.each(["getCode", "getStorageAt"] as const)(
+    "rejects conflicting %s evidence from another endpoint",
+    async (method) => {
+      const clientForUrl = (url: string) => ({
+        getChainId: () => Promise.resolve(chainId),
+        getCode: () => Promise.resolve(url === urls[0] ? "0x01" : "0x02"),
+        getStorageAt: () => Promise.resolve(url === urls[0] ? "0x01" : "0x02"),
+      });
+      await expect(
+        withDestinationVerification(
+          urls,
+          chainId,
+          clientForUrl,
+          async (client) => {
+            await client[method]();
+            return "verified";
+          },
+          { chain: "sepolia" },
+        ),
+      ).rejects.toMatchObject({ reason: "inconsistent_evidence" });
+    },
+  );
 });
