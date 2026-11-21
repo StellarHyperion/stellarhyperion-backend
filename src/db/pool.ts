@@ -18,6 +18,13 @@ import { Client, Pool } from "pg";
 import type { PoolClient, PoolConfig } from "pg";
 import { currentWorkerRun } from "../runtime/worker-runs.js";
 import {
+  migrationPreflight,
+  migrationRollbackReport,
+  type MigrationPreflightOptions,
+  type MigrationPreflightReport,
+  type MigrationRollbackReport,
+} from "./migration-report.js";
+import {
   computeHistoryDigest as computeRangeDigest,
   recordHistoryDigest as storeRangeDigest,
   verifyHistoryDigest as verifyRangeDigest,
@@ -357,6 +364,16 @@ export class Database implements Transactional {
    */
   async auditTransferAndClaimInvariants(): Promise<TransferClaimAuditReport> {
     return auditTransferAndClaimInvariants(this);
+  }
+
+  async migrationPreflight(options: MigrationPreflightOptions): Promise<MigrationPreflightReport> {
+    return migrationPreflight(this, options);
+  }
+
+  async migrationRollbackReport(
+    migrations: readonly { readonly name: string; readonly downSql: string }[],
+  ): Promise<MigrationRollbackReport> {
+    return migrationRollbackReport(migrations);
   }
 
   async close(): Promise<void> {
