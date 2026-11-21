@@ -49,6 +49,7 @@ import {
   quarantineEvmLog,
   readQuarantinedEvmLogs,
   releaseLease,
+  rewindEvmEvents,
   type EvmFinalityPolicy,
   type EvmFinalityPolicyChange,
 } from "./store.js";
@@ -520,6 +521,9 @@ export class EvmWatcher {
           ownerId: this.ownerId,
           ttlMs: this.leaseTtlMs,
         });
+
+        if (reorgDetected)
+          await rewindEvmEvents(tx, chainKey, leaseContract, from);
 
         for (const log of logs) {
           throwIfAborted(signal);
