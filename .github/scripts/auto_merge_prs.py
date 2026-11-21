@@ -60,8 +60,8 @@ def run_matches(pr, run, repository):
 def safe_text(value):
     # Untrusted titles, names and diagnostics must not notify users or inject HTML/Markdown.
     value = " ".join(str(value).split())[:700]
-    value = html.escape(value, quote=True).replace("@", "&#64;")
-    return re.sub(r"([\\`*_{}\[\]()#!|])", r"\\\1", value)
+    value = re.sub(r"([\\`*_{}\[\]()#!|])", r"\\\1", value)
+    return html.escape(value, quote=False).replace("@", "&#64;")
 
 
 class AutoMerge:

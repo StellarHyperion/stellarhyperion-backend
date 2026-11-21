@@ -272,6 +272,8 @@ class AutoMergeTests(unittest.TestCase):
         self.assertNotIn("<script>", value)
         self.assertNotIn("\n", value)
         self.assertIn("\\[click", value)
+        self.assertNotIn("&\\#", value)
+        self.assertEqual(merger.safe_text("Answer '## Summary'."), "Answer '\\#\\# Summary'.")
 
     def test_privileged_workflow_never_checks_out_or_downloads_artifacts(self):
         path = Path(__file__).resolve().parents[1] / "workflows/auto-merge-prs.yml"
