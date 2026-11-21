@@ -94,7 +94,11 @@ const connection = process.env.TEST_DATABASE_URL;
       await Promise.all(Array.from({ length: 16 }, () => getApp()));
       expect(app.server.listenerCount("request")).toBe(listeners);
       await Promise.all([closeApp(), closeApp()]);
-      expect(await sessions()).toBe(0);
+      expect(db.poolSnapshot().totalConnections).toBe(0);
+      // pg-pool removes local clients before PostgreSQL finishes observing their disconnects.
+      await vi.waitFor(async () => {
+        expect(await sessions()).toBe(0);
+      });
       expect(getDb()).toBeNull();
     }
   });
@@ -114,6 +118,9 @@ const connection = process.env.TEST_DATABASE_URL;
     expect(nextPid).not.toBe(pid);
     expect((await app.inject({ method: "GET", url: "/health" })).statusCode).toBe(200);
     await closeApp();
-    expect(await sessions()).toBe(0);
+    expect(db.poolSnapshot().totalConnections).toBe(0);
+    await vi.waitFor(async () => {
+      expect(await sessions()).toBe(0);
+    });
   });
 });
