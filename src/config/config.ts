@@ -109,6 +109,7 @@ export interface EvmWatchConfig {
   readonly routerAddress: Hex;
   /** The block the router was deployed in, from the deployment record. */
   readonly startBlock: bigint;
+  readonly deploymentRevision?: number;
   /** From the chain registry. How many blocks before a log is believed. */
   readonly confirmations: number;
   readonly finalityMode?: "confirmations" | "finalized";

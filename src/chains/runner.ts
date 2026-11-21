@@ -517,6 +517,7 @@ function evmWorker(
     router: config.routerAddress,
     chainId: config.chainId,
     startBlock: config.startBlock,
+    deploymentRevision: config.deploymentRevision,
     confirmations: config.confirmations,
     finalityMode: config.finalityMode ?? "confirmations",
     allowFinalityFallback: config.allowFinalityFallback ?? false,
