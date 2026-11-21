@@ -49,7 +49,8 @@ function fixture() {
             ]
           : sql.includes("SELECT hash FROM keeper_checkpoint") &&
               sql.includes("state = 'confirmed'") &&
-              confirmed?.intent_key === params[2]
+              confirmed !== null &&
+              confirmed.intent_key === params[2]
             ? [confirmed]
             : sql.includes("state = 'submitted' ORDER BY") && pending
               ? [pending]
