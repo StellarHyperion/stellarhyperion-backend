@@ -242,7 +242,8 @@ export class RecordingDb implements Transactional {
   /** Set to make every statement inside the next transaction throw. */
   failInTransaction: Error | null = null;
   /** One-shot crash points used by the deterministic restart harness. */
-  crashAt: "before-source-write" | "after-source-write" | "before-commit" | null = null;
+  crashAt: "before-source-write" | "after-source-write" | "before-commit" | "after-commit" | null =
+    null;
   /** What the open ingestion rejection count reports, to exercise the boundary limit. */
   openRejections = 0;
   /** Source events recorded so far; each insert is treated as a first observation. */
@@ -261,6 +262,8 @@ export class RecordingDb implements Transactional {
     if (this.failInTransaction !== null && this.open !== null) {
       return Promise.reject(this.failInTransaction);
     }
+    if (text.includes("INSERT INTO evm_deployment_revision"))
+      return Promise.resolve({ rows: [{ chain_key: params[0] }], rowCount: 1 });
     if (/INSERT INTO source_event\s*\(/.test(text)) {
       if (this.crashAt === "before-source-write") {
         this.crashAt = null;
@@ -793,6 +796,7 @@ export class RecordingDb implements Transactional {
     const journals = [...this.journals];
     const cursorRow = this.cursorRow === null ? null : { ...this.cursorRow };
     const sourceEvents = this.sourceEvents;
+    let committed = false;
     try {
       const value = await work(this);
       if (this.crashAt === "before-commit") {
@@ -800,8 +804,15 @@ export class RecordingDb implements Transactional {
         throw new Error("injected crash before commit");
       }
       this.commits.push(id);
+      committed = true;
+      if (this.crashAt === "after-commit") {
+        this.crashAt = null;
+        throw new Error("injected crash after commit");
+      }
       return value;
     } catch (error) {
+      // A crash after COMMIT cannot undo database state even if the process never receives it.
+      if (committed) throw error;
       this.identities = identities;
       this.conflicts = conflicts;
       this.journals = journals;

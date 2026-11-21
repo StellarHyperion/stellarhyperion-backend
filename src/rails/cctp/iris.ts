@@ -61,6 +61,8 @@ export const MAX_IRIS_RESPONSE_BYTES = 2 * 1024 * 1024;
 export const MAX_IRIS_MESSAGE_BYTES = 64 * 1024;
 /** Attestations are signatures, not arbitrary provider documents. */
 export const MAX_IRIS_ATTESTATION_BYTES = 128 * 1024;
+/** Bound per-transaction parsing and full-identity verification work, including malformed entries. */
+export const MAX_IRIS_MESSAGE_CANDIDATES = 256;
 const MAX_IRIS_ERROR_BYTES = 16 * 1024;
 
 export class IrisResourceLimitError extends RailError {
@@ -310,6 +312,9 @@ export class IrisClient implements RailClient {
       }
     }
 
+    if (rawList.length > MAX_IRIS_MESSAGE_CANDIDATES) {
+      throw new IrisResourceLimitError(`message candidates exceed ${MAX_IRIS_MESSAGE_CANDIDATES}`);
+    }
     const messages = rawList.filter(isIrisMessage);
     if (rawList.length > 0 && messages.length === 0) {
       throw new RailError(this.rail, "transient", "invalid iris message in response payload");
@@ -319,9 +324,11 @@ export class IrisClient implements RailClient {
     // failure would be reporting the normal case.
     if (message === undefined) return { kind: "missing" };
 
-    const limit = messageLimitViolation(message);
-    if (limit !== null) {
-      throw new IrisResourceLimitError(limit);
+    for (const [index, candidate] of messages.entries()) {
+      const limit = messageLimitViolation(candidate);
+      if (limit !== null) {
+        throw new IrisResourceLimitError(`${limit} (candidate ${String(index + 1)})`);
+      }
     }
 
     const reports = messages.map(reportFor);
@@ -329,10 +336,7 @@ export class IrisClient implements RailClient {
     if (!firstReport) return { kind: "missing" };
     return {
       kind: "found",
-      report:
-        reports.length === 1
-          ? firstReport
-          : { ...firstReport, candidates: reports },
+      report: reports.length === 1 ? firstReport : { ...firstReport, candidates: reports },
     };
   }
 

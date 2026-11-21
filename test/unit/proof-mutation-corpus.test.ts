@@ -19,6 +19,8 @@ const evm = vi.hoisted(() => ({
   getBlockNumber: vi.fn(),
   readContract: vi.fn(),
   getBlock: vi.fn(),
+  getCode: vi.fn(),
+  getStorageAt: vi.fn(),
 }));
 vi.mock("viem", async (original) => ({
   ...(await original<typeof Viem>()),
@@ -202,9 +204,24 @@ describe("independent real CCTP and ITS destination proof mutation corpus", () =
         },
         expectedAccepted: true,
       });
+      const contractBaselines = new Map<string, Record<string, unknown>>();
       const db: Queryable = {
-        query: (sql: string) =>
-          Promise.resolve(
+        query: (sql: string, params: readonly unknown[] = []) => {
+          if (
+            sql.includes("INSERT INTO cctp_contract_baseline") &&
+            !contractBaselines.has(String(params[1]))
+          )
+            contractBaselines.set(String(params[1]), {
+              role: params[1],
+              contract_address: params[2],
+              code_hash: params[3],
+            });
+          if (sql.includes("FROM cctp_contract_baseline"))
+            return Promise.resolve({
+              rows: [...contractBaselines.values()],
+              rowCount: contractBaselines.size,
+            });
+          return Promise.resolve(
             sql.includes("FROM inbound_delivery")
               ? { rows: [], rowCount: 0 }
               : {
@@ -226,7 +243,8 @@ describe("independent real CCTP and ITS destination proof mutation corpus", () =
                   ],
                   rowCount: 1,
                 },
-          ),
+          );
+        },
       };
       const stellar = vi.spyOn(rpc.Server.prototype, "simulateTransaction");
       const simulation = (value: unknown) => ({
@@ -241,6 +259,8 @@ describe("independent real CCTP and ITS destination proof mutation corpus", () =
       const records = await runProofCorpus(cases, async (candidate) => {
         evm.getChainId.mockResolvedValue(destinationChain.chainId);
         evm.getBlockNumber.mockResolvedValue(1000n);
+        evm.getCode.mockResolvedValue("0x6000");
+        evm.getStorageAt.mockResolvedValue(`0x${"00".repeat(32)}`);
         evm.getTransactionReceipt.mockResolvedValue({
           status: "success",
           blockNumber: 100n,

@@ -19,11 +19,18 @@ async function main(): Promise<void> {
       downSql: downSql(await readFile(resolve(directory, name), "utf8")),
     })),
   );
-  const db = Database.open(connection, { applicationName: "hyperion-migration-report", readOnly: true });
+  const db = Database.open(connection, {
+    applicationName: "hyperion-migration-report",
+    readOnly: true,
+  });
   try {
     const preflight = await db.migrationPreflight({
       expectedMigrations: migrations.map((migration) => migration.name),
-      backupBoundaryId: process.env.HYPERION_MIGRATION_BACKUP_ID,
+      ...(process.env.HYPERION_MIGRATION_BACKUP_ID === undefined
+        ? {}
+        : {
+            backupBoundaryId: process.env.HYPERION_MIGRATION_BACKUP_ID,
+          }),
     });
     const report = {
       preflight,

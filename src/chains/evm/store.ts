@@ -46,12 +46,36 @@ export async function recordEvmDeploymentRevision(
     readonly previousCursorHash: string | null;
   },
 ): Promise<void> {
-  await db.query(
+  if (entry.previousRevision !== null) {
+    // Legacy cursors predate this history table: retain their identity and retirement boundary
+    // without inventing an activation block that was never persisted.
+    const previous = await db.query(
+      `INSERT INTO evm_deployment_revision
+      (chain_key, chain_id, deployment_revision, contract, start_block)
+      VALUES ($1,$2,$3,$4,NULL) ON CONFLICT (chain_key,deployment_revision) DO UPDATE SET chain_key = EXCLUDED.chain_key
+        WHERE evm_deployment_revision.chain_id = EXCLUDED.chain_id
+          AND evm_deployment_revision.contract = EXCLUDED.contract RETURNING chain_key`,
+      [
+        entry.chainKey,
+        entry.chainId,
+        entry.previousRevision,
+        entry.previousContract?.toLowerCase(),
+      ],
+    );
+    if (previous.rowCount !== 1) throw new Error("conflicting previous EVM deployment revision");
+  }
+  const inserted = await db.query(
     `INSERT INTO evm_deployment_revision
        (chain_key, chain_id, deployment_revision, contract, start_block,
         previous_revision, previous_contract, previous_cursor, previous_cursor_hash)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-     ON CONFLICT (chain_key, deployment_revision) DO NOTHING`,
+     ON CONFLICT (chain_key, deployment_revision) DO UPDATE SET chain_key = EXCLUDED.chain_key
+       WHERE evm_deployment_revision.chain_id = EXCLUDED.chain_id
+         AND evm_deployment_revision.contract = EXCLUDED.contract
+         AND evm_deployment_revision.start_block IS NOT DISTINCT FROM EXCLUDED.start_block
+         AND evm_deployment_revision.previous_revision IS NOT DISTINCT FROM EXCLUDED.previous_revision
+         AND evm_deployment_revision.previous_contract IS NOT DISTINCT FROM EXCLUDED.previous_contract
+     RETURNING chain_key`,
     [
       entry.chainKey,
       entry.chainId,
@@ -64,6 +88,7 @@ export async function recordEvmDeploymentRevision(
       entry.previousCursorHash,
     ],
   );
+  if (inserted.rowCount !== 1) throw new Error("conflicting immutable EVM deployment revision");
   if (entry.previousRevision !== null) {
     await db.query(
       `UPDATE evm_deployment_revision
@@ -104,12 +129,13 @@ export async function rewindEvmEvents(
   chainKey: string,
   contract: string,
   fromBlock: bigint,
+  deploymentRevision = 1,
 ): Promise<void> {
   const source = await db.query(
     `SELECT id FROM source_event
       WHERE chain_key = $1 AND family = 'evm' AND lower(contract) = lower($2)
-        AND block_number >= $3`,
-    [chainKey, contract, fromBlock.toString()],
+        AND block_number >= $3 AND deployment_revision = $4`,
+    [chainKey, contract, fromBlock.toString(), deploymentRevision],
   );
   const sourceIds = source.rows.map((row) => String(row.id));
 
@@ -130,9 +156,7 @@ export async function rewindEvmEvents(
 
     const createdInbound = [...(created.get("inbound_delivery") ?? [])];
     if (createdInbound.length > 0)
-      await db.query(`DELETE FROM inbound_delivery WHERE id = ANY($1::bigint[])`, [
-        createdInbound,
-      ]);
+      await db.query(`DELETE FROM inbound_delivery WHERE id = ANY($1::bigint[])`, [createdInbound]);
     const createdClaims = [...(created.get("pending_claim") ?? [])];
     if (createdClaims.length > 0)
       await db.query(
@@ -180,24 +204,23 @@ export async function rewindEvmEvents(
         [settledActions],
       );
 
-    await db.query(
-      `DELETE FROM source_event_link WHERE source_event_id = ANY($1::bigint[])`,
-      [sourceIds],
-    );
+    await db.query(`DELETE FROM source_event_link WHERE source_event_id = ANY($1::bigint[])`, [
+      sourceIds,
+    ]);
   }
 
   await db.query(
     `DELETE FROM source_event_conflict WHERE source_event_id IN (
        SELECT id FROM source_event
         WHERE chain_key = $1 AND family = 'evm' AND lower(contract) = lower($2)
-          AND block_number >= $3)`,
-    [chainKey, contract, fromBlock.toString()],
+          AND block_number >= $3 AND deployment_revision = $4)`,
+    [chainKey, contract, fromBlock.toString(), deploymentRevision],
   );
   await db.query(
     `DELETE FROM source_event
       WHERE chain_key = $1 AND family = 'evm' AND lower(contract) = lower($2)
-        AND block_number >= $3`,
-    [chainKey, contract, fromBlock.toString()],
+        AND block_number >= $3 AND deployment_revision = $4`,
+    [chainKey, contract, fromBlock.toString(), deploymentRevision],
   );
   await db.query(
     `DELETE FROM evm_applied_event
@@ -207,13 +230,13 @@ export async function rewindEvmEvents(
   await db.query(
     `DELETE FROM ingestion_rejection
       WHERE chain_key = $1 AND family = 'evm' AND lower(contract) = lower($2)
-        AND block_number >= $3`,
-    [chainKey, contract, fromBlock.toString()],
+        AND block_number >= $3 AND deployment_revision = $4`,
+    [chainKey, contract, fromBlock.toString(), deploymentRevision],
   );
   await db.query(
     `DELETE FROM evm_log_quarantine
-      WHERE chain_key = $1 AND block_number >= $2`,
-    [chainKey, fromBlock.toString()],
+      WHERE chain_key = $1 AND lower(contract) = lower($2) AND block_number >= $3`,
+    [chainKey, contract, fromBlock.toString()],
   );
 }
 

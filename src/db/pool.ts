@@ -108,6 +108,7 @@ export class Database implements Transactional {
   private readonly transactionStatementTimeoutMs: number;
   private readonly transactionLockTimeoutMs: number;
   private readonly admission: PoolAdmission;
+  private readonly acquireTimeoutMs: number;
 
   private constructor(
     private readonly pool: Pool,
@@ -120,15 +121,18 @@ export class Database implements Transactional {
     this.logger = options.logger;
     this.transactionStatementTimeoutMs = options.transactionStatementTimeoutMs ?? 60_000;
     this.transactionLockTimeoutMs = options.transactionLockTimeoutMs ?? 5_000;
+    this.acquireTimeoutMs = timeoutMilliseconds(options.acquireTimeoutMs, 1_000);
     this.admission = new PoolAdmission(
       this.maxConnections,
       options.maxWaitingRequests ?? Math.max(16, this.maxConnections * 4),
-      timeoutMilliseconds(options.acquireTimeoutMs, 1_000),
+      this.acquireTimeoutMs,
     );
   }
 
   static open(connectionString: string, options: OpenOptions = {}): Database {
     const maxConnections = options.maxConnections ?? 10;
+    if (!Number.isSafeInteger(maxConnections) || maxConnections < 1 || maxConnections > 1_000)
+      throw new RangeError("Database connections must be an integer from 1 to 1000.");
     const statementTimeoutMs = timeoutMilliseconds(options.statementTimeoutMs, 30_000);
     const lockTimeoutMs = timeoutMilliseconds(options.lockTimeoutMs, 5_000);
     const transactionStatementTimeoutMs = timeoutMilliseconds(
@@ -176,16 +180,9 @@ export class Database implements Transactional {
     options?: QueryOptions,
   ): Promise<QueryResultRows> {
     const workload = options?.workload ?? classifySqlWorkload(text);
-    const release = await this.admission.acquire(workload);
+    const { client, release } = await this.acquireClient(workload, options?.signal);
     try {
-      if (options?.signal === undefined)
-        return await this.measure(workload, () => this.pool.query(text, params as unknown[]));
-      const client = await this.pool.connect();
-      try {
-        return await this.queryClient(client, text, params, options);
-      } finally {
-        client.release();
-      }
+      return await this.queryClient(client, text, params, options);
     } finally {
       release();
     }
@@ -199,35 +196,93 @@ export class Database implements Transactional {
    * only as good as nobody being able to write one without the other.
    */
   async transaction<T>(work: (tx: Queryable) => Promise<T>): Promise<T> {
-    const release = await this.admission.acquire("transaction");
+    const { client, release } = await this.acquireClient("transaction");
     try {
-      const client = await this.pool.connect();
-      try {
-        await this.measure("transaction", () => client.query("BEGIN"));
-        const run = currentWorkerRun();
-        // SET LOCAL does not establish a data snapshot, so callers can still select isolation.
-        await this.measure("transaction", () =>
-          client.query(`SET LOCAL lock_timeout = ${this.transactionLockTimeoutMs}`),
-        );
-        await this.measure("transaction", () =>
-          client.query(`SET LOCAL statement_timeout = ${this.transactionStatementTimeoutMs}`),
-        );
-        if (run !== undefined)
-          await client.query("SELECT set_config('hyperion.worker_run_id',$1,true)", [run.runId]);
-        const value = await work(this.wrapClient(client));
-        await this.measure("transaction", () => client.query("COMMIT"));
-        return value;
-      } catch (error) {
-        // A rollback that itself fails means the connection is gone, in which case the server has
-        // already rolled back and the original error is the one worth reporting.
-        await this.measure("transaction", () => client.query("ROLLBACK")).catch(() => undefined);
-        throw normalizeDatabaseError(error);
-      } finally {
-        client.release();
-      }
+      await this.measure("transaction", () => client.query("BEGIN"));
+      const run = currentWorkerRun();
+      // SET LOCAL does not establish a data snapshot, so callers can still select isolation.
+      await this.measure("transaction", () =>
+        client.query(`SET LOCAL lock_timeout = ${this.transactionLockTimeoutMs}`),
+      );
+      await this.measure("transaction", () =>
+        client.query(`SET LOCAL statement_timeout = ${this.transactionStatementTimeoutMs}`),
+      );
+      if (run !== undefined)
+        await client.query("SELECT set_config('hyperion.worker_run_id',$1,true)", [run.runId]);
+      const value = await work(this.wrapClient(client));
+      await this.measure("transaction", () => client.query("COMMIT"));
+      return value;
+    } catch (error) {
+      // A rollback that itself fails means the connection is gone, in which case the server has
+      // already rolled back and the original error is the one worth reporting.
+      await this.measure("transaction", () => client.query("ROLLBACK")).catch(() => undefined);
+      throw normalizeDatabaseError(error);
     } finally {
       release();
     }
+  }
+
+  private async acquireClient(
+    workload: DbWorkload,
+    signal?: AbortSignal,
+  ): Promise<{ client: PoolClient; release: () => void }> {
+    const deadline = Date.now() + this.acquireTimeoutMs;
+    const releaseAdmission = await this.admission.acquire(workload, signal);
+    const remaining = deadline - Date.now();
+    if (remaining <= 0 || signal?.aborted) {
+      releaseAdmission();
+      signal?.throwIfAborted();
+      throw new DatabaseBackpressureError(this.acquireTimeoutMs);
+    }
+    return new Promise((resolve, reject) => {
+      let abandoned = false;
+      const fail = (error: unknown) => {
+        if (abandoned) return;
+        abandoned = true;
+        cleanup();
+        // Cancellation preserves the caller-provided AbortSignal reason.
+        // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
+        reject(error);
+      };
+      const timer = setTimeout(() => {
+        fail(new DatabaseBackpressureError(this.acquireTimeoutMs));
+      }, remaining);
+      const abort = () => {
+        fail(signal?.reason);
+      };
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+      };
+      signal?.addEventListener("abort", abort, { once: true });
+      // An abandoned connect keeps its admission permit until pg settles. This bounds pg's
+      // own queue, and any late client is released before another caller can borrow it.
+      this.pool.connect().then(
+        (client) => {
+          cleanup();
+          if (abandoned) {
+            client.release();
+            releaseAdmission();
+            return;
+          }
+          let released = false;
+          resolve({
+            client,
+            release: () => {
+              if (released) return;
+              released = true;
+              client.release();
+              releaseAdmission();
+            },
+          });
+        },
+        () => {
+          cleanup();
+          releaseAdmission();
+          fail(new DatabaseBackpressureError(this.acquireTimeoutMs));
+        },
+      );
+    });
   }
 
   /** Cheapest possible proof the database is answering, for the ready check. */
@@ -396,13 +451,14 @@ export class Database implements Transactional {
     return migrationPreflight(this, options);
   }
 
-  async migrationRollbackReport(
+  migrationRollbackReport(
     migrations: readonly { readonly name: string; readonly downSql: string }[],
-  ): Promise<MigrationRollbackReport> {
+  ): MigrationRollbackReport {
     return migrationRollbackReport(migrations);
   }
 
   async close(): Promise<void> {
+    this.admission.close();
     this.closing ??= this.pool.end();
     await this.closing;
   }
@@ -444,8 +500,9 @@ const BACKGROUND_WORKLOADS: ReadonlySet<DbWorkload> = new Set([
 interface AdmissionWaiter {
   readonly workload: DbWorkload;
   readonly resolve: (release: () => void) => void;
-  readonly reject: (error: DatabaseBackpressureError) => void;
+  readonly reject: (error: unknown) => void;
   readonly timer: ReturnType<typeof setTimeout>;
+  readonly cleanup: () => void;
 }
 
 /**
@@ -454,6 +511,7 @@ interface AdmissionWaiter {
  * more than one connection. The queue is bounded and every waiter has a deadline.
  */
 class PoolAdmission {
+  private closed = false;
   private active = 0;
   private activeBackground = 0;
   private readonly activeWorkloads = new Map<string, number>();
@@ -474,11 +532,22 @@ class PoolAdmission {
     this.backgroundLimit = maxConnections > 1 ? maxConnections - 1 : maxConnections;
   }
 
-  async acquire(workload: DbWorkload): Promise<() => void> {
+  async acquire(workload: DbWorkload, signal?: AbortSignal): Promise<() => void> {
+    signal?.throwIfAborted();
+    if (this.closed) throw new DatabaseBackpressureError();
     if (this.canStart(workload)) return this.start(workload);
     if (this.waiting.length >= this.maxWaitingRequests) throw new DatabaseBackpressureError();
 
     return new Promise<() => void>((resolve, reject) => {
+      const abort = () => {
+        const index = this.waiting.indexOf(waiter);
+        if (index < 0) return;
+        this.waiting.splice(index, 1);
+        waiter.cleanup();
+        // Preserve AbortSignal.reason, which may intentionally be any value.
+        // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
+        reject(signal?.reason);
+      };
       const waiter: AdmissionWaiter = {
         workload,
         resolve,
@@ -486,11 +555,25 @@ class PoolAdmission {
         timer: setTimeout(() => {
           const index = this.waiting.indexOf(waiter);
           if (index >= 0) this.waiting.splice(index, 1);
+          waiter.cleanup();
           reject(new DatabaseBackpressureError(this.acquireTimeoutMs));
         }, this.acquireTimeoutMs),
+        cleanup: () => {
+          clearTimeout(waiter.timer);
+          signal?.removeEventListener("abort", abort);
+        },
       };
       this.waiting.push(waiter);
+      signal?.addEventListener("abort", abort, { once: true });
     });
+  }
+
+  close(): void {
+    this.closed = true;
+    for (const waiter of this.waiting.splice(0)) {
+      waiter.cleanup();
+      waiter.reject(new DatabaseBackpressureError());
+    }
   }
 
   snapshot(): {
@@ -534,12 +617,19 @@ class PoolAdmission {
   }
 
   private pump(): void {
+    if (this.closed) return;
     while (this.active < this.maxConnections) {
-      const index = this.waiting.findIndex((waiter) => this.canStart(waiter.workload));
+      const foreground = this.waiting.findIndex(
+        (waiter) => !BACKGROUND_WORKLOADS.has(waiter.workload) && this.canStart(waiter.workload),
+      );
+      const index =
+        foreground >= 0
+          ? foreground
+          : this.waiting.findIndex((waiter) => this.canStart(waiter.workload));
       if (index < 0) return;
       const [waiter] = this.waiting.splice(index, 1);
       if (waiter === undefined) return;
-      clearTimeout(waiter.timer);
+      waiter.cleanup();
       waiter.resolve(this.start(waiter.workload));
     }
   }

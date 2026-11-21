@@ -18,6 +18,8 @@ const evm = vi.hoisted(() => ({
   getTransactionReceipt: vi.fn(),
   getBlockNumber: vi.fn(),
   getBlock: vi.fn(),
+  getCode: vi.fn(),
+  getStorageAt: vi.fn(),
 }));
 vi.mock("viem", async (original) => ({
   ...(await original<typeof Viem>()),
@@ -51,6 +53,7 @@ const connection = process.env.TEST_DATABASE_URL;
   const hash = `0x${"ef".repeat(32)}` as const;
   let now = new Date("2026-11-19T00:00:00Z");
   const clean = async () => {
+    await db.query("DELETE FROM cctp_contract_baseline WHERE chain_key='sepolia'");
     await db.query(
       "DELETE FROM inbound_delivery WHERE source_chain='stellar-testnet' AND source_nonce IN (9998300,9998301)",
     );
@@ -97,6 +100,8 @@ const connection = process.env.TEST_DATABASE_URL;
     );
     evm.getChainId.mockResolvedValue(11155111);
     evm.getBlockNumber.mockResolvedValue(1000n);
+    evm.getCode.mockResolvedValue("0x6000");
+    evm.getStorageAt.mockResolvedValue(`0x${"00".repeat(32)}`);
     evm.getTransactionReceipt.mockResolvedValue({
       status: "success",
       blockNumber: 100n,

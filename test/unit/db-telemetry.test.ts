@@ -44,6 +44,9 @@ describe("database pool & query latency telemetry (#110)", () => {
       idleConnections: 2,
       activeConnections: 3,
       waitingRequests: 0,
+      queuedRequests: 0,
+      queuedBackgroundRequests: 0,
+      activeWorkloads: {},
       utilizationRatio: 0.3,
       saturated: false,
     });

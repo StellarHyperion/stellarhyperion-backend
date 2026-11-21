@@ -8,7 +8,14 @@ import {
   toHex,
   toEvmAddress,
 } from "@hyperion/protocol";
-import { decodeEventLog, keccak256, parseAbi, type Hex } from "viem";
+import {
+  decodeEventLog,
+  encodeAbiParameters,
+  keccak256,
+  parseAbi,
+  stringToHex,
+  type Hex,
+} from "viem";
 import type { DeliveryLog } from "../axelar/events.js";
 import type { CctpFeeReconciliation, CctpVerificationFailure } from "../types.js";
 
@@ -52,6 +59,49 @@ export function codeHashOf(code: Hex | undefined): Hex {
   return keccak256(code ?? "0x");
 }
 
+export const EIP1967_IMPLEMENTATION_SLOT: Hex =
+  "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
+export const USDC_IMPLEMENTATION_SLOT = keccak256(
+  stringToHex("org.zeppelinos.proxy.implementation"),
+);
+
+export function proxyImplementationAddress(value: Hex | undefined): Hex | null {
+  if (value === undefined || !/^0x0{24}[0-9a-fA-F]{40}$/.test(value)) {
+    throw new Error("Contract implementation storage is unavailable or malformed.");
+  }
+  const address = `0x${value.slice(-40).toLowerCase()}` as const;
+  return /^0x0{40}$/.test(address) ? null : address;
+}
+
+/** Keep direct-contract hashes unchanged; bind known proxies to implementation address and code. */
+export function cctpContractFingerprint(
+  code: Hex | undefined,
+  implementations: readonly {
+    readonly slot: Hex;
+    readonly address: Hex;
+    readonly code: Hex | undefined;
+  }[],
+): Hex {
+  if (
+    code === undefined ||
+    code === "0x" ||
+    implementations.some((entry) => entry.code === undefined || entry.code === "0x")
+  )
+    return codeHashOf(undefined);
+  if (implementations.length === 0) return codeHashOf(code);
+  return keccak256(
+    encodeAbiParameters(
+      [{ type: "bytes32" }, { type: "bytes32[]" }, { type: "address[]" }, { type: "bytes32[]" }],
+      [
+        codeHashOf(code),
+        implementations.map((entry) => entry.slot),
+        implementations.map((entry) => entry.address),
+        implementations.map((entry) => codeHashOf(entry.code)),
+      ],
+    ),
+  );
+}
+
 /** Compare destination contract code at the canonical proof block with durable baselines. */
 export function evaluateCctpContractIdentity(input: {
   readonly destinationChain: string;
@@ -66,8 +116,12 @@ export function evaluateCctpContractIdentity(input: {
   let unexpectedUpgrade = false;
   for (const observation of input.observations) {
     const baseline = input.baselines.get(observation.role);
-    if (observation.codeHash === codeHashOf(undefined)) issues.push(`${observation.role}:empty_code`);
-    if (baseline === undefined) continue;
+    if (observation.codeHash === codeHashOf(undefined))
+      issues.push(`${observation.role}:empty_code`);
+    if (baseline === undefined) {
+      issues.push(`${observation.role}:baseline_missing`);
+      continue;
+    }
     if (baseline.address.toLowerCase() !== observation.address.toLowerCase()) {
       issues.push(`${observation.role}:address_mismatch`);
     } else if (baseline.codeHash.toLowerCase() !== observation.codeHash.toLowerCase()) {

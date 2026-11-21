@@ -255,14 +255,16 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   app.setErrorHandler((error: FastifyError, request, reply) => {
     if (error instanceof DatabaseBackpressureError) {
       reply.header("Retry-After", Math.max(1, Math.ceil(error.retryAfterMs / 1000)));
-      void reply.code(error.statusCode).send(
-        errorEnvelope(
-          "unavailable",
-          "the database is temporarily busy; retry shortly",
-          request.id,
-          { retryAfterMs: error.retryAfterMs },
-        ),
-      );
+      void reply
+        .code(error.statusCode)
+        .send(
+          errorEnvelope(
+            "unavailable",
+            "the database is temporarily busy; retry shortly",
+            request.id,
+            { retryAfterMs: error.retryAfterMs },
+          ),
+        );
       return;
     }
     if (error instanceof RequestBudgetExceededError) {

@@ -7,7 +7,7 @@ CREATE TABLE evm_deployment_revision (
   chain_id             integer NOT NULL CHECK (chain_id > 0),
   deployment_revision  integer NOT NULL CHECK (deployment_revision >= 1),
   contract             text NOT NULL,
-  start_block          numeric(20, 0) NOT NULL CHECK (start_block >= 0),
+  start_block          numeric(20, 0) CHECK (start_block >= 0),
   previous_revision    integer,
   previous_contract    text,
   previous_cursor      numeric(20, 0),

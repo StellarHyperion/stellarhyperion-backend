@@ -116,6 +116,7 @@ export class EvmWatcher {
   private lastProgress: EvmProgress | null = null;
   private activeDeploymentRevision = 1;
   private reorgs = 0;
+  private pendingReorgRecovery = false;
   /** Set once the node has confirmed which chain it is. */
   private chainConfirmed = false;
   /** Signatures seen once and logged once. A router ahead of this build is not a log flood. */
@@ -151,6 +152,10 @@ export class EvmWatcher {
 
   get progress(): EvmProgress | null {
     return this.lastProgress;
+  }
+
+  get recoveryPending(): boolean {
+    return this.pendingReorgRecovery;
   }
 
   get policy(): EvmFinalityPolicy {
@@ -352,6 +357,7 @@ export class EvmWatcher {
                 logIndex: log.logIndex,
                 eventName: conflict.eventName,
                 reason: conflict.reason,
+                raw: log,
               },
               new Date(Number(timestamp) * 1000),
             );
@@ -377,6 +383,12 @@ export class EvmWatcher {
    * reason to stop answering about the chains that are reachable.
    */
   readiness(): ReadinessReport {
+    if (this.pendingReorgRecovery)
+      return {
+        name: this.name,
+        state: "degraded",
+        detail: "reorg recovery has not committed; indexed progress is unverified",
+      };
     const progress = this.lastProgress;
     if (progress === null) {
       return {
@@ -539,8 +551,7 @@ export class EvmWatcher {
             previousCursor: previous?.cursor ?? null,
             previousCursorHash: previous?.hash ?? null,
           });
-        if (reorgDetected)
-          await rewindEvmEvents(tx, chainKey, leaseContract, from);
+        if (reorgDetected) await rewindEvmEvents(tx, chainKey, leaseContract, from, revision);
 
         for (const log of logs) {
           throwIfAborted(signal);
@@ -572,6 +583,7 @@ export class EvmWatcher {
                   logIndex: log.logIndex,
                   eventName: conflict.eventName,
                   reason: conflict.reason,
+                  raw: log,
                 },
                 new Date(Number(timestamp) * 1000),
               );
@@ -634,6 +646,8 @@ export class EvmWatcher {
         });
       });
 
+      if (reorgDetected) this.reorgs += 1;
+      this.pendingReorgRecovery = false;
       if (policyChange !== null) {
         this.recentPolicyChanges.push(policyChange);
         if (this.recentPolicyChanges.length > MAX_POLICY_CHANGES_CACHED) {
@@ -700,10 +714,19 @@ export class EvmWatcher {
   } {
     const { chainKey, router, startBlock, deploymentRevision, logger } = this.options;
     if (stored === null)
-      return { base: startBlock - 1n, fresh: true, revision: deploymentRevision ?? 1, previous: null };
+      return {
+        base: startBlock - 1n,
+        fresh: true,
+        revision: deploymentRevision ?? 1,
+        previous: null,
+      };
 
     if (stored.contract.toLowerCase() !== router.toLowerCase()) {
-      const nextRevision = Math.max(stored.deploymentRevision + 1, deploymentRevision ?? 1);
+      if (deploymentRevision === undefined || deploymentRevision <= stored.deploymentRevision)
+        throw new Error(
+          `router changed on ${chainKey}; it needs its cursor reset rather than reused without an explicit newer deployment revision`,
+        );
+      const nextRevision = deploymentRevision;
       logger.warn(
         {
           chain: chainKey,
@@ -731,7 +754,11 @@ export class EvmWatcher {
       throw new Error(
         `configured deployment revision ${String(deploymentRevision)} for ${chainKey} is older than stored revision ${String(stored.deploymentRevision)}`,
       );
-    if (deploymentRevision !== undefined && deploymentRevision > stored.deploymentRevision)
+    if (deploymentRevision !== undefined && deploymentRevision > stored.deploymentRevision) {
+      if (startBlock <= stored.position)
+        throw new Error(
+          "a new deployment at the same router must activate after the previous cursor",
+        );
       return {
         base: startBlock - 1n,
         fresh: true,
@@ -743,7 +770,13 @@ export class EvmWatcher {
           hash: stored.hash,
         },
       };
-    return { base: stored.position, fresh: false, revision: stored.deploymentRevision, previous: null };
+    }
+    return {
+      base: stored.position,
+      fresh: false,
+      revision: stored.deploymentRevision,
+      previous: null,
+    };
   }
 
   private async scanLimit(
@@ -821,7 +854,7 @@ export class EvmWatcher {
 
     if (actual !== null && actual.toLowerCase() === expected.toLowerCase()) return null;
 
-    this.reorgs += 1;
+    this.pendingReorgRecovery = true;
     const rewound = position - BigInt(reorgDepth) + 1n;
     const from = rewound < this.options.startBlock ? this.options.startBlock : rewound;
     logger.error(

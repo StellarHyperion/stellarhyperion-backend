@@ -90,6 +90,7 @@ interface Pass extends ReadinessSource {
   tick(signal: AbortSignal): Promise<boolean>;
   release?(): Promise<unknown>;
   readonly progress?: { readonly block?: bigint; readonly ledger?: number } | RailProgress | null;
+  readonly recoveryPending?: boolean;
   circuitState?(): unknown;
 }
 
@@ -211,7 +212,7 @@ export class PolledWorker implements Worker {
     const recoveryMetadata = isEvmProgress(progress)
       ? {
           reorgs: progress.reorgs,
-          reorgDepth: progress.policy.reorgDepth,
+          rewindDepth: progress.policy.reorgDepth,
           headBlock: progress.head.toString(),
           blocksBehind: progress.behind,
         }
@@ -239,6 +240,9 @@ export class PolledWorker implements Worker {
         ticks: stats.ticks + (completed ? 1 : 0),
         running: stats.running,
         ...recoveryMetadata,
+        ...(this.pass.recoveryPending === undefined
+          ? {}
+          : { reorgRecoveryPending: this.pass.recoveryPending }),
         ...(this.pass.circuitState === undefined ? {} : { circuits: this.pass.circuitState() }),
       },
     });
@@ -517,7 +521,9 @@ function evmWorker(
     router: config.routerAddress,
     chainId: config.chainId,
     startBlock: config.startBlock,
-    deploymentRevision: config.deploymentRevision,
+    ...(config.deploymentRevision === undefined
+      ? {}
+      : { deploymentRevision: config.deploymentRevision }),
     confirmations: config.confirmations,
     finalityMode: config.finalityMode ?? "confirmations",
     allowFinalityFallback: config.allowFinalityFallback ?? false,

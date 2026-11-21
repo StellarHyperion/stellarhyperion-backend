@@ -14,6 +14,10 @@ import { completeEnv } from "../helpers.js";
 import {
   CCTP_RECEIPT_ABI,
   codeHashOf,
+  cctpContractFingerprint,
+  EIP1967_IMPLEMENTATION_SLOT,
+  USDC_IMPLEMENTATION_SLOT,
+  proxyImplementationAddress,
   evaluateCctpContractIdentity,
   cctpMessageIdentity,
   inspectCctpMessage,
@@ -87,15 +91,67 @@ const paid: DeliveryLog = {
   logIndex: 3,
 };
 describe("CCTP forwarded destination proof", () => {
+  it("fingerprints implementation upgrades while retaining direct contract hash semantics", () => {
+    const first: Hex = `0x${"11".repeat(20)}`;
+    const second: Hex = `0x${"22".repeat(20)}`;
+    const old = cctpContractFingerprint("0x6000", [
+      { slot: EIP1967_IMPLEMENTATION_SLOT, address: first, code: "0x6001" },
+    ]);
+    expect(cctpContractFingerprint("0x6000", [])).toBe(codeHashOf("0x6000"));
+    expect(
+      cctpContractFingerprint("0x6000", [
+        { slot: EIP1967_IMPLEMENTATION_SLOT, address: first, code: "0x6002" },
+      ]),
+    ).not.toBe(old);
+    expect(
+      cctpContractFingerprint("0x6000", [
+        { slot: EIP1967_IMPLEMENTATION_SLOT, address: second, code: "0x6001" },
+      ]),
+    ).not.toBe(old);
+    expect(
+      cctpContractFingerprint("0x6000", [
+        { slot: USDC_IMPLEMENTATION_SLOT, address: first, code: "0x6001" },
+      ]),
+    ).not.toBe(old);
+    expect(
+      cctpContractFingerprint("0x6000", [
+        { slot: EIP1967_IMPLEMENTATION_SLOT, address: first, code: undefined },
+      ]),
+    ).toBe(codeHashOf(undefined));
+    expect(proxyImplementationAddress(`0x${"0".repeat(24)}${first.slice(2)}`)).toBe(first);
+    expect(proxyImplementationAddress(`0x${"0".repeat(64)}`)).toBeNull();
+    expect(() => proxyImplementationAddress(undefined)).toThrow("unavailable");
+    expect(() => proxyImplementationAddress(`0x${"11".repeat(32)}`)).toThrow("malformed");
+  });
+
+  it("never labels missing durable baselines as verified", () => {
+    expect(
+      evaluateCctpContractIdentity({
+        destinationChain: "sepolia",
+        chainId: 11155111,
+        blockNumber: 42n,
+        blockHash: `0x${"ab".repeat(32)}`,
+        txHash: `0x${"cd".repeat(32)}`,
+        observations: [{ role: "usdc", address: expected.token, codeHash: codeHashOf("0x6000") }],
+        baselines: new Map(),
+      }),
+    ).toMatchObject({ verdict: "mismatch", issues: ["usdc:baseline_missing"] });
+  });
   it("binds contract code identity to the canonical proof block", () => {
     const observations = [
-      { role: "token_messenger_v2" as const, address: expected.destinationMessenger, codeHash: codeHashOf("0x6000") },
-      { role: "message_transmitter_v2" as const, address: expected.transmitter, codeHash: codeHashOf("0x6001") },
+      {
+        role: "token_messenger_v2" as const,
+        address: expected.destinationMessenger,
+        codeHash: codeHashOf("0x6000"),
+      },
+      {
+        role: "message_transmitter_v2" as const,
+        address: expected.transmitter,
+        codeHash: codeHashOf("0x6001"),
+      },
       { role: "usdc" as const, address: expected.token, codeHash: codeHashOf("0x6002") },
     ];
-    const baseline = new Map(
-      observations.map((observation) => [observation.role, observation]),
-    );
+    const baseline = new Map(observations.map((observation) => [observation.role, observation]));
     expect(
       evaluateCctpContractIdentity({
         destinationChain: "sepolia",
@@ -114,7 +170,10 @@ describe("CCTP forwarded destination proof", () => {
         blockNumber: 42n,
         blockHash: `0x${"ab".repeat(32)}`,
         txHash: `0x${"cd".repeat(32)}`,
-        observations: [{ ...observations[0], codeHash: codeHashOf("0x6003") }, ...observations.slice(1)],
+        observations: [
+          { ...observations[0]!, codeHash: codeHashOf("0x6003") },
+          ...observations.slice(1),
+        ],
         baselines: baseline,
       }).verdict,
     ).toBe("unexpected_upgrade");
@@ -290,6 +349,8 @@ const evm = vi.hoisted(() => ({
   getTransactionReceipt: vi.fn(),
   getBlockNumber: vi.fn(),
   getBlock: vi.fn(),
+  getCode: vi.fn(),
+  getStorageAt: vi.fn(),
 }));
 vi.mock("viem", async (original) => ({
   ...(await original<typeof Viem>()),
@@ -343,15 +404,17 @@ describe("CCTP full message identity", () => {
   });
 
   it("retains every message candidate returned for one source transaction", async () => {
-    const fetch = vi.fn(async () =>
-      new Response(
-        JSON.stringify({
-          messages: [
-            { status: "complete", eventNonce: displayed, message: raw },
-            { status: "complete", eventNonce: displayed, message: sibling },
-          ],
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
+    const fetch = vi.fn(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            messages: [
+              { status: "complete", eventNonce: displayed, message: raw },
+              { status: "complete", eventNonce: displayed, message: sibling },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
       ),
     );
     const result = await new IrisClient("testnet", { fetch }).look({
@@ -431,14 +494,28 @@ describe("CCTP full message identity", () => {
     const database = (
       source: Record<string, unknown> | null,
       delivered: readonly Record<string, unknown>[] = [],
-    ): Queryable => ({
-      query: (sql: string) =>
-        Promise.resolve(
-          sql.includes("FROM inbound_delivery")
-            ? { rows: [...delivered], rowCount: delivered.length }
-            : { rows: source ? [source] : [], rowCount: source ? 1 : 0 },
-        ),
-    });
+    ): Queryable => {
+      const baselines = new Map<string, Record<string, unknown>>();
+      return {
+        query(sql: string, params: readonly unknown[] = []) {
+          if (sql.includes("INSERT INTO cctp_contract_baseline")) {
+            const role = String(params[1]);
+            if (!baselines.has(role))
+              baselines.set(role, { role, contract_address: params[2], code_hash: params[3] });
+            return Promise.resolve({ rows: [], rowCount: 1 });
+          }
+          if (sql.includes("FROM cctp_contract_baseline"))
+            return Promise.resolve({ rows: [...baselines.values()], rowCount: baselines.size });
+          if (sql.includes("INSERT INTO cctp_contract_diagnostic"))
+            return Promise.resolve({ rows: [], rowCount: 1 });
+          return Promise.resolve(
+            sql.includes("FROM inbound_delivery")
+              ? { rows: [...delivered], rowCount: delivered.length }
+              : { rows: source ? [source] : [], rowCount: source ? 1 : 0 },
+          );
+        },
+      };
+    };
 
     beforeEach(() => {
       evm.getChainId.mockResolvedValue(11155111);
@@ -451,6 +528,8 @@ describe("CCTP full message identity", () => {
         logs: [received, paid],
       });
       evm.getBlock.mockResolvedValue({ hash, timestamp: 1700000000n });
+      evm.getCode.mockReset().mockResolvedValue("0x6000");
+      evm.getStorageAt.mockReset().mockResolvedValue(`0x${"0".repeat(64)}`);
     });
 
     it("retries the complete CCTP proof on the secondary destination RPC", async () => {
@@ -505,6 +584,98 @@ describe("CCTP full message identity", () => {
       expect(repeat.delivery).toEqual(first.delivery);
     });
 
+    it("rejects a racing first-use code observation after rereading the immutable winner", async () => {
+      const db = database(stored);
+      let inserted = false;
+      const racing: Queryable = {
+        async query(sql, params = []) {
+          if (!inserted && sql.includes("INSERT INTO cctp_contract_baseline")) {
+            inserted = true;
+            await db.query(sql, [
+              params[0],
+              params[1],
+              params[2],
+              codeHashOf("0x6001"),
+              params[4],
+              params[5],
+            ]);
+          }
+          return db.query(sql, params);
+        },
+      };
+      const result = await inspectCctpDelivery(config, racing, transfer, report);
+      expect(inserted).toBe(true);
+      expect(result).toMatchObject({
+        delivery: null,
+        failure: "configuration_unavailable",
+        proofEvidence: null,
+      });
+    });
+
+    it.each([EIP1967_IMPLEMENTATION_SLOT, USDC_IMPLEMENTATION_SLOT])(
+      "detects a USDC implementation upgrade through slot %s",
+      async (slot) => {
+        const implementation: Hex = `0x${"12".repeat(20)}`;
+        let implementationCode: Hex = "0x6001";
+        evm.getStorageAt.mockImplementation(
+          ({ address, slot: requested }: { address: Hex; slot: Hex }) =>
+            Promise.resolve(
+              address.toLowerCase() === expected.token.toLowerCase() && requested === slot
+                ? `0x${"0".repeat(24)}${implementation.slice(2)}`
+                : `0x${"0".repeat(64)}`,
+            ),
+        );
+        evm.getCode.mockImplementation(({ address }: { address: Hex }) =>
+          Promise.resolve(address === implementation ? implementationCode : "0x6000"),
+        );
+        const db = database(stored);
+        expect((await inspectCctpDelivery(config, db, transfer, report)).delivery).not.toBeNull();
+        implementationCode = "0x6002";
+        expect(await inspectCctpDelivery(config, db, transfer, report)).toMatchObject({
+          delivery: null,
+          failure: "configuration_unavailable",
+        });
+        expect(evm.getStorageAt).toHaveBeenCalledWith({
+          address: expected.token,
+          slot,
+          blockNumber: 100n,
+        });
+        expect(evm.getCode).toHaveBeenCalledWith({ address: implementation, blockNumber: 100n });
+      },
+    );
+
+    it("rejects empty implementation code without seeding its baseline", async () => {
+      const implementation: Hex = `0x${"12".repeat(20)}`;
+      evm.getStorageAt.mockResolvedValue(`0x${"0".repeat(24)}${implementation.slice(2)}`);
+      evm.getCode.mockImplementation(({ address }: { address: Hex }) =>
+        Promise.resolve(address === implementation ? "0x" : "0x6000"),
+      );
+      const db = database(stored);
+      expect(await inspectCctpDelivery(config, db, transfer, report)).toMatchObject({
+        delivery: null,
+        failure: "configuration_unavailable",
+      });
+      expect(
+        (await db.query("SELECT role, contract_address, code_hash FROM cctp_contract_baseline"))
+          .rows,
+      ).toHaveLength(0);
+    });
+
+    it("rechecks canonical block identity after reading implementation code", async () => {
+      evm.getBlock
+        .mockResolvedValueOnce({ hash, timestamp: 1700000000n })
+        .mockResolvedValueOnce({ hash: `0x${"aa".repeat(32)}`, timestamp: 1700000000n });
+      const db = database(stored);
+      expect(await inspectCctpDelivery(config, db, transfer, report)).toMatchObject({
+        delivery: null,
+        failure: "non_canonical_receipt",
+      });
+      expect(
+        (await db.query("SELECT role, contract_address, code_hash FROM cctp_contract_baseline"))
+          .rows,
+      ).toHaveLength(0);
+    });
+
     it("never re-associates a message already delivered for another transfer", async () => {
       const result = await inspectCctpDelivery(
         config,
@@ -516,23 +687,19 @@ describe("CCTP full message identity", () => {
     });
 
     it("matches the complete source intent when unrelated candidates share the source tx", async () => {
-      const result = await inspectCctpDelivery(
-        config,
-        database(stored),
-        transfer,
-        { ...report, candidates: [{ ...report, messageBytes: "0x01" }, report] },
-      );
+      const result = await inspectCctpDelivery(config, database(stored), transfer, {
+        ...report,
+        candidates: [{ ...report, messageBytes: "0x01" }, report],
+      });
       expect(result.failure).toBeNull();
       expect(result.delivery?.row.railMessageId).toBe(identity.nonce);
     });
 
     it("keeps duplicate complete candidates unverified", async () => {
-      const result = await inspectCctpDelivery(
-        config,
-        database(stored),
-        transfer,
-        { ...report, candidates: [report, report] },
-      );
+      const result = await inspectCctpDelivery(config, database(stored), transfer, {
+        ...report,
+        candidates: [report, report],
+      });
       expect(result).toMatchObject({ delivery: null, failure: "invalid_message" });
     });
 

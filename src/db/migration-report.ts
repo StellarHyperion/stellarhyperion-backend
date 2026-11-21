@@ -1,3 +1,4 @@
+import { PG_MIGRATE_LOCK_ID } from "node-pg-migrate";
 import type { Queryable } from "./pool.js";
 import { integer, text, timestampOrNull } from "./rows.js";
 
@@ -46,29 +47,66 @@ export async function migrationPreflight(
   db: Queryable & { transaction?<T>(work: (tx: Queryable) => Promise<T>): Promise<T> },
   options: MigrationPreflightOptions,
 ): Promise<MigrationPreflightReport> {
+  const unavailable = (failure: string): MigrationPreflightReport => ({
+    safe: false,
+    schema: { applied: [], missing: [...options.expectedMigrations] },
+    migrationLockAvailable: false,
+    rowCounts: {},
+    invalidConstraints: [],
+    backupBoundary: null,
+    failures: [failure],
+  });
+  if (!db.transaction) return unavailable("consistent migration preflight transaction unavailable");
+  try {
+    return await db.transaction(async (tx) => {
+      await tx.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      const lock = await tx.query("SELECT pg_try_advisory_xact_lock($1::bigint) AS available", [
+        String(PG_MIGRATE_LOCK_ID),
+      ]);
+      if (lock.rows[0]?.available !== true)
+        return unavailable("migration advisory lock is not available");
+      return await readMigrationPreflight(tx, options);
+    });
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "42P01")
+      return unavailable(
+        "migration preflight schema is unavailable; apply the required migrations",
+      );
+    throw error;
+  }
+}
+
+async function readMigrationPreflight(
+  db: Queryable,
+  options: MigrationPreflightOptions,
+): Promise<MigrationPreflightReport> {
   const applied = (await db.query("SELECT name FROM pgmigrations ORDER BY id")).rows.map((row) =>
     text(row, "name"),
   );
   const missing = options.expectedMigrations.filter((name) => !applied.includes(name));
   const rowCounts: Record<string, number> = {};
   for (const table of MIGRATION_REPORT_TABLES) {
-    const result = await db.query(`SELECT count(*)::int AS count FROM ${table}`);
+    const result = await db.query(`SELECT count(*)::text AS count FROM ${table}`);
     rowCounts[table] = integer(result.rows[0] ?? {}, "count");
   }
-  const invalidConstraints = (await db.query(
-    `SELECT conrelid::regclass::text AS relation, conname
+  const invalidConstraints = (
+    await db.query(
+      `SELECT conrelid::regclass::text AS relation, conname
        FROM pg_constraint
       WHERE convalidated = false
       ORDER BY relation, conname`,
-  )).rows.map((row) => `${text(row, "relation")}.${text(row, "conname")}`);
-  const backupRows = (await db.query(
-    `SELECT backup_id, migration_name, verified_at
+    )
+  ).rows.map((row) => `${text(row, "relation")}.${text(row, "conname")}`);
+  const backupRows = (
+    await db.query(
+      `SELECT backup_id, migration_name, verified_at
        FROM migration_backup_boundary
       WHERE ($1::text IS NULL OR backup_id = $1)
       ORDER BY verified_at DESC
       LIMIT 1`,
-    [options.backupBoundaryId ?? null],
-  )).rows;
+      [options.backupBoundaryId ?? null],
+    )
+  ).rows;
   const backup = backupRows[0];
   const backupBoundary = backup
     ? {
@@ -77,16 +115,8 @@ export async function migrationPreflight(
         verifiedAt: (timestampOrNull(backup, "verified_at") ?? new Date(0)).toISOString(),
       }
     : null;
-  const migrationLockAvailable = db.transaction
-    ? await db.transaction(async (tx) => {
-        const result = await tx.query(
-          "SELECT pg_try_advisory_xact_lock(hashtextextended('pgmigrations', 0)) AS available",
-        );
-        return result.rows[0]?.available === true;
-      })
-    : false;
   const failures = [
-    ...(!migrationLockAvailable ? ["migration advisory lock is not available"] : []),
+    ...(missing.length > 0 ? [`missing expected migrations: ${missing.join(", ")}`] : []),
     ...(invalidConstraints.length > 0
       ? [`unvalidated constraints: ${invalidConstraints.join(", ")}`]
       : []),
@@ -95,7 +125,7 @@ export async function migrationPreflight(
   return {
     safe: failures.length === 0,
     schema: { applied, missing },
-    migrationLockAvailable,
+    migrationLockAvailable: true,
     rowCounts,
     invalidConstraints,
     backupBoundary,
@@ -107,19 +137,38 @@ export function migrationRollbackReport(
   migrations: readonly { readonly name: string; readonly downSql: string }[],
 ): MigrationRollbackReport {
   const entries = migrations.map(({ name, downSql }) => {
-    const down = downSql.trim();
-    const irreversibleDataRewrite = /\b(?:DELETE|UPDATE|INSERT|TRUNCATE)\b/i.test(down);
-    const reversibleSchema = down.length > 0 && !irreversibleDataRewrite;
+    const down = downSql
+      .replace(/\/\*[\s\S]*?\*\//g, " ")
+      .replace(/--[^\n]*/g, " ")
+      .trim();
+    const statements = down
+      .split(";")
+      .map((sql) => sql.trim())
+      .filter(Boolean);
+    // Only explicitly understood non-data reversals can be described as reversible.
+    // Dropping tables/columns, CASCADE, procedural SQL and unknown statements require backup.
+    const identifier = '(?:[a-z_][a-z0-9_]*|"[^"]+")';
+    const qualified = `${identifier}(?:\\.${identifier})?`;
+    const nonDataReversal = new RegExp(
+      `^(?:DROP\\s+INDEX\\s+(?:CONCURRENTLY\\s+)?(?:IF\\s+EXISTS\\s+)?${qualified}(?:\\s+RESTRICT)?|` +
+        `ALTER\\s+TABLE\\s+(?:ONLY\\s+)?${qualified}\\s+DROP\\s+CONSTRAINT\\s+(?:IF\\s+EXISTS\\s+)?${identifier}(?:\\s+RESTRICT)?|` +
+        `ALTER\\s+(?:TABLE|INDEX)\\s+${qualified}\\s+RENAME\\s+(?:(?:COLUMN|CONSTRAINT)\\s+${identifier}\\s+)?TO\\s+${identifier}|` +
+        `COMMENT\\s+ON\\s+(?:TABLE|INDEX|COLUMN)\\s+${qualified}\\s+IS\\s+(?:NULL|'(?:''|[^'])*'))$`,
+      "i",
+    );
+    const reversibleSchema =
+      statements.length > 0 && statements.every((sql) => nonDataReversal.test(sql));
+    const irreversibleDataRewrite = statements.length > 0 && !reversibleSchema;
     return {
       name,
       reversibleSchema,
       irreversibleDataRewrite,
       reason: irreversibleDataRewrite
-        ? "down migration rewrites or removes data; restore from the verified backup boundary"
+        ? "down migration may rewrite or remove data; restore from the verified backup boundary"
         : reversibleSchema
           ? "down migration contains schema-only reversal"
           : "no executable down migration is present",
     };
   });
-  return { entries, backupBoundaryRequired: entries.some((entry) => entry.irreversibleDataRewrite) };
+  return { entries, backupBoundaryRequired: entries.some((entry) => !entry.reversibleSchema) };
 }

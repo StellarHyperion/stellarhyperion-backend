@@ -12,7 +12,7 @@ const CHAIN = "stellar-testnet";
 const START_LEDGER = 4_965_951;
 
 describe("deterministic indexer crash rehearsal", () => {
-  it.each(["before-source-write", "after-source-write", "before-commit"] as const)(
+  it.each(["before-source-write", "after-source-write", "before-commit", "after-commit"] as const)(
     "replays safely after a %s crash",
     async (crashAt) => {
       const db = new RecordingDb();
@@ -51,15 +51,33 @@ describe("deterministic indexer crash rehearsal", () => {
 
       db.crashAt = crashAt;
       await expect(first().tick(AbortSignal.timeout(5_000))).rejects.toThrow("injected crash");
-      expect(db.rollbacks).toHaveLength(1);
+      const committed = crashAt === "after-commit";
+      const trace = () =>
+        JSON.stringify({
+          seed: 0x330,
+          boundary: crashAt,
+          sourceEvents: db.sourceEvents,
+          cursor: db.cursorRow,
+          commits: db.commits,
+          rollbacks: db.rollbacks,
+        });
+      expect(db.sourceEvents, trace()).toBe(committed ? 1 : 0);
+      expect(db.cursorRow === null, trace()).toBe(!committed);
+      expect(db.rollbacks, trace()).toHaveLength(committed ? 0 : 1);
+      expect(db.commits, trace()).toHaveLength(committed ? 1 : 0);
       // The crashed process no longer renews its lease. Advance the fake clock
       // past the lease expiry before the replacement worker takes over.
       if (db.leaseRow !== null) db.leaseRow.lease_until = new Date(0);
 
-      await first().tick(AbortSignal.timeout(5_000));
-      expect(db.sourceEvents).toBe(1);
-      expect(db.cursorRow).not.toBeNull();
-      expect(db.commits).toHaveLength(1);
+      const restarted = first();
+      rpc.advanceHeadTo(START_LEDGER + 2);
+      await restarted.tick(AbortSignal.timeout(5_000));
+      const committedAfterRestart = db.commits.length;
+      rpc.advanceHeadTo(START_LEDGER + 3);
+      await restarted.tick(AbortSignal.timeout(5_000));
+      expect(db.sourceEvents, trace()).toBe(1);
+      expect(db.cursorRow, trace()).not.toBeNull();
+      expect(db.commits.length, trace()).toBeGreaterThanOrEqual(committedAfterRestart);
     },
   );
 });

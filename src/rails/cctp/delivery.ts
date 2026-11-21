@@ -22,7 +22,10 @@ import {
 } from "../../chains/evm/client.js";
 import {
   cctpMessageIdentity,
-  codeHashOf,
+  cctpContractFingerprint,
+  EIP1967_IMPLEMENTATION_SLOT,
+  USDC_IMPLEMENTATION_SLOT,
+  proxyImplementationAddress,
   evaluateCctpContractIdentity,
   inspectCctpMessage,
   inspectCctpPayment,
@@ -229,12 +232,12 @@ export async function inspectCctpDelivery(
   };
   const candidates: readonly RailCandidate[] =
     report.candidates && report.candidates.length > 0 ? report.candidates : [report];
-  const matches: Array<{
+  const matches: {
     candidate: RailCandidate;
     raw: Hex;
     identity: NonNullable<ReturnType<typeof cctpMessageIdentity>>;
     message: Extract<ReturnType<typeof inspectCctpMessage>, { failure: null }>;
-  }> = [];
+  }[] = [];
   let firstFailure: CctpVerificationFailure | null = null;
   for (const candidate of candidates) {
     if (!candidate.forwardTxHash) {
@@ -274,7 +277,9 @@ export async function inspectCctpDelivery(
   // from being associated with the wrong transfer on replay.
   if (matches.length === 0) return failed(firstFailure ?? "invalid_message");
   if (matches.length > 1) return failed("invalid_message");
-  const [{ candidate, raw, identity, message }] = matches;
+  const match = matches[0];
+  if (match === undefined) return failed(firstFailure ?? "invalid_message");
+  const { candidate, raw, identity, message } = match;
   const forwardTxHash = candidate.forwardTxHash;
   if (!forwardTxHash) return failed("forward_tx_missing");
   // One message mints once. An exact repeat for this transfer is replayable and upserts the same
@@ -305,19 +310,68 @@ export async function inspectCctpDelivery(
       });
       if (block.hash !== receipt.blockHash) return failed("non_canonical_receipt");
 
-      const observations: readonly CctpContractObservation[] = await Promise.all(
-        [
-          ["token_messenger_v2", contracts.tokenMessengerV2],
-          ["message_transmitter_v2", contracts.messageTransmitterV2],
-          ["usdc", token.address],
-        ].map(async ([role, address]) => ({
-          role: role as CctpContractRole,
+      const observations: CctpContractObservation[] = [];
+      // Keep tracked evidence reads deterministic across independent RPC endpoints.
+      for (const [role, address] of [
+        ["token_messenger_v2", contracts.tokenMessengerV2],
+        ["message_transmitter_v2", contracts.messageTransmitterV2],
+        ["usdc", token.address],
+      ] as const) {
+        const code = await client.getCode({ address, blockNumber: receipt.blockNumber });
+        const implementations: { slot: Hex; address: Hex; code: Hex | undefined }[] = [];
+        const slots =
+          role === "usdc"
+            ? [EIP1967_IMPLEMENTATION_SLOT, USDC_IMPLEMENTATION_SLOT]
+            : [EIP1967_IMPLEMENTATION_SLOT];
+        for (const slot of slots) {
+          const implementation = proxyImplementationAddress(
+            await client.getStorageAt({ address, slot, blockNumber: receipt.blockNumber }),
+          );
+          if (implementation !== null)
+            implementations.push({
+              slot,
+              address: implementation,
+              code: await client.getCode({
+                address: implementation,
+                blockNumber: receipt.blockNumber,
+              }),
+            });
+        }
+        observations.push({
+          role,
           address,
-          codeHash: codeHashOf(
-            await client.getCode({ address: address as Hex, blockNumber: receipt.blockNumber }),
-          ),
-        })),
-      );
+          codeHash: cctpContractFingerprint(code, implementations),
+        });
+      }
+      const codeBlock = await client.getBlock({
+        blockNumber: receipt.blockNumber,
+        includeTransactions: false,
+      });
+      if (codeBlock.hash !== receipt.blockHash) return failed("non_canonical_receipt");
+      // Invalid/empty code never seeds a baseline. A competing first-use insert may win; always
+      // reread the durable winner before deciding whether these observations are admissible.
+      if (
+        observations.every(
+          (observation) => observation.codeHash !== cctpContractFingerprint(undefined, []),
+        )
+      ) {
+        for (const observation of observations) {
+          await db.query(
+            `INSERT INTO cctp_contract_baseline
+               (chain_key, role, contract_address, code_hash, first_seen_block, first_seen_block_hash)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (chain_key, role) DO NOTHING`,
+            [
+              transfer.destinationChain,
+              observation.role,
+              observation.address.toLowerCase(),
+              observation.codeHash.toLowerCase(),
+              receipt.blockNumber.toString(),
+              receipt.blockHash.toLowerCase(),
+            ],
+          );
+        }
+      }
       const { rows: baselineRows } = await db.query(
         `SELECT role, contract_address, code_hash
            FROM cctp_contract_baseline WHERE chain_key = $1`,
@@ -359,22 +413,6 @@ export async function inspectCctpDelivery(
         ],
       );
       if (diagnostic.verdict !== "verified") return failed("configuration_unavailable");
-      for (const observation of observations) {
-        await db.query(
-          `INSERT INTO cctp_contract_baseline
-             (chain_key, role, contract_address, code_hash, first_seen_block, first_seen_block_hash)
-           VALUES ($1, $2, $3, $4, $5, $6)
-           ON CONFLICT (chain_key, role) DO NOTHING`,
-          [
-            diagnostic.destinationChain,
-            observation.role,
-            observation.address.toLowerCase(),
-            observation.codeHash.toLowerCase(),
-            diagnostic.blockNumber.toString(),
-            diagnostic.blockHash.toLowerCase(),
-          ],
-        );
-      }
 
       const proofEvidence: CctpProofEvidence = {
         txHash: receipt.transactionHash,

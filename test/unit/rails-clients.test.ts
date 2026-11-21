@@ -20,6 +20,7 @@ import {
   IrisResourceLimitError,
   MAX_IRIS_ATTESTATION_BYTES,
   MAX_IRIS_MESSAGE_BYTES,
+  MAX_IRIS_MESSAGE_CANDIDATES,
   MAX_IRIS_RESPONSE_BYTES,
   reportFor,
 } from "../../src/rails/cctp/iris.js";
@@ -405,6 +406,66 @@ describe("Circle's Iris", () => {
           error.message.includes(`resource limit exceeded: ${field}`),
       );
     }
+  });
+
+  it.each([
+    ["message", MAX_IRIS_MESSAGE_BYTES],
+    ["messageBytes", MAX_IRIS_MESSAGE_BYTES],
+    ["rawMessage", MAX_IRIS_MESSAGE_BYTES],
+    ["attestation", MAX_IRIS_ATTESTATION_BYTES],
+    ["signature", MAX_IRIS_ATTESTATION_BYTES],
+    ["attestationSignature", MAX_IRIS_ATTESTATION_BYTES],
+    ["fastAttestation.signature", MAX_IRIS_ATTESTATION_BYTES],
+    ["fastAttestation.attestation", MAX_IRIS_ATTESTATION_BYTES],
+  ] as const)("rejects an oversized %s on a later candidate", async (field, size) => {
+    const oversized = "x".repeat(size + 1);
+    const candidate = field.startsWith("fastAttestation.")
+      ? { fastAttestation: { [field.split(".")[1] ?? "signature"]: oversized } }
+      : { [field]: oversized };
+    const { fetch } = answering(200, {
+      messages: [{ status: "pending_confirmations" }, { status: "complete", ...candidate }],
+    });
+    await expect(new IrisClient("testnet", { fetch }).look(TRANSFER)).rejects.toMatchObject({
+      category: "provider_resource_limit",
+      kind: "permanent",
+      message: expect.stringContaining("candidate 2"),
+    });
+  });
+
+  it.each(["messages", "data"] as const)(
+    "caps the %s candidate count before mapping reports",
+    async (field) => {
+      const { fetch } = answering(200, {
+        [field]: Array.from({ length: MAX_IRIS_MESSAGE_CANDIDATES + 1 }, () => ({
+          status: "complete",
+        })),
+      });
+      await expect(new IrisClient("testnet", { fetch }).look(TRANSFER)).rejects.toMatchObject({
+        category: "provider_resource_limit",
+        kind: "permanent",
+        message: expect.stringContaining("message candidates exceed"),
+      });
+    },
+  );
+
+  it("counts malformed entries toward the candidate bound and accepts its inclusive limit", async () => {
+    const oversized = answering(
+      200,
+      Array.from({ length: MAX_IRIS_MESSAGE_CANDIDATES + 1 }, () => null),
+    );
+    await expect(
+      new IrisClient("testnet", { fetch: oversized.fetch }).look(TRANSFER),
+    ).rejects.toBeInstanceOf(IrisResourceLimitError);
+    const valid = answering(200, {
+      messages: Array.from({ length: MAX_IRIS_MESSAGE_CANDIDATES }, (_, index) => ({
+        status: "pending_confirmations",
+        eventNonce: String(index),
+      })),
+    });
+    const lookup = await new IrisClient("testnet", { fetch: valid.fetch }).look(TRANSFER);
+    expect(lookup.kind).toBe("found");
+    if (lookup.kind === "found")
+      expect(lookup.report.candidates).toHaveLength(MAX_IRIS_MESSAGE_CANDIDATES);
   });
 
   it("cancels a chunked oversized response with no declared length before accepting JSON", async () => {
