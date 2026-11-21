@@ -22,9 +22,13 @@ import {
 } from "../../chains/evm/client.js";
 import {
   cctpMessageIdentity,
+  codeHashOf,
+  evaluateCctpContractIdentity,
   inspectCctpMessage,
   inspectCctpPayment,
   type CctpProofEvidence,
+  type CctpContractRole,
+  type CctpContractObservation,
   type ExpectedCctpTransfer,
 } from "./events.js";
 import type { CctpVerificationFailure } from "../types.js";
@@ -265,6 +269,77 @@ export async function inspectCctpDelivery(
         includeTransactions: false,
       });
       if (block.hash !== receipt.blockHash) return failed("non_canonical_receipt");
+
+      const observations: readonly CctpContractObservation[] = await Promise.all(
+        [
+          ["token_messenger_v2", contracts.tokenMessengerV2],
+          ["message_transmitter_v2", contracts.messageTransmitterV2],
+          ["usdc", token.address],
+        ].map(async ([role, address]) => ({
+          role: role as CctpContractRole,
+          address,
+          codeHash: codeHashOf(
+            await client.getCode({ address: address as Hex, blockNumber: receipt.blockNumber }),
+          ),
+        })),
+      );
+      const { rows: baselineRows } = await db.query(
+        `SELECT role, contract_address, code_hash
+           FROM cctp_contract_baseline WHERE chain_key = $1`,
+        [transfer.destinationChain],
+      );
+      const baselines = new Map(
+        baselineRows.map((row) => [
+          text(row, "role") as CctpContractRole,
+          { address: text(row, "contract_address"), codeHash: text(row, "code_hash") },
+        ]),
+      );
+      const diagnostic = evaluateCctpContractIdentity({
+        destinationChain: transfer.destinationChain,
+        chainId: destination.chainId,
+        blockNumber: receipt.blockNumber,
+        blockHash: receipt.blockHash,
+        txHash: receipt.transactionHash,
+        observations,
+        baselines,
+      });
+      await db.query(
+        `INSERT INTO cctp_contract_diagnostic
+           (transfer_id, destination_chain, chain_id, block_number, block_hash, tx_hash,
+            verdict, issues, observations)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb)
+         ON CONFLICT (transfer_id, destination_chain, block_number, block_hash)
+         DO UPDATE SET verdict = EXCLUDED.verdict, issues = EXCLUDED.issues,
+                       observations = EXCLUDED.observations, tx_hash = EXCLUDED.tx_hash`,
+        [
+          String(transfer.transferId),
+          diagnostic.destinationChain,
+          diagnostic.chainId,
+          diagnostic.blockNumber.toString(),
+          diagnostic.blockHash.toLowerCase(),
+          diagnostic.txHash.toLowerCase(),
+          diagnostic.verdict,
+          JSON.stringify(diagnostic.issues),
+          JSON.stringify(diagnostic.observations),
+        ],
+      );
+      if (diagnostic.verdict !== "verified") return failed("configuration_unavailable");
+      for (const observation of observations) {
+        await db.query(
+          `INSERT INTO cctp_contract_baseline
+             (chain_key, role, contract_address, code_hash, first_seen_block, first_seen_block_hash)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (chain_key, role) DO NOTHING`,
+          [
+            diagnostic.destinationChain,
+            observation.role,
+            observation.address.toLowerCase(),
+            observation.codeHash.toLowerCase(),
+            diagnostic.blockNumber.toString(),
+            diagnostic.blockHash.toLowerCase(),
+          ],
+        );
+      }
 
       const proofEvidence: CctpProofEvidence = {
         txHash: receipt.transactionHash,

@@ -29,6 +29,64 @@ export interface ExpectedCctpTransfer {
   sourceAmount: bigint;
 }
 
+export type CctpContractRole = "token_messenger_v2" | "message_transmitter_v2" | "usdc";
+
+export interface CctpContractObservation {
+  readonly role: CctpContractRole;
+  readonly address: string;
+  readonly codeHash: Hex;
+}
+
+export interface CctpContractIdentityDiagnostic {
+  readonly destinationChain: string;
+  readonly chainId: number;
+  readonly blockNumber: bigint;
+  readonly blockHash: Hex;
+  readonly txHash: Hex;
+  readonly verdict: "verified" | "mismatch" | "unexpected_upgrade";
+  readonly issues: readonly string[];
+  readonly observations: readonly CctpContractObservation[];
+}
+
+export function codeHashOf(code: Hex | undefined): Hex {
+  return keccak256(code ?? "0x");
+}
+
+/** Compare destination contract code at the canonical proof block with durable baselines. */
+export function evaluateCctpContractIdentity(input: {
+  readonly destinationChain: string;
+  readonly chainId: number;
+  readonly blockNumber: bigint;
+  readonly blockHash: Hex;
+  readonly txHash: Hex;
+  readonly observations: readonly CctpContractObservation[];
+  readonly baselines: ReadonlyMap<CctpContractRole, { address: string; codeHash: string }>;
+}): CctpContractIdentityDiagnostic {
+  const issues: string[] = [];
+  let unexpectedUpgrade = false;
+  for (const observation of input.observations) {
+    const baseline = input.baselines.get(observation.role);
+    if (observation.codeHash === codeHashOf(undefined)) issues.push(`${observation.role}:empty_code`);
+    if (baseline === undefined) continue;
+    if (baseline.address.toLowerCase() !== observation.address.toLowerCase()) {
+      issues.push(`${observation.role}:address_mismatch`);
+    } else if (baseline.codeHash.toLowerCase() !== observation.codeHash.toLowerCase()) {
+      issues.push(`${observation.role}:code_hash_changed`);
+      unexpectedUpgrade = true;
+    }
+  }
+  return {
+    destinationChain: input.destinationChain,
+    chainId: input.chainId,
+    blockNumber: input.blockNumber,
+    blockHash: input.blockHash,
+    txHash: input.txHash,
+    verdict: unexpectedUpgrade ? "unexpected_upgrade" : issues.length > 0 ? "mismatch" : "verified",
+    issues,
+    observations: input.observations,
+  };
+}
+
 /**
  * The full-width identity of one exact CCTP message.
  *
