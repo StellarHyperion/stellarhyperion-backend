@@ -73,6 +73,30 @@ export function sanitizeDiagnosticText(input: string): string {
     .slice(0, 2048);
 }
 
+function sanitizeSerializedError(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (typeof value === "string") return sanitizeDiagnosticText(value);
+  if (typeof value !== "object" || value === null) return value;
+  if (seen.has(value)) return "[circular]";
+  seen.add(value);
+  if (Array.isArray(value)) {
+    const result = value.map((entry) => sanitizeSerializedError(entry, seen));
+    seen.delete(value);
+    return result;
+  }
+  const result = Object.fromEntries(
+    Object.entries(value).map(([key, entry]) => [
+      key,
+      /password|secret|api.?key|authorization|cookie|token|url|endpoint|connection|credential/i.test(
+        key,
+      )
+        ? "[redacted]"
+        : sanitizeSerializedError(entry, seen),
+    ]),
+  );
+  seen.delete(value);
+  return result;
+}
+
 const SAFE_OPERATION_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
 
 /** Check if an identifier is a safe operation or run identity. */
@@ -95,7 +119,7 @@ export function createLogger(config: AppConfig): Logger {
     base: { service: "hyperion-backend", network: config.network },
     redact: { paths: REDACTED_PATHS, censor: "[redacted]" },
     serializers: {
-      err: stdSerializers.err,
+      err: (error) => sanitizeSerializedError(stdSerializers.err(error)),
     },
     hooks: {
       // Applied to every object logged, at every level, including the ones pino builds itself on

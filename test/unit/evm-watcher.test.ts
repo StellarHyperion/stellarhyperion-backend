@@ -713,7 +713,9 @@ describe("an arrival, which the capture has none of", () => {
 describe("RPC endpoint failover", () => {
   it("routes requests to secondary RPC when primary returns 500 error", async () => {
     const { logger, lines } = capturingLogger();
-    const failoverEvents: { failedUrl: string; fallbackUrl: string }[] = [];
+    const failoverEvents: { failedEndpoint: string; fallbackEndpoint: string }[] = [];
+    const primaryUrl = "https://primary.invalid/rpc?token=do-not-log";
+    const secondaryUrl = "https://secondary.invalid/rpc?token=also-secret";
 
     const mockFetch: typeof globalThis.fetch = (input) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
@@ -728,18 +730,23 @@ describe("RPC endpoint failover", () => {
       );
     };
 
-    const client = viemClient(["https://primary.invalid/rpc", "https://secondary.invalid/rpc"], {
+    const client = viemClient([primaryUrl, secondaryUrl], {
       fetchFn: mockFetch,
       logger,
       onFailover: (e) =>
-        failoverEvents.push({ failedUrl: e.failedUrl, fallbackUrl: e.fallbackUrl }),
+        failoverEvents.push({
+          failedEndpoint: e.failedEndpoint,
+          fallbackEndpoint: e.fallbackEndpoint,
+        }),
     });
 
     const chainId = await client.chainId();
     expect(chainId).toBe(11_155_111);
     expect(failoverEvents).toEqual([
-      { failedUrl: "https://primary.invalid/rpc", fallbackUrl: "https://secondary.invalid/rpc" },
+      { failedEndpoint: "https://primary.invalid", fallbackEndpoint: "https://secondary.invalid" },
     ]);
+    expect(JSON.stringify(lines)).not.toContain("do-not-log");
+    expect(JSON.stringify(lines)).not.toContain("also-secret");
     expect(
       lines.some(
         (l) =>
@@ -750,7 +757,7 @@ describe("RPC endpoint failover", () => {
 
   it("routes requests to secondary RPC when primary encounters network timeout", async () => {
     const { logger, lines } = capturingLogger();
-    const failoverEvents: { failedUrl: string; fallbackUrl: string }[] = [];
+    const failoverEvents: { failedEndpoint: string; fallbackEndpoint: string }[] = [];
 
     const mockFetch: typeof globalThis.fetch = (input) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
@@ -771,13 +778,16 @@ describe("RPC endpoint failover", () => {
       fetchFn: mockFetch,
       logger,
       onFailover: (e) =>
-        failoverEvents.push({ failedUrl: e.failedUrl, fallbackUrl: e.fallbackUrl }),
+        failoverEvents.push({
+          failedEndpoint: e.failedEndpoint,
+          fallbackEndpoint: e.fallbackEndpoint,
+        }),
     });
 
     const blockNumber = await client.blockNumber();
     expect(blockNumber).toBe(100n);
     expect(failoverEvents).toEqual([
-      { failedUrl: "https://primary.invalid/rpc", fallbackUrl: "https://secondary.invalid/rpc" },
+      { failedEndpoint: "https://primary.invalid", fallbackEndpoint: "https://secondary.invalid" },
     ]);
     expect(lines.some((l) => l.level === "40")).toBe(true);
   });

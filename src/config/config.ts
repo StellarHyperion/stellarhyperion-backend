@@ -31,6 +31,7 @@ import {
   DeploymentFormatError,
   IRIS_API,
   chainsFor,
+  isChainKey,
   isEvmChain,
   isEvmDeployment,
   isStellarChain,
@@ -182,6 +183,7 @@ export interface AppConfig {
   readonly network: NetworkMode;
   readonly deploymentsFile: string;
   readonly deployments: DeploymentSet;
+  readonly activeProviderLanes: readonly ActiveProviderLane[];
   /** Destination-only RPCs; independent of EVM watcher and router deployment settings. */
   readonly destinationVerification: {
     readonly evmRpcUrls: Readonly<Record<DestinationVerificationChain, readonly string[]>>;
@@ -200,6 +202,11 @@ export interface AppConfig {
   readonly indexerLeaseOwnerId: string;
   readonly configDigest: string;
   readonly configProvenance: ConfigProvenanceReport;
+}
+
+export interface ActiveProviderLane {
+  readonly route: "cctp" | "axelar-its";
+  readonly destination: DestinationVerificationChain;
 }
 
 /** Injected so the unit suite can hand over a record without touching a disk or a process. */
@@ -930,7 +937,8 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     : null;
 
   const absoluteDeployments = deploymentsPath === "" ? "" : resolvePath(cwd, deploymentsPath);
-  const deployments = readDeployments(reader, read, absoluteDeployments);
+  const deploymentRecord = readDeployments(reader, read, absoluteDeployments, network);
+  const deployments = deploymentRecord.deployments;
   const indexer = planIndexer(reader, {
     network,
     deployments,
@@ -948,13 +956,20 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     env,
   });
 
+  const inferredDeploymentMode = inferDeploymentMode({
+    indexerEnabled,
+    railsEnabled,
+    keeperEnabled,
+  });
   const deploymentMode: DeploymentMode = reader.has(DEPLOYMENT_MODE.name)
     ? reader.choice(DEPLOYMENT_MODE)
-    : inferDeploymentMode({
-        indexerEnabled,
-        railsEnabled,
-        keeperEnabled,
-      });
+    : inferredDeploymentMode;
+  if (deploymentMode !== "custom" && deploymentMode !== inferredDeploymentMode) {
+    reader.reject(
+      DEPLOYMENT_MODE,
+      `is ${deploymentMode}, but the enabled components require ${inferredDeploymentMode}; use custom only when this combination is intentional`,
+    );
+  }
 
   const readinessPolicy = resolveReadinessPolicy({
     mode: deploymentMode,
@@ -1002,6 +1017,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     network,
     deploymentsFile: absoluteDeployments,
     deployments,
+    activeProviderLanes: deploymentRecord.activeProviderLanes,
     destinationVerification: { evmRpcUrls: destinationRpcUrls },
     indexer,
     rails: {
@@ -1169,6 +1185,13 @@ function buildProvenanceEntries(
           address,
           "deployment",
         );
+  }
+  for (const lane of config.activeProviderLanes) {
+    add(
+      `ACTIVE_PROVIDER_LANE_${lane.route.toUpperCase().replaceAll("-", "_")}_${envSuffixFor(lane.destination)}`,
+      "active",
+      "deployment",
+    );
   }
   const commits = [...new Set(Object.values(revisions))];
   add(
@@ -1386,12 +1409,18 @@ function parseLaneTargets(
 
 const EMPTY_SET: DeploymentSet = { schemaVersion: 1, generatedAt: "", networks: {} };
 
+interface LoadedDeploymentRecord {
+  readonly deployments: DeploymentSet;
+  readonly activeProviderLanes: readonly ActiveProviderLane[];
+}
+
 function readDeployments(
   reader: EnvReader,
   read: (path: string) => string,
   path: string,
-): DeploymentSet {
-  if (path === "") return EMPTY_SET;
+  network: NetworkMode,
+): LoadedDeploymentRecord {
+  if (path === "") return { deployments: EMPTY_SET, activeProviderLanes: [] };
 
   let text: string;
   try {
@@ -1401,7 +1430,7 @@ function readDeployments(
     // directory is the single most common way this fails, and the resolved absolute path is the
     // thing that makes it obvious.
     reader.reject(DEPLOYMENTS_FILE, `cannot be read at ${path}`);
-    return EMPTY_SET;
+    return { deployments: EMPTY_SET, activeProviderLanes: [] };
   }
 
   let parsed: unknown;
@@ -1409,21 +1438,89 @@ function readDeployments(
     parsed = JSON.parse(text);
   } catch (error) {
     reader.reject(DEPLOYMENTS_FILE, `is not valid JSON: ${messageOf(error)}`);
-    return EMPTY_SET;
+    return { deployments: EMPTY_SET, activeProviderLanes: [] };
   }
 
   try {
     // Validated rather than cast. An address with a transposed character parses fine as a string
     // and turns into a watcher reading an empty contract for a week without complaining.
-    return parseDeploymentSet(parsed);
+    const deployments = parseDeploymentSet(parsed);
+    return {
+      deployments,
+      activeProviderLanes: readActiveProviderLanes(reader, parsed, deployments, network),
+    };
   } catch (error) {
     const detail =
       error instanceof DeploymentFormatError
         ? error.message
         : `is not a deployment set: ${messageOf(error)}`;
     reader.reject(DEPLOYMENTS_FILE, detail);
-    return EMPTY_SET;
+    return { deployments: EMPTY_SET, activeProviderLanes: [] };
   }
+}
+
+function readActiveProviderLanes(
+  reader: EnvReader,
+  raw: unknown,
+  deployments: DeploymentSet,
+  network: NetworkMode,
+): ActiveProviderLane[] {
+  if (typeof raw !== "object" || raw === null) return [];
+  const rawNetworks = (raw as Record<string, unknown>).networks;
+  if (typeof rawNetworks !== "object" || rawNetworks === null) return [];
+
+  const lanes = new Map<string, ActiveProviderLane>();
+  const add = (route: ActiveProviderLane["route"], destination: unknown, path: string): void => {
+    if (
+      typeof destination !== "string" ||
+      !isChainKey(destination) ||
+      !isDestinationVerificationChain(destination) ||
+      CHAINS[destination].network !== network
+    ) {
+      reader.reject(DEPLOYMENTS_FILE, `${path} must name a supported ${network} destination chain`);
+      return;
+    }
+    lanes.set(`${route}:${destination}`, { route, destination });
+  };
+
+  for (const [chain, deployment] of Object.entries(deployments.networks)) {
+    const rawDeployment = (rawNetworks as Record<string, unknown>)[chain];
+    if (typeof rawDeployment !== "object" || rawDeployment === null) continue;
+    const record = rawDeployment as Record<string, unknown>;
+    const activation =
+      typeof record.activation === "object" && record.activation !== null
+        ? (record.activation as Record<string, unknown>)
+        : null;
+    if (activation?.status !== "active") continue;
+
+    if (RouteKind.AxelarIts in deployment.adapters) {
+      add("axelar-its", record.peerChain, `$.networks.${chain}.peerChain`);
+    }
+
+    if (RouteKind.Cctp in deployment.adapters) {
+      const cctp =
+        typeof activation.cctp === "object" && activation.cctp !== null
+          ? (activation.cctp as Record<string, unknown>)
+          : null;
+      if (cctp?.status !== "active") continue;
+      if (Array.isArray(cctp.destinations) && cctp.destinations.length > 0) {
+        cctp.destinations.forEach((destination, index) =>
+          add(
+            "cctp",
+            destination,
+            `$.networks.${chain}.activation.cctp.destinations[${String(index)}]`,
+          ),
+        );
+      } else {
+        add("cctp", record.peerChain, `$.networks.${chain}.peerChain`);
+      }
+    }
+  }
+
+  return [...lanes.values()].sort(
+    (left, right) =>
+      left.route.localeCompare(right.route) || left.destination.localeCompare(right.destination),
+  );
 }
 
 interface PlanInput {
