@@ -30,6 +30,54 @@ import {
 } from "../writers.js";
 
 export { acquireLease, assertLeaseHeld, LeaseLostError, releaseLease, type WatcherLease };
+
+/** Record an EVM router deployment boundary without rewriting the previous deployment. */
+export async function recordEvmDeploymentRevision(
+  db: Queryable,
+  entry: {
+    readonly chainKey: string;
+    readonly chainId: number;
+    readonly deploymentRevision: number;
+    readonly contract: string;
+    readonly startBlock: bigint;
+    readonly previousRevision: number | null;
+    readonly previousContract: string | null;
+    readonly previousCursor: bigint | null;
+    readonly previousCursorHash: string | null;
+  },
+): Promise<void> {
+  await db.query(
+    `INSERT INTO evm_deployment_revision
+       (chain_key, chain_id, deployment_revision, contract, start_block,
+        previous_revision, previous_contract, previous_cursor, previous_cursor_hash)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     ON CONFLICT (chain_key, deployment_revision) DO NOTHING`,
+    [
+      entry.chainKey,
+      entry.chainId,
+      entry.deploymentRevision,
+      entry.contract.toLowerCase(),
+      entry.startBlock.toString(),
+      entry.previousRevision,
+      entry.previousContract?.toLowerCase() ?? null,
+      entry.previousCursor?.toString() ?? null,
+      entry.previousCursorHash,
+    ],
+  );
+  if (entry.previousRevision !== null) {
+    await db.query(
+      `UPDATE evm_deployment_revision
+          SET retired_block = $3, retired_block_hash = $4, retired_at = now()
+        WHERE chain_key = $1 AND deployment_revision = $2 AND retired_block IS NULL`,
+      [
+        entry.chainKey,
+        entry.previousRevision,
+        entry.previousCursor?.toString() ?? null,
+        entry.previousCursorHash,
+      ],
+    );
+  }
+}
 import {
   type DecodedLog,
   requireAddress,

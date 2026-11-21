@@ -45,6 +45,7 @@ import {
   applyRouterLog,
   assertLeaseHeld,
   ClaimPairing,
+  recordEvmDeploymentRevision,
   recordEvmScanProvenance,
   quarantineEvmLog,
   readQuarantinedEvmLogs,
@@ -75,6 +76,8 @@ export interface EvmWatcherOptions {
   readonly chainId: number;
   /** The block the router was deployed in. Where a fresh cursor starts. */
   readonly startBlock: bigint;
+  /** Explicit deployment revision from the registry, when supplied. */
+  readonly deploymentRevision?: number;
   /** How many blocks behind the head this chain's own finality needs. */
   readonly confirmations: number;
   readonly finalityMode?: "confirmations" | "finalized";
@@ -110,6 +113,7 @@ export interface EvmProgress {
 
 export class EvmWatcher {
   private lastProgress: EvmProgress | null = null;
+  private activeDeploymentRevision = 1;
   private reorgs = 0;
   /** Set once the node has confirmed which chain it is. */
   private chainConfirmed = false;
@@ -133,6 +137,11 @@ export class EvmWatcher {
       options.logRange < 1
     )
       throw new RangeError("invalid EVM scan policy");
+    if (
+      options.deploymentRevision !== undefined &&
+      (!Number.isSafeInteger(options.deploymentRevision) || options.deploymentRevision < 1)
+    )
+      throw new RangeError("invalid EVM deployment revision");
   }
 
   get name(): string {
@@ -419,14 +428,10 @@ export class EvmWatcher {
 
     try {
       const stored = await readCursor(db, chainKey);
-      if (stored !== null && stored.contract.toLowerCase() !== leaseContract) {
-        // A different router at a different address shares no history with this cursor. Carrying it
-        // over would skip everything the new deployment has ever done, silently.
-        throw new Error(
-          `the cursor for ${chainKey} was written for router ${stored.contract} and this process is watching ${router}. ` +
-            "A redeployed router needs its cursor reset rather than reused.",
-        );
-      }
+      const deployment = this.resolveDeployment(stored);
+      const { base, fresh, revision, previous } = deployment;
+      const expectedRevision = stored?.revision ?? null;
+      this.activeDeploymentRevision = revision;
 
       await this.confirmChain(signal);
 
@@ -436,9 +441,9 @@ export class EvmWatcher {
       const finality = await this.scanLimit(head, signal);
       const confirmed = finality.boundary;
 
-      let from = stored === null ? this.options.startBlock : stored.position + 1n;
+      let from = base + 1n;
       let reorgDetected = false;
-      if (stored !== null && stored.hash !== null) {
+      if (!fresh && stored !== null && stored.hash !== null) {
         const rewound = await this.checkForReorg(stored.position, stored.hash, signal);
         if (rewound !== null) {
           from = rewound;
@@ -449,7 +454,7 @@ export class EvmWatcher {
       if (from > confirmed) {
         // Caught up to the confirmation line. Normal, and the common case on a fast chain.
         this.lastProgress = {
-          block: stored?.position ?? this.options.startBlock - 1n,
+          block: base,
           written: 0,
           ignored: 0,
           head,
@@ -521,6 +526,19 @@ export class EvmWatcher {
           ttlMs: this.leaseTtlMs,
         });
 
+        if (fresh)
+          await recordEvmDeploymentRevision(tx, {
+            chainKey,
+            chainId,
+            deploymentRevision: revision,
+            contract: router,
+            startBlock: this.options.startBlock,
+            previousRevision: previous?.revision ?? null,
+            previousContract: previous?.contract ?? null,
+            previousCursor: previous?.cursor ?? null,
+            previousCursorHash: previous?.hash ?? null,
+          });
+
         for (const log of logs) {
           throwIfAborted(signal);
           if (log.removed) {
@@ -584,11 +602,14 @@ export class EvmWatcher {
           family: "evm",
           contract: router,
           position: to,
-          expectedRevision: stored?.revision ?? null,
           observedAt: timestampOf(blocks.get(to)?.timestamp ?? null),
           // The whole reason the column exists. Without it the next pass cannot tell advancing from
           // being handed a different history.
           hash: endHash,
+          expectedRevision,
+          deploymentRevision: revision,
+          expectedContract: stored?.contract ?? router,
+          expectedDeploymentRevision: stored?.deploymentRevision ?? revision,
         });
 
         return recordEvmScanProvenance(tx, {
@@ -661,6 +682,65 @@ export class EvmWatcher {
         await this.release().catch(() => undefined);
       }
     }
+  }
+
+  private resolveDeployment(stored: Awaited<ReturnType<typeof readCursor>>): {
+    readonly base: bigint;
+    readonly fresh: boolean;
+    readonly revision: number;
+    readonly previous: {
+      readonly revision: number;
+      readonly contract: string;
+      readonly cursor: bigint;
+      readonly hash: string | null;
+    } | null;
+  } {
+    const { chainKey, router, startBlock, deploymentRevision, logger } = this.options;
+    if (stored === null)
+      return { base: startBlock - 1n, fresh: true, revision: deploymentRevision ?? 1, previous: null };
+
+    if (stored.contract.toLowerCase() !== router.toLowerCase()) {
+      const nextRevision = Math.max(stored.deploymentRevision + 1, deploymentRevision ?? 1);
+      logger.warn(
+        {
+          chain: chainKey,
+          previousRouter: stored.contract,
+          router,
+          previousRevision: stored.deploymentRevision,
+          deploymentRevision: nextRevision,
+          startBlock: startBlock.toString(),
+        },
+        "router changed; starting a new EVM deployment revision at its activation block",
+      );
+      return {
+        base: startBlock - 1n,
+        fresh: true,
+        revision: nextRevision,
+        previous: {
+          revision: stored.deploymentRevision,
+          contract: stored.contract,
+          cursor: stored.position,
+          hash: stored.hash,
+        },
+      };
+    }
+    if (deploymentRevision !== undefined && deploymentRevision < stored.deploymentRevision)
+      throw new Error(
+        `configured deployment revision ${String(deploymentRevision)} for ${chainKey} is older than stored revision ${String(stored.deploymentRevision)}`,
+      );
+    if (deploymentRevision !== undefined && deploymentRevision > stored.deploymentRevision)
+      return {
+        base: startBlock - 1n,
+        fresh: true,
+        revision: deploymentRevision,
+        previous: {
+          revision: stored.deploymentRevision,
+          contract: stored.contract,
+          cursor: stored.position,
+          hash: stored.hash,
+        },
+      };
+    return { base: stored.position, fresh: false, revision: stored.deploymentRevision, previous: null };
   }
 
   private async scanLimit(
@@ -909,6 +989,7 @@ export class EvmWatcher {
       chainKey: this.options.chainKey,
       family: "evm",
       contract: this.options.router.toLowerCase(),
+      deploymentRevision: this.activeDeploymentRevision,
       block: log.blockNumber,
       txHash: log.transactionHash,
       position: log.logIndex,
