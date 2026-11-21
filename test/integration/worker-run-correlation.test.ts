@@ -14,6 +14,8 @@ import { concurrencyBarrier, validateConcurrencyDatabase } from "../helpers.js";
 const connection = process.env.TEST_DATABASE_URL;
 (connection ? describe : describe.skip)("durable job and atomic evidence correlation", () => {
   let db: Database;
+  // Two concurrent worker transactions plus the foreground capacity reserved by admission.
+  const maxConnections = 3;
   const executionId = randomUUID();
   const identities: WorkerRunIdentity[] = [0, 1].map((index) => ({
     runId: randomUUID(),
@@ -27,7 +29,7 @@ const connection = process.env.TEST_DATABASE_URL;
   let transferId: string;
   beforeAll(async () => {
     validateConcurrencyDatabase(connection ?? "");
-    db = Database.open(connection ?? "", { maxConnections: 2 });
+    db = Database.open(connection ?? "", { maxConnections });
     const result = await db.query(
       `INSERT INTO outbound_transfer
       (origin_chain,origin_router,route,nonce,sender,token,gross_amount,fee,net_amount,destination_chain,destination,origin_block,origin_tx)
@@ -52,7 +54,7 @@ const connection = process.env.TEST_DATABASE_URL;
     await recordWorkerRun(db, second, "running");
     await recordWorkerRun(db, second, "caught_up", true);
     await db.close();
-    db = Database.open(connection ?? "", { maxConnections: 2 });
+    db = Database.open(connection ?? "", { maxConnections });
     const runs = (await readWorkerRuns(db)).filter((run) => run.executionId === executionId);
     expect(runs).toHaveLength(2);
     expect(runs.find((run) => run.runId === first.runId)).toMatchObject({
