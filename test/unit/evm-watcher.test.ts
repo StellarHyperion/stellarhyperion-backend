@@ -888,4 +888,19 @@ describe("RPC endpoint failover", () => {
     // Cursor now advances properly from cursorRow(20n)
     expect(cursorWrites(db)).toEqual([{ block: 57n, family: "evm", hash: expect.any(String) }]);
   });
+
+  it("commits the canonical hash for an empty range", async () => {
+    const head = ANVIL_START_BLOCK + 5n;
+    const { watcher, db } = harness({
+      head,
+      confirmations: 0,
+      client: new FakeEvmClient({ logs: [], head }),
+    });
+
+    await watcher.tick(AbortSignal.timeout(5_000));
+
+    // Empty ranges still need a durable checkpoint: a later reorg can replace blocks that emitted
+    // no router logs, so relying on the last event would leave the watcher blind to that history.
+    expect(cursorWrites(db)).toEqual([{ block: head, family: "evm", hash: expect.any(String) }]);
+  });
 });
