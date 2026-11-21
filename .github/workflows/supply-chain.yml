@@ -70,6 +70,9 @@ jobs:
       - name: Analyze every workflow for unsafe trust boundaries
         run: python3 -B .github/scripts/scan_workflow_security.py
 
+      - name: Verify exact public-token secret scanner boundaries
+        run: python3 -B .github/scripts/test_write_gitleaks_config.py
+
       - name: Scan contributed Git history for secrets
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
@@ -88,7 +91,7 @@ jobs:
             echo "::error::Repository .gitleaksignore files cannot suppress the contribution scan."
             exit 1
           fi
-          printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/gitleaks.toml"
+          python3 -B .github/scripts/write_gitleaks_config.py "$RUNNER_TEMP/gitleaks.toml"
           gitleaks git --redact --no-banner --ignore-gitleaks-allow \
             --config "$RUNNER_TEMP/gitleaks.toml" \
             --gitleaks-ignore-path "$RUNNER_TEMP/security-tools" --log-opts="$range" .
