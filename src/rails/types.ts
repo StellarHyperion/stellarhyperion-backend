@@ -63,7 +63,7 @@ export function isTerminal(status: AttestationStatus): boolean {
   return TERMINAL.includes(status);
 }
 
-export interface RailReport {
+export interface RailCandidate {
   readonly forwardTxHash?: `0x${string}`;
   readonly execution?: { readonly txHash: `0x${string}`; readonly commandId: `0x${string}` };
   readonly quarantine?: {
@@ -106,6 +106,11 @@ export interface RailReport {
   readonly attestationSignature?: string | null;
   readonly attestationTimestamp?: Date | null;
   readonly fastTransfer?: boolean;
+}
+
+export interface RailReport extends RailCandidate {
+  /** All provider candidates returned for one source transaction, when there is more than one. */
+  readonly candidates?: readonly RailCandidate[];
 }
 
 export type RailLookup =

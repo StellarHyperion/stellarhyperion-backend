@@ -13,7 +13,7 @@ import type { Logger } from "pino";
 import { isDestinationVerificationChain, type AppConfig } from "../../config/config.js";
 import type { Queryable } from "../../db/pool.js";
 import { bigintOf, text, textOrNull } from "../../db/rows.js";
-import type { PendingTransfer, RailReport } from "../types.js";
+import type { PendingTransfer, RailCandidate, RailReport } from "../types.js";
 import type { VerifiedDelivery } from "../axelar/delivery.js";
 import {
   destinationVerificationViemClient,
@@ -173,13 +173,8 @@ export async function inspectCctpDelivery(
     failure,
     proofEvidence: null,
   });
-  const forwardTxHash = report.forwardTxHash;
   if (transfer.route !== RouteKind.Cctp || transfer.originChain !== "stellar-testnet")
     return noResult();
-  if (!forwardTxHash) return failed("forward_tx_missing");
-  if (!report.messageBytes) return failed("message_missing");
-  if (report.messageBytes.length > 8192 || !/^0x(?:[0-9a-fA-F]{2})+$/.test(report.messageBytes))
-    return failed("invalid_message");
   if (!isChainKey(transfer.destinationChain)) return failed("configuration_unavailable");
   if (!isDestinationVerificationChain(transfer.destinationChain))
     return failed("configuration_unavailable");
@@ -201,14 +196,6 @@ export async function inspectCctpDelivery(
     destination.cctpDomain === null
   )
     return failed("configuration_unavailable");
-  const raw = report.messageBytes as Hex;
-  const identity = cctpMessageIdentity(raw);
-  if (
-    !identity ||
-    (report.messageNonce != null && report.messageNonce.toLowerCase() !== identity.nonce) ||
-    (report.messageDigest != null && report.messageDigest.toLowerCase() !== identity.digest)
-  )
-    return failed("invalid_message");
   // Every burn binding the queue knows must hold on the stored source row, not only its id.
   const { rows } = await db.query(
     `SELECT origin_chain, nonce, origin_tx, destination_chain, token, net_amount, destination
@@ -236,8 +223,56 @@ export async function inspectCctpDelivery(
     recipient: toEvmAddress(text(stored, "destination") as Hex),
     sourceAmount: bigintOf(stored, "net_amount"),
   };
-  const message = inspectCctpMessage(raw, expected);
-  if (message.failure !== null) return failed(message.failure);
+  const candidates: readonly RailCandidate[] =
+    report.candidates && report.candidates.length > 0 ? report.candidates : [report];
+  const matches: Array<{
+    candidate: RailCandidate;
+    raw: Hex;
+    identity: NonNullable<ReturnType<typeof cctpMessageIdentity>>;
+    message: Extract<ReturnType<typeof inspectCctpMessage>, { failure: null }>;
+  }> = [];
+  let firstFailure: CctpVerificationFailure | null = null;
+  for (const candidate of candidates) {
+    if (!candidate.forwardTxHash) {
+      firstFailure ??= "forward_tx_missing";
+      continue;
+    }
+    if (!candidate.messageBytes) {
+      firstFailure ??= "message_missing";
+      continue;
+    }
+    if (
+      candidate.messageBytes.length > 8192 ||
+      !/^0x(?:[0-9a-fA-F]{2})+$/.test(candidate.messageBytes)
+    ) {
+      firstFailure ??= "invalid_message";
+      continue;
+    }
+    const raw = candidate.messageBytes as Hex;
+    const identity = cctpMessageIdentity(raw);
+    if (
+      !identity ||
+      (candidate.messageNonce != null && candidate.messageNonce.toLowerCase() !== identity.nonce) ||
+      (candidate.messageDigest != null && candidate.messageDigest.toLowerCase() !== identity.digest)
+    ) {
+      firstFailure ??= "invalid_message";
+      continue;
+    }
+    const message = inspectCctpMessage(raw, expected);
+    if (message.failure !== null) {
+      firstFailure ??= message.failure;
+      continue;
+    }
+    matches.push({ candidate, raw, identity, message });
+  }
+  // A source transaction can legitimately contain unrelated messages, but never enough evidence
+  // to choose between two complete matches. Keeping that ambiguity unverified prevents a burn
+  // from being associated with the wrong transfer on replay.
+  if (matches.length === 0) return failed(firstFailure ?? "invalid_message");
+  if (matches.length > 1) return failed("invalid_message");
+  const [{ candidate, raw, identity, message }] = matches;
+  const forwardTxHash = candidate.forwardTxHash;
+  if (!forwardTxHash) return failed("forward_tx_missing");
   // One message mints once. An exact repeat for this transfer is replayable and upserts the same
   // row; the same full nonce already credited to a different transfer is never re-associated.
   const { rows: prior } = await db.query(

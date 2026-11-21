@@ -21,7 +21,7 @@ import {
   type ExpectedCctpTransfer,
 } from "../../src/rails/cctp/events.js";
 import type { DeliveryLog } from "../../src/rails/axelar/events.js";
-import { reportFor } from "../../src/rails/cctp/iris.js";
+import { IrisClient, reportFor } from "../../src/rails/cctp/iris.js";
 import { writeAttestation, writeInbound } from "../../src/chains/writers.js";
 import type { Queryable } from "../../src/db/pool.js";
 
@@ -307,6 +307,38 @@ describe("CCTP full message identity", () => {
     expect(shortMismatch.reference).toBeNull();
   });
 
+  it("retains every message candidate returned for one source transaction", async () => {
+    const fetch = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          messages: [
+            { status: "complete", eventNonce: displayed, message: raw },
+            { status: "complete", eventNonce: displayed, message: sibling },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    const result = await new IrisClient("testnet", { fetch }).look({
+      transferId: 1n,
+      route: RouteKind.Cctp,
+      originChain: "stellar-testnet",
+      destinationChain: "sepolia",
+      nonce: 1n,
+      originTx: "source-burn-tx",
+      status: null,
+      checkFailures: 0,
+      retryAttempts: 0,
+      delivered: false,
+    });
+    expect(result.kind).toBe("found");
+    if (result.kind !== "found") return;
+    expect(result.report.candidates?.map((candidate) => candidate.messageBytes)).toEqual([
+      raw,
+      sibling,
+    ]);
+  });
+
   describe("delivery association", () => {
     const base = loadConfig({ env: completeEnv() });
     const source = base.deployments.networks["stellar-testnet"];
@@ -446,6 +478,27 @@ describe("CCTP full message identity", () => {
         report,
       );
       expect(result).toMatchObject({ delivery: null, failure: "message_already_delivered" });
+    });
+
+    it("matches the complete source intent when unrelated candidates share the source tx", async () => {
+      const result = await inspectCctpDelivery(
+        config,
+        database(stored),
+        transfer,
+        { ...report, candidates: [{ ...report, messageBytes: "0x01" }, report] },
+      );
+      expect(result.failure).toBeNull();
+      expect(result.delivery?.row.railMessageId).toBe(identity.nonce);
+    });
+
+    it("keeps duplicate complete candidates unverified", async () => {
+      const result = await inspectCctpDelivery(
+        config,
+        database(stored),
+        transfer,
+        { ...report, candidates: [report, report] },
+      );
+      expect(result).toMatchObject({ delivery: null, failure: "invalid_message" });
     });
 
     it("refuses a report whose bound digest or nonce differs from the message bytes", async () => {
