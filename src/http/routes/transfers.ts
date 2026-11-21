@@ -102,6 +102,33 @@ export interface FormattedTransfer {
     readonly chain: string;
     readonly recipient: string;
     readonly delivered: boolean;
+    readonly cctpFeeReconciliation: {
+      readonly burnedAmount: {
+        readonly amount: string;
+        readonly unit: "USDC";
+        readonly decimals: 7;
+      };
+      readonly forwardingBudget: {
+        readonly amount: string;
+        readonly unit: "USDC";
+        readonly decimals: 6;
+      };
+      readonly executedDeduction: {
+        readonly amount: string;
+        readonly unit: "USDC";
+        readonly decimals: 6;
+      };
+      readonly actualPayout: {
+        readonly amount: string;
+        readonly unit: "USDC";
+        readonly decimals: 6;
+      };
+      readonly plannedMinimum: {
+        readonly amount: string;
+        readonly unit: "USDC";
+        readonly decimals: 6;
+      };
+    } | null;
     readonly block: string | null;
     readonly txHash: string | null;
     readonly deliveredAt: string | null;
@@ -146,6 +173,48 @@ function deriveStage(
   return "initiated";
 }
 
+/** Publish only a complete, self-consistent canonical delivery accounting record. */
+function formatCctpFeeReconciliation(
+  row: Record<string, unknown>,
+  receivedAmount: string | null,
+): FormattedTransfer["destination"]["cctpFeeReconciliation"] {
+  if (row.inbound_delivered !== true || integer(row, "route") !== 0) return null;
+  const names = [
+    "cctp_burned_amount_source_units",
+    "cctp_forwarding_budget_destination_units",
+    "cctp_executed_deduction_destination_units",
+    "cctp_actual_payout_destination_units",
+  ] as const;
+  const values = names.map((name) => textOrNull(row, name));
+  if (receivedAmount === null || !/^[0-9]{1,78}$/.test(receivedAmount)) return null;
+  if (values.some((value) => value === null || !/^[0-9]{1,78}$/.test(value))) return null;
+  const [burned, budget, deduction, payout] = values.map((value) => BigInt(value ?? "0"));
+  if (
+    burned === undefined ||
+    budget === undefined ||
+    deduction === undefined ||
+    payout === undefined
+  )
+    return null;
+  if (
+    burned <= 0n ||
+    burned % 10n !== 0n ||
+    budget >= burned / 10n ||
+    deduction > budget ||
+    payout <= 0n ||
+    payout !== BigInt(receivedAmount) ||
+    burned / 10n !== deduction + payout
+  )
+    return null;
+  return {
+    burnedAmount: { amount: burned.toString(), unit: "USDC", decimals: 7 },
+    forwardingBudget: { amount: budget.toString(), unit: "USDC", decimals: 6 },
+    executedDeduction: { amount: deduction.toString(), unit: "USDC", decimals: 6 },
+    actualPayout: { amount: payout.toString(), unit: "USDC", decimals: 6 },
+    plannedMinimum: { amount: (burned / 10n - budget).toString(), unit: "USDC", decimals: 6 },
+  };
+}
+
 function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTransfer {
   const chain = text(row, "origin_chain");
   const token = text(row, "token");
@@ -183,6 +252,10 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
   const hasClaim = row.claim_id !== null && row.claim_id !== undefined;
   const claimSettled = row.claim_settled === true;
   const railStatus = textOrNull(row, "attestation_status");
+  const cctpFeeReconciliation = formatCctpFeeReconciliation(
+    row,
+    textOrNull(row, "received_amount"),
+  );
 
   const stage = deriveStage(delivered, hasClaim, claimSettled, railStatus);
   const originRouter = textOrNull(row, "origin_router");
@@ -218,6 +291,7 @@ function formatRow(row: Record<string, unknown>, config: AppConfig): FormattedTr
       amount: textOrNull(row, "received_amount"),
       symbol: receivedMetadata?.symbol ?? null,
       decimals: receivedMetadata?.decimals ?? null,
+      cctpFeeReconciliation,
       chain: destinationChain,
       recipient,
       delivered,
@@ -381,6 +455,10 @@ const TRANSFER_QUERY = `
          d.destination_log_index,
          d.token AS received_token,
          d.amount AS received_amount,
+         d.cctp_burned_amount_source_units,
+         d.cctp_forwarding_budget_destination_units,
+         d.cctp_executed_deduction_destination_units,
+         d.cctp_actual_payout_destination_units,
          d.observed_at AS delivered_at,
          c.claim_id,
          c.settled AS claim_settled,

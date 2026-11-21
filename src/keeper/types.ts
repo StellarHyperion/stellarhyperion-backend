@@ -8,6 +8,13 @@ export interface TtlBumpPayload {
 }
 export interface ClaimSettlementPayload {
   readonly limit?: number;
+  /** Decimal-string IDs for an explicitly bounded maintenance batch. */
+  readonly claimIds?: readonly string[];
+}
+export interface ClaimSettlementItemResult {
+  readonly claimId: string;
+  readonly outcome: "missing" | "already_settled" | "confirmed" | "pending";
+  readonly transactionHash?: string;
 }
 export interface KeeperOperationPreview {
   readonly kind: "keep_alive" | "settle_claim";
@@ -33,6 +40,8 @@ export interface ClaimSettlementResult {
   readonly settled: number;
   readonly attempted: number;
   readonly pending: number;
+  readonly missing: number;
+  readonly claims: readonly ClaimSettlementItemResult[];
   readonly dryRun: boolean;
   readonly detail: string;
   readonly operations: readonly KeeperOperationPreview[];

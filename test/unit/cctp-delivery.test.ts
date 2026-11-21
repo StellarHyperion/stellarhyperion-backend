@@ -4,7 +4,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { encodeAbiParameters, encodeEventTopics, hexToBytes, type Hex } from "viem";
 import type * as Viem from "viem";
 import { loadConfig } from "../../src/config/config.js";
-import { inspectCctpDelivery } from "../../src/rails/cctp/delivery.js";
+import {
+  inspectCctpDelivery,
+  describeCctpProofChecks,
+  type CctpProofCheckSummary,
+} from "../../src/rails/cctp/delivery.js";
 import type { PendingTransfer, RailReport } from "../../src/rails/types.js";
 import { completeEnv } from "../helpers.js";
 import {
@@ -18,7 +22,7 @@ import {
 } from "../../src/rails/cctp/events.js";
 import type { DeliveryLog } from "../../src/rails/axelar/events.js";
 import { reportFor } from "../../src/rails/cctp/iris.js";
-import { writeAttestation } from "../../src/chains/writers.js";
+import { writeAttestation, writeInbound } from "../../src/chains/writers.js";
 import type { Queryable } from "../../src/db/pool.js";
 
 const expected: ExpectedCctpTransfer = {
@@ -83,11 +87,27 @@ const paid: DeliveryLog = {
 describe("CCTP forwarded destination proof", () => {
   it("requires the exact attested message and an actual native-USDC mint after fees", () => {
     expect(verified.amount).toBe(99600000n);
+    expect(verified.feeReconciliation).toEqual({
+      burnedAmountSourceUnits: 997000000n,
+      forwardingBudgetDestinationUnits: 500000n,
+      executedDeductionDestinationUnits: 100000n,
+      actualPayoutDestinationUnits: 99600000n,
+    });
     expect(matchingCctpPayment([paid, received], raw, expected)).toBe(paid);
     expect(matchingCctpPayment([received], raw, expected)).toBeNull();
     expect(matchingCctpPayment([paid], raw, expected)).toBeNull();
     expect(inspectCctpPayment([received], raw, expected).failure).toBe("mint_missing");
     expect(inspectCctpPayment([paid], raw, expected).failure).toBe("receipt_missing");
+    expect(
+      inspectCctpPayment(
+        [
+          { ...paid, data: encodeAbiParameters([{ type: "uint256" }], [verified.amount + 1n]) },
+          received,
+        ],
+        raw,
+        expected,
+      ).failure,
+    ).toBe("amount_mismatch");
   });
   it.each(["sourceToken", "sourceAdapter", "sourceMessenger"] as const)(
     "binds the %s to the indexed source deployment",
@@ -113,6 +133,21 @@ describe("CCTP forwarded destination proof", () => {
     );
     expect(
       inspectCctpMessage(raw, { ...expected, sourceAmount: expected.sourceAmount + 10n }).failure,
+    ).toBe("amount_mismatch");
+  });
+  it.each([
+    [280, expected.sourceAmount / 10n],
+    [280, expected.sourceAmount / 10n + 1n],
+    [312, 500001n],
+    [312, expected.sourceAmount / 10n],
+  ])("rejects inconsistent fee accounting at message offset %i", (offset, value) => {
+    const changed = hexToBytes(raw);
+    changed.set(word(`0x${value.toString(16)}`), offset);
+    expect(inspectCctpMessage(toHex(changed), expected).failure).toBe("fee_mismatch");
+  });
+  it("rejects a seven-decimal burn that cannot be converted exactly", () => {
+    expect(
+      inspectCctpMessage(raw, { ...expected, sourceAmount: expected.sourceAmount + 1n }).failure,
     ).toBe("amount_mismatch");
   });
   it.each(["destinationMessenger", "recipient"] as const)("refuses a different %s", (field) => {
@@ -160,6 +195,7 @@ describe("CCTP forwarded destination proof", () => {
     const changed = hexToBytes(raw);
     changed.set(word(`0x${600000n.toString(16)}`), 312);
     expect(verifiedCctpMessage(toHex(changed), expected)).toBeNull();
+    expect(inspectCctpMessage(toHex(changed), expected).failure).toBe("fee_mismatch");
     const slow = hexToBytes(raw);
     new DataView(slow.buffer).setUint32(144, 1000);
     expect(verifiedCctpMessage(toHex(slow), expected)).toBeNull();
@@ -350,6 +386,44 @@ describe("CCTP full message identity", () => {
       evm.getBlock.mockResolvedValue({ hash, timestamp: 1700000000n });
     });
 
+    it("retries the complete CCTP proof on the secondary destination RPC", async () => {
+      const withSecondary = {
+        ...config,
+        destinationVerification: {
+          ...config.destinationVerification,
+          evmRpcUrls: {
+            ...config.destinationVerification.evmRpcUrls,
+            sepolia: ["https://primary.example/private-key", "https://secondary.example/rpc"],
+          },
+        },
+      };
+      evm.getTransactionReceipt.mockRejectedValueOnce(new Error("primary unavailable"));
+
+      const result = await inspectCctpDelivery(withSecondary, database(stored), transfer, report);
+
+      expect(result.delivery).not.toBeNull();
+      expect(evm.getTransactionReceipt).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not produce CCTP delivery when all destination RPCs report another chain", async () => {
+      const withSecondary = {
+        ...config,
+        destinationVerification: {
+          ...config.destinationVerification,
+          evmRpcUrls: {
+            ...config.destinationVerification.evmRpcUrls,
+            sepolia: ["https://primary.example/rpc", "https://secondary.example/rpc"],
+          },
+        },
+      };
+      evm.getChainId.mockResolvedValue(1);
+
+      await expect(
+        inspectCctpDelivery(withSecondary, database(stored), transfer, report),
+      ).rejects.toMatchObject({ name: "DestinationVerificationRpcError" });
+      expect(evm.getTransactionReceipt).not.toHaveBeenCalled();
+    });
+
     it("records the full nonce and replays an exact repeat for the same transfer", async () => {
       const first = await inspectCctpDelivery(config, database(stored), transfer, report);
       expect(first.failure).toBeNull();
@@ -371,7 +445,7 @@ describe("CCTP full message identity", () => {
         transfer,
         report,
       );
-      expect(result).toEqual({ delivery: null, failure: "message_already_delivered" });
+      expect(result).toMatchObject({ delivery: null, failure: "message_already_delivered" });
     });
 
     it("refuses a report whose bound digest or nonce differs from the message bytes", async () => {
@@ -397,7 +471,7 @@ describe("CCTP full message identity", () => {
         transfer,
         report,
       );
-      expect(result).toEqual({ delivery: null, failure: "source_transfer_missing" });
+      expect(result).toMatchObject({ delivery: null, failure: "source_transfer_missing" });
     });
 
     it("requires the source row to exist on the CCTP route", async () => {
@@ -405,5 +479,269 @@ describe("CCTP full message identity", () => {
         "source_transfer_missing",
       );
     });
+
+    it("exposes canonical proof evidence with bounded public references on success", async () => {
+      const result = await inspectCctpDelivery(config, database(stored), transfer, report);
+      expect(result.failure).toBeNull();
+      expect(result.delivery).not.toBeNull();
+      if (result.proofEvidence === null) throw new Error("Expected successful delivery");
+      expect(result.proofEvidence.txHash).toBe(hash);
+      expect(result.proofEvidence.blockNumber).toBe("100");
+      expect(typeof result.proofEvidence.blockNumber).toBe("string");
+      expect(result.proofEvidence.blockHash).toBe(hash);
+      expect(result.proofEvidence.messageNonce).toBe(identity.nonce);
+      expect(result.proofEvidence.messageDigest).toBe(identity.digest);
+      // mintAmount is an integer string — no floating point
+      expect(result.proofEvidence.mintAmount).toBe("99600000");
+      expect(typeof result.proofEvidence.mintAmount).toBe("string");
+      expect(result.proofEvidence.destinationChain).toBe("sepolia");
+      // No credential or adapter address leaks
+      const serialized = JSON.stringify(result.proofEvidence);
+      expect(serialized).not.toMatch(/apiKey|secret|password|sourceAdapter|CARH6I/i);
+    });
+
+    it("does not set proofEvidence when delivery fails", async () => {
+      const result = await inspectCctpDelivery(
+        config,
+        database(stored, [{ source_transfer_id: "40" }]),
+        transfer,
+        report,
+      );
+      expect(result.proofEvidence).toBeNull();
+      expect(result.failure).toBe("message_already_delivered");
+    });
+  });
+});
+
+describe("CCTP proof check summary (describeCctpProofChecks)", () => {
+  const candidateForwardTx = `0x${"aa".repeat(32)}` as const;
+  const baseReport: RailReport = {
+    status: "attested",
+    railStatus: "complete",
+    reference: null,
+    attestedAt: null,
+  };
+
+  it("lists forward_tx_missing and message_missing when both are absent", () => {
+    const summary = describeCctpProofChecks(baseReport, null);
+    expect(summary.hasForwardTxHash).toBe(false);
+    expect(summary.hasMessageBytes).toBe(false);
+    expect(summary.hasMessageIdentity).toBe(false);
+    expect(summary.missingChecks).toContain("forward_tx_missing");
+    expect(summary.missingChecks).toContain("message_missing");
+    expect(summary.evidence).toBeNull();
+  });
+
+  it("sets hasForwardTxHash when a valid 0x hash is present", () => {
+    const summary = describeCctpProofChecks(
+      { ...baseReport, forwardTxHash: candidateForwardTx },
+      null,
+    );
+    expect(summary.hasForwardTxHash).toBe(true);
+    expect(summary.missingChecks).not.toContain("forward_tx_missing");
+  });
+
+  it("sets hasMessageBytes when valid hex message bytes are present", () => {
+    const summary = describeCctpProofChecks({ ...baseReport, messageBytes: raw }, null);
+    expect(summary.hasMessageBytes).toBe(true);
+    expect(summary.missingChecks).not.toContain("message_missing");
+  });
+
+  it("sets hasMessageIdentity only when both nonce and digest are present alongside message bytes", () => {
+    const id = cctpMessageIdentity(raw);
+    if (!id) throw new Error("Expected valid test message identity");
+    const withIdentity = describeCctpProofChecks(
+      { ...baseReport, messageBytes: raw, messageNonce: id.nonce, messageDigest: id.digest },
+      null,
+    );
+    expect(withIdentity.hasMessageIdentity).toBe(true);
+
+    const withoutNonce = describeCctpProofChecks(
+      { ...baseReport, messageBytes: raw, messageDigest: id.digest },
+      null,
+    );
+    expect(withoutNonce.hasMessageIdentity).toBe(false);
+  });
+
+  it("surfaces a secondary durable failure not already in missingChecks", () => {
+    const summary = describeCctpProofChecks(
+      { ...baseReport, forwardTxHash: candidateForwardTx, messageBytes: raw },
+      "receipt_reverted",
+    );
+    expect(summary.missingChecks).toContain("receipt_reverted");
+    expect(summary.missingChecks).not.toContain("forward_tx_missing");
+    expect(summary.missingChecks).not.toContain("message_missing");
+  });
+
+  it("does not duplicate forward_tx_missing or message_missing when already in missingChecks", () => {
+    const summary = describeCctpProofChecks(baseReport, "forward_tx_missing");
+    const count = summary.missingChecks.filter((c) => c === "forward_tx_missing").length;
+    expect(count).toBe(1);
+  });
+
+  it("produces an empty missingChecks list when all ingredients are present", () => {
+    const id = cctpMessageIdentity(raw);
+    if (!id) throw new Error("Expected valid test message identity");
+    const summary = describeCctpProofChecks(
+      {
+        ...baseReport,
+        forwardTxHash: candidateForwardTx,
+        messageBytes: raw,
+        messageNonce: id.nonce,
+        messageDigest: id.digest,
+      },
+      null,
+    );
+    expect(summary.missingChecks).toHaveLength(0);
+    expect(summary.hasForwardTxHash).toBe(true);
+    expect(summary.hasMessageBytes).toBe(true);
+    expect(summary.hasMessageIdentity).toBe(true);
+  });
+
+  it("never lets a provider status alone establish delivery — evidence is always null", () => {
+    // Even with attested status and a known nonce, describeCctpProofChecks never sets evidence.
+    const id = cctpMessageIdentity(raw);
+    if (!id) throw new Error("Expected valid test message identity");
+    const summary = describeCctpProofChecks(
+      {
+        ...baseReport,
+        status: "attested",
+        forwardTxHash: candidateForwardTx,
+        messageBytes: raw,
+        messageNonce: id.nonce,
+        messageDigest: id.digest,
+      },
+      null,
+    );
+    // The only allowed source of evidence is inspectCctpDelivery with a live EVM receipt.
+    expect(summary.evidence).toBeNull();
+  });
+
+  it("omits oversized or malformed message bytes from hasMessageBytes", () => {
+    const oversized = describeCctpProofChecks(
+      { ...baseReport, messageBytes: `0x${"ab".repeat(4097)}` },
+      null,
+    );
+    expect(oversized.hasMessageBytes).toBe(false);
+
+    const malformed = describeCctpProofChecks({ ...baseReport, messageBytes: "not-hex" }, null);
+    expect(malformed.hasMessageBytes).toBe(false);
+  });
+
+  it("summary output contains only bounded public references, no credentials", () => {
+    const summary: CctpProofCheckSummary = describeCctpProofChecks(
+      {
+        ...baseReport,
+        forwardTxHash: candidateForwardTx,
+        messageBytes: raw,
+      },
+      "amount_mismatch",
+    );
+    const serialized = JSON.stringify(summary);
+    expect(serialized).not.toMatch(/apiKey|token=|secret|password|authorization/i);
+    // The failure code itself is bounded — it's one of the allow-listed enum values
+    expect(summary.missingChecks).toContain("amount_mismatch");
+  });
+});
+
+describe("CCTP pending transfer proof check regression", () => {
+  const candidateForwardTx = `0x${"aa".repeat(32)}` as const;
+  /**
+   * Verifies that a report without forwardTxHash or messageBytes shows the right
+   * missing checks without touching the database — mirrors what the pass does when
+   * it records forward_tx_missing or message_missing without consuming check_failures.
+   */
+  it("forward_tx_missing is retryable and does not expose internal fields", () => {
+    const summary = describeCctpProofChecks(
+      {
+        status: "attested",
+        railStatus: "complete",
+        reference: null,
+        attestedAt: null,
+        // No forwardTxHash
+        messageBytes: raw,
+      },
+      null,
+    );
+    expect(summary.hasForwardTxHash).toBe(false);
+    expect(summary.hasMessageBytes).toBe(true);
+    expect(summary.missingChecks).toEqual(["forward_tx_missing"]);
+    expect(summary.evidence).toBeNull();
+  });
+
+  it("message_missing is retryable and both forward_tx and message checks are shown", () => {
+    const summary = describeCctpProofChecks(
+      {
+        status: "attested",
+        railStatus: "complete",
+        reference: null,
+        attestedAt: null,
+        forwardTxHash: candidateForwardTx,
+        // No messageBytes
+      },
+      null,
+    );
+    expect(summary.hasForwardTxHash).toBe(true);
+    expect(summary.hasMessageBytes).toBe(false);
+    expect(summary.missingChecks).toEqual(["message_missing"]);
+    expect(summary.evidence).toBeNull();
+  });
+
+  it("provider status 'attested' with both ingredients still yields evidence:null until receipt confirmed", () => {
+    const id = cctpMessageIdentity(raw);
+    if (!id) throw new Error("Expected valid test message identity");
+    const summary = describeCctpProofChecks(
+      {
+        status: "attested",
+        railStatus: "complete",
+        reference: id.nonce,
+        attestedAt: new Date(),
+        forwardTxHash: candidateForwardTx,
+        messageBytes: raw,
+        messageNonce: id.nonce,
+        messageDigest: id.digest,
+      },
+      null,
+    );
+    // All ingredients present — missingChecks is empty — but evidence is still null
+    // because confirming delivery requires inspectCctpDelivery with an EVM receipt.
+    expect(summary.missingChecks).toHaveLength(0);
+    expect(summary.evidence).toBeNull();
+  });
+  it("persists the CCTP fee reconciliation as integer base units with the indexed delivery", async () => {
+    let statement = "";
+    let parameters: readonly unknown[] = [];
+    const db: Queryable = {
+      query(sql, values = []) {
+        statement = sql;
+        parameters = values;
+        return Promise.resolve({ rows: [], rowCount: 1 });
+      },
+    };
+    await writeInbound(
+      db,
+      {
+        chainKey: "sepolia",
+        block: 100n,
+        txHash: `0x${"11".repeat(32)}`,
+        logIndex: 4,
+        observedAt: new Date("2026-11-19T09:00:00Z"),
+      },
+      {
+        sourceTransferId: 7n,
+        route: RouteKind.Cctp,
+        sourceChain: "stellar-testnet",
+        sourceNonce: 8n,
+        railMessageId: nonce,
+        recipient: expected.recipient,
+        token: expected.token,
+        amount: 99600000n,
+        delivered: true,
+        claimId: null,
+        cctpFeeReconciliation: verified.feeReconciliation,
+      },
+    );
+    expect(statement).toContain("cctp_actual_payout_destination_units");
+    expect(parameters.slice(15)).toEqual(["997000000", "500000", "100000", "99600000"]);
   });
 });

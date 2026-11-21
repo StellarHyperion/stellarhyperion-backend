@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
@@ -29,27 +29,6 @@ import {
   FakeEvmClient,
 } from "../evm-fakes.js";
 import { capturingLogger } from "../stellar-fakes.js";
-
-const MIGRATIONS = [
-  "1790900000000_initial-schema.sql",
-  "1791000000000_cursor-block-hash.sql",
-  "1791100000000_cursor-autovacuum-tuning.sql",
-  "1791300000000_stellar-durable-scan-evidence.sql",
-  "1791400000000_stellar-cursor-cas-leases-gaps.sql",
-  "1791500000000_stellar-revisions-and-quarantine.sql",
-  "1791600000000_durable-rail-retry-schedules.sql",
-  "1791700000000_rail-requeue-audit.sql",
-  "1791800000000_outbound-router-identity.sql",
-  "1791900000000_evm-log-quarantine.sql",
-  "1792000000000_evm-backfill-jobs.sql",
-  "1792100000000_route-health-compaction-and-audits.sql",
-  "1792200000000_evm-scan-provenance.sql",
-  "1792800000000_cctp-verification-failure-reasons.sql",
-  "1793000000000_evm-quarantine-raw-replay.sql",
-  "1793300000000_attestation-diagnostics.sql",
-  "1793500000000_ingestion-rejections.sql",
-  "1793600000000_source-event-provenance.sql",
-] as const;
 
 function makePgliteDb(pg: PGlite): Transactional {
   const runQuery = async (
@@ -89,7 +68,9 @@ describe("PostgreSQL compaction, invariant audits, EVM leases and finality prove
   const db = makePgliteDb(pg);
 
   beforeAll(async () => {
-    for (const name of MIGRATIONS) {
+    for (const name of readdirSync(new URL("../../migrations/", import.meta.url))
+      .filter((file) => file.endsWith(".sql"))
+      .sort()) {
       const sql = readFileSync(new URL(`../../migrations/${name}`, import.meta.url), "utf8").split(
         "-- Down Migration",
       )[0]!;

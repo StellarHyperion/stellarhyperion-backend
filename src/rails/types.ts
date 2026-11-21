@@ -48,6 +48,14 @@ export const CCTP_VERIFICATION_FAILURES = [
 ] as const;
 export type CctpVerificationFailure = (typeof CCTP_VERIFICATION_FAILURES)[number];
 
+/** CCTP reconciliation in integer USDC base units: source burns have 7 decimals, destination 6. */
+export interface CctpFeeReconciliation {
+  readonly burnedAmountSourceUnits: bigint;
+  readonly forwardingBudgetDestinationUnits: bigint;
+  readonly executedDeductionDestinationUnits: bigint;
+  readonly actualPayoutDestinationUnits: bigint;
+}
+
 /** Terminal states. Nothing polls a transfer again once it reaches one. */
 export const TERMINAL: readonly AttestationStatus[] = ["delivered", "failed", "expired"];
 

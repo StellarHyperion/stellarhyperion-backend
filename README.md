@@ -45,6 +45,22 @@ Before indexing shared cursors, a replica acquires an expiring lease per chain/r
 
 Run the watchers and rail pollers in a continuous process or in regular scheduled catch-up windows. Deploying only `api/index.ts` provides reads from an existing database; it does not run indexing in the background. Set the frontend's `NEXT_PUBLIC_HYPERION_API_URL` to this service's origin. Public API reads support cross-origin GET requests.
 
+### Destination verification RPCs
+
+`EVM_DELIVERY_RPC_URLS_SEPOLIA`, `EVM_DELIVERY_RPC_URLS_BASE_SEPOLIA`, and
+`EVM_DELIVERY_RPC_URLS_ARC_TESTNET` configure ordered, comma-separated RPC endpoints for CCTP
+and ITS destination proof checks. These are destination-only settings: they work without an EVM
+Hyperion router deployment and do not enable or configure an EVM source watcher. When unset, each
+chain's registry RPC remains the default. Each setting accepts at most three HTTP(S) endpoints.
+
+Verification checks the expected chain ID and runs the receipt, confirmation, canonical-block,
+and payment reads against one endpoint. If an RPC call fails, the whole proof restarts on the next
+endpoint; evidence from different endpoints is never combined. Each endpoint has a 15-second
+request timeout with no hidden transport retries. If every endpoint fails or reports another
+chain, the transfer remains unverified for the normal rail retry policy. Failover logs identify
+only the endpoint origin; URL credentials, paths, query parameters, and authorization headers are
+not logged.
+
 ## Deploy on Vercel
 
 The `hyperion-backend` Vercel project serves [stellarhyperion-backend.vercel.app](https://stellarhyperion-backend.vercel.app). Configure its production `DATABASE_URL` through Vercel environment variables with a managed PostgreSQL connection and TLS. Keep the value server-side. Redis and signing keys are unnecessary while `KEEPER_ENABLED=false`.
@@ -147,6 +163,8 @@ A claim number identifies funds parked by a destination router after an unsucces
 Before a signed keeper transaction is broadcast, its hash, intended operation, chain and contract are durably written to `keeper_checkpoint` with state `submitted`. Only a definitive terminal outcome changes the row to `confirmed` or `failed`; ambiguous responses and timeouts remain `submitted` and block new envelopes, so an unknown broadcast outcome can be reconciled by the saved hash before retrying. Recovery never generates a second claim payment attempt blindly, and no secret key or signed credential material appears in logs.
 
 PostgreSQL serializes submissions across replicas sharing a signer. Keep at least two pool connections available: one holds the signer lock while independent journal writes commit before broadcast. The keeper counts confirmations and leaves database claim/delivery changes to indexed events. It does not perform rail second-step delivery or gas top-ups. TTL maintenance covers configured router tokens/routes and recent indexed transfer/claim entries; it is not a guarantee that every adapter or upstream storage entry remains live.
+
+Claim-settlement jobs are bounded to 20 items and submit one independently simulated and confirmed `settle_claim` transaction per claim, so one frozen or unavailable recipient does not fabricate success for other claims. Job results account for each decimal-string claim ID as confirmed, already settled, missing, or pending. A targeted `claimIds` batch accepts up to 20 unique unsigned decimal strings; IDs are never converted through JavaScript numbers. The router's current claim and recipient remain authoritative, and only its confirmed transaction plus indexed chain event changes settlement state.
 
 When simulation reports an archived Soroban footprint, the keeper submits the protocol's
 `restoreFootprint` operation for that exact footprint. Its signed public hash is journaled under
@@ -474,3 +492,11 @@ Each indexer build has a generated execution UUID shared by its source and rail 
 Migration `1793700000000_worker-run-correlation` adds the history table and nullable run references to Stellar scan journals, EVM scan provenance and rail transition history. `Database.transaction` binds the internal worker context with a parameterized, transaction-local setting; insert triggers record the reference in the same commit as the evidence. Rollback removes both evidence and links, and pooled connections clear the setting at transaction end. Existing records remain uncorrelated. Apply migrations and grant the API reader SELECT on `indexer_worker_run` before restarting a reader; no monetary precision, replay identity, delivery predicate or claim ownership changes.
 
 `/ready` and `/v1/metrics` expose at most 100 durable recent worker runs, safe UUIDs, partial/completed status, integer-string counters and correlated scan/verification-transition counts. Legacy heartbeats without a valid run UUID or an explicit caught-up observation remain unverified/partial. No provider URLs, raw metadata or credential-bearing IDs are included in this projection. Scheduled catch-up and process startup logs carry the execution UUID. Run the focused unit and dedicated PostgreSQL `worker-run-correlation.test.ts` suites plus the full check/build before deployment.
+
+The fault-only `RateLimitSimulator` in `test/helpers.ts` can queue Retry-After, timeout and
+malformed-response faults per transfer, or use injected deterministic randomness for repeatable
+campaigns. Optional bounded latency supports cancellation. Its reports always omit execution,
+forwarded transaction and payment-proof material; it cannot create delivered records. Real
+PostgreSQL rail tests verify overlapping workers claim separate rows, reopening pools retains
+retry deadlines, unrelated rails progress during provider cooldown, and faults leave source
+amounts and destination delivery records intact.

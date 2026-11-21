@@ -52,7 +52,7 @@ import {
   type EvmFinalityPolicy,
   type EvmFinalityPolicyChange,
 } from "./store.js";
-import { decodeRouterLog, LogShapeError, signatureOf } from "./logs.js";
+import { decodeRouterLog, fetchEvmLogsAdaptive, LogShapeError, signatureOf } from "./logs.js";
 import type { EvmClient, RawEvmLog } from "./client.js";
 
 /**
@@ -284,7 +284,11 @@ export class EvmWatcher {
     const head = await client.blockNumber(signal);
     if (to > (await this.scanLimit(head, signal)).boundary)
       throw new Error("backfill range is not confirmed");
-    const fetched = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
+    const fetched = await fetchEvmLogsAdaptive(
+      client,
+      { address: router, fromBlock: from, toBlock: to },
+      signal,
+    );
     if (
       fetched.some(
         (log) =>
@@ -458,7 +462,11 @@ export class EvmWatcher {
       }
 
       const to = min(from + BigInt(this.options.logRange) - 1n, confirmed);
-      const fetched = await client.logs({ address: router, fromBlock: from, toBlock: to }, signal);
+      const fetched = await fetchEvmLogsAdaptive(
+        client,
+        { address: router, fromBlock: from, toBlock: to },
+        signal,
+      );
       if (
         fetched.some(
           (log) =>

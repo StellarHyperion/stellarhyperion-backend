@@ -17,9 +17,9 @@ import {
   toHex,
   toEvmAddress,
 } from "@hyperion/protocol";
-import { createPublicClient, http, stringToHex } from "viem";
-import type { PublicClient } from "viem";
-import type { AppConfig } from "../../config/config.js";
+import { stringToHex } from "viem";
+import type { Logger } from "pino";
+import { isDestinationVerificationChain, type AppConfig } from "../../config/config.js";
 import type { Queryable, Transactional } from "../../db/pool.js";
 import { bigintOf, text } from "../../db/rows.js";
 import type { InboundRow, Position } from "../../chains/writers.js";
@@ -27,6 +27,19 @@ import type { PendingTransfer, RailReport } from "../types.js";
 
 import { ITS_ABI, inspectPayment, type VerificationDiagnostic } from "./events.js";
 import type { AxelarDeliveryEvidenceRow } from "../../chains/writers.js";
+import {
+  DestinationVerificationRpcError,
+  destinationVerificationViemClient,
+  withDestinationVerification,
+  type DestinationVerificationClientFactory,
+} from "../../chains/evm/client.js";
+
+export interface ItsVerificationOptions {
+  readonly signal?: AbortSignal;
+  readonly logger?: Logger;
+  readonly clientForUrl?: DestinationVerificationClientFactory;
+}
+
 export interface VerifiedDelivery {
   readonly at: Position;
   readonly row: InboundRow;
@@ -62,6 +75,8 @@ export interface AxelarCanonicalityClient {
 export interface RevalidationOptions {
   readonly signal?: AbortSignal;
   readonly clientForChain?: (chainKey: string) => AxelarCanonicalityClient;
+  readonly clientForUrl?: DestinationVerificationClientFactory<AxelarCanonicalityClient>;
+  readonly logger?: Logger;
 }
 
 export async function revalidateItsDeliveryProofs(
@@ -83,32 +98,51 @@ export async function revalidateItsDeliveryProofs(
   for (const row of rows) {
     options.signal?.throwIfAborted();
     const chain = text(row, "destination_chain");
-    const chainConfig = isChainKey(chain) && isEvmChain(CHAINS[chain]) ? CHAINS[chain] : null;
-    if (chainConfig?.network !== config.network)
+    if (
+      !isChainKey(chain) ||
+      !isDestinationVerificationChain(chain) ||
+      !isEvmChain(CHAINS[chain]) ||
+      CHAINS[chain].network !== config.network
+    )
       throw new Error("Axelar proof names an unsupported destination chain.");
-    let client = clients.get(chain);
-    if (!client) {
-      const configured = config.indexer.evm.find((item) => item.chain === chain);
-      client =
-        options.clientForChain?.(chain) ??
-        canonicalityClient(configured?.rpcUrl ?? chainConfig.defaultRpcUrl);
-      if ((await client.getChainId()) !== chainConfig.chainId)
-        throw new Error("Destination RPC chain mismatch during Axelar proof revalidation.");
-      clients.set(chain, client);
-    }
+    const chainConfig = CHAINS[chain];
+    const urls = config.destinationVerification.evmRpcUrls[chain];
     const blockNumber = bigintOf(row, "receipt_block");
     const blockHash = text(row, "receipt_block_hash");
     const txHash = text(row, "execution_tx_hash") as `0x${string}`;
-    const block = await client.getBlock({ blockNumber });
-    let canonical = block.hash.toLowerCase() === blockHash.toLowerCase();
-    if (canonical) {
-      const receipt = await client.getTransactionReceipt({ hash: txHash });
-      canonical =
-        receipt.status === "success" &&
-        receipt.blockNumber === blockNumber &&
-        receipt.blockHash.toLowerCase() === blockHash.toLowerCase() &&
-        receipt.transactionHash.toLowerCase() === txHash.toLowerCase();
-    }
+    const canonical = await withDestinationVerification(
+      urls,
+      chainConfig.chainId,
+      (url, signal) => {
+        const key = `${chain}:${url}`;
+        let client = clients.get(key);
+        if (!client) {
+          client =
+            options.clientForUrl?.(url, signal) ??
+            options.clientForChain?.(chain) ??
+            canonicalityClient(url, signal);
+          clients.set(key, client);
+        }
+        return client;
+      },
+      async (client) => {
+        const block = await client.getBlock({ blockNumber });
+        const blockCanonical = block.hash.toLowerCase() === blockHash.toLowerCase();
+        if (!blockCanonical) return false;
+        const receipt = await client.getTransactionReceipt({ hash: txHash });
+        return (
+          receipt.status === "success" &&
+          receipt.blockNumber === blockNumber &&
+          receipt.blockHash.toLowerCase() === blockHash.toLowerCase() &&
+          receipt.transactionHash.toLowerCase() === txHash.toLowerCase()
+        );
+      },
+      {
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+        ...(options.logger === undefined ? {} : { logger: options.logger }),
+        chain,
+      },
+    );
     options.signal?.throwIfAborted();
     const changed = await db.transaction(async (tx) => {
       // Serialize with the rail pass and re-check the exact proof after remote reads. A newer
@@ -156,11 +190,8 @@ export async function revalidateItsDeliveryProofs(
   return orphaned;
 }
 
-function canonicalityClient(url: string): AxelarCanonicalityClient {
-  const client: PublicClient = createPublicClient({
-    transport: http(url, { timeout: 15_000, retryCount: 0 }),
-  });
-  return client;
+function canonicalityClient(url: string, signal?: AbortSignal): AxelarCanonicalityClient {
+  return destinationVerificationViemClient(url, signal);
 }
 
 // The rail API supplies a candidate receipt. Only matching confirmed chain events establish delivery.
@@ -169,6 +200,7 @@ export async function verifyItsDelivery(
   db: Queryable,
   transfer: PendingTransfer,
   report: RailReport,
+  options: ItsVerificationOptions = {},
 ): Promise<VerifiedItsDelivery | VerificationFailure | null> {
   const execution = report.execution;
   const source = config.indexer.stellar;
@@ -182,7 +214,12 @@ export async function verifyItsDelivery(
     return null;
   const destination = CHAINS[transfer.destinationChain];
   const its = RAIL_CONTRACTS[transfer.destinationChain]?.axelar?.interchainTokenService;
-  if (!isEvmChain(destination) || !its?.startsWith("0x")) return null;
+  if (
+    !isDestinationVerificationChain(transfer.destinationChain) ||
+    !isEvmChain(destination) ||
+    !its?.startsWith("0x")
+  )
+    return null;
   const { rows } = await db.query(
     "SELECT origin_chain,origin_router,nonce,origin_tx,sender,token,net_amount,destination_chain,destination FROM outbound_transfer WHERE id = $1",
     [String(transfer.transferId)],
@@ -218,114 +255,128 @@ export async function verifyItsDelivery(
   if (!(id instanceof Uint8Array) || id.length !== 32)
     throw new Error("Source token id is invalid.");
   const tokenId = toHex(id);
-  const client = createPublicClient({
-    transport: http(destination.defaultRpcUrl, { timeout: 15_000, retryCount: 0 }),
-  });
-  if ((await client.getChainId()) !== destination.chainId)
-    throw new Error("Destination RPC chain mismatch.");
-  const receipt = await client.getTransactionReceipt({ hash: execution.txHash }).catch(() => null);
-  if (!receipt) return { state: "receipt_unavailable", diagnostics: [] };
-  if (receipt.status !== "success")
-    return {
-      state: "payout_unverified",
-      diagnostics: [
-        {
-          category: "payment_evidence",
-          expected: "successful destination receipt",
-          observed: "reverted",
-        },
-      ],
-    };
-  const head = await client.getBlockNumber();
-  if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations))
-    return { state: "receipt_unavailable", diagnostics: [] };
-  const block = await client.getBlock({ blockNumber: receipt.blockNumber });
-  if (block.hash !== receipt.blockHash)
-    return {
-      state: "payout_unverified",
-      diagnostics: [
-        { category: "payment_evidence", expected: block.hash, observed: receipt.blockHash },
-      ],
-    };
-  const destinationToken = await client.readContract({
-    address: its as `0x${string}`,
-    abi: ITS_ABI,
-    functionName: "registeredTokenAddress",
-    args: [tokenId],
-    blockNumber: receipt.blockNumber,
-  });
-  const tokenManager = await client.readContract({
-    address: its as `0x${string}`,
-    abi: ITS_ABI,
-    functionName: "tokenManagerAddress",
-    args: [tokenId],
-    blockNumber: receipt.blockNumber,
-  });
-  if (/^0x0{40}$/i.test(tokenManager)) return null;
   const adapterConfig = (await view(adapter, "get_config")) as { its?: string };
   if (!adapterConfig.its) return null;
   const sourceName = await view(adapterConfig.its, "chain_name");
   if (typeof sourceName !== "string") return null;
-  const inspection = inspectPayment(receipt.logs, {
-    its,
-    token: destinationToken,
-    tokenManager,
-    commandId: execution.commandId,
-    tokenId,
-    sourceChain: sourceName,
-    sourceAddress: stringToHex(text(stored, "sender")),
-    recipient,
-    amount,
-  });
-  if (!inspection.payment)
-    return { state: "payout_unverified", diagnostics: inspection.diagnostics };
-  return {
-    at: {
-      chainKey: transfer.destinationChain,
-      block: receipt.blockNumber,
-      txHash: receipt.transactionHash,
-      logIndex: inspection.payment.logIndex,
-      observedAt: new Date(Number(block.timestamp) * 1000),
-    },
-    row: {
-      sourceTransferId: transfer.transferId,
-      route: transfer.route,
-      sourceChain: transfer.originChain,
-      sourceNonce: transfer.nonce,
-      railMessageId: execution.commandId,
-      recipient: recipient.toLowerCase(),
-      token: destinationToken.toLowerCase(),
-      amount,
-      delivered: true,
-      claimId: null,
-    },
-    evidence: {
-      sourceBinding: {
-        chain: text(stored, "origin_chain"),
-        router: text(stored, "origin_router"),
-        nonce: bigintOf(stored, "nonce").toString(),
-        transaction: text(stored, "origin_tx"),
-        sender: text(stored, "sender"),
-        token,
-        amount: amount.toString(),
-        destinationChain: text(stored, "destination_chain"),
-        destination: text(stored, "destination"),
+  try {
+    return await withDestinationVerification(
+      config.destinationVerification.evmRpcUrls[transfer.destinationChain],
+      destination.chainId,
+      options.clientForUrl ?? destinationVerificationViemClient,
+      async (client) => {
+        const receipt = await client.getTransactionReceipt({ hash: execution.txHash });
+        if (receipt.status !== "success")
+          return {
+            state: "payout_unverified",
+            diagnostics: [
+              {
+                category: "payment_evidence",
+                expected: "successful destination receipt",
+                observed: "reverted",
+              },
+            ],
+          };
+        const head = await client.getBlockNumber();
+        if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations))
+          return { state: "receipt_unavailable", diagnostics: [] };
+        const block = await client.getBlock({
+          blockNumber: receipt.blockNumber,
+          includeTransactions: false,
+        });
+        if (block.hash !== receipt.blockHash)
+          return {
+            state: "payout_unverified",
+            diagnostics: [
+              { category: "payment_evidence", expected: block.hash, observed: receipt.blockHash },
+            ],
+          };
+        const destinationToken = await client.readContract({
+          address: its as `0x${string}`,
+          abi: ITS_ABI,
+          functionName: "registeredTokenAddress",
+          args: [tokenId],
+          blockNumber: receipt.blockNumber,
+        });
+        const tokenManager = await client.readContract({
+          address: its as `0x${string}`,
+          abi: ITS_ABI,
+          functionName: "tokenManagerAddress",
+          args: [tokenId],
+          blockNumber: receipt.blockNumber,
+        });
+        if (/^0x0{40}$/i.test(tokenManager)) return null;
+        const inspection = inspectPayment(receipt.logs, {
+          its,
+          token: destinationToken,
+          tokenManager,
+          commandId: execution.commandId,
+          tokenId,
+          sourceChain: sourceName,
+          sourceAddress: stringToHex(text(stored, "sender")),
+          recipient,
+          amount,
+        });
+        if (!inspection.payment)
+          return { state: "payout_unverified", diagnostics: inspection.diagnostics };
+        return {
+          at: {
+            chainKey: transfer.destinationChain,
+            block: receipt.blockNumber,
+            txHash: receipt.transactionHash,
+            logIndex: inspection.payment.logIndex,
+            observedAt: new Date(Number(block.timestamp) * 1000),
+          },
+          row: {
+            sourceTransferId: transfer.transferId,
+            route: transfer.route,
+            sourceChain: transfer.originChain,
+            sourceNonce: transfer.nonce,
+            railMessageId: execution.commandId,
+            recipient: recipient.toLowerCase(),
+            token: destinationToken.toLowerCase(),
+            amount,
+            delivered: true,
+            claimId: null,
+          },
+          evidence: {
+            sourceBinding: {
+              chain: text(stored, "origin_chain"),
+              router: text(stored, "origin_router"),
+              nonce: bigintOf(stored, "nonce").toString(),
+              transaction: text(stored, "origin_tx"),
+              sender: text(stored, "sender"),
+              token,
+              amount: amount.toString(),
+              destinationChain: text(stored, "destination_chain"),
+              destination: text(stored, "destination"),
+            },
+            transferId: transfer.transferId,
+            destinationChain: transfer.destinationChain,
+            commandId: execution.commandId,
+            executionTxHash: receipt.transactionHash,
+            receiptBlock: receipt.blockNumber,
+            receiptBlockHash: receipt.blockHash,
+            itsAddress: its,
+            tokenId,
+            registeredToken: destinationToken,
+            tokenManager,
+            tokenManagerBlock: receipt.blockNumber,
+            tokenManagerBlockHash: block.hash,
+            paymentLogIndex: inspection.payment.logIndex,
+            paymentRecipient: recipient,
+            paymentAmount: amount,
+          },
+        };
       },
-      transferId: transfer.transferId,
-      destinationChain: transfer.destinationChain,
-      commandId: execution.commandId,
-      executionTxHash: receipt.transactionHash,
-      receiptBlock: receipt.blockNumber,
-      receiptBlockHash: receipt.blockHash,
-      itsAddress: its,
-      tokenId,
-      registeredToken: destinationToken,
-      tokenManager,
-      tokenManagerBlock: receipt.blockNumber,
-      tokenManagerBlockHash: block.hash,
-      paymentLogIndex: inspection.payment.logIndex,
-      paymentRecipient: recipient,
-      paymentAmount: amount,
-    },
-  };
+      {
+        ...options,
+        chain: transfer.destinationChain,
+      },
+    );
+  } catch (error) {
+    if (error instanceof DestinationVerificationRpcError)
+      return { state: "receipt_unavailable", diagnostics: [] };
+    throw error;
+  }
 }

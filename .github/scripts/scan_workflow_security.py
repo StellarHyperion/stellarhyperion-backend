@@ -1,7 +1,7 @@
-"""Keep strict Zizmor checks, with one byte-pinned trusted approval workflow.
+"""Keep strict Zizmor checks, with byte-pinned trusted control-plane workflows.
 
-The only exception is dangerous-triggers for the reviewed, checkout-free
-approval control plane. Any change to that workflow invalidates the exception.
+The only exception is dangerous-triggers for reviewed, checkout-free
+authorization and merge control planes. Workflow changes invalidate the exception.
 No repository ignore comments/configuration can suppress any other finding.
 """
 
@@ -15,13 +15,18 @@ import sys
 APPROVAL_WORKFLOW = ".github/workflows/approve-pr-ci.yml"
 APPROVAL_SHA256 = "b03e8bd64b173868e454cf5ae25b2d7352c0b5d46d64e74fdca523fe8641a411"
 
+MERGE_WORKFLOW = ".github/workflows/auto-merge-prs.yml"
+MERGE_SHA256 = "0b2581f5203c02cfb44d8aa5248d4b558f924d15de71e04598d8bebd1191b5fa"
+TRUSTED_WORKFLOWS = {APPROVAL_WORKFLOW: APPROVAL_SHA256, MERGE_WORKFLOW: MERGE_SHA256}
+
 
 def verify_approval(root=Path(".")):
-    path = root / APPROVAL_WORKFLOW
-    if not stat.S_ISREG(path.lstat().st_mode):
-        raise ValueError("Approval workflow must be a regular file")
-    if hashlib.sha256(path.read_bytes()).hexdigest() != APPROVAL_SHA256:
-        raise ValueError("Approval workflow changed: review its trust boundary and update the fingerprint")
+    for workflow, fingerprint in TRUSTED_WORKFLOWS.items():
+        path = root / workflow
+        if not stat.S_ISREG(path.lstat().st_mode):
+            raise ValueError("Control-plane workflow must be a regular file")
+        if hashlib.sha256(path.read_bytes()).hexdigest() != fingerprint:
+            raise ValueError("Control-plane workflow changed: review its trust boundary and update the fingerprint")
 
 
 def blocking_findings(report):
@@ -37,7 +42,7 @@ def blocking_findings(report):
         paths = [location.get("symbolic", {}).get("key", {}).get("Local", {}).get("verbatim_path")
                  for location in locations]
         if (finding["ident"] == "dangerous-triggers" and not finding.get("ignored")
-                and all(path == APPROVAL_WORKFLOW for path in paths)):
+                and all(path in TRUSTED_WORKFLOWS for path in paths)):
             continue
         blocking.append(finding)
     return blocking
@@ -57,7 +62,7 @@ def main():
         print(f"::error::{finding['ident']}: {finding.get('desc', 'workflow security finding')}")
     if findings:
         return 1
-    print("Strict workflow scan passed; only the fingerprinted trusted approval trigger is permitted.")
+    print("Strict workflow scan passed; only fingerprinted trusted control-plane triggers are permitted.")
     return 0
 
 

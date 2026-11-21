@@ -59,8 +59,17 @@ suite("replaying the anvil deployment's logs", () => {
   };
 
   /** Run the watcher to the confirmation line, the way the poller would. */
-  const drain = async (logRange = 2_000): Promise<number> => {
+  const drain = async (
+    logRange = 2_000,
+    providerRangeLimit = Number.MAX_SAFE_INTEGER,
+  ): Promise<number> => {
     const { logger } = capturingLogger();
+    const client = new FakeEvmClient({ head: ANVIL_HEAD });
+    const readLogs = client.logs.bind(client);
+    client.logs = (query) =>
+      query.toBlock - query.fromBlock + 1n > BigInt(providerRangeLimit)
+        ? Promise.reject(new Error("block range is too wide"))
+        : readLogs(query);
     const watcher = new EvmWatcher({
       chainKey: CHAIN,
       router: ANVIL_ROUTER,
@@ -70,7 +79,7 @@ suite("replaying the anvil deployment's logs", () => {
       reorgDepth: 5,
       logRange,
       releaseLeaseOnTick: true,
-      client: new FakeEvmClient({ head: ANVIL_HEAD }),
+      client,
       db,
       logger,
     });
@@ -204,6 +213,23 @@ suite("replaying the anvil deployment's logs", () => {
 
     await clean();
     await drain();
+  });
+
+  it("recovers every block when the provider rejects the configured range", async () => {
+    await clean();
+    const normal = await drain();
+    const expected = await snapshot(db);
+
+    await clean();
+    const splitPasses = await drain(2_000, 3);
+
+    expect(splitPasses).toBe(normal);
+    expect(await snapshot(db)).toEqual(expected);
+    const { rows } = await db.query(
+      "SELECT count(*)::int AS count FROM outbound_transfer WHERE origin_chain = $1",
+      [CHAIN],
+    );
+    expect(rows[0]?.count).toBe(1);
   });
 
   it("records finality-policy provenance per committed scan and exposes policy changes", async () => {

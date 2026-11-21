@@ -24,6 +24,89 @@
 import { hyperionRouterAbi } from "@hyperion/protocol/abi";
 import { decodeEventLog } from "viem";
 import type { Hex } from "viem";
+import type { EvmClient, LogQuery, RawEvmLog } from "./client.js";
+
+const MIN_PROVIDER_LOG_RANGE = 1n;
+const RANGE_LIMIT_ERROR =
+  /(?:too many (?:results|logs)|(?:result|log) limit|limit exceeded|exceed(?:ed|s)? (?:the )?(?:maximum|max|provider|query|response)|maximum (?:block )?range|block range (?:is )?too (?:wide|large)|query returned more than|response size (?:limit|exceeded)|more than \d+ results)/i;
+
+export class EvmLogRangeLimitError extends Error {
+  constructor(
+    readonly fromBlock: bigint,
+    readonly toBlock: bigint,
+    cause: unknown,
+  ) {
+    super(
+      `EVM provider rejected the minimum log range ${fromBlock.toString()}-${toBlock.toString()}.`,
+      { cause },
+    );
+    this.name = "EvmLogRangeLimitError";
+  }
+}
+
+/** Split only provider result/range-limit failures; other RPC failures retain their original error. */
+export async function fetchEvmLogsAdaptive(
+  client: Pick<EvmClient, "logs">,
+  query: LogQuery,
+  signal?: AbortSignal,
+): Promise<readonly RawEvmLog[]> {
+  if (query.fromBlock > query.toBlock) throw new RangeError("EVM log range is reversed.");
+  signal?.throwIfAborted();
+  try {
+    const logs = await client.logs(query, signal);
+    return uniqueSortedLogs(logs);
+  } catch (error) {
+    if (!isProviderLogRangeLimitError(error)) throw error;
+    if (query.fromBlock === query.toBlock)
+      throw new EvmLogRangeLimitError(query.fromBlock, query.toBlock, error);
+    const midpoint = query.fromBlock + (query.toBlock - query.fromBlock) / 2n;
+    if (midpoint < query.fromBlock || midpoint >= query.toBlock)
+      throw new EvmLogRangeLimitError(query.fromBlock, query.toBlock, error);
+    const left = await fetchEvmLogsAdaptive(client, { ...query, toBlock: midpoint }, signal);
+    const right = await fetchEvmLogsAdaptive(
+      client,
+      { ...query, fromBlock: midpoint + MIN_PROVIDER_LOG_RANGE },
+      signal,
+    );
+    return uniqueSortedLogs([...left, ...right]);
+  }
+}
+
+export function isProviderLogRangeLimitError(error: unknown): boolean {
+  const pending: unknown[] = [error];
+  const visited = new Set<object>();
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === null || (typeof current !== "object" && typeof current !== "function")) {
+      if (typeof current === "string" && RANGE_LIMIT_ERROR.test(current)) return true;
+      continue;
+    }
+    if (visited.has(current)) continue;
+    visited.add(current);
+    const record = current as Record<string, unknown>;
+    for (const key of ["message", "shortMessage", "details", "body", "reason"]) {
+      const value = record[key];
+      if (typeof value === "string" && RANGE_LIMIT_ERROR.test(value)) return true;
+      if (value !== undefined) pending.push(value);
+    }
+    if (record.cause !== undefined) pending.push(record.cause);
+  }
+  return false;
+}
+
+function uniqueSortedLogs(logs: readonly RawEvmLog[]): readonly RawEvmLog[] {
+  const unique = new Map<string, RawEvmLog>();
+  for (const log of logs) {
+    const key = `${log.blockNumber}|${log.transactionHash.toLowerCase()}|${log.logIndex}`;
+    if (!unique.has(key)) unique.set(key, log);
+  }
+  return [...unique.values()].sort(
+    (a, b) =>
+      (a.blockNumber < b.blockNumber ? -1 : a.blockNumber > b.blockNumber ? 1 : 0) ||
+      a.logIndex - b.logIndex ||
+      a.transactionHash.localeCompare(b.transactionHash),
+  );
+}
 
 /** A 32 byte word of zeroes, which is how the router spells "no rail reference yet". */
 const ZERO_WORD = `0x${"0".repeat(64)}` as const;
