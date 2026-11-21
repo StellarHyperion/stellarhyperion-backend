@@ -58,30 +58,32 @@ describe("rail delivery persistence during shutdown", () => {
   beforeEach(() => {
     vi.mocked(revalidateItsDeliveryProofs).mockReset();
     vi.mocked(verifyItsDelivery).mockReset().mockResolvedValue(null);
-    vi.mocked(inspectCctpDelivery).mockReset().mockResolvedValue({
-      delivery: {
-        at: {
-          chainKey: "sepolia",
-          block: 10n,
-          txHash: "0xdead",
-          logIndex: 0,
-          observedAt: new Date("2026-11-21T00:00:00.000Z"),
+    vi.mocked(inspectCctpDelivery)
+      .mockReset()
+      .mockResolvedValue({
+        delivery: {
+          at: {
+            chainKey: "sepolia",
+            block: 10n,
+            txHash: "0xdead",
+            logIndex: 0,
+            observedAt: new Date("2026-11-21T00:00:00.000Z"),
+          },
+          row: {
+            route: 0,
+            sourceChain: "stellar-testnet",
+            sourceNonce: 42n,
+            recipient: "0x2222222222222222222222222222222222222222",
+            token: "0x3333333333333333333333333333333333333333",
+            amount: 1_000n,
+            delivered: true,
+            claimId: null,
+            railMessageId: "rail-42",
+          },
         },
-        row: {
-          route: 0,
-          sourceChain: "stellar-testnet",
-          sourceNonce: 42n,
-          recipient: "0x2222222222222222222222222222222222222222",
-          token: "0x3333333333333333333333333333333333333333",
-          amount: 1_000n,
-          delivered: true,
-          claimId: null,
-          railMessageId: "rail-42",
-        },
-      },
-      failure: null,
-      proofEvidence: null,
-    } as never);
+        failure: null,
+        proofEvidence: null,
+      } as never);
   });
 
   it("does not write delivered status when shutdown lands after verified inbound persistence", async () => {
