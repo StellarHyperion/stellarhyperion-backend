@@ -112,8 +112,13 @@ export class Database implements Transactional {
 
   static open(connectionString: string, options: OpenOptions = {}): Database {
     const maxConnections = options.maxConnections ?? 10;
-    const statementTimeoutMs = options.statementTimeoutMs ?? 30_000;
-    const lockTimeoutMs = options.lockTimeoutMs ?? 5_000;
+    const statementTimeoutMs = timeoutMilliseconds(options.statementTimeoutMs, 30_000);
+    const lockTimeoutMs = timeoutMilliseconds(options.lockTimeoutMs, 5_000);
+    const transactionStatementTimeoutMs = timeoutMilliseconds(
+      options.transactionStatementTimeoutMs,
+      60_000,
+    );
+    const transactionLockTimeoutMs = timeoutMilliseconds(options.transactionLockTimeoutMs, 5_000);
     const startupOptions = [
       `-c statement_timeout=${statementTimeoutMs}`,
       `-c lock_timeout=${lockTimeoutMs}`,
@@ -140,7 +145,12 @@ export class Database implements Transactional {
         "database idle connection failed",
       );
     });
-    return new Database(pool, config, { ...options, maxConnections });
+    return new Database(pool, config, {
+      ...options,
+      maxConnections,
+      transactionStatementTimeoutMs,
+      transactionLockTimeoutMs,
+    });
   }
 
   async query(
@@ -171,15 +181,12 @@ export class Database implements Transactional {
     try {
       await this.measure("transaction", () => client.query("BEGIN"));
       const run = currentWorkerRun();
+      // SET LOCAL does not establish a data snapshot, so callers can still select isolation.
       await this.measure("transaction", () =>
-        client.query("SELECT set_config('lock_timeout',$1,true)", [
-          `${this.transactionLockTimeoutMs}ms`,
-        ]),
+        client.query(`SET LOCAL lock_timeout = ${this.transactionLockTimeoutMs}`),
       );
       await this.measure("transaction", () =>
-        client.query("SELECT set_config('statement_timeout',$1,true)", [
-          `${this.transactionStatementTimeoutMs}ms`,
-        ]),
+        client.query(`SET LOCAL statement_timeout = ${this.transactionStatementTimeoutMs}`),
       );
       if (run !== undefined)
         await client.query("SELECT set_config('hyperion.worker_run_id',$1,true)", [run.runId]);
@@ -361,7 +368,7 @@ export class Database implements Transactional {
 export class DatabaseTimeoutError extends Error {
   readonly code = "DATABASE_TIMEOUT";
 
-  constructor(kind: "statement" | "lock") {
+  constructor(readonly kind: "statement" | "lock") {
     super(
       kind === "lock"
         ? "Database lock wait exceeded the configured limit"
@@ -424,4 +431,11 @@ export function startMaintenanceTask(
   return () => {
     clearInterval(timer);
   };
+}
+
+function timeoutMilliseconds(value: number | undefined, fallback: number): number {
+  const timeout = value ?? fallback;
+  if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 2_147_483_647)
+    throw new RangeError("Database timeouts must be positive bounded integer milliseconds.");
+  return timeout;
 }

@@ -12,5 +12,6 @@ values can be overridden through `Database.open` options for a deployment that
 has measured different limits.
 
 PostgreSQL timeout codes are normalized to credential-free errors before they
-leave the database layer. Callers can report a timeout outcome without logging
+leave the database layer as `DatabaseTimeoutError` with a `statement` or `lock` kind.
+Transaction timeout setup uses `SET LOCAL`, allowing callers to establish a repeatable-read snapshot before querying data. Callers can report a timeout outcome without logging
 connection strings, SQL parameters, or provider responses.

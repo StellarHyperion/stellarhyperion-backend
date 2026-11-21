@@ -117,7 +117,11 @@ const connection = process.env.TEST_DATABASE_URL;
           await tx.query("UPDATE indexer_cursor SET last_processed=1 WHERE chain_key=$1", [chain]);
           await tx.query(`UPDATE ${table} SET value=99 WHERE id=1`);
         }),
-      ).rejects.toMatchObject({ code: "55P03" });
+      ).rejects.toMatchObject({
+        code: "DATABASE_TIMEOUT",
+        name: "DatabaseTimeoutError",
+        kind: "lock",
+      });
     } finally {
       release();
       await holder;
