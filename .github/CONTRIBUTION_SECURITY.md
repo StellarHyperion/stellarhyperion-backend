@@ -19,14 +19,16 @@ the current suite use mocks.
 These checks reduce exposure; they cannot establish that arbitrary contributed code is trustworthy.
 Review changes to wallet/transaction construction, external requests, scripts, dependencies, SDK
 archives, workflow files, and deployment configuration before merge. Inspect new dependency behavior,
-not just whether the package has a published vulnerability. Do not auto-merge contributor PRs based
-solely on a green build or a Drips bot review.
+not just whether the package has a published vulnerability. Test-based automatic merging uses the
+full CI/security/description gate, assignment authorization, current-base checks and resolved feedback.
+It does not prove semantic issue resolution or use a Drips bot review as merge authorization.
 
 ## GitHub settings
 
-Require the existing `gate` check from the GitHub Actions app, an up-to-date branch, one approving
-review, code-owner review, dismissal of stale approvals, approval after the latest push, and resolved
-review conversations. Protect workflows, CODEOWNERS, lockfiles, vendored code, and SDK archives.
+Require the existing `gate` check and existing build checks from the GitHub Actions app, an
+up-to-date branch and resolved review conversations. Test-based merging replaces the mandatory
+human/code-owner approval requirement; no automated model approval is claimed. Protect workflows,
+CODEOWNERS, lockfiles, vendored code, and SDK archives.
 The trusted owner's existing administrator bypass is retained for owner maintenance; contributors
 must not receive administrative access. Require approval before running external-contributor workflows.
 Set default workflow permissions to read and disallow Actions approving PRs. Require SHA-pinned actions
@@ -57,7 +59,7 @@ migration execution, role changes, and deployment promotion remain maintainer re
 
 Use supported Node 22 and `npm ci --ignore-scripts`. Then run the repository's normal checks. Workflow
 syntax is checked with actionlint. Zizmor runs offline with medium/high findings blocking the gate,
-except for the byte-pinned, reviewed approval workflow trigger described in CONTRIBUTING.md.
+except for the byte-pinned, reviewed authorization and merge workflow triggers described in CONTRIBUTING.md.
 The gate also requires CodeQL source analysis and the established PR description template.
 Inspect endpoint-policy failures from the hosted run and add only endpoints required by reviewed
 commands. Never broaden the allowlist merely to make an unexpected request pass.

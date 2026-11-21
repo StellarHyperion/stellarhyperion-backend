@@ -218,3 +218,38 @@ Run its regression tests locally:
 ```bash
 python3 -B .github/scripts/test_approve_pr_ci.py
 ```
+
+## Test-based automatic merging
+
+`Automatic PR merge` runs after `ci` completes, on issue assignment/description changes,
+and every 15 minutes as recovery. It has no model, review credits, or daily merge quota.
+It squash-merges open, non-draft PRs targeting `main` only after the current head's newest
+CI attempt and every CI job (including `gate`) succeed, every external check/status succeeds,
+the head includes current `main`, and GitHub reports no conflicts. Existing assignment
+exemptions and automatic closure of unauthorized contributors are preserved. A PR must still
+reference at least one real StellarHyperion issue, and its current description must satisfy
+the established template. Dependency bots retain their description-formatting exemption.
+
+Tests and description attestations provide evidence of correctness; this bot does not
+independently establish that every referenced issue is semantically resolved. Add acceptance
+and regression tests covering the issue's requirements. No model or mandatory approving human
+review is used. Existing change requests and unresolved review conversations still block.
+
+When merging is blocked, one bot-owned PR comment explains current blockers and is updated
+when they change. Fix failing checks, complete the description, request issue assignment,
+resolve conflicts, or update your branch as instructed. CI links identify the failed run;
+read its job logs for exact failures. API errors preserve PRs and are retried. Closed PRs
+receive no new comments. Scheduled workflows can be delayed by GitHub.
+
+The privileged workflow never checks out or executes PR code, downloads PR artifacts, or
+uses caches. It loads policy modules from its immutable default-branch workflow revision.
+It verifies PR text/head/base, issue content/assignments, and the latest CI attempt twice,
+then checks the head/default branch again and supplies the expected head to GitHub's merge
+API. GitHub enforces branch rules at the merge boundary. Changes to `.github/`, CODEOWNERS,
+agent instructions or secret-scan suppression files require a maintainer merge so a PR cannot
+replace the checks that authorize it. Its privileged trigger has a separately byte-pinned
+Zizmor exception; all other security findings still block.
+
+Run `python3 -B .github/scripts/test_auto_merge_prs.py` for regression tests. Dispatch the
+workflow with its default `dry_run: true` to inspect eligibility without merges or comments;
+set `dry_run: false` to perform the same automatic behavior as event/scheduled runs.

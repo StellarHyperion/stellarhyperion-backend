@@ -18,6 +18,18 @@ class WorkflowSecurityTests(unittest.TestCase):
     def test_actual_reviewed_workflow_matches_fingerprint(self):
         scanner.verify_approval(Path(__file__).resolve().parents[2])
 
+    def test_merge_trigger_exception_is_narrow_and_byte_pinned(self):
+        self.assertEqual(scanner.blocking_findings([finding(path=scanner.MERGE_WORKFLOW)]), [])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for workflow in scanner.TRUSTED_WORKFLOWS:
+                path = root / workflow
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes((Path(__file__).resolve().parents[2] / workflow).read_bytes())
+            (root / scanner.MERGE_WORKFLOW).write_text("on: workflow_run\n")
+            with self.assertRaises(ValueError):
+                scanner.verify_approval(root)
+
     def test_edits_cannot_keep_privileged_trigger_exception(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

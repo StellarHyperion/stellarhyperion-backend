@@ -1,0 +1,88 @@
+name: Automatic PR merge
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+  issues:
+    types: [assigned, unassigned, edited]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Check eligibility without merging or commenting
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+  actions: read
+  checks: read
+
+concurrency:
+  group: automatic-pr-merge-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Restrict policy network access
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a
+        with:
+          egress-policy: block
+          disable-sudo-and-containers: true
+          disable-telemetry: true
+          allowed-endpoints: api.github.com:443
+
+      - name: Run immutable default-branch merge policy
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          POLICY_SHA: ${{ github.workflow_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR_ASSIGNMENT_HELPER_BOTS: ${{ vars.PR_ASSIGNMENT_HELPER_BOTS }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+        run: |
+          python3 -B - <<'PY'
+          import base64
+          import json
+          import os
+          import re
+          import sys
+          import types
+          import urllib.parse
+          import urllib.request
+
+          # Privileged control plane: no checkout, PR import, artifacts or caches.
+          # All modules come from the immutable default-branch workflow revision.
+          revision = os.environ["POLICY_SHA"]
+          if not re.fullmatch(r"[0-9a-f]{40}", revision):
+              raise ValueError("Invalid trusted workflow revision")
+          for module in ["enforce_pr_assignments", "check_pr_description", "auto_merge_prs"]:
+              path = ".github/scripts/" + module + ".py"
+              query = urllib.parse.urlencode({"ref": revision})
+              request = urllib.request.Request(
+                  "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"]
+                  + "/contents/" + path + "?" + query,
+                  headers={
+                      "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "hyperion-auto-merge-bootstrap",
+                  },
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  content = json.load(response)
+              if content.get("type") != "file" or content.get("encoding") != "base64":
+                  raise ValueError("Trusted policy module unavailable")
+              source = base64.b64decode(content["content"])
+              loaded = types.ModuleType(module)
+              sys.modules[module] = loaded
+              exec(compile(source, path, "exec"), loaded.__dict__)
+          sys.exit(sys.modules["auto_merge_prs"].main())
+          PY
