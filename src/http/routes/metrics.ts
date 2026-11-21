@@ -108,6 +108,14 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
         typeof hb.metadata.ticks === "number" && Number.isSafeInteger(hb.metadata.ticks)
           ? hb.metadata.ticks
           : 0;
+      const reorgs =
+        typeof hb.metadata.reorgs === "number" && Number.isSafeInteger(hb.metadata.reorgs)
+          ? hb.metadata.reorgs
+          : 0;
+      const reorgDepth =
+        typeof hb.metadata.reorgDepth === "number" && Number.isSafeInteger(hb.metadata.reorgDepth)
+          ? hb.metadata.reorgDepth
+          : null;
       return {
         name: hb.workerName,
         kind: hb.workerKind,
@@ -123,10 +131,31 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
         ageSeconds: freshness.ageSeconds,
         runId: hb.runId ?? null,
         completedTicks,
+        reorgs,
+        reorgDepth,
+        recoveryState:
+          reorgs === 0 ? "none" : hb.state === "down" ? "operator_intervention" : "automatic",
       };
     });
-
     const freshnessSlo = await evaluateFreshnessSlo(db, deps.config);
+    const reorgWorkers = workers.filter((worker) => worker.reorgs > 0);
+    const reorgRecovery = {
+      detected: reorgWorkers.reduce((total, worker) => total + worker.reorgs, 0),
+      automaticWorkers: reorgWorkers.filter((worker) => worker.recoveryState === "automatic").length,
+      operatorInterventionWorkers: reorgWorkers.filter(
+        (worker) => worker.recoveryState === "operator_intervention",
+      ).length,
+      workers: reorgWorkers.map((worker) => ({
+        name: worker.name,
+        chain: worker.chain,
+        reorgs: worker.reorgs,
+        reorgDepth: worker.reorgDepth,
+        state: worker.state,
+        recoveryState: worker.recoveryState,
+      })),
+      reconciliation: freshnessSlo,
+      canonicalProofCounts: proofRejections.coverage,
+    };
     const database = typeof db.telemetrySnapshot === "function" ? db.telemetrySnapshot() : null;
     let keeperSubmissions = {
       simulated: 0,
@@ -168,6 +197,7 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
       database,
       deploymentMode: deps.config.deploymentMode,
       workers,
+      reorgRecovery,
       workerRuns: await readWorkerRuns(db),
       freshness: {
         totalWorkers: workers.length,

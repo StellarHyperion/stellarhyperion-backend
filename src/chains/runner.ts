@@ -187,6 +187,24 @@ export class PolledWorker implements Worker {
     const report = await (completed ? this.pass.readiness() : this.readiness());
     const progress = this.pass.progress;
     const consecutiveFailures = completed ? 0 : stats.consecutiveFailures + 1;
+    const recoveryMetadata =
+      progress !== null &&
+      progress !== undefined &&
+      "reorgs" in progress &&
+      "policy" in progress &&
+      typeof progress.reorgs === "number" &&
+      Number.isSafeInteger(progress.reorgs)
+        ? {
+            reorgs: progress.reorgs,
+            reorgDepth:
+              typeof progress.policy.reorgDepth === "number" &&
+              Number.isSafeInteger(progress.policy.reorgDepth)
+                ? progress.policy.reorgDepth
+                : null,
+            headBlock: "head" in progress ? progress.head.toString() : null,
+            blocksBehind: "behind" in progress ? progress.behind : null,
+          }
+        : {};
     await recordWorkerHeartbeat(this.db, {
       workerName: this.name,
       workerKind: this.workerKind,
@@ -209,6 +227,7 @@ export class PolledWorker implements Worker {
         caughtUp: this.runState === "caught_up",
         ticks: stats.ticks + (completed ? 1 : 0),
         running: stats.running,
+        ...recoveryMetadata,
         ...(this.pass.circuitState === undefined ? {} : { circuits: this.pass.circuitState() }),
       },
     });
