@@ -13,6 +13,8 @@ import type { PendingTransfer, RailReport } from "../../src/rails/types.js";
 import { completeEnv } from "../helpers.js";
 import {
   CCTP_RECEIPT_ABI,
+  codeHashOf,
+  evaluateCctpContractIdentity,
   cctpMessageIdentity,
   inspectCctpMessage,
   inspectCctpPayment,
@@ -85,6 +87,39 @@ const paid: DeliveryLog = {
   logIndex: 3,
 };
 describe("CCTP forwarded destination proof", () => {
+  it("binds contract code identity to the canonical proof block", () => {
+    const observations = [
+      { role: "token_messenger_v2" as const, address: expected.destinationMessenger, codeHash: codeHashOf("0x6000") },
+      { role: "message_transmitter_v2" as const, address: expected.transmitter, codeHash: codeHashOf("0x6001") },
+      { role: "usdc" as const, address: expected.token, codeHash: codeHashOf("0x6002") },
+    ];
+    const baseline = new Map(
+      observations.map((observation) => [observation.role, observation]),
+    );
+    expect(
+      evaluateCctpContractIdentity({
+        destinationChain: "sepolia",
+        chainId: 11155111,
+        blockNumber: 42n,
+        blockHash: `0x${"ab".repeat(32)}`,
+        txHash: `0x${"cd".repeat(32)}`,
+        observations,
+        baselines: baseline,
+      }).verdict,
+    ).toBe("verified");
+    expect(
+      evaluateCctpContractIdentity({
+        destinationChain: "sepolia",
+        chainId: 11155111,
+        blockNumber: 42n,
+        blockHash: `0x${"ab".repeat(32)}`,
+        txHash: `0x${"cd".repeat(32)}`,
+        observations: [{ ...observations[0], codeHash: codeHashOf("0x6003") }, ...observations.slice(1)],
+        baselines: baseline,
+      }).verdict,
+    ).toBe("unexpected_upgrade");
+  });
+
   it("requires the exact attested message and an actual native-USDC mint after fees", () => {
     expect(verified.amount).toBe(99600000n);
     expect(verified.feeReconciliation).toEqual({
