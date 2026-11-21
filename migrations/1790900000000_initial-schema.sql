@@ -285,9 +285,21 @@ COMMENT ON TABLE route_health IS
 COMMENT ON COLUMN route_health.median_seconds IS
   'Observed, not predicted. Null when nothing completed in the window, which an app should render as unknown rather than as fast.';
 
+CREATE TABLE migration_backup_boundary (
+  backup_id       text PRIMARY KEY,
+  migration_name  text NOT NULL,
+  verified_at     timestamptz NOT NULL,
+  verified_by     text NOT NULL,
+  verification    text NOT NULL
+);
+
+COMMENT ON TABLE migration_backup_boundary IS
+  'Operator-recorded backup boundary verified before a migration that may require restore.';
+
 -- Down Migration
 
 DROP TABLE IF EXISTS route_health;
+DROP TABLE IF EXISTS migration_backup_boundary;
 DROP TABLE IF EXISTS admin_action;
 DROP TABLE IF EXISTS rail_attestation;
 DROP TABLE IF EXISTS pending_claim;
