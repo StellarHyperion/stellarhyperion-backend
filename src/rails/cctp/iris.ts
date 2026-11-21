@@ -324,7 +324,16 @@ export class IrisClient implements RailClient {
       throw new IrisResourceLimitError(limit);
     }
 
-    return { kind: "found", report: reportFor(message) };
+    const reports = messages.map(reportFor);
+    const firstReport = reports[0];
+    if (!firstReport) return { kind: "missing" };
+    return {
+      kind: "found",
+      report:
+        reports.length === 1
+          ? firstReport
+          : { ...firstReport, candidates: reports },
+    };
   }
 
   private async send(url: string, signal?: AbortSignal): Promise<Response> {
