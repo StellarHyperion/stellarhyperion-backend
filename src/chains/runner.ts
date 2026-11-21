@@ -47,7 +47,7 @@ import type {
 } from "../rails/types.js";
 import { KeeperWorker } from "../keeper/worker.js";
 import { viemClient } from "./evm/client.js";
-import { EvmWatcher } from "./evm/watcher.js";
+import { EvmWatcher, type EvmProgress } from "./evm/watcher.js";
 import { StellarRpc } from "./stellar/rpc.js";
 import { StellarWatcher } from "./stellar/watcher.js";
 
@@ -91,6 +91,27 @@ interface Pass extends ReadinessSource {
   release?(): Promise<unknown>;
   readonly progress?: { readonly block?: bigint; readonly ledger?: number } | RailProgress | null;
   circuitState?(): unknown;
+}
+
+function isEvmProgress(progress: Pass["progress"]): progress is EvmProgress {
+  return (
+    progress !== null &&
+    progress !== undefined &&
+    typeof progress === "object" &&
+    "reorgs" in progress &&
+    typeof progress.reorgs === "number" &&
+    Number.isSafeInteger(progress.reorgs) &&
+    "policy" in progress &&
+    typeof progress.policy === "object" &&
+    progress.policy !== null &&
+    "reorgDepth" in progress.policy &&
+    typeof progress.policy.reorgDepth === "number" &&
+    Number.isSafeInteger(progress.policy.reorgDepth) &&
+    "head" in progress &&
+    typeof progress.head === "bigint" &&
+    "behind" in progress &&
+    typeof progress.behind === "number"
+  );
 }
 
 export interface PolledWorkerOptions {
@@ -187,24 +208,14 @@ export class PolledWorker implements Worker {
     const report = await (completed ? this.pass.readiness() : this.readiness());
     const progress = this.pass.progress;
     const consecutiveFailures = completed ? 0 : stats.consecutiveFailures + 1;
-    const recoveryMetadata =
-      progress !== null &&
-      progress !== undefined &&
-      "reorgs" in progress &&
-      "policy" in progress &&
-      typeof progress.reorgs === "number" &&
-      Number.isSafeInteger(progress.reorgs)
-        ? {
-            reorgs: progress.reorgs,
-            reorgDepth:
-              typeof progress.policy.reorgDepth === "number" &&
-              Number.isSafeInteger(progress.policy.reorgDepth)
-                ? progress.policy.reorgDepth
-                : null,
-            headBlock: "head" in progress ? progress.head.toString() : null,
-            blocksBehind: "behind" in progress ? progress.behind : null,
-          }
-        : {};
+    const recoveryMetadata = isEvmProgress(progress)
+      ? {
+          reorgs: progress.reorgs,
+          reorgDepth: progress.policy.reorgDepth,
+          headBlock: progress.head.toString(),
+          blocksBehind: progress.behind,
+        }
+      : {};
     await recordWorkerHeartbeat(this.db, {
       workerName: this.name,
       workerKind: this.workerKind,

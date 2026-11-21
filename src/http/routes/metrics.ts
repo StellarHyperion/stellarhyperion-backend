@@ -141,7 +141,8 @@ export function registerMetricsRoutes(app: FastifyInstance, deps: ServerDeps): v
     const reorgWorkers = workers.filter((worker) => worker.reorgs > 0);
     const reorgRecovery = {
       detected: reorgWorkers.reduce((total, worker) => total + worker.reorgs, 0),
-      automaticWorkers: reorgWorkers.filter((worker) => worker.recoveryState === "automatic").length,
+      automaticWorkers: reorgWorkers.filter((worker) => worker.recoveryState === "automatic")
+        .length,
       operatorInterventionWorkers: reorgWorkers.filter(
         (worker) => worker.recoveryState === "operator_intervention",
       ).length,
