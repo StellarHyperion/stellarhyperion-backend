@@ -264,11 +264,19 @@ export interface ViemClientOptions {
   readonly timeoutMs?: number;
   readonly logger?: Logger;
   readonly onFailover?: (event: {
-    readonly failedUrl: string;
-    readonly fallbackUrl: string;
-    readonly error: unknown;
+    readonly failedEndpoint: string;
+    readonly fallbackEndpoint: string;
   }) => void;
   readonly fetchFn?: typeof globalThis.fetch;
+}
+
+function safeEndpointLabel(url: string): string {
+  if (url.length === 0) return "unknown";
+  try {
+    return safeRpcEndpointIdentity(url);
+  } catch {
+    return "configured RPC endpoint";
+  }
 }
 
 export function viemClient(
@@ -315,11 +323,13 @@ export function viemClient(
                 (failedIndex >= 0 ? urls[failedIndex + 1] : undefined) ??
                 urls.find((u) => u !== failedUrl) ??
                 "";
+              const failedEndpoint = safeEndpointLabel(failedUrl);
+              const fallbackEndpoint = safeEndpointLabel(fallbackUrl);
               options.logger?.warn(
-                { failedRpc: failedUrl, fallbackRpc: fallbackUrl, err },
+                { failedEndpoint, fallbackEndpoint },
                 "RPC endpoint failed, failing over to secondary RPC endpoint",
               );
-              options.onFailover?.({ failedUrl, fallbackUrl, error: err });
+              options.onFailover?.({ failedEndpoint, fallbackEndpoint });
               return false;
             },
           },

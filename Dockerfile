@@ -11,8 +11,6 @@ WORKDIR /app
 ENV NODE_ENV=production \
     HTTP_HOST=0.0.0.0 \
     HTTP_PORT=8080 \
-    HYPERION_NETWORK=testnet \
-    HYPERION_DEPLOYMENTS_FILE=./deployments/testnet.json \
     INDEXER_ENABLED=true \
     RAILS_ENABLED=true \
     KEEPER_ENABLED=false \
@@ -23,6 +21,6 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./
 COPY migrations ./migrations
-COPY deployments/testnet.json ./deployments/testnet.json
+COPY deployments ./deployments
 USER node
 CMD ["node", "dist/main.js"]
