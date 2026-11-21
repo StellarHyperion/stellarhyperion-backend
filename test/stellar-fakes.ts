@@ -241,6 +241,8 @@ export class RecordingDb implements Transactional {
   >();
   /** Set to make every statement inside the next transaction throw. */
   failInTransaction: Error | null = null;
+  /** One-shot crash points used by the deterministic restart harness. */
+  crashAt: "before-source-write" | "after-source-write" | "before-commit" | null = null;
   /** What the open ingestion rejection count reports, to exercise the boundary limit. */
   openRejections = 0;
   /** Source events recorded so far; each insert is treated as a first observation. */
@@ -260,7 +262,15 @@ export class RecordingDb implements Transactional {
       return Promise.reject(this.failInTransaction);
     }
     if (/INSERT INTO source_event\s*\(/.test(text)) {
+      if (this.crashAt === "before-source-write") {
+        this.crashAt = null;
+        return Promise.reject(new Error("injected crash before source write"));
+      }
       this.sourceEvents += 1;
+      if (this.crashAt === "after-source-write") {
+        this.crashAt = null;
+        return Promise.reject(new Error("injected crash after source write"));
+      }
       return Promise.resolve({ rows: [{ id: String(this.sourceEvents) }], rowCount: 1 });
     }
     if (text.includes("AS open FROM ingestion_rejection")) {
@@ -781,14 +791,22 @@ export class RecordingDb implements Transactional {
     const identities = new Map(this.identities);
     const conflicts = new Map(this.conflicts);
     const journals = [...this.journals];
+    const cursorRow = this.cursorRow === null ? null : { ...this.cursorRow };
+    const sourceEvents = this.sourceEvents;
     try {
       const value = await work(this);
+      if (this.crashAt === "before-commit") {
+        this.crashAt = null;
+        throw new Error("injected crash before commit");
+      }
       this.commits.push(id);
       return value;
     } catch (error) {
       this.identities = identities;
       this.conflicts = conflicts;
       this.journals = journals;
+      this.cursorRow = cursorRow;
+      this.sourceEvents = sourceEvents;
       this.rollbacks.push(id);
       throw error;
     } finally {
