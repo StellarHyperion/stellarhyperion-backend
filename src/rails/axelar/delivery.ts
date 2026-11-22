@@ -32,6 +32,7 @@ import {
   type VerificationDiagnostic,
 } from "./events.js";
 import type { AxelarDeliveryEvidenceRow } from "../../chains/writers.js";
+import type { BoundedCandidateReceiptCache } from "../candidate-receipt-cache.js";
 import {
   DestinationVerificationRpcError,
   destinationVerificationViemClient,
@@ -43,6 +44,7 @@ export interface ItsVerificationOptions {
   readonly signal?: AbortSignal;
   readonly logger?: Logger;
   readonly clientForUrl?: DestinationVerificationClientFactory;
+  readonly candidateReceiptCache?: BoundedCandidateReceiptCache;
 }
 
 export interface VerifiedDelivery {
@@ -279,7 +281,18 @@ export async function verifyItsDelivery(
       destination.chainId,
       options.clientForUrl ?? destinationVerificationViemClient,
       async (client) => {
-        const receipt = await client.getTransactionReceipt({ hash: execution.txHash });
+        const receipt = options.candidateReceiptCache
+          ? await options.candidateReceiptCache.get({
+              chain: transfer.destinationChain,
+              txHash: execution.txHash,
+              read: () => client.getTransactionReceipt({ hash: execution.txHash }),
+              readBlock: ({ blockNumber }) => client.getBlock({ blockNumber }),
+              identity: (candidate) => ({
+                blockNumber: candidate.blockNumber,
+                blockHash: candidate.blockHash,
+              }),
+            })
+          : await client.getTransactionReceipt({ hash: execution.txHash });
         if (receipt.status !== "success")
           return {
             state: "payout_unverified",
