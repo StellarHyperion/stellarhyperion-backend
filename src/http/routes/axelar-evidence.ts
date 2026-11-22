@@ -4,6 +4,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { Database } from "../../db/pool.js";
 import { bigintOf, integer, text, textOrNull } from "../../db/rows.js";
+import { negotiateSchemaVersion, withSchemaMetadata } from "../schema-version.js";
 import type { ServerDeps } from "../server.js";
 
 const EVIDENCE_QUERY = `
@@ -31,6 +32,8 @@ export function registerAxelarEvidenceRoutes(app: FastifyInstance, deps: ServerD
     request: FastifyRequest<{ Params: { id: string } }>,
     reply: FastifyReply,
   ) => {
+    const version = negotiateSchemaVersion(request, reply);
+    if (version === null) return;
     const transferId = request.params.id;
     if (!/^[1-9][0-9]{0,18}$/.test(transferId) || BigInt(transferId) > 9223372036854775807n)
       return reply.code(400).send({
@@ -49,8 +52,8 @@ export function registerAxelarEvidenceRoutes(app: FastifyInstance, deps: ServerD
         message: `no transfer found with id ${transferId}`,
       });
 
-    if (integer(transfer, "route") !== RouteKind.AxelarIts)
-      return reply.send({
+    if (integer(transfer, "route") !== RouteKind.AxelarIts) {
+      const payload = {
         transferId: text(transfer, "id"),
         evidenceStatus: "not_applicable",
         providerExecutionSufficient: false,
@@ -61,13 +64,15 @@ export function registerAxelarEvidenceRoutes(app: FastifyInstance, deps: ServerD
         tokenPayment: null,
         history: [],
         quarantined: [],
-      });
+      };
+      return reply.send(withSchemaMetadata(payload, version));
+    }
 
     const { rows: evidenceRows } = await db.query(EVIDENCE_QUERY, [transferId]);
     const { rows: quarantineRows } = await db.query(QUARANTINE_QUERY, [transferId]);
     const latest = evidenceRows[0];
     const verified = latest !== undefined && text(latest, "status") === "canonical";
-    return reply.send({
+    const payload = {
       transferId: text(transfer, "id"),
       evidenceStatus: latest === undefined ? "unavailable" : text(latest, "status"),
       providerExecutionSufficient: false,
@@ -135,7 +140,8 @@ export function registerAxelarEvidenceRoutes(app: FastifyInstance, deps: ServerD
         lastSeenAt: timestamp(row, "last_seen_at"),
         replayCount: integer(row, "replay_count"),
       })),
-    });
+    };
+    return reply.send(withSchemaMetadata(payload, version));
   };
 
   app.get("/v1/transfers/:id/evidence", getEvidence);

@@ -723,9 +723,9 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
           historyId: afterId,
           oldStatus: row.old_status,
           newStatus: row.new_status,
-          reason: row.reason,
-          railStatus: row.rail_status,
-          evidenceReference: row.evidence_reference,
+          reason: sanitizeRailDiagnostic(textOrNull(row, "reason")),
+          railStatus: sanitizeRailDiagnostic(textOrNull(row, "rail_status")),
+          evidenceReference: sanitizeRailDiagnostic(textOrNull(row, "evidence_reference")),
           observedAt: new Date(row.observed_at as Date | string).toISOString(),
         });
       }

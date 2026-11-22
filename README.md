@@ -119,6 +119,11 @@ Background processes must be disabled in serverless functions: `INDEXER_ENABLED=
 
 ## What establishes status
 
+The machine-readable OpenAPI 3.1 contract is served at `GET /openapi.json`. Read endpoints accept
+`X-API-Schema-Version: 1.0` (the default) or `1.1`; version 1.1 adds forward-compatible metadata
+without changing response fields. Amounts, nonces, block heights and wide numeric identifiers are
+decimal strings, and clients should ignore unknown metadata and error fields.
+
 Stellar router events establish source transfers and claim changes. The EVM watcher indexes configured Hyperion routers with confirmation and reorg checks. The default record does not deploy an EVM Hyperion router.
 
 For direct Stellar ITS transfers, Axelar's status API supplies a candidate destination transaction. Delivery is recorded only after the destination RPC confirms a successful receipt, sufficient confirmations, the matching ITS command/token/source/recipient/amount event and a matching token payment. The received asset is the ITS representation of Stellar USDC, with seven decimals. A rail API `executed` status alone is not delivery.

@@ -1,0 +1,1052 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Stellar Hyperion Public API",
+    "version": "1.1",
+    "description": "Read-only indexed transfer, claim, route-health, and destination-evidence API. Amounts and wide numeric identifiers are decimal strings in base units. Source provenance records indexed source events; destination delivery requires independently verified canonical destination evidence. Provider status is candidate discovery only. This deployment does not require or imply an active Hyperion EVM router."
+  },
+  "servers": [{ "url": "/" }],
+  "tags": [
+    { "name": "Transfers" },
+    { "name": "Claims" },
+    { "name": "Route health" },
+    { "name": "Evidence" },
+    { "name": "Contract" }
+  ],
+  "paths": {
+    "/v1/transfers/{id}": {
+      "get": {
+        "operationId": "getTransfer",
+        "tags": ["Transfers"],
+        "summary": "Get a transfer by indexed database identifier",
+        "parameters": [
+          { "$ref": "#/components/parameters/TransferId" },
+          { "$ref": "#/components/parameters/SchemaVersionHeader" },
+          { "$ref": "#/components/parameters/SchemaVersionQuery" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Transfer" },
+          "304": { "description": "The transfer has not changed; see the ETag response header." },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" },
+          "504": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/transfers/{originChain}/{nonce}": {
+      "get": {
+        "operationId": "getTransferByOriginNonce",
+        "tags": ["Transfers"],
+        "summary": "Get a transfer by source chain and full-width nonce",
+        "parameters": [
+          { "name": "originChain", "in": "path", "required": true, "schema": { "type": "string" } },
+          {
+            "name": "nonce",
+            "in": "path",
+            "required": true,
+            "schema": { "$ref": "#/components/schemas/DecimalString" }
+          },
+          { "$ref": "#/components/parameters/SchemaVersionHeader" },
+          { "$ref": "#/components/parameters/SchemaVersionQuery" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Transfer" },
+          "304": { "description": "The transfer has not changed; see the ETag response header." },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" },
+          "504": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/transfers/by-tx/{txHash}": {
+      "get": {
+        "operationId": "getTransferByTransaction",
+        "tags": ["Transfers"],
+        "summary": "Get a transfer by source or destination transaction hash",
+        "parameters": [
+          { "name": "txHash", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "$ref": "#/components/parameters/SchemaVersionHeader" },
+          { "$ref": "#/components/parameters/SchemaVersionQuery" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Transfer" },
+          "304": { "description": "The transfer has not changed; see the ETag response header." },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" },
+          "504": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/transfers": {
+      "get": {
+        "operationId": "listTransfers",
+        "tags": ["Transfers"],
+        "summary": "List indexed transfers using offset or cursor pagination",
+        "parameters": [
+          { "name": "originChain", "in": "query", "schema": { "type": "string" } },
+          { "name": "destinationChain", "in": "query", "schema": { "type": "string" } },
+          {
+            "name": "route",
+            "in": "query",
+            "schema": { "type": "integer", "minimum": 0, "maximum": 3 }
+          },
+          { "name": "sender", "in": "query", "schema": { "type": "string" } },
+          { "name": "recipient", "in": "query", "schema": { "type": "string" } },
+          { "name": "search", "in": "query", "schema": { "type": "string", "maxLength": 128 } },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+          },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
+          { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+          { "$ref": "#/components/parameters/SchemaVersionHeader" },
+          { "$ref": "#/components/parameters/SchemaVersionQuery" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/TransferList" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" },
+          "504": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/transfers/{id}/evidence": {
+      "get": {
+        "operationId": "getTransferEvidence",
+        "tags": ["Evidence"],
+        "summary": "Get indexed Axelar ITS destination proof and replayable status quarantine",
+        "description": "Provider execution status is never sufficient for delivery. A canonical successful receipt, scoped token-manager mapping, and exact token payment are verified independently. `unavailable` means no stored proof was found; it is distinct from `not_applicable` and from an empty evidence history.",
+        "parameters": [
+          { "$ref": "#/components/parameters/TransferId" },
+          { "$ref": "#/components/parameters/SchemaVersionHeader" },
+          { "$ref": "#/components/parameters/SchemaVersionQuery" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Evidence" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" },
+          "504": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/transfers/{id}/stream": {
+      "get": {
+        "operationId": "streamTransfer",
+        "tags": ["Transfers"],
+        "summary": "Stream replayable transfer and rail-transition updates",
+        "description": "Server-sent events are replayable using Last-Event-ID. Provider status and evidence references are sanitized candidate diagnostics; only independently verified destination records establish delivery.",
+        "parameters": [
+          { "$ref": "#/components/parameters/TransferId" },
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "pollIntervalMs",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 100 }
+          },
+          {
+            "name": "heartbeatIntervalMs",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 100 }
+          },
+          { "$ref": "#/components/parameters/SchemaVersionHeader" },
+          { "$ref": "#/components/parameters/SchemaVersionQuery" }
+        ],
+        "x-sse-events": [
+          {
+            "name": "rail_transition",
+            "data": { "$ref": "#/components/schemas/StreamTransition" }
+          },
+          {
+            "name": "transfer_update",
+            "data": { "$ref": "#/components/schemas/TransferResponse" }
+          },
+          {
+            "name": "complete",
+            "data": { "$ref": "#/components/schemas/TransferResponse" }
+          },
+          {
+            "name": "resync",
+            "data": { "$ref": "#/components/schemas/Error" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Server-sent event stream containing the named JSON event payloads.",
+            "headers": {
+              "X-API-Schema-Version": { "schema": { "type": "string", "enum": ["1.0", "1.1"] } },
+              "Cache-Control": { "schema": { "type": "string" } }
+            },
+            "content": {
+              "text/event-stream": {
+                "schema": { "type": "string" },
+                "example": "event: transfer_update\ndata: {\"id\":\"123\",\"stage\":\"attesting\"}\n\n"
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" },
+          "504": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/claims/{chain}/{claimId}": {
+      "get": {
+        "operationId": "getClaim",
+        "tags": ["Claims"],
+        "summary": "Get an indexed claim by chain and full-width claim identifier",
+        "parameters": [
+          { "name": "chain", "in": "path", "required": true, "schema": { "type": "string" } },
+          {
+            "name": "claimId",
+            "in": "path",
+            "required": true,
+            "schema": { "$ref": "#/components/schemas/DecimalString" }
+          },
+          { "$ref": "#/components/parameters/SchemaVersionHeader" },
+          { "$ref": "#/components/parameters/SchemaVersionQuery" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Claim" },
+          "304": { "description": "The claim has not changed; see the ETag response header." },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" },
+          "504": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/claims": {
+      "get": {
+        "operationId": "listClaims",
+        "tags": ["Claims"],
+        "summary": "List indexed claims",
+        "parameters": [
+          { "name": "chain", "in": "query", "schema": { "type": "string" } },
+          { "name": "recipient", "in": "query", "schema": { "type": "string" } },
+          {
+            "name": "settled",
+            "in": "query",
+            "schema": { "type": "string", "enum": ["true", "false"] }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 100 }
+          },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
+          { "$ref": "#/components/parameters/SchemaVersionHeader" },
+          { "$ref": "#/components/parameters/SchemaVersionQuery" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/ClaimList" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" },
+          "504": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/routes/health": {
+      "get": {
+        "operationId": "getRouteHealth",
+        "tags": ["Route health"],
+        "summary": "Get latest indexed availability samples for configured routes",
+        "parameters": [
+          { "$ref": "#/components/parameters/SchemaVersionHeader" },
+          { "$ref": "#/components/parameters/SchemaVersionQuery" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/RouteHealth" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" },
+          "504": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "operationId": "getOpenApiDocument",
+        "tags": ["Contract"],
+        "summary": "Get this machine-readable API contract",
+        "responses": {
+          "200": {
+            "description": "OpenAPI 3.1 contract for the public read API.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/OpenApiDocument" } }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "TransferId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "Positive database identifier, kept as a decimal string to preserve width.",
+        "schema": { "type": "string", "pattern": "^[1-9][0-9]{0,18}$" }
+      },
+      "SchemaVersionHeader": {
+        "name": "X-API-Schema-Version",
+        "in": "header",
+        "required": false,
+        "description": "Selects the response envelope. Defaults to 1.0. Version 1.1 adds schemaVersion and metadata without changing existing fields.",
+        "schema": { "type": "string", "enum": ["1.0", "1.1"], "default": "1.0" }
+      },
+      "SchemaVersionQuery": {
+        "name": "schemaVersion",
+        "in": "query",
+        "required": false,
+        "description": "Alternative to the X-API-Schema-Version header, useful for EventSource clients.",
+        "schema": { "type": "string", "enum": ["1.0", "1.1"], "default": "1.0" }
+      }
+    },
+    "responses": {
+      "Transfer": {
+        "description": "Indexed transfer detail. In version 1.1, the response includes additive schema metadata.",
+        "headers": {
+          "X-API-Schema-Version": { "schema": { "type": "string", "enum": ["1.0", "1.1"] } },
+          "ETag": { "schema": { "type": "string" } },
+          "Cache-Control": { "schema": { "type": "string" } }
+        },
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/TransferResponse" } }
+        }
+      },
+      "TransferList": {
+        "description": "Indexed transfer page with stable cursor pagination.",
+        "headers": {
+          "X-API-Schema-Version": { "schema": { "type": "string", "enum": ["1.0", "1.1"] } }
+        },
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/TransferListResponse" } }
+        }
+      },
+      "Claim": {
+        "description": "Indexed claim detail. In version 1.1, the response includes additive schema metadata.",
+        "headers": {
+          "X-API-Schema-Version": { "schema": { "type": "string", "enum": ["1.0", "1.1"] } }
+        },
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/ClaimResponse" } }
+        }
+      },
+      "ClaimList": {
+        "description": "Indexed claim page.",
+        "headers": {
+          "X-API-Schema-Version": { "schema": { "type": "string", "enum": ["1.0", "1.1"] } }
+        },
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/ClaimListResponse" } }
+        }
+      },
+      "RouteHealth": {
+        "description": "Latest persisted route-health samples; an empty routes array means no samples are currently available.",
+        "headers": {
+          "X-API-Schema-Version": { "schema": { "type": "string", "enum": ["1.0", "1.1"] } }
+        },
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/RouteHealthResponse" } }
+        }
+      },
+      "Evidence": {
+        "description": "Stored destination evidence and replayable provider quarantine. An empty history is distinct from unavailable evidence.",
+        "headers": {
+          "X-API-Schema-Version": { "schema": { "type": "string", "enum": ["1.0", "1.1"] } }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/EvidenceVersionedResponse" }
+          }
+        }
+      },
+      "Error": {
+        "description": "Normalized public error. Endpoint-specific legacy fields may be present; unrecognized fields must be ignored.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    },
+    "schemas": {
+      "DecimalString": {
+        "type": "string",
+        "pattern": "^[0-9]+$",
+        "description": "Unsigned integer encoded in base-10 text. Never parse through an IEEE-754 number; monetary values are in base units."
+      },
+      "NullableDecimalString": {
+        "anyOf": [{ "$ref": "#/components/schemas/DecimalString" }, { "type": "null" }]
+      },
+      "Timestamp": { "type": "string", "format": "date-time" },
+      "NullableTimestamp": {
+        "anyOf": [{ "$ref": "#/components/schemas/Timestamp" }, { "type": "null" }]
+      },
+      "Metadata": {
+        "type": "object",
+        "description": "Forward-compatible metadata envelope. Clients must ignore unrecognized metadata fields.",
+        "required": ["source", "schemaVersion"],
+        "properties": {
+          "source": { "type": "string", "const": "indexed_postgres" },
+          "schemaVersion": { "type": "string", "const": "1.1" }
+        },
+        "additionalProperties": true
+      },
+      "VersionMetadata": {
+        "type": "object",
+        "required": ["schemaVersion", "metadata"],
+        "properties": {
+          "schemaVersion": { "type": "string", "const": "1.1" },
+          "metadata": { "$ref": "#/components/schemas/Metadata" }
+        },
+        "additionalProperties": true
+      },
+      "SourceProvenance": {
+        "type": "object",
+        "required": ["status", "chain", "txHash", "block", "logIndex"],
+        "properties": {
+          "status": { "type": "string", "const": "confirmed" },
+          "chain": { "type": "string" },
+          "txHash": { "type": "string" },
+          "block": { "$ref": "#/components/schemas/DecimalString" },
+          "logIndex": { "type": ["integer", "null"] }
+        },
+        "additionalProperties": true
+      },
+      "DestinationProvenance": {
+        "type": "object",
+        "description": "Confirmed only when indexed destination delivery evidence passed canonical receipt and payment checks.",
+        "required": ["status", "chain", "txHash", "block", "logIndex"],
+        "properties": {
+          "status": { "type": "string", "enum": ["confirmed", "unverified"] },
+          "chain": { "type": "string" },
+          "txHash": { "type": ["string", "null"] },
+          "block": { "$ref": "#/components/schemas/NullableDecimalString" },
+          "logIndex": { "type": ["integer", "null"] }
+        },
+        "additionalProperties": true
+      },
+      "CctpAmountSourceUnits": {
+        "type": "object",
+        "required": ["amount", "unit", "decimals"],
+        "properties": {
+          "amount": { "$ref": "#/components/schemas/DecimalString" },
+          "unit": { "type": "string", "const": "USDC" },
+          "decimals": { "type": "integer", "const": 7 }
+        },
+        "additionalProperties": true
+      },
+      "CctpAmountDestinationUnits": {
+        "type": "object",
+        "required": ["amount", "unit", "decimals"],
+        "properties": {
+          "amount": { "$ref": "#/components/schemas/DecimalString" },
+          "unit": { "type": "string", "const": "USDC" },
+          "decimals": { "type": "integer", "const": 6 }
+        },
+        "additionalProperties": true
+      },
+      "CctpFeeReconciliation": {
+        "type": ["object", "null"],
+        "required": [
+          "burnedAmount",
+          "forwardingBudget",
+          "executedDeduction",
+          "actualPayout",
+          "plannedMinimum"
+        ],
+        "properties": {
+          "burnedAmount": { "$ref": "#/components/schemas/CctpAmountSourceUnits" },
+          "forwardingBudget": { "$ref": "#/components/schemas/CctpAmountDestinationUnits" },
+          "executedDeduction": { "$ref": "#/components/schemas/CctpAmountDestinationUnits" },
+          "actualPayout": { "$ref": "#/components/schemas/CctpAmountDestinationUnits" },
+          "plannedMinimum": { "$ref": "#/components/schemas/CctpAmountDestinationUnits" }
+        },
+        "additionalProperties": true
+      },
+      "RailCandidateProvenance": {
+        "type": "object",
+        "required": ["status", "reference"],
+        "properties": {
+          "status": { "type": "string", "const": "candidate" },
+          "reference": { "type": ["string", "null"] }
+        },
+        "additionalProperties": true
+      },
+      "Rail": {
+        "type": ["object", "null"],
+        "description": "Provider rail status is candidate information and does not establish destination delivery.",
+        "required": [
+          "provenance",
+          "status",
+          "railStatus",
+          "verificationFailure",
+          "reference",
+          "attestedAt",
+          "lastError"
+        ],
+        "properties": {
+          "provenance": { "$ref": "#/components/schemas/RailCandidateProvenance" },
+          "status": { "type": ["string", "null"] },
+          "railStatus": { "type": ["string", "null"] },
+          "verificationFailure": { "type": ["string", "null"] },
+          "reference": { "type": ["string", "null"] },
+          "attestedAt": { "$ref": "#/components/schemas/NullableTimestamp" },
+          "lastError": { "type": ["string", "null"] }
+        },
+        "additionalProperties": true
+      },
+      "Transfer": {
+        "type": "object",
+        "required": ["id", "stage", "route", "origin", "destination", "rail", "claim"],
+        "properties": {
+          "id": { "$ref": "#/components/schemas/DecimalString" },
+          "stage": {
+            "type": "string",
+            "enum": [
+              "initiated",
+              "attesting",
+              "attested",
+              "delivering",
+              "delivered",
+              "parked",
+              "settled",
+              "failed"
+            ]
+          },
+          "route": { "type": "integer", "minimum": 0, "maximum": 3 },
+          "origin": {
+            "type": "object",
+            "required": [
+              "chain",
+              "router",
+              "nonce",
+              "sender",
+              "token",
+              "symbol",
+              "decimals",
+              "grossAmount",
+              "fee",
+              "netAmount",
+              "block",
+              "txHash",
+              "observedAt",
+              "provenance"
+            ],
+            "properties": {
+              "chain": { "type": "string" },
+              "router": { "type": ["string", "null"] },
+              "nonce": { "$ref": "#/components/schemas/DecimalString" },
+              "sender": { "type": "string" },
+              "token": { "type": "string" },
+              "symbol": { "type": ["string", "null"] },
+              "decimals": { "type": ["integer", "null"] },
+              "grossAmount": { "$ref": "#/components/schemas/DecimalString" },
+              "fee": { "$ref": "#/components/schemas/DecimalString" },
+              "netAmount": { "$ref": "#/components/schemas/DecimalString" },
+              "block": { "$ref": "#/components/schemas/DecimalString" },
+              "txHash": { "type": "string" },
+              "observedAt": { "$ref": "#/components/schemas/Timestamp" },
+              "provenance": { "$ref": "#/components/schemas/SourceProvenance" }
+            },
+            "additionalProperties": true
+          },
+          "destination": {
+            "type": "object",
+            "required": [
+              "token",
+              "amount",
+              "symbol",
+              "decimals",
+              "chain",
+              "recipient",
+              "delivered",
+              "cctpFeeReconciliation",
+              "block",
+              "txHash",
+              "deliveredAt",
+              "provenance"
+            ],
+            "properties": {
+              "token": { "type": ["string", "null"] },
+              "amount": { "$ref": "#/components/schemas/NullableDecimalString" },
+              "symbol": { "type": ["string", "null"] },
+              "decimals": { "type": ["integer", "null"] },
+              "chain": { "type": "string" },
+              "recipient": { "type": "string" },
+              "delivered": {
+                "type": "boolean",
+                "description": "True only for a recorded indexed destination delivery, not a provider status."
+              },
+              "cctpFeeReconciliation": { "$ref": "#/components/schemas/CctpFeeReconciliation" },
+              "block": { "$ref": "#/components/schemas/NullableDecimalString" },
+              "txHash": { "type": ["string", "null"] },
+              "deliveredAt": { "$ref": "#/components/schemas/NullableTimestamp" },
+              "provenance": { "$ref": "#/components/schemas/DestinationProvenance" }
+            },
+            "additionalProperties": true
+          },
+          "rail": { "$ref": "#/components/schemas/Rail" },
+          "claim": {
+            "type": ["object", "null"],
+            "required": ["id", "settled"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Claim identifier; decimal digits are preserved as text."
+              },
+              "settled": { "type": "boolean" }
+            },
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": true
+      },
+      "TransferResponse": {
+        "anyOf": [
+          { "$ref": "#/components/schemas/Transfer" },
+          {
+            "allOf": [
+              { "$ref": "#/components/schemas/Transfer" },
+              { "$ref": "#/components/schemas/VersionMetadata" }
+            ]
+          }
+        ]
+      },
+      "TransferList": {
+        "type": "object",
+        "required": ["transfers", "limit", "count", "nextCursor"],
+        "properties": {
+          "transfers": { "type": "array", "items": { "$ref": "#/components/schemas/Transfer" } },
+          "limit": { "type": "integer" },
+          "offset": { "type": "integer" },
+          "count": { "type": "integer" },
+          "nextCursor": { "type": ["string", "null"] }
+        },
+        "additionalProperties": true
+      },
+      "TransferListResponse": {
+        "anyOf": [
+          { "$ref": "#/components/schemas/TransferList" },
+          {
+            "allOf": [
+              { "$ref": "#/components/schemas/TransferList" },
+              { "$ref": "#/components/schemas/VersionMetadata" }
+            ]
+          }
+        ]
+      },
+      "Claim": {
+        "type": "object",
+        "required": [
+          "id",
+          "chain",
+          "claimId",
+          "recipient",
+          "token",
+          "amount",
+          "route",
+          "sourceChain",
+          "sourceNonce",
+          "settled",
+          "createdAt",
+          "observedAt",
+          "provenance"
+        ],
+        "properties": {
+          "id": { "type": "string", "description": "Composite chain and claim identifier." },
+          "chain": { "type": "string" },
+          "claimId": { "$ref": "#/components/schemas/DecimalString" },
+          "recipient": { "type": "string" },
+          "token": { "type": "string" },
+          "amount": { "$ref": "#/components/schemas/DecimalString" },
+          "route": { "type": "integer", "minimum": 0, "maximum": 3 },
+          "sourceChain": { "type": "string" },
+          "sourceNonce": { "$ref": "#/components/schemas/DecimalString" },
+          "settled": { "type": "boolean" },
+          "createdAt": { "$ref": "#/components/schemas/Timestamp" },
+          "observedAt": { "$ref": "#/components/schemas/Timestamp" },
+          "provenance": {
+            "type": "object",
+            "required": ["source", "destination"],
+            "properties": {
+              "source": {
+                "anyOf": [{ "$ref": "#/components/schemas/SourceProvenance" }, { "type": "null" }]
+              },
+              "destination": { "$ref": "#/components/schemas/DestinationProvenance" }
+            },
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": true
+      },
+      "ClaimResponse": {
+        "anyOf": [
+          { "$ref": "#/components/schemas/Claim" },
+          {
+            "allOf": [
+              { "$ref": "#/components/schemas/Claim" },
+              { "$ref": "#/components/schemas/VersionMetadata" }
+            ]
+          }
+        ]
+      },
+      "ClaimList": {
+        "type": "object",
+        "required": ["claims", "limit", "offset", "count"],
+        "properties": {
+          "claims": { "type": "array", "items": { "$ref": "#/components/schemas/Claim" } },
+          "limit": { "type": "integer" },
+          "offset": { "type": "integer" },
+          "count": { "type": "integer" }
+        },
+        "additionalProperties": true
+      },
+      "ClaimListResponse": {
+        "anyOf": [
+          { "$ref": "#/components/schemas/ClaimList" },
+          {
+            "allOf": [
+              { "$ref": "#/components/schemas/ClaimList" },
+              { "$ref": "#/components/schemas/VersionMetadata" }
+            ]
+          }
+        ]
+      },
+      "RouteHealth": {
+        "type": "object",
+        "required": [
+          "originChain",
+          "destinationChain",
+          "route",
+          "token",
+          "available",
+          "blocker",
+          "flowAvailable",
+          "observedAt"
+        ],
+        "properties": {
+          "originChain": { "type": "string" },
+          "destinationChain": { "type": "string" },
+          "route": { "type": "integer", "minimum": 0, "maximum": 3 },
+          "token": { "type": "string" },
+          "available": { "type": "boolean" },
+          "blocker": {
+            "type": "object",
+            "required": ["code", "label", "detail"],
+            "properties": {
+              "code": { "type": "integer" },
+              "label": { "type": "string" },
+              "detail": { "type": "string" }
+            },
+            "additionalProperties": true
+          },
+          "flowAvailable": { "$ref": "#/components/schemas/NullableDecimalString" },
+          "observedAt": { "$ref": "#/components/schemas/Timestamp" }
+        },
+        "additionalProperties": true
+      },
+      "RouteHealthList": {
+        "type": "object",
+        "required": ["routes", "count"],
+        "properties": {
+          "routes": { "type": "array", "items": { "$ref": "#/components/schemas/RouteHealth" } },
+          "count": { "type": "integer" }
+        },
+        "additionalProperties": true
+      },
+      "RouteHealthResponse": {
+        "anyOf": [
+          { "$ref": "#/components/schemas/RouteHealthList" },
+          {
+            "allOf": [
+              { "$ref": "#/components/schemas/RouteHealthList" },
+              { "$ref": "#/components/schemas/VersionMetadata" }
+            ]
+          }
+        ]
+      },
+      "StreamTransition": {
+        "type": "object",
+        "required": [
+          "transferId",
+          "historyId",
+          "oldStatus",
+          "newStatus",
+          "reason",
+          "railStatus",
+          "evidenceReference",
+          "observedAt"
+        ],
+        "properties": {
+          "transferId": { "$ref": "#/components/schemas/DecimalString" },
+          "historyId": { "$ref": "#/components/schemas/DecimalString" },
+          "oldStatus": {
+            "type": "string",
+            "enum": ["unobserved", "pending", "attested", "delivered", "failed", "expired"]
+          },
+          "newStatus": {
+            "type": "string",
+            "enum": ["pending", "attested", "delivered", "failed", "expired"]
+          },
+          "reason": { "type": ["string", "null"] },
+          "railStatus": { "type": ["string", "null"] },
+          "evidenceReference": { "type": ["string", "null"] },
+          "observedAt": { "$ref": "#/components/schemas/Timestamp" }
+        },
+        "additionalProperties": true
+      },
+      "EvidenceChecklistItem": {
+        "type": "object",
+        "required": ["passed"],
+        "properties": {
+          "passed": { "type": "boolean" },
+          "sufficient": { "type": "boolean" },
+          "note": { "type": "string" },
+          "historicalProofAvailable": { "type": "boolean" }
+        },
+        "additionalProperties": true
+      },
+      "EvidenceResponse": {
+        "type": "object",
+        "required": [
+          "transferId",
+          "evidenceStatus",
+          "providerExecutionSufficient",
+          "verificationChecklist",
+          "command",
+          "destinationReceipt",
+          "tokenManagerMapping",
+          "tokenPayment",
+          "history",
+          "quarantined"
+        ],
+        "properties": {
+          "transferId": { "$ref": "#/components/schemas/DecimalString" },
+          "evidenceStatus": {
+            "type": "string",
+            "enum": ["not_applicable", "unavailable", "canonical", "orphaned", "superseded"]
+          },
+          "providerExecutionSufficient": { "type": "boolean", "const": false },
+          "providerStatus": { "type": ["string", "null"] },
+          "verificationChecklist": {
+            "type": "object",
+            "required": [
+              "providerExecutedStatus",
+              "commandIdentityMatched",
+              "successfulDestinationReceipt",
+              "receiptCanonical",
+              "tokenManagerScopedToProofBlock",
+              "exactErc20PaymentMatched"
+            ],
+            "properties": {
+              "providerExecutedStatus": { "$ref": "#/components/schemas/EvidenceChecklistItem" },
+              "commandIdentityMatched": { "$ref": "#/components/schemas/EvidenceChecklistItem" },
+              "successfulDestinationReceipt": {
+                "$ref": "#/components/schemas/EvidenceChecklistItem"
+              },
+              "receiptCanonical": { "$ref": "#/components/schemas/EvidenceChecklistItem" },
+              "tokenManagerScopedToProofBlock": {
+                "$ref": "#/components/schemas/EvidenceChecklistItem"
+              },
+              "exactErc20PaymentMatched": { "$ref": "#/components/schemas/EvidenceChecklistItem" }
+            },
+            "additionalProperties": true
+          },
+          "command": {
+            "type": ["object", "null"],
+            "required": ["id", "executionTransaction"],
+            "properties": {
+              "id": { "type": "string" },
+              "executionTransaction": { "type": "string" }
+            },
+            "additionalProperties": true
+          },
+          "destinationReceipt": {
+            "type": ["object", "null"],
+            "required": [
+              "transactionHash",
+              "status",
+              "blockNumber",
+              "blockHash",
+              "canonical",
+              "lastRevalidatedAt"
+            ],
+            "properties": {
+              "transactionHash": { "type": "string" },
+              "status": { "type": "string", "const": "success" },
+              "blockNumber": { "$ref": "#/components/schemas/DecimalString" },
+              "blockHash": { "type": "string" },
+              "canonical": { "type": "boolean" },
+              "lastRevalidatedAt": { "$ref": "#/components/schemas/NullableTimestamp" }
+            },
+            "additionalProperties": true
+          },
+          "tokenManagerMapping": {
+            "type": ["object", "null"],
+            "required": [
+              "destinationChain",
+              "interchainTokenService",
+              "tokenId",
+              "registeredToken",
+              "tokenManager",
+              "proofBlockNumber",
+              "proofBlockHash",
+              "verified"
+            ],
+            "properties": {
+              "destinationChain": { "type": "string" },
+              "interchainTokenService": { "type": "string" },
+              "tokenId": { "type": "string" },
+              "registeredToken": { "type": "string" },
+              "tokenManager": { "type": "string" },
+              "proofBlockNumber": { "$ref": "#/components/schemas/DecimalString" },
+              "proofBlockHash": { "type": "string" },
+              "verified": { "type": "boolean" }
+            },
+            "additionalProperties": true
+          },
+          "tokenPayment": {
+            "type": ["object", "null"],
+            "required": [
+              "token",
+              "recipient",
+              "amount",
+              "transactionHash",
+              "logIndex",
+              "exactMatch"
+            ],
+            "properties": {
+              "token": { "type": "string" },
+              "recipient": { "type": "string" },
+              "amount": { "$ref": "#/components/schemas/DecimalString" },
+              "transactionHash": { "type": "string" },
+              "logIndex": { "type": "integer" },
+              "exactMatch": { "type": "boolean" }
+            },
+            "additionalProperties": true
+          },
+          "history": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "status",
+                "commandId",
+                "executionTransaction",
+                "receiptBlockNumber",
+                "receiptBlockHash",
+                "verifiedAt",
+                "lastRevalidatedAt"
+              ],
+              "properties": {
+                "status": { "type": "string", "enum": ["canonical", "orphaned", "superseded"] },
+                "commandId": { "type": "string" },
+                "executionTransaction": { "type": "string" },
+                "receiptBlockNumber": { "$ref": "#/components/schemas/DecimalString" },
+                "receiptBlockHash": { "type": "string" },
+                "verifiedAt": { "$ref": "#/components/schemas/Timestamp" },
+                "lastRevalidatedAt": { "$ref": "#/components/schemas/NullableTimestamp" }
+              },
+              "additionalProperties": true
+            }
+          },
+          "quarantined": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "providerReference",
+                "schema",
+                "payload",
+                "firstSeenAt",
+                "lastSeenAt",
+                "replayCount"
+              ],
+              "properties": {
+                "providerReference": { "type": ["string", "null"] },
+                "schema": { "type": "string" },
+                "payload": {},
+                "firstSeenAt": { "$ref": "#/components/schemas/Timestamp" },
+                "lastSeenAt": { "$ref": "#/components/schemas/Timestamp" },
+                "replayCount": { "type": "integer", "minimum": 0 }
+              },
+              "additionalProperties": true
+            }
+          }
+        },
+        "additionalProperties": true
+      },
+      "EvidenceResponseVersioned": {
+        "allOf": [
+          { "$ref": "#/components/schemas/EvidenceResponse" },
+          { "$ref": "#/components/schemas/VersionMetadata" }
+        ]
+      },
+      "EvidenceVersionedResponse": {
+        "anyOf": [
+          { "$ref": "#/components/schemas/EvidenceResponse" },
+          { "$ref": "#/components/schemas/EvidenceResponseVersioned" }
+        ]
+      },
+      "Error": {
+        "type": "object",
+        "description": "Public errors may carry legacy endpoint-specific fields such as supportedVersions or resync. Clients must ignore unknown fields. Internal error messages, credentials, and provider diagnostics are not exposed.",
+        "required": ["error", "message"],
+        "properties": {
+          "error": { "type": "string" },
+          "code": { "type": "string" },
+          "message": { "type": "string" },
+          "requestId": { "type": "string" },
+          "retryAfterMs": { "type": "number", "minimum": 0 },
+          "supportedVersions": { "type": "array", "items": { "type": "string" } },
+          "resync": { "type": "boolean" }
+        },
+        "additionalProperties": true
+      },
+      "OpenApiDocument": {
+        "type": "object",
+        "required": ["openapi", "info", "paths", "components"],
+        "properties": {
+          "openapi": { "type": "string", "const": "3.1.0" },
+          "info": { "type": "object" },
+          "servers": { "type": "array" },
+          "tags": { "type": "array" },
+          "paths": { "type": "object" },
+          "components": { "type": "object" }
+        },
+        "additionalProperties": true
+      }
+    }
+  }
+}

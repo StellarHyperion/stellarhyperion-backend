@@ -43,7 +43,7 @@ export function negotiateSchemaVersion(
     reply.header("Vary", "X-API-Schema-Version");
     void reply.code(400).send({
       error: "unsupported_schema_version",
-      message: `unsupported API schema version '${requested}'`,
+      message: "unsupported API schema version",
       supportedVersions: SUPPORTED_API_SCHEMA_VERSIONS,
     });
     return null;

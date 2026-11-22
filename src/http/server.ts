@@ -16,6 +16,7 @@ import { registerMetricsRoutes } from "./routes/metrics.js";
 import { registerRouteHealthRoutes } from "./routes/routes.js";
 import { registerTransferRoutes } from "./routes/transfers.js";
 import { RequestBudgetExceededError } from "./request-budget.js";
+import { openApiDocument } from "./openapi.js";
 
 export const DEFAULT_RATE_LIMIT_MAX = 120;
 export const DEFAULT_STREAM_RATE_LIMIT_MAX = 20;
@@ -177,6 +178,9 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     );
   });
   app.options("/*", async (_request, reply) => reply.code(204).send());
+  app.get("/openapi.json", (_request, reply) =>
+    reply.header("Cache-Control", "public, max-age=300").send(openApiDocument),
+  );
 
   const rateLimitEnabled = deps.rateLimit?.enabled ?? deps.config.nodeEnv !== "test";
   const max = deps.rateLimit?.max ?? DEFAULT_RATE_LIMIT_MAX;

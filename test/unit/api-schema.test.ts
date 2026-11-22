@@ -10,6 +10,7 @@ import {
   captureResponse,
   differentialReport,
   validateResponse,
+  validateOpenApiOperationResponse,
   type ResponseShape,
 } from "../tooling/api-contract.js";
 import { capturingLogger } from "../stellar-fakes.js";
@@ -542,6 +543,9 @@ describe("public response differential runner", () => {
   const shapes = JSON.parse(
     readFileSync(new URL("../../docs/api-response-contracts.json", import.meta.url), "utf8"),
   ) as Record<string, ResponseShape>;
+  const openApi = JSON.parse(
+    readFileSync(new URL("../../src/http/openapi.json", import.meta.url), "utf8"),
+  ) as unknown;
   it("checks real transfer and claim handlers against the published contract and classifies metadata additions", async () => {
     for (const [kind, url] of [
       ["transfer", "/v1/transfers/stellar-testnet/42"],
@@ -550,11 +554,81 @@ describe("public response differential runner", () => {
       const shape = shapes[kind]!;
       const previous = await captureResponse(app, url, "1.0", shape);
       const current = await captureResponse(app, url, "1.1", shape);
+      const path =
+        kind === "transfer"
+          ? "/v1/transfers/{originChain}/{nonce}"
+          : "/v1/claims/{chain}/{claimId}";
       const report = differentialReport(previous, current);
       expect(report.breaking).toEqual([]);
       expect(report.additive).toEqual(["$.schemaVersion", "$.metadata"]);
+      expect(validateOpenApiOperationResponse(openApi, path, "get", 200, previous.body)).toEqual(
+        [],
+      );
+      expect(validateOpenApiOperationResponse(openApi, path, "get", 200, current.body)).toEqual([]);
       expect(current.statusCode).toBe(200);
     }
+  });
+  it("serves OpenAPI and validates real route-health, evidence, and error responses", async () => {
+    const published = await app.inject("/openapi.json");
+    expect(published.statusCode).toBe(200);
+    expect(published.json()).toEqual(openApi);
+    expect(
+      validateOpenApiOperationResponse(openApi, "/openapi.json", "get", 200, published.json()),
+    ).toEqual([]);
+
+    const routeHealth = await app.inject({
+      method: "GET",
+      url: "/v1/routes/health",
+      headers: { "x-api-schema-version": "1.1" },
+    });
+    expect(routeHealth.statusCode).toBe(200);
+    expect(
+      validateOpenApiOperationResponse(
+        openApi,
+        "/v1/routes/health",
+        "get",
+        routeHealth.statusCode,
+        routeHealth.json(),
+      ),
+    ).toEqual([]);
+
+    const transferResult = await pg.query(
+      "SELECT id::text FROM outbound_transfer WHERE origin_tx = 'source-hash' LIMIT 1",
+    );
+    const transferId = String((transferResult.rows[0] as Record<string, unknown> | undefined)?.id);
+    const evidence = await app.inject({
+      method: "GET",
+      url: `/v1/transfers/${transferId}/evidence`,
+      headers: { "x-api-schema-version": "1.1" },
+    });
+    expect(evidence.statusCode).toBe(200);
+    expect(evidence.json().evidenceStatus).toBe("unavailable");
+    expect(
+      validateOpenApiOperationResponse(
+        openApi,
+        "/v1/transfers/{id}/evidence",
+        "get",
+        evidence.statusCode,
+        evidence.json(),
+      ),
+    ).toEqual([]);
+
+    const unsupported = await app.inject({
+      method: "GET",
+      url: "/v1/routes/health",
+      headers: { "x-api-schema-version": "secret=must-not-be-echoed" },
+    });
+    expect(unsupported.statusCode).toBe(400);
+    expect(unsupported.body).not.toContain("must-not-be-echoed");
+    expect(
+      validateOpenApiOperationResponse(
+        openApi,
+        "/v1/routes/health",
+        "get",
+        unsupported.statusCode,
+        unsupported.json(),
+      ),
+    ).toEqual([]);
   });
   it("detects removed nested fields, number coercion, full-width integer drift and token identity drift", () => {
     const previous = {
