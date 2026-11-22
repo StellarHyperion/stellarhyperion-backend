@@ -5,8 +5,8 @@ describe("BoundedCandidateReceiptCache", () => {
   it("shares canonical reads, invalidates on block changes, and evicts oldest entries", async () => {
     const cache = new BoundedCandidateReceiptCache(1);
     let blockHash = "0xaaa";
-    const read = vi.fn(async () => ({ blockNumber: 7n, blockHash, value: "receipt" }));
-    const readBlock = vi.fn(async () => ({ hash: blockHash }));
+    const read = vi.fn(() => Promise.resolve({ blockNumber: 7n, blockHash, value: "receipt" }));
+    const readBlock = vi.fn(() => Promise.resolve({ hash: blockHash }));
     const request = () =>
       cache.get({
         chain: "chain-a",
