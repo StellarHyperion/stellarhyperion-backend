@@ -45,8 +45,16 @@ export const CCTP_VERIFICATION_FAILURES = [
   "confirmations_pending",
   "non_canonical_receipt",
   "message_already_delivered",
+  "inbound_contract_capability_missing",
+  "parked_claim",
+  "parked_claim_mismatch",
 ] as const;
 export type CctpVerificationFailure = (typeof CCTP_VERIFICATION_FAILURES)[number];
+
+export type CctpDestinationDisposition =
+  | "successful_recipient_payment"
+  | "parked_claim"
+  | "unverified";
 
 /** CCTP reconciliation in integer USDC base units: source burns have 7 decimals, destination 6. */
 export interface CctpFeeReconciliation {

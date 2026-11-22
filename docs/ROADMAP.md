@@ -21,3 +21,5 @@ The reusable PostgreSQL concurrency runner uses only `TEST_DATABASE_URL`, never 
 ## EVM-origin source-router activation
 
 EVM-origin source indexing remains disabled until the owning contracts repository supplies an implemented and deployed Hyperion source router, validated deployment metadata, its verified initialization block and independent signed source/destination acceptance evidence. Registry presence, provider status or an active destination/provider lane must never create an EVM source watcher or establish destination delivery. Activation metadata must bind the exact chain, router address and revision and preserve full-width identifiers, integer-string amounts and canonical replayable source evidence.
+
+EVM-to-Stellar CCTP delivery remains disabled until implemented inbound contracts, validated deployment metadata and independent signed source/destination acceptance are supplied. Provider status alone is not payout evidence; reverse support must bind source burns to destination message identity and distinguish parked claims from recipient payment. Missing inbound contract capability blocks admission.
