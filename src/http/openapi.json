@@ -14,6 +14,46 @@
     { "name": "Contract" }
   ],
   "paths": {
+    "/v1/transfers/bulk": {
+      "post": {
+        "operationId": "getTransfersBulk",
+        "tags": ["Transfers"],
+        "summary": "Look up a bounded set of transfers by canonical source identities",
+        "description": "Each identity is scoped by source chain, emitting router, and full-width nonce. Results preserve input order and distinguish found transfers, indexed-but-missing transfers, and identities whose source history is unavailable.",
+        "parameters": [
+          { "$ref": "#/components/parameters/SchemaVersionHeader" },
+          { "$ref": "#/components/parameters/SchemaVersionQuery" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["identities"],
+                "properties": {
+                  "identities": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "items": { "$ref": "#/components/schemas/TransferIdentity" }
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/BulkTransferLookup" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" },
+          "504": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/v1/transfers/{id}": {
       "get": {
         "operationId": "getTransfer",
@@ -356,6 +396,17 @@
           "application/json": { "schema": { "$ref": "#/components/schemas/TransferListResponse" } }
         }
       },
+      "BulkTransferLookup": {
+        "description": "Bounded lookup results retain request order and report status per identity.",
+        "headers": {
+          "X-API-Schema-Version": { "schema": { "type": "string", "enum": ["1.0", "1.1"] } }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/BulkTransferLookupResponse" }
+          }
+        }
+      },
       "Claim": {
         "description": "Indexed claim detail. In version 1.1, the response includes additive schema metadata.",
         "headers": {
@@ -654,6 +705,58 @@
           "nextCursor": { "type": ["string", "null"] }
         },
         "additionalProperties": true
+      },
+      "TransferIdentity": {
+        "type": "object",
+        "required": ["originChain", "originRouter", "nonce"],
+        "properties": {
+          "originChain": { "type": "string" },
+          "originRouter": {
+            "type": "string",
+            "description": "Canonical router address or contract id on the source chain."
+          },
+          "nonce": { "$ref": "#/components/schemas/DecimalString" }
+        },
+        "additionalProperties": false
+      },
+      "BulkTransferResult": {
+        "type": "object",
+        "required": ["identity", "status", "transfer"],
+        "properties": {
+          "identity": { "$ref": "#/components/schemas/TransferIdentity" },
+          "status": {
+            "type": "string",
+            "enum": ["found", "missing", "unavailable"],
+            "description": "missing means the matching source router is indexed; unavailable means no matching source cursor exists."
+          },
+          "transfer": {
+            "anyOf": [{ "$ref": "#/components/schemas/Transfer" }, { "type": "null" }]
+          }
+        },
+        "additionalProperties": true
+      },
+      "BulkTransferLookup": {
+        "type": "object",
+        "required": ["results", "count"],
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/BulkTransferResult" }
+          },
+          "count": { "type": "integer" }
+        },
+        "additionalProperties": true
+      },
+      "BulkTransferLookupResponse": {
+        "anyOf": [
+          { "$ref": "#/components/schemas/BulkTransferLookup" },
+          {
+            "allOf": [
+              { "$ref": "#/components/schemas/BulkTransferLookup" },
+              { "$ref": "#/components/schemas/VersionMetadata" }
+            ]
+          }
+        ]
       },
       "TransferListResponse": {
         "anyOf": [
