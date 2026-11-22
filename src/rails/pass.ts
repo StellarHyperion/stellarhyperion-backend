@@ -28,6 +28,7 @@ import { revalidateItsDeliveryProofs, verifyItsDelivery } from "./axelar/deliver
 import { ingestAxelarGasEvidence } from "./axelar/gas.js";
 import type { VerificationDiagnostic } from "./axelar/events.js";
 import { inspectCctpDelivery } from "./cctp/delivery.js";
+import { BoundedCandidateReceiptCache } from "./candidate-receipt-cache.js";
 import type { Logger } from "pino";
 
 import type { Queryable, Transactional } from "../db/pool.js";
@@ -232,6 +233,7 @@ export class RailPass {
     let selected = 0;
     let stoppedForCooldown = false;
     const seen: bigint[] = [];
+    const candidateReceiptCache = new BoundedCandidateReceiptCache();
 
     // The short claim transaction commits the lease before provider I/O. A crashed worker's claim
     // becomes available again after its bounded expiry.
@@ -262,7 +264,12 @@ export class RailPass {
       seen.push(transfer.transferId);
 
       try {
-        const outcome = await this.processTransfer(transfer, lease, effective);
+        const outcome = await this.processTransfer(
+          transfer,
+          lease,
+          effective,
+          candidateReceiptCache,
+        );
         if (outcome.kind === "processed") {
           checked += 1;
           if (outcome.settled) settled += 1;
@@ -336,7 +343,12 @@ export class RailPass {
     );
     if (claimed === null) return false;
     try {
-      const outcome = await this.processTransfer(claimed.transfer, claimed.lease, effective);
+      const outcome = await this.processTransfer(
+        claimed.transfer,
+        claimed.lease,
+        effective,
+        new BoundedCandidateReceiptCache(),
+      );
       if (outcome.kind === "failed" && outcome.rateLimitedError !== null) {
         this.cooldownUntil = this.failureRetryAt(
           this.now(),
@@ -357,10 +369,14 @@ export class RailPass {
     transfer: PendingTransfer,
     lease: RailWorkLease,
     signal: AbortSignal,
+    candidateReceiptCache: BoundedCandidateReceiptCache,
   ): Promise<TransferOutcome> {
     return this.options.db.transaction(async (tx) => {
       try {
-        return { kind: "processed", settled: await this.handle(transfer, tx, signal, lease) };
+        return {
+          kind: "processed",
+          settled: await this.handle(transfer, tx, signal, lease, candidateReceiptCache),
+        };
       } catch (error) {
         signal.throwIfAborted();
         if (error instanceof RailLeaseLostError) throw error;
@@ -380,6 +396,7 @@ export class RailPass {
     db: Queryable,
     signal: AbortSignal,
     lease: RailWorkLease,
+    candidateReceiptCache: BoundedCandidateReceiptCache,
   ): Promise<boolean> {
     const at = this.now();
 
@@ -448,7 +465,11 @@ export class RailPass {
       null;
     let verificationFailure: CctpVerificationFailure | null = null;
     if (this.options.config) {
-      const verificationOptions = { signal, logger: this.options.logger };
+      const verificationOptions = {
+        signal,
+        logger: this.options.logger,
+        candidateReceiptCache,
+      };
       const verificationKey = this.verificationCircuitKey(transfer.destinationChain);
       if (this.circuits.allow(verificationKey)) {
         try {
