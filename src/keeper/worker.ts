@@ -5,6 +5,7 @@
  * to chain watchers and rail pollers.
  */
 import type { Logger } from "pino";
+import { randomUUID } from "node:crypto";
 
 import type { AppConfig } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
@@ -17,12 +18,15 @@ export class KeeperWorker implements ReadinessSource {
   private handle: KeeperHandle | null = null;
   private starting = false;
   private failedError: string | null = null;
+  private readonly signerLeaseOwnerId: string;
 
   constructor(
     private readonly config: AppConfig,
     private readonly db: Transactional,
     private readonly logger: Logger,
-  ) {}
+  ) {
+    this.signerLeaseOwnerId = `${this.config.indexerLeaseOwnerId}:${randomUUID()}`;
+  }
 
   readiness(): ReadinessReport {
     if (!this.config.keeper.enabled) {
@@ -67,7 +71,12 @@ export class KeeperWorker implements ReadinessSource {
           );
         }
         return startKeeperQueue(
-          { db: this.db, config: this.config, logger: this.logger },
+          {
+            db: this.db,
+            config: this.config,
+            logger: this.logger,
+            signerLeaseOwnerId: this.signerLeaseOwnerId,
+          },
           this.config.redisUrl,
         );
       })

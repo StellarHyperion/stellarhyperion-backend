@@ -56,4 +56,6 @@ export interface KeeperContext {
   readonly db: Transactional;
   readonly config: AppConfig;
   readonly logger: Logger;
+  /** Unique for this process so an expired lease cannot be mistaken for a live owner. */
+  readonly signerLeaseOwnerId?: string;
 }

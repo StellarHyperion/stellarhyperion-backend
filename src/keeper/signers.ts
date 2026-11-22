@@ -1,10 +1,49 @@
 import { Keypair, rpc } from "@stellar/stellar-sdk";
 import type { AppConfig } from "../config/config.js";
 import type { Queryable, Transactional } from "../db/pool.js";
+import { acquireLease, assertLeaseHeld, releaseLease } from "../db/lease.js";
 
 export interface KeeperSigner {
   readonly key: Keypair;
   readonly publicKey: string;
+}
+
+export function keeperSignerLeaseParams(config: AppConfig, ownerId: string) {
+  const chain = config.indexer.stellar;
+  if (!chain) throw new Error("A Stellar deployment is required for keeper signing.");
+  if (!/^[A-Za-z0-9_.:-]{1,128}:[0-9a-f-]{36}$/.test(ownerId))
+    throw new Error("Keeper signer lease owner identity is invalid.");
+  return {
+    chainKey: chain.chain,
+    contract: `keeper-signer:${chain.routerContractId}`,
+    ownerId,
+    ttlMs: config.indexerLeaseTtlMs,
+  } as const;
+}
+
+export async function acquireKeeperSignerLease(
+  db: Queryable,
+  config: AppConfig,
+  ownerId: string,
+): Promise<void> {
+  const lease = await acquireLease(db, keeperSignerLeaseParams(config, ownerId));
+  if (lease === null) throw new Error("Keeper signer lease is held by another replica.");
+}
+
+export async function assertKeeperSignerLease(
+  db: Queryable,
+  config: AppConfig,
+  ownerId: string,
+): Promise<void> {
+  await assertLeaseHeld(db, keeperSignerLeaseParams(config, ownerId));
+}
+
+export async function releaseKeeperSignerLease(
+  db: Queryable,
+  config: AppConfig,
+  ownerId: string,
+): Promise<void> {
+  await releaseLease(db, keeperSignerLeaseParams(config, ownerId));
 }
 export function configuredKeeperSigners(config: AppConfig): readonly KeeperSigner[] {
   return config.keeper.stellarSecrets.map((secret) => {
