@@ -69,8 +69,9 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
       }
     }
 
+    const apiOnly = deps.config.deploymentMode === "api-only";
     let heartbeats: WorkerHeartbeatRecord[] = [];
-    if (dbCheck.state !== "down") {
+    if (!apiOnly && dbCheck.state !== "down") {
       try {
         heartbeats = await readWorkerHeartbeats(deps.db);
         const now = new Date();
@@ -132,8 +133,12 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
       policy: deps.config.readinessPolicy,
       indexer: deps.config.indexer.enabled ? "enabled" : "disabled",
       checks: evaluated.checks,
-      runCorrelation,
-      workerRuns: dbCheck.state === "down" ? [] : await readWorkerRuns(deps.db),
+      ...(apiOnly
+        ? {}
+        : {
+            runCorrelation,
+            workerRuns: dbCheck.state === "down" ? [] : await readWorkerRuns(deps.db),
+          }),
     });
   });
 }

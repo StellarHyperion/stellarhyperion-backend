@@ -14,7 +14,11 @@ import { checkSchemaCompatibility } from "../../src/db/schema.js";
 import { checkDatabasePolicy } from "../../src/db/policy.js";
 import * as serverModule from "../../src/http/server.js";
 import { createApiRedis } from "../../src/http/rate-limit-redis.js";
-import { completeEnv } from "../helpers.js";
+import {
+  assertIndexedTransferSemantics,
+  canonicalIndexedTransferFixture,
+  completeEnv,
+} from "../helpers.js";
 
 vi.mock("../../src/http/rate-limit-redis.js", () => ({
   createApiRedis: vi.fn(() => ({
@@ -374,5 +378,16 @@ describe("Serverless Cold-Start Database Lifecycle", () => {
     const body = JSON.parse(getRes.body);
     expect(body.error).toBe("internal_error");
     expect(body.message).toBe("The API is not configured or is unavailable.");
+  });
+
+  it("omits active-worker claims and preserves identical indexed transfer semantics", async () => {
+    const app = await getApp();
+    const ready = await app.inject({ method: "GET", url: "/ready" });
+    expect(ready.statusCode).toBe(200);
+    expect(ready.json()).not.toHaveProperty("runCorrelation");
+    expect(ready.json()).not.toHaveProperty("workerRuns");
+
+    const fixture = canonicalIndexedTransferFixture();
+    expect(() => assertIndexedTransferSemantics(fixture, { ...fixture })).not.toThrow();
   });
 });
