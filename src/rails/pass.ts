@@ -85,6 +85,8 @@ export interface RailPassOptions extends RailCancellationOptions {
   readonly db: Transactional;
   readonly logger: Logger;
   readonly batchSize: number;
+  /** Maximum number of transfers for one destination in a pass. */
+  readonly maxPerDestination?: number;
   /** Don't re-check a transfer sooner than this, so one stuck row cannot starve the queue. */
   readonly recheckAfterMs: number;
   readonly maxCheckFailures: number;
@@ -233,6 +235,12 @@ export class RailPass {
     let selected = 0;
     let stoppedForCooldown = false;
     const seen: bigint[] = [];
+    const destinationCounts = new Map<string, number>();
+    const excludedDestinations: string[] = [];
+    const maxPerDestination = Math.max(
+      1,
+      this.options.maxPerDestination ?? Math.ceil(batchSize / 2),
+    );
     const candidateReceiptCache = new BoundedCandidateReceiptCache();
 
     // The short claim transaction commits the lease before provider I/O. A crashed worker's claim
@@ -252,6 +260,8 @@ export class RailPass {
             notCheckedSince: new Date(this.now().getTime() - this.options.recheckAfterMs),
             maxCheckFailures: this.options.maxCheckFailures,
             excludedTransferIds: seen,
+            excludedDestinationChains: excludedDestinations,
+            scheduleBucket: (selected % 2) as 0 | 1,
             signal: effective,
           },
           this.ownerId,
@@ -262,6 +272,10 @@ export class RailPass {
       const { transfer, lease } = claimed;
       selected += 1;
       seen.push(transfer.transferId);
+      const destinationCount = (destinationCounts.get(transfer.destinationChain) ?? 0) + 1;
+      destinationCounts.set(transfer.destinationChain, destinationCount);
+      if (destinationCount >= maxPerDestination)
+        excludedDestinations.push(transfer.destinationChain);
 
       try {
         const outcome = await this.processTransfer(

@@ -1736,7 +1736,9 @@ suite("rail pollers against real Postgres", () => {
       recheckAfterMs: 5000,
       maxCheckFailures: 5,
     }).tick(new AbortController().signal);
-    expect(simulator.callCount).toBe(3);
+    // The pass caps work for one destination at ceil(batchSize / 2), so the
+    // third same-destination transfer remains queued for a later pass.
+    expect(simulator.callCount).toBe(2);
     expect(
       (await db.query("SELECT count(*)::int AS count FROM inbound_delivery WHERE route=0")).rows[0]
         ?.count,

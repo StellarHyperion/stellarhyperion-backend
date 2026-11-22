@@ -41,7 +41,11 @@ export interface QueueQuery {
   /** Only inside the transaction that processes and writes this transfer. */
   readonly lock?: boolean;
   readonly excludedTransferIds?: readonly bigint[];
+  /** Destinations that have already used their share of the current pass. */
+  readonly excludedDestinationChains?: readonly string[];
   readonly onlyTransferId?: bigint;
+  /** Alternate between new (never checked) and existing work when scheduling a pass. */
+  readonly scheduleBucket?: 0 | 1;
   /**
    * Skip transfers checked more recently than this.
    *
@@ -170,6 +174,7 @@ export async function pendingForRail(
              AND l.lease_until > clock_timestamp()
         )
         AND NOT (t.id = ANY($6::bigint[]))
+        AND NOT (t.destination_chain = ANY($8::text[]))
         AND ($7::bigint IS NULL OR t.id = $7)
         AND (a.transfer_id IS NULL OR a.status IN ('pending', 'attested'))
         AND COALESCE(a.check_failures, 0) < $2
@@ -181,7 +186,16 @@ export async function pendingForRail(
           (a.next_attempt_at IS NULL AND
             (a.last_checked_at IS NULL OR a.last_checked_at < $4))
         )
-      ORDER BY a.next_attempt_at NULLS FIRST, a.last_checked_at NULLS FIRST, t.id
+      ORDER BY
+        CASE
+          WHEN $9::integer IS NULL THEN 0
+          WHEN $9::integer = 0 AND a.last_checked_at IS NULL THEN 0
+          WHEN $9::integer = 1 AND a.last_checked_at IS NOT NULL THEN 0
+          ELSE 1
+        END,
+        a.next_attempt_at NULLS FIRST,
+        a.last_checked_at NULLS FIRST,
+        t.id
       LIMIT $5
       ${query.lock === true ? "FOR UPDATE OF t SKIP LOCKED" : ""}`,
     [
@@ -192,6 +206,8 @@ export async function pendingForRail(
       query.limit,
       (query.excludedTransferIds ?? []).map(String),
       query.onlyTransferId?.toString() ?? null,
+      query.excludedDestinationChains ?? [],
+      query.scheduleBucket ?? null,
     ],
     { workload: "rails", ...(query.signal === undefined ? {} : { signal: query.signal }) },
   );
