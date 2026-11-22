@@ -480,6 +480,8 @@ export function buildRailPasses(
       db,
       logger: child,
       batchSize: config.batchSize,
+      providerConcurrency: config.providerConcurrency,
+      destinationRpcConcurrency: config.destinationRpcConcurrency,
       recheckAfterMs: config.recheckAfterMs,
       maxCheckFailures: config.maxCheckFailures,
       ...(shutdownSignal === undefined ? {} : { shutdownSignal }),

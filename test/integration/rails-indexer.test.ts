@@ -481,7 +481,11 @@ suite("rail pollers against real Postgres", () => {
     expect(rows[0]?.status).toBe("pending");
     expect(rows[0]?.delivered).toBe(false);
   });
-  async function seedRetry(nonce: bigint, route = 0): Promise<void> {
+  async function seedRetry(
+    nonce: bigint,
+    route = 0,
+    destinationChain = DESTINATION_CHAIN,
+  ): Promise<void> {
     await db.transaction(async (tx) => {
       await writeOutbound(
         tx,
@@ -500,7 +504,7 @@ suite("rail pollers against real Postgres", () => {
           grossAmount: 1001000n,
           fee: 1000n,
           netAmount: 1000000n,
-          destinationChain: DESTINATION_CHAIN,
+          destinationChain,
           destination: "0x2222222222222222222222222222222222222222",
           railRef: "0x0000",
         },
@@ -1635,6 +1639,127 @@ suite("rail pollers against real Postgres", () => {
       expect(row.status).toBe("pending");
     }
     expect(simulator.callCount).toBe(2);
+  });
+
+  it("enforces provider budgets while a slow destination does not block healthy destinations", async () => {
+    await seedRetry(31721n, 0, "slow-destination");
+    await seedRetry(31722n, 0, "healthy-destination");
+    await seedRetry(31723n, 0, "other-healthy-destination");
+    const { logger } = capturingLogger();
+    let active = 0;
+    let peak = 0;
+    let releaseSlow: (() => void) | undefined;
+    let releaseHealthy: (() => void) | undefined;
+    let markSlowStarted: (() => void) | undefined;
+    let markHealthyStarted: (() => void) | undefined;
+    let markOtherStarted: (() => void) | undefined;
+    const slowGate = new Promise<void>((resolve) => {
+      releaseSlow = resolve;
+    });
+    const healthyGate = new Promise<void>((resolve) => {
+      releaseHealthy = resolve;
+    });
+    const slowStarted = new Promise<void>((resolve) => {
+      markSlowStarted = resolve;
+    });
+    const healthyStarted = new Promise<void>((resolve) => {
+      markHealthyStarted = resolve;
+    });
+    const otherStarted = new Promise<void>((resolve) => {
+      markOtherStarted = resolve;
+    });
+    const provider: RailClient = {
+      rail: "cctp",
+      look: async (transfer) => {
+        active += 1;
+        peak = Math.max(peak, active);
+        try {
+          if (transfer.destinationChain === "slow-destination") {
+            markSlowStarted?.();
+            await slowGate;
+          } else if (transfer.destinationChain === "healthy-destination") {
+            markHealthyStarted?.();
+            await healthyGate;
+          } else {
+            markOtherStarted?.();
+          }
+          return {
+            kind: "found",
+            report: {
+              status: "pending",
+              railStatus: "pending",
+              reference: null,
+              attestedAt: null,
+            },
+          };
+        } finally {
+          active -= 1;
+        }
+      },
+    };
+    const pass = new RailPass({
+      route: 0,
+      client: provider,
+      db,
+      logger,
+      batchSize: 3,
+      providerConcurrency: 2,
+      destinationRpcConcurrency: 1,
+      maxPerDestination: 1,
+      recheckAfterMs: 0,
+      maxCheckFailures: 5,
+    });
+    const tick = pass.tick(new AbortController().signal);
+
+    try {
+      expect(await settleWithin(Promise.all([slowStarted, healthyStarted]), 1000)).not.toBe(
+        "timeout",
+      );
+      const thirdClaimed = async (): Promise<boolean> => {
+        for (let attempt = 0; attempt < 50; attempt += 1) {
+          const { rows } = await db.query(
+            `SELECT 1
+               FROM rail_work_lease l
+               JOIN outbound_transfer t ON t.id = l.transfer_id
+              WHERE t.nonce = 31723 AND t.route = 0`,
+          );
+          if (rows.length === 1) return true;
+          await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        }
+        return false;
+      };
+      expect(await settleWithin(thirdClaimed(), 1000)).toBe(true);
+      expect(await settleWithin(otherStarted, 100)).toBe("timeout");
+      releaseHealthy?.();
+      const healthyPersisted = async (): Promise<string | null> => {
+        for (let attempt = 0; attempt < 50; attempt += 1) {
+          const { rows } = await db.query(
+            `SELECT a.status
+               FROM rail_attestation a
+               JOIN outbound_transfer t ON t.id = a.transfer_id
+              WHERE t.nonce = 31722 AND a.route = 0`,
+          );
+          if (rows.length === 1 && rows[0]?.status === "pending") return "pending";
+          await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        }
+        return null;
+      };
+      expect(await settleWithin(healthyPersisted(), 1000)).toBe("pending");
+      expect(await settleWithin(otherStarted, 1000)).not.toBe("timeout");
+      expect(peak).toBeLessThanOrEqual(2);
+    } finally {
+      releaseSlow?.();
+      releaseHealthy?.();
+      await tick;
+    }
+
+    expect(
+      (
+        await db.query(
+          "SELECT count(*)::int AS n FROM rail_attestation WHERE route = 0 AND transfer_id IN (SELECT id FROM outbound_transfer WHERE nonce IN (31721,31722,31723))",
+        )
+      ).rows[0]?.n,
+    ).toBe(3);
   });
 
   it("retains simulator backoff through closed pools and new provider/pass instances", async () => {
