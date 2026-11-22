@@ -25,7 +25,12 @@ import { bigintOf, text } from "../../db/rows.js";
 import type { InboundRow, Position } from "../../chains/writers.js";
 import type { PendingTransfer, RailReport } from "../types.js";
 
-import { ITS_ABI, inspectPayment, type VerificationDiagnostic } from "./events.js";
+import {
+  ITS_ABI,
+  inspectPayment,
+  inspectTokenMapping,
+  type VerificationDiagnostic,
+} from "./events.js";
 import type { AxelarDeliveryEvidenceRow } from "../../chains/writers.js";
 import {
   DestinationVerificationRpcError,
@@ -255,6 +260,15 @@ export async function verifyItsDelivery(
   if (!(id instanceof Uint8Array) || id.length !== 32)
     throw new Error("Source token id is invalid.");
   const tokenId = toHex(id);
+  const sourceToken = (
+    Object.values(deployment.tokens) as readonly {
+      readonly sacId?: string;
+      readonly code?: string;
+      readonly decimals: number;
+    }[]
+  ).find((candidate) => candidate.sacId === token);
+  if (!sourceToken?.code) return null;
+  const sourceSymbol = sourceToken.code;
   const adapterConfig = (await view(adapter, "get_config")) as { its?: string };
   if (!adapterConfig.its) return null;
   const sourceName = await view(adapterConfig.its, "chain_name");
@@ -306,6 +320,26 @@ export async function verifyItsDelivery(
           blockNumber: receipt.blockNumber,
         });
         if (/^0x0{40}$/i.test(tokenManager)) return null;
+        const [destinationSymbol, destinationDecimals] = await Promise.all([
+          client.readContract({
+            address: destinationToken,
+            abi: ITS_ABI,
+            functionName: "symbol",
+            blockNumber: receipt.blockNumber,
+          }),
+          client.readContract({
+            address: destinationToken,
+            abi: ITS_ABI,
+            functionName: "decimals",
+            blockNumber: receipt.blockNumber,
+          }),
+        ]);
+        const mappingDiagnostics = inspectTokenMapping(
+          { symbol: sourceSymbol, decimals: sourceToken.decimals },
+          { symbol: destinationSymbol, decimals: destinationDecimals },
+        );
+        if (mappingDiagnostics.length > 0)
+          return { state: "payout_unverified", diagnostics: mappingDiagnostics };
         const inspection = inspectPayment(receipt.logs, {
           its,
           token: destinationToken,
