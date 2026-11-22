@@ -262,6 +262,8 @@ export class RecordingDb implements Transactional {
     if (this.failInTransaction !== null && this.open !== null) {
       return Promise.reject(this.failInTransaction);
     }
+    if (text.includes("INSERT INTO evm_block_checkpoint"))
+      return Promise.resolve({ rows: [{ block_hash: params[4] }], rowCount: 1 });
     if (text.includes("INSERT INTO evm_deployment_revision"))
       return Promise.resolve({ rows: [{ chain_key: params[0] }], rowCount: 1 });
     if (/INSERT INTO source_event\s*\(/.test(text)) {

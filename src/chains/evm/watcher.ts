@@ -56,6 +56,7 @@ import {
 } from "./store.js";
 import { decodeRouterLog, fetchEvmLogsAdaptive, LogShapeError, signatureOf } from "./logs.js";
 import type { EvmClient, RawEvmLog } from "./client.js";
+import { readEvmBlockCheckpointHash, recordEvmBlockCheckpoint } from "./checkpoints.js";
 
 /**
  * How far behind the confirmation line still counts as current.
@@ -456,8 +457,17 @@ export class EvmWatcher {
 
       let from = base + 1n;
       let reorgDetected = false;
-      if (!fresh && stored !== null && stored.hash !== null) {
-        const rewound = await this.checkForReorg(stored.position, stored.hash, signal);
+      const checkpointHash =
+        !fresh && stored !== null && stored.hash === null
+          ? await readEvmBlockCheckpointHash(
+              db,
+              { chainKey, contract: router, deploymentRevision: revision },
+              stored.position,
+            )
+          : null;
+      const expectedHash = stored?.hash ?? checkpointHash;
+      if (!fresh && stored !== null && expectedHash !== null) {
+        const rewound = await this.checkForReorg(stored.position, expectedHash, signal);
         if (rewound !== null) {
           from = rewound;
           reorgDetected = true;
@@ -612,6 +622,14 @@ export class EvmWatcher {
           if (await this.apply(tx, log, stamp.timestamp, pairing, stamp.hash)) written += 1;
           else ignored += 1;
         }
+        await recordEvmBlockCheckpoint(tx, {
+          chainKey,
+          contract: router,
+          deploymentRevision: revision,
+          block: to,
+          hash: endHash,
+          ...(reorgDetected ? { rewindFrom: from } : {}),
+        });
         await writeCursor(tx, {
           chainKey,
           family: "evm",
@@ -625,6 +643,7 @@ export class EvmWatcher {
           deploymentRevision: revision,
           expectedContract: stored?.contract ?? router,
           expectedDeploymentRevision: stored?.deploymentRevision ?? revision,
+          allowEvmRewind: reorgDetected,
         });
 
         return recordEvmScanProvenance(tx, {

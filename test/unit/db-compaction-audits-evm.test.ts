@@ -8,6 +8,12 @@ import {
   readLatestEvmScanProvenance,
 } from "../../src/chains/evm/store.js";
 import { EvmWatcher } from "../../src/chains/evm/watcher.js";
+import { readCursor, writeCursor } from "../../src/chains/stellar/store.js";
+import {
+  MAX_EVM_BLOCK_CHECKPOINTS,
+  recordEvmBlockCheckpoint,
+  readEvmBlockCheckpointHash,
+} from "../../src/chains/evm/checkpoints.js";
 import {
   auditTransferAndClaimInvariants,
   acquireLease,
@@ -93,9 +99,215 @@ describe("PostgreSQL compaction, invariant audits, EVM leases and finality prove
         route_health,
         indexer_cursor,
         indexer_lease,
-        evm_scan_provenance
+        evm_scan_provenance,
+        evm_block_checkpoint
       RESTART IDENTITY CASCADE;
     `);
+  });
+
+  it("retains bounded exact checkpoints independently of event and audit rows", async () => {
+    const deployment = {
+      chainKey: "checkpoint-test",
+      contract: ANVIL_ROUTER,
+      deploymentRevision: 1,
+    };
+    const offset = 1n << 63n;
+    const hash = (block: bigint) => `0x${block.toString(16).padStart(64, "0")}`;
+    await db.transaction(async (tx) => {
+      for (let index = 0; index < MAX_EVM_BLOCK_CHECKPOINTS + 3; index++) {
+        const block = offset + BigInt(index);
+        await recordEvmBlockCheckpoint(tx, { ...deployment, block, hash: hash(block) });
+      }
+      await recordEvmBlockCheckpoint(tx, {
+        ...deployment,
+        deploymentRevision: 2,
+        block: offset,
+        hash: hash(offset),
+      });
+    });
+    const { rows } = await db.query(
+      "SELECT block_number, block_hash FROM evm_block_checkpoint WHERE deployment_revision=1 ORDER BY block_number",
+    );
+    expect(rows).toHaveLength(MAX_EVM_BLOCK_CHECKPOINTS);
+    expect(String(rows[0]?.block_number)).toBe((offset + 3n).toString());
+    expect(await readEvmBlockCheckpointHash(db, deployment, offset)).toBeNull();
+    expect(
+      await readEvmBlockCheckpointHash(db, { ...deployment, deploymentRevision: 2 }, offset),
+    ).toBe(hash(offset));
+    expect(
+      (await db.query("SELECT count(*)::int AS count FROM evm_scan_provenance")).rows[0]?.count,
+    ).toBe(0);
+  });
+
+  it("rejects conflicting anchors and rolls back checkpoint writes with their transaction", async () => {
+    const entry = {
+      chainKey: "checkpoint-test",
+      contract: ANVIL_ROUTER,
+      deploymentRevision: 1,
+      block: 10n,
+      hash: `0x${"a".repeat(64)}`,
+    };
+    await recordEvmBlockCheckpoint(db, entry);
+    await expect(
+      db.transaction(async (tx) => {
+        await recordEvmBlockCheckpoint(tx, { ...entry, hash: `0x${"b".repeat(64)}` });
+      }),
+    ).rejects.toThrow("conflicts with retained canonical history");
+    expect(await readEvmBlockCheckpointHash(db, entry, 10n)).toBe(entry.hash);
+    await expect(
+      db.transaction(async (tx) => {
+        await recordEvmBlockCheckpoint(tx, { ...entry, block: 11n });
+        throw new Error("cursor commit failed");
+      }),
+    ).rejects.toThrow("cursor commit failed");
+    expect(await readEvmBlockCheckpointHash(db, entry, 11n)).toBeNull();
+    await db.transaction(async (tx) => {
+      await recordEvmBlockCheckpoint(tx, {
+        ...entry,
+        block: 12n,
+        hash: `0x${"b".repeat(64)}`,
+        rewindFrom: 10n,
+      });
+    });
+    expect(await readEvmBlockCheckpointHash(db, entry, 10n)).toBeNull();
+    expect(await readEvmBlockCheckpointHash(db, entry, 12n)).toBe(`0x${"b".repeat(64)}`);
+  });
+
+  it("permits verified EVM rewinds without bypassing cursor ownership or Stellar monotonicity", async () => {
+    const entry = {
+      chainKey: "checkpoint-test",
+      family: "evm" as const,
+      contract: ANVIL_ROUTER,
+      position: 20n,
+      observedAt: null,
+      hash: `0x${"a".repeat(64)}`,
+      deploymentRevision: 1,
+    };
+    await writeCursor(db, { ...entry, expectedRevision: null });
+    const original = await readCursor(db, entry.chainKey);
+    if (original === null) throw new Error("cursor fixture missing");
+    await expect(
+      writeCursor(db, { ...entry, position: 18n, expectedRevision: original.revision }),
+    ).rejects.toThrow("stale cursor");
+    for (const overrides of [
+      { expectedRevision: original.revision + 1n },
+      { expectedContract: `0x${"b".repeat(40)}` },
+      { expectedDeploymentRevision: 2 },
+    ]) {
+      await expect(
+        writeCursor(db, {
+          ...entry,
+          position: 18n,
+          expectedRevision: original.revision,
+          allowEvmRewind: true,
+          ...overrides,
+        }),
+      ).rejects.toThrow("stale cursor");
+    }
+    await expect(
+      writeCursor(db, {
+        ...entry,
+        family: "stellar",
+        expectedRevision: original.revision,
+        allowEvmRewind: true,
+      }),
+    ).rejects.toThrow("only valid for an EVM cursor");
+    expect(await readCursor(db, entry.chainKey)).toEqual(original);
+    await writeCursor(db, {
+      ...entry,
+      position: 18n,
+      expectedRevision: original.revision,
+      allowEvmRewind: true,
+    });
+    expect((await readCursor(db, entry.chainKey))?.position).toBe(18n);
+  });
+
+  it("cleans an oversized checkpoint backlog in bounded deployment-specific batches", async () => {
+    const entry = {
+      chainKey: "checkpoint-test",
+      contract: ANVIL_ROUTER,
+      deploymentRevision: 1,
+      block: 1000n,
+      hash: `0x${"a".repeat(64)}`,
+    };
+    await db.query(
+      `INSERT INTO evm_block_checkpoint(chain_key,contract,deployment_revision,block_number,block_hash)
+      SELECT $1,$2,1,block,'0x' || lpad(to_hex(block),64,'0') FROM generate_series(0,521) AS block`,
+      [entry.chainKey, entry.contract.toLowerCase()],
+    );
+    const other = [
+      { ...entry, chainKey: "another-chain" },
+      { ...entry, contract: `0x${"b".repeat(40)}` },
+      { ...entry, deploymentRevision: 2 },
+    ];
+    for (const deployment of other) await recordEvmBlockCheckpoint(db, deployment);
+    const count = async () =>
+      Number(
+        (
+          await db.query(
+            "SELECT count(*)::int AS count FROM evm_block_checkpoint WHERE chain_key=$1 AND contract=$2 AND deployment_revision=1",
+            [entry.chainKey, entry.contract.toLowerCase()],
+          )
+        ).rows[0]?.count,
+      );
+    await recordEvmBlockCheckpoint(db, entry);
+    expect(await count()).toBe(267);
+    await recordEvmBlockCheckpoint(db, entry);
+    expect(await count()).toBe(MAX_EVM_BLOCK_CHECKPOINTS);
+    for (const deployment of other)
+      expect(await readEvmBlockCheckpointHash(db, deployment, 1000n)).toBe(entry.hash);
+  });
+
+  it("recovers an empty-range reorg from a retained anchor when a legacy cursor has no hash", async () => {
+    const chainKey = "checkpoint-test";
+    const head = ANVIL_START_BLOCK + 5n;
+    const client = new FakeEvmClient({ head, logs: [] });
+    const make = () =>
+      new EvmWatcher({
+        chainKey,
+        router: ANVIL_ROUTER,
+        chainId: ANVIL_CHAIN_ID,
+        startBlock: ANVIL_START_BLOCK,
+        confirmations: 0,
+        reorgDepth: 5,
+        logRange: 2,
+        releaseLeaseOnTick: true,
+        client,
+        db,
+        logger: capturingLogger().logger,
+      });
+    const initial = make();
+    while (await initial.tick(AbortSignal.timeout(20_000))) {
+      /* drain bounded empty ranges */
+    }
+    const originals = (await db.query("SELECT * FROM evm_scan_provenance ORDER BY id")).rows;
+    expect(originals).toHaveLength(3);
+    await db.query("UPDATE indexer_cursor SET last_processed_hash=NULL WHERE chain_key=$1", [
+      chainKey,
+    ]);
+    client.reorg(head - 2n, []);
+    client.advanceHeadTo(head + 1n);
+    const restarted = make();
+    await restarted.tick(AbortSignal.timeout(20_000));
+    expect(restarted.progress?.reorgs).toBe(1);
+    expect(client.logQueries.at(-1)?.fromBlock).toBe(head - 4n);
+    const cursor = (
+      await db.query(
+        "SELECT last_processed, last_processed_hash FROM indexer_cursor WHERE chain_key=$1",
+        [chainKey],
+      )
+    ).rows[0];
+    expect(String(cursor?.last_processed)).toBe((head - 3n).toString());
+    expect(cursor?.last_processed_hash).toBe(client.stampFor(head - 3n).hash);
+    expect(
+      await readEvmBlockCheckpointHash(
+        db,
+        { chainKey, contract: ANVIL_ROUTER, deploymentRevision: 1 },
+        head,
+      ),
+    ).toBeNull();
+    const history = (await db.query("SELECT * FROM evm_scan_provenance ORDER BY id")).rows;
+    expect(history.slice(0, 3)).toEqual(originals);
   });
 
   it("records a weaker evidence policy without changing any previous scan", async () => {

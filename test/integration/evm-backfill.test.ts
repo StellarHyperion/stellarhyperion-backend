@@ -43,6 +43,7 @@ suite("durable bounded EVM historical jobs", () => {
     await db.query("DELETE FROM pending_claim WHERE chain = $1", [config.chain]);
     await db.query("DELETE FROM inbound_delivery WHERE destination_chain = $1", [config.chain]);
     await db.query("DELETE FROM indexer_cursor WHERE chain_key = $1", [config.chain]);
+    await db.query("DELETE FROM evm_block_checkpoint WHERE chain_key = $1", [config.chain]);
   };
   beforeAll(() => {
     db = Database.open(connection ?? "");

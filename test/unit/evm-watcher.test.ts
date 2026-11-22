@@ -43,9 +43,10 @@ function harness(
     readonly finalityMode?: "confirmations" | "finalized";
     readonly allowFinalityFallback?: boolean;
     readonly deploymentRevision?: number;
+    readonly db?: RecordingDb;
   } = {},
 ): Harness {
-  const db = new RecordingDb();
+  const db = options.db ?? new RecordingDb();
   const client =
     options.client ?? new FakeEvmClient(options.head === undefined ? {} : { head: options.head });
   const { logger, lines } = capturingLogger();
@@ -891,7 +892,7 @@ describe("RPC endpoint failover", () => {
 
   it("commits the canonical hash for an empty range", async () => {
     const head = ANVIL_START_BLOCK + 5n;
-    const { watcher, db } = harness({
+    const { watcher, db, client } = harness({
       head,
       confirmations: 0,
       client: new FakeEvmClient({ logs: [], head }),
@@ -901,6 +902,58 @@ describe("RPC endpoint failover", () => {
 
     // Empty ranges still need a durable checkpoint: a later reorg can replace blocks that emitted
     // no router logs, so relying on the last event would leave the watcher blind to that history.
-    expect(cursorWrites(db)).toEqual([{ block: head, family: "evm", hash: expect.any(String) }]);
+    expect(cursorWrites(db)).toEqual([
+      { block: head, family: "evm", hash: client.stampFor(head).hash },
+    ]);
+    const checkpoint = db.matching("INSERT INTO evm_block_checkpoint")[0];
+    expect(checkpoint?.params).toEqual([
+      CHAIN,
+      ANVIL_ROUTER.toLowerCase(),
+      1,
+      head.toString(),
+      client.stampFor(head).hash,
+    ]);
+    expect(checkpoint?.transaction).not.toBeNull();
+    expect(checkpoint?.transaction).toBe(rawCursorWrites(db)[0]?.transaction);
+    expect(db.commits).toContain(checkpoint?.transaction);
+  });
+
+  it("detects an empty-block reorg after restarting and replaces orphaned checkpoints", async () => {
+    const head = ANVIL_START_BLOCK + 5n;
+    const client = new FakeEvmClient({ logs: [], head });
+    const first = harness({ client, confirmations: 0 });
+    await first.watcher.tick(AbortSignal.timeout(5_000));
+    await first.watcher.release();
+    const original = client.stampFor(head).hash;
+    client.reorg(head - 2n, []);
+    client.advanceHeadTo(head + 1n);
+    const restarted = harness({ client, db: first.db, confirmations: 0 });
+    await restarted.watcher.tick(AbortSignal.timeout(5_000));
+    expect(client.stampFor(head).hash).not.toBe(original);
+    expect(client.logQueries[1]?.fromBlock).toBe(head - 4n);
+    expect(restarted.watcher.progress?.reorgs).toBe(1);
+    expect(restarted.db.matching("block_number >= $4")[0]?.params).toEqual([
+      CHAIN,
+      ANVIL_ROUTER.toLowerCase(),
+      1,
+      (head - 4n).toString(),
+    ]);
+    expect(cursorWrites(restarted.db).at(-1)).toEqual({
+      block: head + 1n,
+      family: "evm",
+      hash: client.stampFor(head + 1n).hash,
+    });
+  });
+
+  it("does not commit an empty range whose canonical end block disappeared", async () => {
+    const head = ANVIL_START_BLOCK + 5n;
+    const { watcher, db } = harness({
+      confirmations: 0,
+      client: new FakeEvmClient({ logs: [], head, missing: [head] }),
+    });
+    await watcher.tick(AbortSignal.timeout(5_000));
+    expect(cursorWrites(db)).toEqual([]);
+    expect(db.matching("INSERT INTO evm_block_checkpoint")).toEqual([]);
+    expect(db.commits).toEqual([]);
   });
 });

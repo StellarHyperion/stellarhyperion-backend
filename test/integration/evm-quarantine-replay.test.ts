@@ -30,6 +30,7 @@ const connection = process.env.TEST_DATABASE_URL;
       ["indexer_cursor", "chain_key"],
       ["indexer_lease", "chain_key"],
       ["evm_scan_provenance", "chain_key"],
+      ["evm_block_checkpoint", "chain_key"],
       ["evm_applied_event", "chain_key"],
       ["evm_log_quarantine", "chain_key"],
     ])

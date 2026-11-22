@@ -118,8 +118,13 @@ export async function writeCursor(
     readonly deploymentRevision?: number;
     readonly expectedContract?: string;
     readonly expectedDeploymentRevision?: number;
+    /** Only the EVM watcher sets this after verifying a canonical reorg under its lease. */
+    readonly allowEvmRewind?: boolean;
   },
 ): Promise<void> {
+  if (entry.allowEvmRewind === true && entry.family !== "evm") {
+    throw new Error("EVM reorg rewind is only valid for an EVM cursor.");
+  }
   const baseParams = [
     entry.chainKey,
     entry.family,
@@ -170,7 +175,8 @@ export async function writeCursor(
            revision = revision + 1, deployment_revision = $8, updated_at = now()
      WHERE chain_key = $1 AND revision = $7 AND contract = $9
        AND deployment_revision = $10
-       AND (($8 = deployment_revision AND contract = $3 AND last_processed <= $4)
+       AND (($8 = deployment_revision AND contract = $3
+             AND (last_processed <= $4 OR ($11 AND family = 'evm' AND $2 = 'evm')))
             OR $8 > deployment_revision)
      RETURNING revision`,
     [
@@ -179,6 +185,7 @@ export async function writeCursor(
       entry.deploymentRevision ?? 1,
       entry.expectedContract ?? entry.contract,
       entry.expectedDeploymentRevision ?? entry.deploymentRevision ?? 1,
+      entry.allowEvmRewind ?? false,
     ],
   );
   if (result.rowCount === 0) {
