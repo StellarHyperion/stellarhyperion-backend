@@ -18,6 +18,7 @@ import { buildServer } from "./http/server.js";
 import { createApiRedis } from "./http/rate-limit-redis.js";
 import { createLogger } from "./logging/logger.js";
 import { Shutdown, installSignalHandlers } from "./runtime/shutdown.js";
+import { WorkerPolicyStore } from "./runtime/worker-policy.js";
 
 async function main(): Promise<void> {
   const startedAt = new Date();
@@ -45,6 +46,20 @@ async function main(): Promise<void> {
   }
 
   const logger = createLogger(config);
+  const workerPolicy = new WorkerPolicyStore(config);
+  const reloadWorkerPolicy = (): void => {
+    try {
+      const candidate = loadConfig();
+      const next = workerPolicy.replace(candidate);
+      logger.info({ policyVersion: next.version }, "validated worker policy reloaded");
+    } catch (error) {
+      logger.warn(
+        { reason: error instanceof Error ? error.message : "invalid worker policy" },
+        "worker policy reload rejected; previous policy remains active",
+      );
+    }
+  };
+  process.on("SIGHUP", reloadWorkerPolicy);
   const shutdown = new Shutdown(logger, config.shutdownTimeoutMs);
   installSignalHandlers(shutdown, logger);
 
@@ -53,6 +68,10 @@ async function main(): Promise<void> {
     readOnly: config.databaseRole === "read-only",
     logger,
     slowQueryThresholdMs: 1_000,
+  });
+  shutdown.add("worker-policy", () => {
+    process.off("SIGHUP", reloadWorkerPolicy);
+    return Promise.resolve();
   });
   shutdown.add("postgres", () => db.close());
   try {

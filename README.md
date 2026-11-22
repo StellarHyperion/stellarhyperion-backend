@@ -208,6 +208,13 @@ for a seeded history.
 
 ## API and checks
 
+The nonsecret worker policy can be validated and reloaded with `SIGHUP`. The reload reads the
+current environment, validates it completely, and publishes one new policy version only after all
+values pass validation; an invalid reload leaves the previous policy active. In-flight work keeps
+the policy version it started with and completes under that version. Deployment identity (network,
+deployment record, routers, RPCs, and indexer topology) is not reloadable and requires a controlled
+restart or migration. Reload logs contain only the policy version or a fixed validation reason.
+
 - `GET /health`, `GET /ready`
   `GET /health` reports hosting environment, database role, a stable public configuration digest
   (`configDigest`) and effective-setting provenance (`configProvenance`). The report uses selected
