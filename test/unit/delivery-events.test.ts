@@ -7,6 +7,7 @@ import {
   inspectDeliveryEvidence,
   matchingPayment,
   inspectPayment,
+  inspectTokenMapping,
   normalizeVerificationDiagnostics,
   type DeliveryLog,
   type ExpectedDelivery,
@@ -91,6 +92,14 @@ describe("Destination delivery evidence", () => {
         },
       ]),
     );
+  });
+  it("reports token identity and precision mapping changes", () => {
+    expect(
+      inspectTokenMapping({ symbol: "USDC", decimals: 7 }, { symbol: "USDC", decimals: 6 }),
+    ).toEqual([{ category: "precision", expected: "7", observed: "6" }]);
+    expect(
+      inspectTokenMapping({ symbol: "USDC", decimals: 7 }, { symbol: "USDT", decimals: 7 }),
+    ).toEqual([{ category: "token", expected: "USDC", observed: "USDT" }]);
   });
   it("does not lose a matching receipt event when another transfer shares the transaction", () => {
     const unrelated = { ...received, address: token as Hex };

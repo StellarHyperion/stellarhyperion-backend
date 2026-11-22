@@ -273,7 +273,11 @@ describe("independent real CCTP and ITS destination proof mutation corpus", () =
           Promise.resolve(
             functionName === "registeredTokenAddress"
               ? its.expected.token
-              : its.expected.tokenManager,
+              : functionName === "tokenManagerAddress"
+                ? its.expected.tokenManager
+                : functionName === "symbol"
+                  ? usdc.code
+                  : usdc.decimals,
           ),
         );
         stellar

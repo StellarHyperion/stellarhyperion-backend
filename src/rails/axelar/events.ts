@@ -3,6 +3,8 @@ import { decodeEventLog, parseAbi, type Hex } from "viem";
 export const ITS_ABI = parseAbi([
   "function registeredTokenAddress(bytes32 tokenId) view returns (address)",
   "function tokenManagerAddress(bytes32 tokenId) view returns (address)",
+  "function symbol() view returns (string)",
+  "function decimals() view returns (uint8)",
   "event InterchainTransferReceived(bytes32 indexed commandId, bytes32 indexed tokenId, string sourceChain, bytes sourceAddress, address indexed destinationAddress, uint256 amount, bytes32 dataHash)",
   "event Transfer(address indexed from, address indexed to, uint256 value)",
 ]);
@@ -227,7 +229,13 @@ export function inspectAxelarGasEvidence<T extends DeliveryLog>(
 }
 
 export type VerificationMismatchCategory =
-  "source_identity" | "command" | "token" | "recipient" | "amount" | "payment_evidence";
+  | "source_identity"
+  | "command"
+  | "token"
+  | "precision"
+  | "recipient"
+  | "amount"
+  | "payment_evidence";
 
 export interface VerificationDiagnostic {
   readonly category: VerificationMismatchCategory;
@@ -374,6 +382,7 @@ export function normalizeVerificationDiagnostics(
     "source_identity",
     "command",
     "token",
+    "precision",
     "recipient",
     "amount",
     "payment_evidence",
@@ -393,6 +402,23 @@ export function normalizeVerificationDiagnostics(
     if (result.length === categories.length) break;
   }
   return result;
+}
+
+/** Compare configured source-token metadata with the destination token contract metadata. */
+export function inspectTokenMapping(
+  expected: { readonly symbol: string; readonly decimals: number },
+  observed: { readonly symbol: string; readonly decimals: number },
+): readonly VerificationDiagnostic[] {
+  const diagnostics: VerificationDiagnostic[] = [];
+  if (expected.symbol !== observed.symbol)
+    diagnostics.push({ category: "token", expected: expected.symbol, observed: observed.symbol });
+  if (expected.decimals !== observed.decimals)
+    diagnostics.push({
+      category: "precision",
+      expected: String(expected.decimals),
+      observed: String(observed.decimals),
+    });
+  return diagnostics;
 }
 
 /** Return bounded public diagnostics only when no exact receipt/payment pair exists. */
