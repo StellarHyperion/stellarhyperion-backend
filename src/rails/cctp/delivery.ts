@@ -35,6 +35,7 @@ import {
   type ExpectedCctpTransfer,
 } from "./events.js";
 import type { CctpVerificationFailure } from "../types.js";
+import type { BoundedCandidateReceiptCache } from "../candidate-receipt-cache.js";
 
 /** Returned by inspectCctpDelivery on a successful delivery. */
 export interface CctpDeliverySuccess {
@@ -62,6 +63,7 @@ export interface DeliveryVerificationOptions {
   readonly signal?: AbortSignal;
   readonly logger?: Logger;
   readonly clientForUrl?: DestinationVerificationClientFactory;
+  readonly candidateReceiptCache?: BoundedCandidateReceiptCache;
 }
 
 /**
@@ -296,7 +298,19 @@ export async function inspectCctpDelivery(
     destination.chainId,
     options.clientForUrl ?? destinationVerificationViemClient,
     async (client) => {
-      const receipt = await client.getTransactionReceipt({ hash: forwardTxHash });
+      const receipt = options.candidateReceiptCache
+        ? await options.candidateReceiptCache.get({
+            chain: transfer.destinationChain,
+            txHash: forwardTxHash,
+            read: () => client.getTransactionReceipt({ hash: forwardTxHash }),
+            readBlock: ({ blockNumber }) =>
+              client.getBlock({ blockNumber, includeTransactions: false }),
+            identity: (candidate) => ({
+              blockNumber: candidate.blockNumber,
+              blockHash: candidate.blockHash,
+            }),
+          })
+        : await client.getTransactionReceipt({ hash: forwardTxHash });
       if (receipt.status !== "success") return failed("receipt_reverted");
       const head = await client.getBlockNumber();
       if (head - receipt.blockNumber + 1n < BigInt(destination.confirmations))
