@@ -6,6 +6,9 @@
  * message on stderr is worth more to whoever is staring at a crash loop than a single line of
  * JSON with the whole explanation escaped inside one field.
  */
+import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
+import type { FastifyInstance } from "fastify";
 import { buildIndexer } from "./chains/runner.js";
 import { admitNetworkEnvironment } from "./config/admission.js";
 import { loadConfig } from "./config/config.js";
@@ -19,7 +22,14 @@ import { createApiRedis } from "./http/rate-limit-redis.js";
 import { createLogger } from "./logging/logger.js";
 import { Shutdown, installSignalHandlers } from "./runtime/shutdown.js";
 
-async function main(): Promise<void> {
+export interface ContinuousApplication {
+  readonly server: FastifyInstance;
+  readonly db: Database;
+  readonly stop: (reason?: string) => Promise<void>;
+}
+
+/** The continuous entrypoint, also available to lifecycle and parity harnesses. */
+export async function startContinuousApplication(): Promise<ContinuousApplication> {
   const startedAt = new Date();
 
   const config = (() => {
@@ -46,7 +56,11 @@ async function main(): Promise<void> {
 
   const logger = createLogger(config);
   const shutdown = new Shutdown(logger, config.shutdownTimeoutMs);
-  installSignalHandlers(shutdown, logger);
+  const removeSignalHandlers = installSignalHandlers(shutdown, logger);
+  shutdown.add("signal-handlers", () => {
+    removeSignalHandlers();
+    return Promise.resolve();
+  });
 
   const db = Database.open(config.databaseUrl, {
     applicationName: "hyperion-backend",
@@ -59,7 +73,7 @@ async function main(): Promise<void> {
     await checkSchemaCompatibility(db, config.schemaVersion);
     await checkDatabasePolicy(db, config);
   } catch (error) {
-    await db.close();
+    await shutdown.run("startup-failure");
     throw error;
   }
 
@@ -86,7 +100,17 @@ async function main(): Promise<void> {
   // Registered before listen so a failed listen still closes what is already open.
   shutdown.add("http", () => server.close());
 
-  await server.listen({ host: config.http.host, port: config.http.port });
+  const application: ContinuousApplication = {
+    server,
+    db,
+    stop: (reason = "application-stop") => shutdown.run(reason),
+  };
+  try {
+    await server.listen({ host: config.http.host, port: config.http.port });
+  } catch (error) {
+    await application.stop("startup-failure");
+    throw error;
+  }
   // After listen, so the probes are answering before the first page is read. A watcher that
   // starts first makes its initial RPC calls while nothing can report on them.
   if (config.catchUpEnabled) {
@@ -97,7 +121,7 @@ async function main(): Promise<void> {
       );
       await shutdown.run(reason);
     });
-    return;
+    return application;
   }
   indexer.start();
   logger.info(
@@ -114,6 +138,9 @@ async function main(): Promise<void> {
     },
     "hyperion backend listening",
   );
+  return application;
 }
 
-await main();
+if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await startContinuousApplication();
+}

@@ -30,6 +30,9 @@ import { sanitizeDiagnosticText } from "../../logging/logger.js";
 const LIVENESS_MEANING =
   "This process is running and answering. It says nothing about Postgres or the chains. Use /ready for that.";
 
+const API_READINESS_MEANING =
+  "This API can serve reads: its database and configured Redis answer. Background workers are not started or assessed by this process.";
+
 const READINESS_MEANING =
   "This process can do its job: Postgres and Redis answer and every watcher is current. A 503 here means take this replica out of rotation, not restart it.";
 
@@ -50,10 +53,11 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
   }));
 
   app.get("/ready", async (_request, reply) => {
+    const apiOnly = deps.config.deploymentMode === "api-only";
     const dbCheck = await checkDatabase(deps);
     const checks: ReadinessReport[] = [dbCheck, await checkRedis(deps)];
 
-    for (const source of deps.readiness) {
+    for (const source of apiOnly ? [] : deps.readiness) {
       try {
         const report = await source.readiness();
         if (report.name === "redis" && deps.redis !== undefined) continue;
@@ -70,7 +74,7 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
     }
 
     let heartbeats: WorkerHeartbeatRecord[] = [];
-    if (dbCheck.state !== "down") {
+    if (!apiOnly && dbCheck.state !== "down") {
       try {
         heartbeats = await readWorkerHeartbeats(deps.db);
         const now = new Date();
@@ -126,14 +130,18 @@ export function registerHealthRoutes(app: FastifyInstance, deps: ServerDeps): vo
     const status = evaluated.state === "down" ? 503 : 200;
     return reply.code(status).send({
       status: evaluated.state,
-      meaning: READINESS_MEANING,
+      meaning: apiOnly ? API_READINESS_MEANING : READINESS_MEANING,
       network: deps.config.network,
       deploymentMode: deps.config.deploymentMode,
       policy: deps.config.readinessPolicy,
-      indexer: deps.config.indexer.enabled ? "enabled" : "disabled",
+      indexer: !apiOnly && deps.config.indexer.enabled ? "enabled" : "disabled",
       checks: evaluated.checks,
-      runCorrelation,
-      workerRuns: dbCheck.state === "down" ? [] : await readWorkerRuns(deps.db),
+      ...(apiOnly
+        ? {}
+        : {
+            runCorrelation,
+            workerRuns: dbCheck.state === "down" ? [] : await readWorkerRuns(deps.db),
+          }),
     });
   });
 }
