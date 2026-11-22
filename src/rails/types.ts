@@ -106,6 +106,30 @@ export interface RailCandidate {
   readonly attestationSignature?: string | null;
   readonly attestationTimestamp?: Date | null;
   readonly fastTransfer?: boolean;
+  /** Allbridge validator signatures authenticate intent only; they never prove payout. */
+  readonly allbridgeIntent?: {
+    readonly messageId: string;
+    readonly sourceChain: string;
+    readonly destinationChain: string;
+    readonly sourceTransaction: string;
+    readonly sourceBlockHash: string;
+    readonly nonce: string;
+    readonly token: string;
+    readonly recipient: string;
+    readonly amount: string;
+    readonly signature: string;
+  } | null;
+  readonly allbridgeDestinationPayment?: {
+    readonly transactionHash: string;
+    readonly blockHash: string;
+    readonly blockNumber: string;
+    readonly logIndex: number;
+    readonly recipient: string;
+    readonly token: string;
+    readonly amount: string;
+    readonly finalized: boolean;
+    readonly reverted: boolean;
+  } | null;
 }
 
 export interface RailReport extends RailCandidate {
