@@ -1,5 +1,4 @@
-import { createHash } from "node:crypto";
-import { Keypair, rpc } from "@stellar/stellar-sdk";
+import { hash, Keypair, rpc } from "@stellar/stellar-sdk";
 import type { AppConfig } from "../config/config.js";
 import type { Queryable, Transactional } from "../db/pool.js";
 import { acquireLease, assertLeaseHeld, releaseLease } from "../db/lease.js";
@@ -16,8 +15,8 @@ export function keeperSignerLeaseParams(config: AppConfig, ownerId: string) {
     throw new Error("Keeper signer lease owner identity is invalid.");
   return {
     // Stellar sequence numbers belong to an account on a network, regardless of which
-    // router or chain label a replica operates. The lease must share that identity.
-    chainKey: `keeper-signers:${createHash("sha256").update(chain.networkPassphrase).digest("hex")}`,
+    // router or chain label a replica operates. Use Stellar's canonical public network ID.
+    chainKey: `keeper-signers:${hash(Buffer.from(chain.networkPassphrase, "utf8")).toString("hex")}`,
     contract: activeKeeperSigner(config).publicKey,
     ownerId,
     ttlMs: config.indexerLeaseTtlMs,
