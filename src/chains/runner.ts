@@ -46,6 +46,7 @@ import type {
   RailRequeueResult,
 } from "../rails/types.js";
 import { KeeperWorker } from "../keeper/worker.js";
+import type { WorkerPolicyStore } from "../runtime/worker-policy.js";
 import { viemClient } from "./evm/client.js";
 import { EvmWatcher, type EvmProgress } from "./evm/watcher.js";
 import { StellarRpc } from "./stellar/rpc.js";
@@ -116,6 +117,7 @@ function isEvmProgress(progress: Pass["progress"]): progress is EvmProgress {
 }
 
 export interface PolledWorkerOptions {
+  readonly workerPolicy?: WorkerPolicyStore;
   readonly db?: Transactional;
   readonly workerKind?: WorkerKind;
   readonly chainKey?: string | null;
@@ -130,6 +132,7 @@ export interface PolledWorkerOptions {
  * read and the reason it cannot be read is the more useful thing to report.
  */
 export class PolledWorker implements Worker {
+  private readonly unsubscribePolicy: (() => void) | undefined;
   private readonly poller: Poller;
   private readonly db: Transactional | undefined;
   private readonly workerKind: WorkerKind;
@@ -190,6 +193,9 @@ export class PolledWorker implements Worker {
             }
           }
         }),
+    });
+    this.unsubscribePolicy = options.workerPolicy?.subscribe((policy) => {
+      this.poller.setIntervalMs(policy.rails.pollIntervalMs);
     });
   }
 
@@ -257,6 +263,7 @@ export class PolledWorker implements Worker {
   }
 
   async stop(): Promise<void> {
+    this.unsubscribePolicy?.();
     await this.poller.stop();
     if (this.started && this.runState === "running" && this.db !== undefined) {
       this.runState = "stopped";
@@ -281,6 +288,7 @@ export class PolledWorker implements Worker {
 }
 
 export interface BuildIndexerDeps {
+  readonly workerPolicy?: WorkerPolicyStore;
   readonly config: AppConfig;
   readonly logger: Logger;
   readonly db: Transactional;
@@ -305,14 +313,17 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
     logger,
     config,
     railShutdown.signal,
+    deps.workerPolicy,
   );
   const inspectBacklog = (
     options: InspectRailBacklogOptions = {},
   ): Promise<BacklogInspectionReport> =>
     inspectRailBacklog(db, {
       ...options,
-      recheckAfterMs: config.rails.recheckAfterMs,
-      maxCheckFailures: config.rails.maxCheckFailures,
+      recheckAfterMs:
+        deps.workerPolicy?.snapshot().rails.recheckAfterMs ?? config.rails.recheckAfterMs,
+      maxCheckFailures:
+        deps.workerPolicy?.snapshot().rails.maxCheckFailures ?? config.rails.maxCheckFailures,
     });
   const requeueTransfer: IndexerHandle["requeueTransfer"] = async (request, options) => {
     if (options?.evaluateNow === true && !config.rails.enabled) {
@@ -372,7 +383,14 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
   // They are not conditional on a router being watched: a transfer indexed by a previous run is
   // still waiting on its rail whether or not this replica is watching the chain it left.
   if (config.rails.enabled) {
-    for (const worker of railWorkersFromPasses(passes, config.rails, db, logger, executionId)) {
+    for (const worker of railWorkersFromPasses(
+      passes,
+      config.rails,
+      db,
+      logger,
+      executionId,
+      deps.workerPolicy,
+    )) {
       workers.push(worker);
     }
   } else {
@@ -387,7 +405,7 @@ export function buildIndexer(deps: BuildIndexerDeps): IndexerHandle {
 
   // The keeper submits Stellar TTL maintenance and claim settlement through BullMQ.
   if (config.keeper.enabled) {
-    workers.push(new KeeperWorker(config, db, logger));
+    workers.push(new KeeperWorker(config, db, logger, deps.workerPolicy));
   } else {
     extra.push(
       fixedReadiness(
@@ -448,6 +466,7 @@ export function buildRailPasses(
   logger: Logger,
   appConfig: AppConfig,
   shutdownSignal?: AbortSignal,
+  workerPolicy?: WorkerPolicyStore,
 ): readonly RailPass[] {
   const clients: readonly { readonly route: RouteKind; readonly client: RailClient }[] = [
     {
@@ -480,9 +499,12 @@ export function buildRailPasses(
       db,
       logger: child,
       batchSize: config.batchSize,
+      providerConcurrency: config.providerConcurrency,
+      destinationRpcConcurrency: config.destinationRpcConcurrency,
       recheckAfterMs: config.recheckAfterMs,
       maxCheckFailures: config.maxCheckFailures,
       ...(shutdownSignal === undefined ? {} : { shutdownSignal }),
+      ...(workerPolicy === undefined ? {} : { workerPolicy }),
     });
   });
 }
@@ -493,6 +515,7 @@ function railWorkersFromPasses(
   db: Transactional,
   logger: Logger,
   executionId: string,
+  workerPolicy?: WorkerPolicyStore,
 ): readonly Worker[] {
   return passes.map((pass) => {
     const child = logger.child({ rail: pass.rail, route: pass.route });
@@ -501,6 +524,7 @@ function railWorkersFromPasses(
       workerKind: "rail",
       chainKey: null,
       executionId,
+      ...(workerPolicy === undefined ? {} : { workerPolicy }),
     });
   });
 }

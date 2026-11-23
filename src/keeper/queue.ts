@@ -57,25 +57,38 @@ export async function startKeeperQueue(
   const worker = new Worker<unknown, KeeperJobResult, string>(
     KEEPER_QUEUE_NAME,
     async (job) => {
-      logger.info({ jobName: job.name, jobId: job.id }, "processing keeper job");
-      switch (job.name as KeeperJobName) {
-        case "ttl-bump": {
-          const result = await processTtlBump(ctx, job.data as object);
-          return { kind: "ttl-bump", result };
+      const processAtVersion = async (): Promise<KeeperJobResult> => {
+        const jobContext =
+          ctx.workerPolicy === undefined
+            ? ctx
+            : {
+                ...ctx,
+                config: ctx.workerPolicy.configuration(),
+              };
+        logger.info({ jobName: job.name, jobId: job.id }, "processing keeper job");
+        switch (job.name as KeeperJobName) {
+          case "ttl-bump": {
+            const result = await processTtlBump(jobContext, job.data as object);
+            return { kind: "ttl-bump", result };
+          }
+          case "claim-settlement": {
+            const result = await processClaimSettlement(jobContext, job.data as object);
+            return { kind: "claim-settlement", result };
+          }
+          default:
+            throw new Error(`unknown keeper job name: ${job.name}`);
         }
-        case "claim-settlement": {
-          const result = await processClaimSettlement(ctx, job.data as object);
-          return { kind: "claim-settlement", result };
-        }
-        default:
-          throw new Error(`unknown keeper job name: ${job.name}`);
-      }
+      };
+      return ctx.workerPolicy?.run(processAtVersion) ?? processAtVersion();
     },
     {
       connection: createKeeperRedis(redisUrl),
       concurrency: config.keeper.concurrency,
     },
   );
+  const unsubscribePolicy = ctx.workerPolicy?.subscribe((policy) => {
+    worker.concurrency = policy.keeper.concurrency;
+  });
 
   worker.on("completed", (job, result) => {
     logger.info({ jobName: job.name, jobId: job.id, kind: result.kind }, "keeper job completed");
@@ -104,6 +117,7 @@ export async function startKeeperQueue(
     worker,
     redis,
     close: async () => {
+      unsubscribePolicy?.();
       await worker.close();
       await queue.close();
       redis.disconnect();

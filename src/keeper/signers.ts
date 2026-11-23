@@ -1,10 +1,57 @@
+import { createHash } from "node:crypto";
 import { Keypair, rpc } from "@stellar/stellar-sdk";
 import type { AppConfig } from "../config/config.js";
 import type { Queryable, Transactional } from "../db/pool.js";
+import { acquireLease, assertLeaseHeld, releaseLease } from "../db/lease.js";
 
 export interface KeeperSigner {
   readonly key: Keypair;
   readonly publicKey: string;
+}
+
+export function keeperSignerLeaseParams(config: AppConfig, ownerId: string) {
+  const chain = config.indexer.stellar;
+  if (!chain) throw new Error("A Stellar deployment is required for keeper signing.");
+  if (!/^[A-Za-z0-9_.:-]{1,165}:[0-9a-f-]{36}$/.test(ownerId))
+    throw new Error("Keeper signer lease owner identity is invalid.");
+  return {
+    // Stellar sequence numbers belong to an account on a network, regardless of which
+    // router or chain label a replica operates. The lease must share that identity.
+    chainKey: `keeper-signers:${createHash("sha256").update(chain.networkPassphrase).digest("hex")}`,
+    contract: activeKeeperSigner(config).publicKey,
+    ownerId,
+    ttlMs: config.indexerLeaseTtlMs,
+  } as const;
+}
+
+export function keeperSubmissionLock(config: AppConfig): string {
+  const lease = keeperSignerLeaseParams(config, "submission:00000000-0000-4000-8000-000000000000");
+  return `${lease.chainKey}:${lease.contract}`;
+}
+
+export async function acquireKeeperSignerLease(
+  db: Queryable,
+  config: AppConfig,
+  ownerId: string,
+): Promise<void> {
+  const lease = await acquireLease(db, keeperSignerLeaseParams(config, ownerId));
+  if (lease === null) throw new Error("Keeper signer lease is held by another replica.");
+}
+
+export async function assertKeeperSignerLease(
+  db: Queryable,
+  config: AppConfig,
+  ownerId: string,
+): Promise<void> {
+  await assertLeaseHeld(db, keeperSignerLeaseParams(config, ownerId));
+}
+
+export async function releaseKeeperSignerLease(
+  db: Queryable,
+  config: AppConfig,
+  ownerId: string,
+): Promise<void> {
+  await releaseLease(db, keeperSignerLeaseParams(config, ownerId));
 }
 export function configuredKeeperSigners(config: AppConfig): readonly KeeperSigner[] {
   return config.keeper.stellarSecrets.map((secret) => {

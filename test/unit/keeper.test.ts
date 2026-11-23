@@ -8,10 +8,15 @@ import { requeueFailedKeeperJob } from "../../src/keeper/queue.js";
 import type { Queue } from "bullmq";
 import { KeeperMaintenancePausedError, reserveKeeperSpending } from "../../src/keeper/spending.js";
 import { KeeperWorker } from "../../src/keeper/worker.js";
+import {
+  acquireKeeperSignerLease,
+  assertKeeperSignerLease,
+  releaseKeeperSignerLease,
+} from "../../src/keeper/signers.js";
 import type { rpc } from "@stellar/stellar-sdk";
 import type { Queryable } from "../../src/db/pool.js";
 import { completeEnv } from "../helpers.js";
-import { capturingLogger } from "../stellar-fakes.js";
+import { RecordingDb, capturingLogger } from "../stellar-fakes.js";
 vi.mock("../../src/keeper/stellar.js", () => ({
   reconcileKeeperCheckpointsBeforeRetry: vi.fn(),
   submitStellar: vi.fn(),
@@ -287,6 +292,27 @@ describe("Stellar keeper execution", () => {
     expect(new KeeperWorker(config, new Db(), logger).readiness().state).toBe("degraded");
     const disabled = loadConfig({ env: completeEnv({ KEEPER_ENABLED: "false" }) });
     expect(new KeeperWorker(disabled, new Db(), logger).readiness().state).toBe("ready");
+  });
+  it("fences competing signer replicas and recovers after lease expiry", async () => {
+    const config = loadConfig({
+      env: completeEnv({ KEEPER_STELLAR_SECRET: Keypair.random().secret() }),
+    });
+    const db = new RecordingDb();
+    const first = `${config.indexerLeaseOwnerId}:00000000-0000-4000-8000-000000000001`;
+    const replacement = `${config.indexerLeaseOwnerId}:00000000-0000-4000-8000-000000000002`;
+
+    await acquireKeeperSignerLease(db, config, first);
+    await expect(acquireKeeperSignerLease(db, config, replacement)).rejects.toThrow(
+      "held by another replica",
+    );
+    if (db.leaseRow === null) throw new Error("missing lease fixture");
+    db.leaseRow.lease_until = new Date(Date.now() - 1_000);
+    await expect(assertKeeperSignerLease(db, config, first)).rejects.toThrow("lease lost");
+
+    await acquireKeeperSignerLease(db, config, replacement);
+    await expect(assertKeeperSignerLease(db, config, first)).rejects.toThrow("lease lost");
+    await assertKeeperSignerLease(db, config, replacement);
+    await releaseKeeperSignerLease(db, config, replacement);
   });
   it("reconciles public checkpoints before a reviewed failed-job retry", async () => {
     const config = loadConfig({ env: completeEnv() });

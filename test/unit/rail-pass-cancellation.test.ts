@@ -113,7 +113,7 @@ describe("rail delivery persistence during shutdown", () => {
       batchSize: 1,
       recheckAfterMs: 60_000,
       maxCheckFailures: 5,
-      config: {} as AppConfig,
+      config: { destinationVerification: { evmRpcUrls: {} } } as AppConfig,
     });
 
     await expect(pass.evaluateTransfer(42n, shutdown.signal)).resolves.toBe(false);

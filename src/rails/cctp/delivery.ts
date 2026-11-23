@@ -182,8 +182,9 @@ export async function inspectCctpDelivery(
     failure,
     proofEvidence: null,
   });
-  if (transfer.route !== RouteKind.Cctp || transfer.originChain !== "stellar-testnet")
-    return noResult();
+  if (transfer.route !== RouteKind.Cctp) return noResult();
+  if (transfer.originChain !== "stellar-testnet")
+    return failed("inbound_contract_capability_missing");
   if (!isChainKey(transfer.destinationChain)) return failed("configuration_unavailable");
   if (!isDestinationVerificationChain(transfer.destinationChain))
     return failed("configuration_unavailable");

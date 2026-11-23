@@ -119,6 +119,11 @@ Background processes must be disabled in serverless functions: `INDEXER_ENABLED=
 
 ## What establishes status
 
+The machine-readable OpenAPI 3.1 contract is served at `GET /openapi.json`. Read endpoints accept
+`X-API-Schema-Version: 1.0` (the default) or `1.1`; version 1.1 adds forward-compatible metadata
+without changing response fields. Amounts, nonces, block heights and wide numeric identifiers are
+decimal strings, and clients should ignore unknown metadata and error fields.
+
 Stellar router events establish source transfers and claim changes. The EVM watcher indexes configured Hyperion routers with confirmation and reorg checks. The default record does not deploy an EVM Hyperion router.
 
 For direct Stellar ITS transfers, Axelar's status API supplies a candidate destination transaction. Delivery is recorded only after the destination RPC confirms a successful receipt, sufficient confirmations, the matching ITS command/token/source/recipient/amount event and a matching token payment. The received asset is the ITS representation of Stellar USDC, with seven decimals. A rail API `executed` status alone is not delivery.
@@ -544,3 +549,17 @@ forwarded transaction and payment-proof material; it cannot create delivered rec
 PostgreSQL rail tests verify overlapping workers claim separate rows, reopening pools retains
 retry deadlines, unrelated rails progress during provider cooldown, and faults leave source
 amounts and destination delivery records intact.
+
+### Shared keeper signer leases
+
+Each maintenance submission acquires a unique expiring lease for the funded Stellar account and
+network. Replicas using the same signer share this lease even when their router addresses differ.
+Concurrent jobs in one process use separate owner tokens. Preparation renews only a live lease;
+expired or replaced ownership cannot sign a new operation.
+
+Signing holds a PostgreSQL row lock through the committed public checkpoint and broadcast, so
+lease takeover cannot race the send. Unknown hashes still block fresh envelopes until their exact
+on-chain outcome is terminal. A disconnected or crashed database session releases its locks; a
+frozen process has a two-minute idle transaction timeout, after which the expired lease can be
+recovered. No signed envelope or private key is persisted. Existing signer rotation checks remain
+required before a replacement funded account starts.

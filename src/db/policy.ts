@@ -15,6 +15,8 @@ export const API_READ_TABLES = [
   "indexer_worker_heartbeat",
   "indexer_worker_run",
   "stellar_history_gap",
+  "stellar_scan_journal",
+  "ingestion_rejection",
   "indexed_history_digest",
   "axelar_delivery_evidence",
   "axelar_status_quarantine",

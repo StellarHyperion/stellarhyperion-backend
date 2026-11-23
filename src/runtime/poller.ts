@@ -47,6 +47,7 @@ export class Poller {
   private readonly controller = new AbortController();
   private loop: Promise<void> | null = null;
   private sleeping: (() => void) | null = null;
+  private intervalMs: number;
 
   private ticks = 0;
   private lastSuccessAt: Date | null = null;
@@ -54,7 +55,18 @@ export class Poller {
   private lastError: string | null = null;
   private consecutiveFailures = 0;
 
-  constructor(private readonly options: PollerOptions) {}
+  constructor(private readonly options: PollerOptions) {
+    this.intervalMs = options.intervalMs;
+  }
+
+  /** Apply to the next wait; waking sleep never interrupts the current tick. */
+  setIntervalMs(value: number): void {
+    if (!Number.isSafeInteger(value) || value < 1 || value > 2_147_483_647)
+      throw new Error("invalid poll interval");
+    if (value === this.intervalMs) return;
+    this.intervalMs = value;
+    this.wake();
+  }
 
   get name(): string {
     return this.options.name;
@@ -97,8 +109,7 @@ export class Poller {
   }
 
   private async run(): Promise<void> {
-    const { logger, name, tick, intervalMs } = this.options;
-    const maxBackoff = this.options.maxBackoffMs ?? Math.min(intervalMs * 30, 60_000);
+    const { logger, name, tick } = this.options;
 
     while (!this.isAborted()) {
       let progressed = false;
@@ -133,8 +144,11 @@ export class Poller {
 
       const wait =
         this.consecutiveFailures === 0
-          ? intervalMs
-          : Math.min(intervalMs * 2 ** (this.consecutiveFailures - 1), maxBackoff);
+          ? this.intervalMs
+          : Math.min(
+              this.intervalMs * 2 ** (this.consecutiveFailures - 1),
+              this.options.maxBackoffMs ?? Math.min(this.intervalMs * 30, 60_000),
+            );
       await this.sleep(wait);
     }
   }

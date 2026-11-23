@@ -1,3 +1,4 @@
+import type { WorkerPolicyStore } from "../runtime/worker-policy.js";
 import type { Logger } from "pino";
 import type { AppConfig } from "../config/config.js";
 import type { Transactional } from "../db/pool.js";
@@ -53,7 +54,10 @@ export type KeeperJobResult =
   | { readonly kind: "ttl-bump"; readonly result: TtlBumpResult }
   | { readonly kind: "claim-settlement"; readonly result: ClaimSettlementResult };
 export interface KeeperContext {
+  readonly workerPolicy?: WorkerPolicyStore;
   readonly db: Transactional;
   readonly config: AppConfig;
   readonly logger: Logger;
+  /** Unique for this process so an expired lease cannot be mistaken for a live owner. */
+  readonly signerLeaseOwnerId?: string;
 }

@@ -97,7 +97,13 @@ export async function processTtlBump(
       vector(claims.map((id) => nativeToScVal(id, { type: "u64" }))),
       vector(transfers.map((id) => nativeToScVal(id, { type: "u64" }))),
     ],
-    { db: ctx.db, jobName: "ttl-bump" },
+    {
+      db: ctx.db,
+      jobName: "ttl-bump",
+      ...(ctx.signerLeaseOwnerId === undefined
+        ? {}
+        : { signerLeaseOwnerId: ctx.signerLeaseOwnerId }),
+    },
   );
   ctx.logger.info({ hash }, "router keep_alive confirmed");
   return {

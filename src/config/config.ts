@@ -129,6 +129,8 @@ export interface RailsConfig {
   readonly axelarUrl: string;
   readonly pollIntervalMs: number;
   readonly batchSize: number;
+  readonly providerConcurrency: number;
+  readonly destinationRpcConcurrency: number;
   readonly recheckAfterMs: number;
   readonly maxCheckFailures: number;
 }
@@ -394,6 +396,28 @@ const RAIL_BATCH_SIZE: VarSpec = {
   printable: true,
   purpose:
     "Transfers looked up per pass. Circle blocks every request for five minutes past forty a second, so this stays well under it even at the fastest interval.",
+};
+
+const RAIL_PROVIDER_CONCURRENCY: VarSpec = {
+  name: "RAIL_PROVIDER_CONCURRENCY",
+  kind: "integer",
+  required: false,
+  fallback: "4",
+  min: 1,
+  max: 200,
+  printable: true,
+  purpose: "Maximum concurrent status lookups against the same rail provider.",
+};
+
+const RAIL_DESTINATION_RPC_CONCURRENCY: VarSpec = {
+  name: "RAIL_DESTINATION_RPC_CONCURRENCY",
+  kind: "integer",
+  required: false,
+  fallback: "2",
+  min: 1,
+  max: 200,
+  printable: true,
+  purpose: "Maximum concurrent delivery-proof checks against each destination RPC.",
 };
 
 const RAIL_RECHECK_AFTER_MS: VarSpec = {
@@ -886,6 +910,8 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const axelarOverride = reader.url(AXELAR_API_URL);
   const railPollIntervalMs = reader.integer(RAIL_POLL_INTERVAL_MS);
   const railBatchSize = reader.integer(RAIL_BATCH_SIZE);
+  const railProviderConcurrency = reader.integer(RAIL_PROVIDER_CONCURRENCY);
+  const railDestinationRpcConcurrency = reader.integer(RAIL_DESTINATION_RPC_CONCURRENCY);
   const railRecheckAfterMs = reader.integer(RAIL_RECHECK_AFTER_MS);
   const railMaxCheckFailures = reader.integer(RAIL_MAX_CHECK_FAILURES);
 
@@ -1041,6 +1067,8 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
       axelarUrl: axelarOverride === "" ? AXELARSCAN_API[network] : axelarOverride,
       pollIntervalMs: railPollIntervalMs,
       batchSize: railBatchSize,
+      providerConcurrency: railProviderConcurrency,
+      destinationRpcConcurrency: railDestinationRpcConcurrency,
       recheckAfterMs: railRecheckAfterMs,
       maxCheckFailures: railMaxCheckFailures,
     },
@@ -1279,6 +1307,8 @@ function buildProvenanceEntries(
     endpoint("AXELAR_API_URL", reader.has("AXELAR_API_URL") ? "env" : "default");
     add("RAIL_POLL_INTERVAL_MS", config.rails.pollIntervalMs);
     add("RAIL_BATCH_SIZE", config.rails.batchSize);
+    add("RAIL_PROVIDER_CONCURRENCY", config.rails.providerConcurrency);
+    add("RAIL_DESTINATION_RPC_CONCURRENCY", config.rails.destinationRpcConcurrency);
     add("RAIL_RECHECK_AFTER_MS", config.rails.recheckAfterMs);
     add("RAIL_MAX_CHECK_FAILURES", config.rails.maxCheckFailures);
   }

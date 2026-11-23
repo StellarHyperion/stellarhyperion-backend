@@ -489,6 +489,74 @@ const TRANSFER_QUERY = `
       )))
 `;
 
+const MAX_BULK_TRANSFER_IDENTITIES = 50;
+const MAX_UINT64 = 18446744073709551615n;
+
+interface TransferIdentity {
+  readonly position: number;
+  readonly originChain: string;
+  readonly originRouter: string;
+  readonly nonce: string;
+  readonly family: "stellar" | "evm";
+}
+
+function parseTransferIdentities(body: unknown, network: AppConfig["network"]): TransferIdentity[] {
+  if (typeof body !== "object" || body === null || Array.isArray(body))
+    throw invalidFilter("body must be an object containing an identities array");
+  const identitiesValue = (body as Record<string, unknown>).identities;
+  if (
+    !Array.isArray(identitiesValue) ||
+    identitiesValue.length < 1 ||
+    identitiesValue.length > MAX_BULK_TRANSFER_IDENTITIES
+  ) {
+    throw invalidFilter(
+      `identities must contain between 1 and ${MAX_BULK_TRANSFER_IDENTITIES} items`,
+    );
+  }
+
+  return identitiesValue.map((value: unknown, position: number) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value))
+      throw invalidFilter(`identities[${String(position)}] must be an object`);
+    const identity = value as Record<string, unknown>;
+    const { originChain, originRouter, nonce } = identity;
+    if (
+      typeof originChain !== "string" ||
+      !isChainKey(originChain) ||
+      CHAINS[originChain].network !== network
+    ) {
+      throw invalidFilter(
+        `identities[${String(position)}].originChain is not supported on this network`,
+      );
+    }
+
+    const family = CHAINS[originChain].family;
+    const routerValid =
+      typeof originRouter === "string" &&
+      (family === "evm"
+        ? /^0x[0-9a-fA-F]{40}$/.test(originRouter)
+        : StrKey.isValidContract(originRouter));
+    if (!routerValid)
+      throw invalidFilter(`identities[${String(position)}].originRouter is not canonical`);
+
+    if (
+      typeof nonce !== "string" ||
+      !/^(0|[1-9][0-9]{0,19})$/.test(nonce) ||
+      BigInt(nonce) > MAX_UINT64
+    ) {
+      throw invalidFilter(
+        `identities[${String(position)}].nonce must be a canonical uint64 string`,
+      );
+    }
+    return {
+      position,
+      originChain,
+      originRouter,
+      nonce,
+      family,
+    };
+  });
+}
+
 function cctpFailureValue(value: string | null): CctpVerificationFailure | null {
   return CCTP_VERIFICATION_FAILURES.find((failure) => failure === value) ?? null;
 }
@@ -521,6 +589,64 @@ function buildTransferRevision(row: Record<string, unknown>, config: AppConfig) 
 
 export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): void {
   const db: Database = deps.db;
+
+  app.post(
+    "/v1/transfers/bulk",
+    async (request: FastifyRequest<{ Body: unknown }>, reply: FastifyReply) => {
+      const version = negotiateSchemaVersion(request, reply);
+      if (version === null) return;
+
+      const identities = parseTransferIdentities(request.body, deps.config.network);
+      const { rows } = await requestQuery(
+        request,
+        db,
+        `WITH requested AS (
+           SELECT * FROM jsonb_to_recordset($1::jsonb)
+             AS x(position integer, "originChain" text, "originRouter" text, nonce numeric, family text)
+         )
+         ${TRANSFER_QUERY.replace(
+           "SELECT t.id,",
+           `SELECT i.position AS request_position,
+                     i."originChain" AS requested_origin_chain,
+                     i."originRouter" AS requested_origin_router,
+                     i.nonce::text AS requested_nonce,
+                     EXISTS (
+                       SELECT 1 FROM indexer_cursor cursor
+                        WHERE cursor.chain_key = i."originChain" AND cursor.family = i.family
+                          AND cursor.contract = i."originRouter"
+                     ) AS indexed_source,
+                     t.id,`,
+         ).replace(
+           "FROM outbound_transfer t",
+           `FROM requested i
+             LEFT JOIN outbound_transfer t
+               ON t.origin_chain = i."originChain"
+              AND t.origin_router = i."originRouter"
+              AND t.nonce = i.nonce`,
+         )}
+         ORDER BY i.position`,
+        [JSON.stringify(identities)],
+      );
+
+      const results = rows.map((row) => {
+        const identity = {
+          originChain: text(row, "requested_origin_chain"),
+          originRouter: text(row, "requested_origin_router"),
+          nonce: text(row, "requested_nonce"),
+        };
+        if (row.id === null || row.id === undefined) {
+          return {
+            identity,
+            status: row.indexed_source === true ? "missing" : "unavailable",
+            transfer: null,
+          };
+        }
+        return { identity, status: "found", transfer: formatRow(row, deps.config) };
+      });
+
+      return reply.send(withSchemaMetadata({ results, count: results.length }, version));
+    },
+  );
 
   const queryTransferRevisionById = async (request: FastifyRequest, id: string) => {
     const { rows } = await requestQuery(request, db, `${TRANSFER_QUERY} WHERE t.id = $1 LIMIT 1`, [
@@ -723,9 +849,9 @@ export function registerTransferRoutes(app: FastifyInstance, deps: ServerDeps): 
           historyId: afterId,
           oldStatus: row.old_status,
           newStatus: row.new_status,
-          reason: row.reason,
-          railStatus: row.rail_status,
-          evidenceReference: row.evidence_reference,
+          reason: sanitizeRailDiagnostic(textOrNull(row, "reason")),
+          railStatus: sanitizeRailDiagnostic(textOrNull(row, "rail_status")),
+          evidenceReference: sanitizeRailDiagnostic(textOrNull(row, "evidence_reference")),
           observedAt: new Date(row.observed_at as Date | string).toISOString(),
         });
       }
