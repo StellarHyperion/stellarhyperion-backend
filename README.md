@@ -74,7 +74,7 @@ not logged.
 
 ## Deploy on Vercel
 
-The `hyperion-backend` Vercel project serves [stellarhyperion-backend.vercel.app](https://stellarhyperion-backend.vercel.app). Configure its production `DATABASE_URL` through Vercel environment variables with a managed PostgreSQL connection and TLS. Keep the value server-side. Set `HYPERION_NETWORK` and `HYPERION_DEPLOYMENTS_FILE` explicitly to the intended network and deployment record. Redis and signing keys are unnecessary while `KEEPER_ENABLED=false`.
+The `hyperion-backend` Vercel project serves [stellarhyperion-backend.vercel.app](https://stellarhyperion-backend.vercel.app). Configure its production `API_DATABASE_URL` (a read-only API reader; existing projects may still use `DATABASE_URL`) through Vercel environment variables with a managed PostgreSQL connection and TLS. Keep the value server-side. Set `HYPERION_NETWORK` and `HYPERION_DEPLOYMENTS_FILE` explicitly to the intended network and deployment record. Redis and signing keys are unnecessary while `KEEPER_ENABLED=false`.
 
 `vercel.json` includes the deployment metadata in the API function. Production indexing runs in [the testnet indexer workflow](.github/workflows/indexer.yml), independently of requests to the API. Store the same database connection as the repository Actions secret `HYPERION_DATABASE_URL`. Each run applies pending SQL migrations and runs the real indexer and bridge pollers for 150 seconds, with graceful shutdown and a persisted PostgreSQL cursor. The concurrency group prevents overlapping hosted jobs. No signer is configured.
 
@@ -105,6 +105,39 @@ not only the `HYPERION_DATABASE_ROLE=read-only` label. The serverless entrypoint
 background writers. Indexer, rail or keeper processes require `HYPERION_DATABASE_ROLE=read-write`
 and a separately provisioned worker credential. Keep migration privileges separate from both.
 
+### Separate database credentials
+
+Each kind of database access has its own connection variable. All three are server-side only and
+are never printed:
+
+| Variable                 | Used by                                                               | Role                            |
+| ------------------------ | --------------------------------------------------------------------- | ------------------------------- |
+| `API_DATABASE_URL`       | The public API (`api/index.ts` and the HTTP server in `dist/main.js`) | Read-only API reader (above)    |
+| `DATABASE_URL`           | Indexer, rail and keeper writes, and operator CLIs                    | Worker writer (`read-write`)    |
+| `MIGRATION_DATABASE_URL` | `npm run migrate`, `migrate:up`, `migrate:down`                       | Migration owner with DDL rights |
+
+- **API-only deployments** (Vercel, or any process with indexer, rails and keeper disabled) need
+  only `API_DATABASE_URL`. Leave `DATABASE_URL` and `MIGRATION_DATABASE_URL` out of that
+  environment. If both API and writer URLs are present, an API-only process still opens only
+  `API_DATABASE_URL`.
+- **Writer processes** (the Dockerfile's default) use `DATABASE_URL` for workers. Set
+  `API_DATABASE_URL` too and the HTTP server reads through a second pool on that credential, with
+  `default_transaction_read_only`. Startup checks the role's real Postgres privileges and refuses
+  it if it can write. While writers are enabled, `API_DATABASE_URL` must be a different credential
+  from `DATABASE_URL`.
+- **Migrations** read `MIGRATION_DATABASE_URL`, falling back to `DATABASE_URL` for existing
+  setups. They refuse `API_DATABASE_URL`. `bin/migrate.mjs` hands the chosen value to
+  node-pg-migrate through a private environment variable, never on the command line.
+- **Diagnostics** report only `hasDatabaseUrl` and `separateApiDatabase` booleans. Configuration
+  errors name the variable, never its value. Logs redact `databaseUrl`, `apiDatabaseUrl` and
+  `migrationDatabaseUrl`.
+
+Compatibility: deployments with only `DATABASE_URL` keep working unchanged. The API shares that
+connection, and migrations use it. To move to least privilege, create the API reader and
+migration owner roles, set `API_DATABASE_URL` and `MIGRATION_DATABASE_URL`, then remove
+`DATABASE_URL` from API-only environments. Nothing in the schema, API responses or ingestion
+changes.
+
 Vercel's installed Git integration publishes `main`. GitHub Actions runs validation and the scheduled indexer; it does not need a Vercel deployment token.
 
 ### Serverless deployment (Vercel)
@@ -115,7 +148,7 @@ Each warm invocation pings the database before handing off its HTTP request. Ini
 
 The cache belongs to one execution environment; separate serverless instances each have their own two-connection budget. `closeApp()` provides an explicit restart boundary for the harness and drains pending initialization before disposal. No platform shutdown callback is assumed. Run `npm run test -- test/unit/serverless-lifecycle.test.ts` for overlap/failure fixtures and, after migrating a dedicated local `TEST_DATABASE_URL`, `npm run test -- test/integration/serverless-lifecycle.test.ts` for repeated restart, pool limits, real read-only grants and terminated-idle-connection recovery.
 
-Background processes must be disabled in serverless functions: `INDEXER_ENABLED=false`, `RAILS_ENABLED=false`, and `KEEPER_ENABLED=false`. Furthermore, database credentials must use `HYPERION_DATABASE_ROLE=read-only`.
+Background processes must be disabled in serverless functions: `INDEXER_ENABLED=false`, `RAILS_ENABLED=false`, and `KEEPER_ENABLED=false`. Furthermore, database credentials must use `HYPERION_DATABASE_ROLE=read-only`. Configure the function with `API_DATABASE_URL` (see [Separate database credentials](#separate-database-credentials)); it then needs no `DATABASE_URL` at all.
 
 ## What establishes status
 

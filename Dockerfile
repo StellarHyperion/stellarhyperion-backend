@@ -8,6 +8,9 @@ RUN npm run build && npm prune --omit=dev
 
 FROM node:22.22.1-bookworm-slim
 WORKDIR /app
+# Credentials are runtime-only and never baked into the image. This image runs writers, so it
+# takes DATABASE_URL (read-write) plus, to give the HTTP API its own least-privilege role,
+# API_DATABASE_URL (read-only). `npm run migrate:up` reads MIGRATION_DATABASE_URL.
 ENV NODE_ENV=production \
     HTTP_HOST=0.0.0.0 \
     HTTP_PORT=8080 \
@@ -21,6 +24,7 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./
 COPY migrations ./migrations
+COPY bin ./bin
 COPY deployments ./deployments
 USER node
 CMD ["node", "dist/main.js"]

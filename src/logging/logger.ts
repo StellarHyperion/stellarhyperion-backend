@@ -26,6 +26,8 @@ export type { Logger };
  */
 const REDACTED_PATHS = [
   "databaseUrl",
+  "apiDatabaseUrl",
+  "migrationDatabaseUrl",
   "redisUrl",
   "connectionString",
   "password",
@@ -44,6 +46,8 @@ const REDACTED_PATHS = [
   "stellarSecrets",
   "config.keeper.stellarSecrets",
   "*.databaseUrl",
+  "*.apiDatabaseUrl",
+  "*.migrationDatabaseUrl",
   "*.redisUrl",
   "*.connectionString",
   "*.password",
@@ -57,6 +61,7 @@ const REDACTED_PATHS = [
   "*.rpcUrls",
   "err.connectionString",
   "config.databaseUrl",
+  "config.apiDatabaseUrl",
   "config.redisUrl",
 ];
 

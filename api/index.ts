@@ -89,7 +89,9 @@ async function createApp(): Promise<AppResources> {
   const logger = createLogger(config);
   const startedAt = new Date();
 
-  const candidateDb = Database.open(config.databaseUrl, {
+  // API_DATABASE_URL when configured, so the hosted API needs only its read-only credential and
+  // DATABASE_URL (the writer) can be left out of this environment entirely.
+  const candidateDb = Database.open(config.apiDatabaseUrl, {
     applicationName: "hyperion-vercel-api",
     connectionTimeoutMs: 2000,
     readOnly: true,
