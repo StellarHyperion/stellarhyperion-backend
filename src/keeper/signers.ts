@@ -16,7 +16,7 @@ export function keeperSignerLeaseParams(config: AppConfig, ownerId: string) {
   return {
     // Stellar sequence numbers belong to an account on a network, regardless of which
     // router or chain label a replica operates. Use Stellar's canonical public network ID.
-    chainKey: `keeper-signers:${hash(Buffer.from(chain.networkPassphrase, "utf8")).toString("hex")}`,
+    chainKey: `keeper-signers:${Buffer.from(hash(Buffer.from(chain.networkPassphrase, "utf8"))).toString("hex")}`,
     contract: activeKeeperSigner(config).publicKey,
     ownerId,
     ttlMs: config.indexerLeaseTtlMs,
