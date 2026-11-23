@@ -17,6 +17,10 @@ updates:
     commit-message:
       prefix: "backend"
       include: scope
+    ignore:
+      # TypeScript 7 is outside the typescript-eslint peer range.
+      - dependency-name: typescript
+        versions: ["7.x"]
     groups:
       dev-dependencies:
         dependency-type: development

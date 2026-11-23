@@ -44,17 +44,17 @@
     "@fastify/rate-limit": "^11.2.0",
     "@hyperion/protocol": "file:hyperion-protocol-0.1.0.tgz",
     "@stellar/stellar-sdk": "^17.4.0",
-    "bullmq": "^6.7.6",
+    "bullmq": "^6.7.8",
     "fastify": "^5.12.8",
     "ioredis": "^6.0.0",
     "node-pg-migrate": "^9.0.0",
     "pg": "^8.16.3",
     "pino": "^10.4.0",
     "pino-pretty": "^13.2.0",
-    "viem": "^2.57.2"
+    "viem": "^2.58.2"
   },
   "devDependencies": {
-    "@electric-sql/pglite": "^0.5.12",
+    "@electric-sql/pglite": "^0.5.17",
     "@types/ioredis": "^5.0.0",
     "@types/node": "^26.6.6",
     "@types/pg": "^8.15.6",
@@ -62,7 +62,7 @@
     "prettier": "^3.10.1",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.73.0",
-    "vitest": "^5.1.0"
+    "vitest": "^5.1.1"
   },
   "overrides": {
     "node-pg-migrate": {
