@@ -86,9 +86,26 @@ export async function startContinuousApplication(): Promise<ContinuousApplicatio
     slowQueryThresholdMs: 1_000,
   });
   shutdown.add("postgres", () => db.close());
+  // With API_DATABASE_URL, the public API reads through its own least-privilege pool and never
+  // shares the writer credential. Without it, the API keeps sharing `db`, as before.
+  const apiDb =
+    config.apiDatabaseUrl === config.databaseUrl
+      ? db
+      : Database.open(config.apiDatabaseUrl, {
+          applicationName: "hyperion-api",
+          readOnly: true,
+          logger,
+          slowQueryThresholdMs: 1_000,
+        });
+  if (apiDb !== db) shutdown.add("postgres-api", () => apiDb.close());
   try {
     await checkSchemaCompatibility(db, config.schemaVersion);
     await checkDatabasePolicy(db, config);
+    if (apiDb !== db) {
+      await checkSchemaCompatibility(apiDb, config.schemaVersion);
+      // The API role is verified as read-only against Postgres privileges, not the label.
+      await checkDatabasePolicy(apiDb, { ...config, databaseRole: "read-only" });
+    }
   } catch (error) {
     await shutdown.run("startup-failure");
     throw error;
@@ -111,7 +128,7 @@ export async function startContinuousApplication(): Promise<ContinuousApplicatio
       return workerPolicy.configuration();
     },
     logger,
-    db,
+    db: apiDb,
     ...(redis ? { redis } : {}),
     readiness: indexer.readiness,
     startedAt,

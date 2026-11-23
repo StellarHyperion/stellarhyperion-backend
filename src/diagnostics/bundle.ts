@@ -146,6 +146,8 @@ export function sanitizeDiagnosticsConfig(config: AppConfig): Record<string, unk
     http: config.http,
     deploymentsFile: config.deploymentsFile,
     hasDatabaseUrl: config.databaseUrl.length > 0,
+    // Whether the API reads through its own credential; never the credential itself.
+    separateApiDatabase: config.apiDatabaseUrl !== config.databaseUrl,
     hasRedisUrl: config.redisUrl.length > 0,
     readinessPolicy: config.readinessPolicy,
     freshnessSlo: config.freshnessSlo,

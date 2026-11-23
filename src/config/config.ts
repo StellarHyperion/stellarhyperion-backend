@@ -181,7 +181,13 @@ export interface AppConfig {
   readonly databaseRole: DatabaseRole;
   readonly logLevel: LogLevel;
   readonly http: { readonly host: string; readonly port: number };
+  /** This process's own connection: the writer for indexer, rail and keeper work. */
   readonly databaseUrl: string;
+  /**
+   * The connection the public API reads through. `API_DATABASE_URL` when set; otherwise
+   * `databaseUrl`. In an API-only process the two are the same read-only credential.
+   */
+  readonly apiDatabaseUrl: string;
   readonly redisUrl: string;
   readonly network: NetworkMode;
   readonly deploymentsFile: string;
@@ -298,6 +304,16 @@ const DATABASE_URL: VarSpec = {
   required: true,
   printable: false,
   purpose: "Postgres connection string. docker compose publishes one on 127.0.0.1:5433.",
+};
+
+const API_DATABASE_URL: VarSpec = {
+  name: "API_DATABASE_URL",
+  kind: "url",
+  protocols: ["postgres", "postgresql"],
+  required: false,
+  printable: false,
+  purpose:
+    "Least-privilege read-only Postgres credential for the public API. Must differ from DATABASE_URL when indexer, rail or keeper writes are enabled.",
 };
 
 const REDIS_URL: VarSpec = {
@@ -869,7 +885,18 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const logLevel = reader.choice(LOG_LEVEL);
   const host = reader.string(HTTP_HOST);
   const port = reader.integer(HTTP_PORT);
-  const databaseUrl = reader.url(DATABASE_URL);
+  // Whether any writer is enabled decides which credential is required. A scratch reader answers
+  // that here, so faults keep their order; `reader` still reports a malformed flag below.
+  const probe = new EnvReader(env);
+  const writesRequested =
+    probe.boolean(INDEXER_ENABLED) || probe.boolean(KEEPER_ENABLED) || probe.boolean(RAILS_ENABLED);
+  // An API-only process needs only the read-only API credential, so the writer credential never
+  // has to be present where the public API runs. Every other process needs DATABASE_URL.
+  const primaryDatabaseUrl = reader.url({
+    ...DATABASE_URL,
+    required: writesRequested || !reader.has(API_DATABASE_URL.name),
+  });
+  const apiDatabaseOnly = reader.url(API_DATABASE_URL);
   const keeperEnabled = reader.boolean(KEEPER_ENABLED);
   const redisUrl = reader.url({ ...REDIS_URL, required: keeperEnabled });
   const network = reader.choice(HYPERION_NETWORK);
@@ -881,8 +908,16 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     fallback: deploymentEnvironment,
   });
   const railsEnabled = reader.boolean(RAILS_ENABLED);
-  const expectedDatabaseRole: DatabaseRole =
-    indexerEnabled || keeperEnabled || railsEnabled ? "read-write" : "read-only";
+  const writes = indexerEnabled || keeperEnabled || railsEnabled;
+  const databaseUrl = writes ? primaryDatabaseUrl : apiDatabaseOnly || primaryDatabaseUrl;
+  const apiDatabaseUrl = apiDatabaseOnly || databaseUrl;
+  if (writes && apiDatabaseOnly.length > 0 && apiDatabaseOnly === primaryDatabaseUrl) {
+    reader.reject(
+      API_DATABASE_URL,
+      "is the same credential as DATABASE_URL; the public API needs its own read-only role while writers are enabled",
+    );
+  }
+  const expectedDatabaseRole: DatabaseRole = writes ? "read-write" : "read-only";
   const databaseRole = reader.choice({ ...DATABASE_ROLE, fallback: expectedDatabaseRole });
   if (deploymentEnvironment !== "development" && databaseEnvironment !== deploymentEnvironment) {
     reader.reject(
@@ -893,7 +928,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   if (databaseRole !== expectedDatabaseRole) {
     reader.reject(
       DATABASE_ROLE,
-      `is ${databaseRole}, but this process requires ${expectedDatabaseRole} access because ${indexerEnabled || keeperEnabled || railsEnabled ? "indexer, rail or keeper writes are enabled" : "it is API-only"}`,
+      `is ${databaseRole}, but this process requires ${expectedDatabaseRole} access because ${writes ? "indexer, rail or keeper writes are enabled" : "it is API-only"}`,
     );
   }
   const shutdownTimeoutMs = reader.integer(SHUTDOWN_TIMEOUT_MS);
@@ -1054,6 +1089,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     logLevel,
     http: { host, port },
     databaseUrl,
+    apiDatabaseUrl,
     redisUrl,
     network,
     deploymentsFile: absoluteDeployments,
