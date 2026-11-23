@@ -375,4 +375,18 @@ describe("Serverless Cold-Start Database Lifecycle", () => {
     expect(body.error).toBe("internal_error");
     expect(body.message).toBe("The API is not configured or is unavailable.");
   });
+
+  it("omits active-worker readiness claims in API-only mode", async () => {
+    const app = await getApp();
+    const ready = await app.inject({ method: "GET", url: "/ready" });
+    expect(ready.statusCode).toBe(200);
+    expect(ready.json()).not.toHaveProperty("runCorrelation");
+    expect(ready.json()).not.toHaveProperty("workerRuns");
+
+    expect(ready.json().meaning).toContain("Background workers are not started or assessed");
+    expect(ready.json().checks.map((check: { name: string }) => check.name)).toEqual([
+      "postgres",
+      "redis",
+    ]);
+  });
 });

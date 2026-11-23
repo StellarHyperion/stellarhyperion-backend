@@ -92,14 +92,16 @@ export function installSignalHandlers(shutdown: Shutdown, logger: Logger): () =>
   // An unhandled rejection in a poll loop is a bug, and continuing past it means the watcher is
   // silently not watching. Shutting down makes the supervisor restart it, which is both more
   // honest and more likely to recover.
-  process.on("unhandledRejection", (reason: unknown) => {
+  const onUnhandledRejection = (reason: unknown): void => {
     logger.fatal({ err: reason }, "unhandled rejection, shutting down");
     void shutdown.run("unhandledRejection").then(() => {
       process.exitCode = 1;
     });
-  });
+  };
+  process.on("unhandledRejection", onUnhandledRejection);
 
   return () => {
+    process.removeListener("unhandledRejection", onUnhandledRejection);
     process.removeListener("SIGTERM", onSignal);
     process.removeListener("SIGINT", onSignal);
   };

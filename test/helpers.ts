@@ -21,6 +21,47 @@ export const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), "fixtu
 
 export const TESTNET_DEPLOYMENTS = join(FIXTURES_DIR, "deployments-testnet.json");
 
+/** Identifiers and amounts that must survive public and database projections as strings. */
+export interface IndexedTransferSemanticsFixture {
+  readonly nonce: string;
+  readonly sourceEventId: string;
+  readonly grossAmount: string;
+  readonly fee: string;
+  readonly netAmount: string;
+  readonly canonicalHash: string;
+  readonly receipt: string;
+  readonly payment: string;
+}
+
+export function assertIndexedTransferSemantics(
+  first: IndexedTransferSemanticsFixture,
+  second: IndexedTransferSemanticsFixture,
+): void {
+  const integerStrings = ["nonce", "sourceEventId", "grossAmount", "fee", "netAmount"] as const;
+  for (const key of integerStrings) {
+    if (!/^\d+$/.test(first[key]) || !/^\d+$/.test(second[key]))
+      throw new Error(`${key} must remain an integer string`);
+  }
+  if (JSON.stringify(first) !== JSON.stringify(second))
+    throw new Error("entrypoints produced different indexed transfer semantics");
+}
+
+export function canonicalIndexedTransferFixture(
+  overrides: Partial<IndexedTransferSemanticsFixture> = {},
+): IndexedTransferSemanticsFixture {
+  return {
+    nonce: "18446744073709551615",
+    sourceEventId: "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+    grossAmount: "18446744073709551615",
+    fee: "300",
+    netAmount: "18446744073709551315",
+    canonicalHash: `0x${"a".repeat(64)}`,
+    receipt: `0x${"b".repeat(64)}`,
+    payment: `0x${"c".repeat(64)}`,
+    ...overrides,
+  };
+}
+
 export function readFixture(name: string): string {
   return readFileSync(join(FIXTURES_DIR, name), "utf8");
 }
