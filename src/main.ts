@@ -11,7 +11,11 @@ import { resolve } from "node:path";
 import type { FastifyInstance } from "fastify";
 import { buildIndexer } from "./chains/runner.js";
 import { admitNetworkEnvironment } from "./config/admission.js";
-import { loadConfig } from "./config/config.js";
+import {
+  WorkerPolicyStore,
+  loadWorkerPolicyConfig,
+  reloadWorkerPolicy,
+} from "./runtime/worker-policy.js";
 import { ConfigError, NetworkAdmissionError } from "./config/env.js";
 import { checkDatabasePolicy } from "./db/policy.js";
 import { checkSchemaCompatibility } from "./db/schema.js";
@@ -25,16 +29,19 @@ import { Shutdown, installSignalHandlers } from "./runtime/shutdown.js";
 export interface ContinuousApplication {
   readonly server: FastifyInstance;
   readonly db: Database;
+  readonly workerPolicy: WorkerPolicyStore;
   readonly stop: (reason?: string) => Promise<void>;
 }
 
 /** The continuous entrypoint, also available to lifecycle and parity harnesses. */
 export async function startContinuousApplication(): Promise<ContinuousApplication> {
   const startedAt = new Date();
+  const configuredPolicyFile = process.env.HYPERION_WORKER_POLICY_FILE?.trim();
+  const workerPolicyFile = configuredPolicyFile === "" ? null : (configuredPolicyFile ?? null);
 
   const config = (() => {
     try {
-      return loadConfig();
+      return loadWorkerPolicyConfig(workerPolicyFile);
     } catch (error) {
       if (error instanceof ConfigError) {
         process.stderr.write(`\n${error.message}\n\n`);
@@ -55,10 +62,20 @@ export async function startContinuousApplication(): Promise<ContinuousApplicatio
   }
 
   const logger = createLogger(config);
+  const workerPolicy = new WorkerPolicyStore(config);
+  const reloadPolicy = (): void => {
+    reloadWorkerPolicy(workerPolicy, () => loadWorkerPolicyConfig(workerPolicyFile), logger);
+  };
   const shutdown = new Shutdown(logger, config.shutdownTimeoutMs);
   const removeSignalHandlers = installSignalHandlers(shutdown, logger);
   shutdown.add("signal-handlers", () => {
     removeSignalHandlers();
+    return Promise.resolve();
+  });
+
+  process.on("SIGHUP", reloadPolicy);
+  shutdown.add("worker-policy", () => {
+    process.off("SIGHUP", reloadPolicy);
     return Promise.resolve();
   });
 
@@ -86,11 +103,13 @@ export async function startContinuousApplication(): Promise<ContinuousApplicatio
   // Registered between the pool and the server, because shutdown runs in reverse: the server
   // stops accepting requests, the watchers finish the page they are on, and only then does the
   // pool close under them.
-  const indexer = buildIndexer({ config, logger, db });
+  const indexer = buildIndexer({ config, logger, db, workerPolicy });
   shutdown.add("indexer", () => indexer.stop());
 
   const server = buildServer({
-    config,
+    get config() {
+      return workerPolicy.configuration();
+    },
     logger,
     db,
     ...(redis ? { redis } : {}),
@@ -103,6 +122,7 @@ export async function startContinuousApplication(): Promise<ContinuousApplicatio
   const application: ContinuousApplication = {
     server,
     db,
+    workerPolicy,
     stop: (reason = "application-stop") => shutdown.run(reason),
   };
   try {

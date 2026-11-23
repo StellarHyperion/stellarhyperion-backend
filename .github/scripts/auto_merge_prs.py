@@ -340,7 +340,7 @@ class AutoMerge:
                 else:
                     try:
                         result = self.github.request(endpoint + "/merge", "PUT", {
-                            "sha": latest["head"]["sha"], "merge_method": "squash",
+                            "sha": latest["head"]["sha"], "merge_method": "merge",
                             "commit_title": f"Merge PR #{number}",
                             "commit_message": "Automatically merged after CI, issue-link and assignment verification."})
                         if result.get("merged") is True:

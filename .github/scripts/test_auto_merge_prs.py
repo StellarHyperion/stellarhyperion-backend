@@ -115,7 +115,7 @@ class AutoMergeTests(unittest.TestCase):
         self.assertEqual(len(self.api.writes), 1)
         data = self.api.writes[0][2]
         self.assertEqual(data["sha"], HEAD)
-        self.assertEqual(data["merge_method"], "squash")
+        self.assertEqual(data["merge_method"], "merge")
         self.assertNotIn("co-authored-by", str(data).lower())
         self.assertEqual(self.policy.decision.call_count, 2)
 

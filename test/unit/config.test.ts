@@ -41,6 +41,26 @@ describe("loadConfig", () => {
     expect(config.network).toBe("testnet");
     expect(config.http.port).toBe(8080);
     expect(config.indexer.enabled).toBe(true);
+    expect(config.rails.providerConcurrency).toBe(4);
+    expect(config.rails.destinationRpcConcurrency).toBe(2);
+  });
+
+  it("accepts explicit rail provider and destination RPC concurrency budgets", () => {
+    const config = loadConfig({
+      env: completeEnv({
+        RAIL_PROVIDER_CONCURRENCY: "3",
+        RAIL_DESTINATION_RPC_CONCURRENCY: "1",
+      }),
+    });
+
+    expect(config.rails.providerConcurrency).toBe(3);
+    expect(config.rails.destinationRpcConcurrency).toBe(1);
+    expect(() => loadConfig({ env: completeEnv({ RAIL_PROVIDER_CONCURRENCY: "0" }) })).toThrow(
+      "RAIL_PROVIDER_CONCURRENCY",
+    );
+    expect(() =>
+      loadConfig({ env: completeEnv({ RAIL_DESTINATION_RPC_CONCURRENCY: "0" }) }),
+    ).toThrow("RAIL_DESTINATION_RPC_CONCURRENCY");
   });
 
   it("requires a preview database identity and read-only API role", () => {

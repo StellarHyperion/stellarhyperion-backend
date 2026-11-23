@@ -10,6 +10,7 @@ import {
   captureResponse,
   differentialReport,
   validateResponse,
+  validateOpenApiOperationResponse,
   type ResponseShape,
 } from "../tooling/api-contract.js";
 import { capturingLogger } from "../stellar-fakes.js";
@@ -160,6 +161,65 @@ describe("HTTP queries against the migrated PostgreSQL schema", () => {
     expect(response.json().destination.recipient).toBe(
       "0x6ef8032ffe4943f27388172549f6700f18bb8b38",
     );
+  });
+  it("looks up canonical bulk identities without nonce collisions and reports per-item availability", async () => {
+    const routerA = "0x0000000000000000000000000000000000000001";
+    const routerB = "0x0000000000000000000000000000000000000002";
+    const nonce = "18446744073709551615";
+    await pg.query(
+      `INSERT INTO indexer_cursor (chain_key,family,contract,last_processed)
+       VALUES ('sepolia','evm',$1,123)`,
+      [routerA],
+    );
+    for (const [router, tx] of [
+      [routerA, "bulk-router-a"],
+      [routerB, "bulk-router-b"],
+    ]) {
+      await pg.query(
+        `INSERT INTO outbound_transfer
+           (origin_chain,origin_router,route,nonce,sender,token,gross_amount,fee,net_amount,
+            destination_chain,destination,origin_block,origin_tx)
+         VALUES ('sepolia',$1,1,$2,'0x0000000000000000000000000000000000000003','USDC',
+                 900719925474099312345678,0,900719925474099312345678,'stellar-testnet',
+                 'Grecipient',123,$3)`,
+        [router, nonce, tx],
+      );
+    }
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/transfers/bulk",
+      payload: {
+        identities: [
+          { originChain: "sepolia", originRouter: routerA, nonce },
+          { originChain: "sepolia", originRouter: routerB, nonce },
+          { originChain: "sepolia", originRouter: routerA, nonce: "9" },
+          { originChain: "sepolia", originRouter: routerB, nonce: "10" },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().results.map((result: { status: string }) => result.status)).toEqual([
+      "found",
+      "found",
+      "missing",
+      "unavailable",
+    ]);
+    expect(response.json().results[0].transfer.origin.nonce).toBe(nonce);
+    expect(response.json().results[0].transfer.origin.grossAmount).toBe("900719925474099312345678");
+    expect(response.json().results[1].transfer.origin.txHash).toBe("bulk-router-b");
+    expect(response.json().results[3].transfer).toBeNull();
+  });
+  it("rejects a bulk lookup larger than its fixed identity bound", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/transfers/bulk",
+      payload: {
+        identities: Array.from({ length: 51 }, () => ({})),
+      },
+    });
+    expect(response.statusCode).toBe(400);
   });
   it("searches real transfer rows with parameterized SQL", async () => {
     const found = await app.inject("/v1/transfers?search=source-hash");
@@ -542,6 +602,9 @@ describe("public response differential runner", () => {
   const shapes = JSON.parse(
     readFileSync(new URL("../../docs/api-response-contracts.json", import.meta.url), "utf8"),
   ) as Record<string, ResponseShape>;
+  const openApi = JSON.parse(
+    readFileSync(new URL("../../src/http/openapi.json", import.meta.url), "utf8"),
+  ) as unknown;
   it("checks real transfer and claim handlers against the published contract and classifies metadata additions", async () => {
     for (const [kind, url] of [
       ["transfer", "/v1/transfers/stellar-testnet/42"],
@@ -550,11 +613,81 @@ describe("public response differential runner", () => {
       const shape = shapes[kind]!;
       const previous = await captureResponse(app, url, "1.0", shape);
       const current = await captureResponse(app, url, "1.1", shape);
+      const path =
+        kind === "transfer"
+          ? "/v1/transfers/{originChain}/{nonce}"
+          : "/v1/claims/{chain}/{claimId}";
       const report = differentialReport(previous, current);
       expect(report.breaking).toEqual([]);
       expect(report.additive).toEqual(["$.schemaVersion", "$.metadata"]);
+      expect(validateOpenApiOperationResponse(openApi, path, "get", 200, previous.body)).toEqual(
+        [],
+      );
+      expect(validateOpenApiOperationResponse(openApi, path, "get", 200, current.body)).toEqual([]);
       expect(current.statusCode).toBe(200);
     }
+  });
+  it("serves OpenAPI and validates real route-health, evidence, and error responses", async () => {
+    const published = await app.inject("/openapi.json");
+    expect(published.statusCode).toBe(200);
+    expect(published.json()).toEqual(openApi);
+    expect(
+      validateOpenApiOperationResponse(openApi, "/openapi.json", "get", 200, published.json()),
+    ).toEqual([]);
+
+    const routeHealth = await app.inject({
+      method: "GET",
+      url: "/v1/routes/health",
+      headers: { "x-api-schema-version": "1.1" },
+    });
+    expect(routeHealth.statusCode).toBe(200);
+    expect(
+      validateOpenApiOperationResponse(
+        openApi,
+        "/v1/routes/health",
+        "get",
+        routeHealth.statusCode,
+        routeHealth.json(),
+      ),
+    ).toEqual([]);
+
+    const transferResult = await pg.query(
+      "SELECT id::text FROM outbound_transfer WHERE origin_tx = 'source-hash' LIMIT 1",
+    );
+    const transferId = String((transferResult.rows[0] as Record<string, unknown> | undefined)?.id);
+    const evidence = await app.inject({
+      method: "GET",
+      url: `/v1/transfers/${transferId}/evidence`,
+      headers: { "x-api-schema-version": "1.1" },
+    });
+    expect(evidence.statusCode).toBe(200);
+    expect(evidence.json().evidenceStatus).toBe("unavailable");
+    expect(
+      validateOpenApiOperationResponse(
+        openApi,
+        "/v1/transfers/{id}/evidence",
+        "get",
+        evidence.statusCode,
+        evidence.json(),
+      ),
+    ).toEqual([]);
+
+    const unsupported = await app.inject({
+      method: "GET",
+      url: "/v1/routes/health",
+      headers: { "x-api-schema-version": "secret=must-not-be-echoed" },
+    });
+    expect(unsupported.statusCode).toBe(400);
+    expect(unsupported.body).not.toContain("must-not-be-echoed");
+    expect(
+      validateOpenApiOperationResponse(
+        openApi,
+        "/v1/routes/health",
+        "get",
+        unsupported.statusCode,
+        unsupported.json(),
+      ),
+    ).toEqual([]);
   });
   it("detects removed nested fields, number coercion, full-width integer drift and token identity drift", () => {
     const previous = {

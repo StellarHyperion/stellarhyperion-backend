@@ -1,3 +1,4 @@
+import type { AllbridgeSignedIntent, AllbridgeDestinationPayment } from "./allbridge/intent.js";
 /**
  * The part of a transfer's life neither chain can tell you about, and one vocabulary for it.
  *
@@ -45,8 +46,14 @@ export const CCTP_VERIFICATION_FAILURES = [
   "confirmations_pending",
   "non_canonical_receipt",
   "message_already_delivered",
+  "inbound_contract_capability_missing",
+  "parked_claim",
+  "parked_claim_mismatch",
 ] as const;
 export type CctpVerificationFailure = (typeof CCTP_VERIFICATION_FAILURES)[number];
+
+export type CctpDestinationDisposition =
+  "successful_recipient_payment" | "parked_claim" | "unverified";
 
 /** CCTP reconciliation in integer USDC base units: source burns have 7 decimals, destination 6. */
 export interface CctpFeeReconciliation {
@@ -106,6 +113,9 @@ export interface RailCandidate {
   readonly attestationSignature?: string | null;
   readonly attestationTimestamp?: Date | null;
   readonly fastTransfer?: boolean;
+  /** Untrusted provider candidates; canonical chain verification is required independently. */
+  readonly allbridgeIntent?: AllbridgeSignedIntent | null;
+  readonly allbridgeDestinationPayment?: AllbridgeDestinationPayment | null;
 }
 
 export interface RailReport extends RailCandidate {

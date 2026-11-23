@@ -22,6 +22,13 @@ function fixture() {
   };
   function query(sql: string, params: readonly unknown[] = []) {
     calls.push(sql);
+    if (sql.includes("INSERT INTO indexer_lease"))
+      return Promise.resolve({
+        rows: [{ owner_id: params[2], lease_until: new Date(Date.now() + 30_000) }],
+        rowCount: 1,
+      });
+    if (sql.includes("UPDATE indexer_lease") || sql.includes("DELETE FROM indexer_lease"))
+      return Promise.resolve({ rows: [{ owner_id: params[2] }], rowCount: 1 });
     if (sql.includes("INSERT INTO keeper_checkpoint"))
       pending = { hash: params[0], intent_key: params[5], phase: params[6] };
     if (sql.includes("UPDATE keeper_checkpoint")) {
@@ -155,7 +162,8 @@ describe("durable keeper admission and recovery", () => {
     const f = fixture();
     const hash = await f.submit();
     expect(hash).toMatch(/^[0-9a-f]{64}$/);
-    expect(f.calls[0]).toContain("pg_advisory_xact_lock");
+    expect(f.calls.some((sql) => sql.includes("INSERT INTO indexer_lease"))).toBe(true);
+    expect(f.calls.some((sql) => sql.includes("pg_advisory_xact_lock"))).toBe(true);
     expect(f.calls.some((sql) => sql.includes("confirmed_at = now()"))).toBe(true);
   });
   it("renews TTL for unchanged keep_alive targets after prior confirmed upkeep", async () => {

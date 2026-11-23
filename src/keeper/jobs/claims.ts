@@ -131,7 +131,13 @@ export async function processClaimSettlement(
         "settle_claim",
         "settle_claim",
         (sender) => [new Address(sender).toScVal(), nativeToScVal(id, { type: "u64" })],
-        { db: ctx.db, jobName: "claim-settlement" },
+        {
+          db: ctx.db,
+          jobName: "claim-settlement",
+          ...(ctx.signerLeaseOwnerId === undefined
+            ? {}
+            : { signerLeaseOwnerId: ctx.signerLeaseOwnerId }),
+        },
       );
       ctx.logger.info(
         { claimId: claim.claimId, hash },
