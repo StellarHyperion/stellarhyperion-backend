@@ -1,6 +1,8 @@
 name: Automatic PR merge
 
 on:
+  pull_request_target:
+    types: [closed]
   workflow_run:
     workflows: [ci]
     types: [completed]
@@ -18,7 +20,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  issues: read
+  issues: write
   actions: read
   checks: read
 

@@ -253,3 +253,13 @@ Zizmor exception; all other security findings still block.
 Run `python3 -B .github/scripts/test_auto_merge_prs.py` for regression tests. Dispatch the
 workflow with its default `dry_run: true` to inspect eligibility without merges or comments;
 set `dry_run: false` to perform the same automatic behavior as event/scheduled runs.
+
+After a verified merge, automatic issue completion requires successful current-head PR CI
+and all PR head checks. Each explicitly declared closing reference or development-linked issue must still be assigned
+to the original PR author; maintainer roles do not bypass this condition. Only its state and
+state reason are updated to `closed` / `completed`. Issue assignees and contributor authorship
+are preserved. Already completed issues are left alone. The checkout-free closed-PR trigger
+also covers maintainer merges; the seven-day updated-PR sweep retries missed or partial issue
+updates. A default-branch ancestry check refuses closed/unmerged PRs or merges into other
+branches. Dry runs never merge, comment, or update issues. Cross-repository updates require
+issue-write permission in that target repository; failures are reported and retried.
