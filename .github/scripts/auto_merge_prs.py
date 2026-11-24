@@ -406,6 +406,20 @@ class IssueCompletion:
         if (comparison.get("merge_base_commit", {}).get("sha") != merge_sha
                 or comparison.get("status") not in {"ahead", "identical"}):
             raise ValueError("Merged revision is not on the current default branch")
+        author = pr["user"]["login"].lower()
+        refs = completion_references(pr.get("body"), self.github.repository)
+        refs |= self.github.linked_issues(number)
+        organization = self.github.repository.split("/")[0].lower()
+        refs = {(repo, issue) for repo, issue in refs if repo.split("/")[0] == organization}
+        candidates = []
+        for repo, issue_number in sorted(refs):
+            issue = self.github.request(f"repos/{repo}/issues/{issue_number}")
+            if ("pull_request" not in issue
+                    and author in {user["login"].lower() for user in issue["assignees"]}
+                    and not (issue.get("state") == "closed" and issue.get("state_reason") == "completed")):
+                candidates.append((repo, issue_number))
+        if not candidates:
+            return "COMPLETED: 0 issue(s)"
         verifier = AutoMerge(self.github, None, self.default_branch)
         _, reasons = verifier.current_ci(pr)
         # Post-merge push checks are separate from the PR's checks. The original
@@ -413,13 +427,8 @@ class IssueCompletion:
         reasons.extend(verifier.checks({**pr, "merge_commit_sha": None}))
         if reasons:
             return "WAIT: PR checks have not all succeeded; issues preserved"
-        author = pr["user"]["login"].lower()
-        refs = completion_references(pr.get("body"), self.github.repository)
-        refs |= self.github.linked_issues(number)
-        organization = self.github.repository.split("/")[0].lower()
-        refs = {(repo, issue) for repo, issue in refs if repo.split("/")[0] == organization}
         completed, errors = 0, []
-        for repo, issue_number in sorted(refs):
+        for repo, issue_number in candidates:
             try:
                 endpoint = f"repos/{repo}/issues/{issue_number}"
                 issue = self.github.request(endpoint)

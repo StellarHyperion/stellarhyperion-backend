@@ -194,6 +194,15 @@ class IssueCompletionTests(unittest.TestCase):
         self.assertEqual(self.bot.process(1), "COMPLETED: 0 issue(s)")
         self.assertEqual(len(self.api.writes), 1)
 
+    def test_assignment_revoked_while_checks_are_read_is_preserved(self):
+        verifier = merger.AutoMerge.current_ci
+        def revoke(bot, candidate):
+            self.api.issue["assignees"] = [{"login": "bob"}]
+            return verifier(bot, candidate)
+        with patch.object(merger.AutoMerge, "current_ci", revoke):
+            self.assertEqual(self.bot.process(1), "COMPLETED: 0 issue(s)")
+        self.assertEqual(self.api.writes, [])
+
     def test_closed_not_planned_is_marked_completed_only_when_assigned(self):
         self.api.issue.update(state="closed", state_reason="not_planned")
         self.assertEqual(self.bot.process(1), "COMPLETED: 1 issue(s)")
