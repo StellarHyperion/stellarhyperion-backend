@@ -37,11 +37,13 @@ import {
   maybeOne,
   numericString,
   one,
+  readMaintenanceLeaseRow,
   text,
   textOrNull,
   timestamp,
   timestampOrNull,
 } from "../db/rows.js";
+import type { MaintenanceLeaseRow } from "../db/rows.js";
 import type { RailRetryClass } from "../rails/types.js";
 
 /** Where on a chain a row was observed. One shape for a ledger and for a block. */
@@ -752,6 +754,415 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
       row.itsVerificationState ?? null,
     ],
   );
+}
+
+export const MAINTENANCE_JOBS = {
+  railAttestationRetention: "rail_attestation_retention",
+  routeHealthCompaction: "route_health_compaction",
+} as const;
+
+export type MaintenanceJobName = (typeof MAINTENANCE_JOBS)[keyof typeof MAINTENANCE_JOBS];
+
+export interface RunMaintenanceJobOptions {
+  readonly jobName: MaintenanceJobName;
+  readonly ownerId: string;
+  readonly olderThanDays?: number;
+  readonly batchSize?: number;
+  readonly maxBatches?: number;
+  readonly leaseDurationMs?: number;
+  readonly retainRecentHours?: number;
+  readonly signal?: AbortSignal;
+}
+
+export interface MaintenanceJobResult {
+  readonly acquired: boolean;
+  readonly completed: boolean;
+  readonly interrupted: boolean;
+  readonly leaseLost: boolean;
+  readonly fenceToken: bigint | null;
+  readonly batchesRun: number;
+  readonly rowsPruned: number;
+  readonly resumeCursor: bigint | null;
+}
+
+const DEFAULT_MAINTENANCE_BATCH_SIZE = 250;
+const MAX_MAINTENANCE_BATCH_SIZE = 5_000;
+const DEFAULT_MAINTENANCE_BATCH_LIMIT = 20;
+const DEFAULT_MAINTENANCE_LEASE_MS = 60_000;
+const MS_PER_DAY = 86_400_000;
+
+function validateMaintenanceOptions(options: RunMaintenanceJobOptions): {
+  readonly olderThanDays: number;
+  readonly batchSize: number;
+  readonly maxBatches: number;
+  readonly leaseDurationMs: number;
+} {
+  const olderThanDays = options.olderThanDays ?? 30;
+  const batchSize = options.batchSize ?? DEFAULT_MAINTENANCE_BATCH_SIZE;
+  const maxBatches = options.maxBatches ?? DEFAULT_MAINTENANCE_BATCH_LIMIT;
+  const leaseDurationMs = options.leaseDurationMs ?? DEFAULT_MAINTENANCE_LEASE_MS;
+  const retainRecentHours = options.retainRecentHours ?? 24;
+  if (!Number.isFinite(retainRecentHours) || retainRecentHours < 0)
+    throw new RangeError("Maintenance retainRecentHours must be a non-negative finite number.");
+  if (!Object.values(MAINTENANCE_JOBS).includes(options.jobName))
+    throw new RangeError("Unknown database maintenance job.");
+  if (options.ownerId.trim().length === 0)
+    throw new RangeError("Maintenance ownerId must be non-empty.");
+  if (!Number.isFinite(olderThanDays) || olderThanDays < 0)
+    throw new RangeError("Maintenance olderThanDays must be a non-negative finite number.");
+  if (olderThanDays > 100_000)
+    throw new RangeError("Maintenance olderThanDays exceeds the supported retention range.");
+  if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > MAX_MAINTENANCE_BATCH_SIZE)
+    throw new RangeError(
+      `Maintenance batchSize must be between 1 and ${MAX_MAINTENANCE_BATCH_SIZE}.`,
+    );
+  if (!Number.isInteger(maxBatches) || maxBatches < 1 || maxBatches > 1_000)
+    throw new RangeError("Maintenance maxBatches must be between 1 and 1000.");
+  if (!Number.isSafeInteger(leaseDurationMs) || leaseDurationMs < 1 || leaseDurationMs > 3_600_000)
+    throw new RangeError("Maintenance leaseDurationMs must be between 1 and 3600000.");
+  return { olderThanDays, batchSize, maxBatches, leaseDurationMs };
+}
+
+export interface AcquireMaintenanceLeaseInput {
+  readonly jobName: MaintenanceJobName;
+  readonly ownerId: string;
+  readonly leaseDurationMs?: number;
+}
+
+export async function acquireMaintenanceLease(
+  db: Transactional,
+  input: AcquireMaintenanceLeaseInput,
+): Promise<MaintenanceLeaseRow | null> {
+  if (input.ownerId.trim().length === 0)
+    throw new RangeError("Maintenance ownerId must be non-empty.");
+  if (!Object.values(MAINTENANCE_JOBS).includes(input.jobName))
+    throw new RangeError("Unknown database maintenance job.");
+  const leaseDurationMs = input.leaseDurationMs ?? DEFAULT_MAINTENANCE_LEASE_MS;
+  if (!Number.isSafeInteger(leaseDurationMs) || leaseDurationMs < 1 || leaseDurationMs > 3_600_000)
+    throw new RangeError("Maintenance leaseDurationMs must be between 1 and 3600000.");
+  return db.transaction(async (tx) => {
+    await tx.query(
+      "INSERT INTO maintenance_job_lease (job_name) VALUES ($1) ON CONFLICT (job_name) DO NOTHING",
+      [input.jobName],
+    );
+    const { rows } = await tx.query(
+      `UPDATE maintenance_job_lease
+          SET owner_id = $2,
+              fence_token = fence_token + 1,
+              lease_expires_at = clock_timestamp() + ($3 * INTERVAL '1 millisecond'),
+              updated_at = clock_timestamp()
+        WHERE job_name = $1
+          AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp())
+        RETURNING job_name, owner_id, fence_token, lease_expires_at, resume_cursor,
+                  batches_completed, rows_pruned, last_batch_at, last_completed_at, updated_at`,
+      [input.jobName, input.ownerId, leaseDurationMs],
+    );
+    const row = maybeOne(rows, "maintenance lease acquisition");
+    return row === null ? null : readMaintenanceLeaseRow(row);
+  });
+}
+
+export interface ReleaseMaintenanceLeaseInput {
+  readonly jobName: MaintenanceJobName;
+  readonly ownerId: string;
+  readonly fenceToken: bigint;
+}
+
+export async function releaseMaintenanceLease(
+  db: Queryable,
+  input: ReleaseMaintenanceLeaseInput,
+): Promise<boolean> {
+  if (input.ownerId.trim().length === 0)
+    throw new RangeError("Maintenance ownerId must be non-empty.");
+  if (!Object.values(MAINTENANCE_JOBS).includes(input.jobName))
+    throw new RangeError("Unknown database maintenance job.");
+  if (input.fenceToken < 1n) throw new RangeError("Maintenance fenceToken must be positive.");
+  const { rowCount } = await db.query(
+    `UPDATE maintenance_job_lease
+        SET owner_id = NULL, lease_expires_at = NULL, updated_at = clock_timestamp()
+      WHERE job_name = $1 AND owner_id = $2 AND fence_token = $3
+        AND lease_expires_at > clock_timestamp()`,
+    [input.jobName, input.ownerId, input.fenceToken.toString()],
+  );
+  return rowCount === 1;
+}
+
+async function runMaintenanceBatch(
+  db: Transactional,
+  options: RunMaintenanceJobOptions,
+  lease: MaintenanceLeaseRow,
+  values: ReturnType<typeof validateMaintenanceOptions>,
+): Promise<
+  | {
+      readonly leaseLost: true;
+      readonly complete: false;
+      readonly rowsPruned: 0;
+      readonly cursor: null;
+    }
+  | {
+      readonly leaseLost: false;
+      readonly complete: boolean;
+      readonly rowsPruned: number;
+      readonly cursor: bigint | null;
+    }
+> {
+  return db.transaction(async (tx) => {
+    const renewed = await tx.query(
+      `UPDATE maintenance_job_lease
+          SET lease_expires_at = clock_timestamp() + ($4 * INTERVAL '1 millisecond'),
+              updated_at = clock_timestamp()
+        WHERE job_name = $1 AND owner_id = $2 AND fence_token = $3
+          AND lease_expires_at > clock_timestamp()
+        RETURNING resume_cursor`,
+      [options.jobName, options.ownerId, lease.fenceToken.toString(), values.leaseDurationMs],
+    );
+    const leaseRow = renewed.rows[0];
+    if (renewed.rowCount === 0 || leaseRow === undefined)
+      return { leaseLost: true, complete: false, rowsPruned: 0, cursor: null };
+
+    const cursor = bigintOf(leaseRow, "resume_cursor");
+    const cutoff = new Date(Date.now() - values.olderThanDays * MS_PER_DAY);
+    let ids: bigint[];
+    let rowsPruned: number;
+
+    if (options.jobName === MAINTENANCE_JOBS.railAttestationRetention) {
+      const selected = await tx.query(
+        `SELECT transfer_id AS id
+           FROM rail_attestation
+          WHERE status = 'delivered' AND updated_at < $1 AND transfer_id > $2
+          ORDER BY transfer_id
+          LIMIT $3
+          FOR UPDATE SKIP LOCKED`,
+        [cutoff, cursor.toString(), values.batchSize],
+      );
+      ids = selected.rows.map((row) => bigintOf(row, "id"));
+      if (ids.length > 0) {
+        const deleted = await tx.query(
+          `DELETE FROM rail_attestation a
+            USING unnest($1::bigint[]) AS candidate(transfer_id),
+                  outbound_transfer t
+           WHERE a.transfer_id = candidate.transfer_id
+             AND t.id = a.transfer_id
+             AND a.status = 'delivered'
+             AND EXISTS (
+               SELECT 1
+                 FROM inbound_delivery d
+                WHERE d.source_chain = t.origin_chain
+                  AND d.source_nonce = t.nonce
+                  AND (
+                    d.delivered
+                    OR EXISTS (
+                      SELECT 1 FROM pending_claim settled
+                       WHERE settled.chain = d.destination_chain
+                         AND settled.claim_id = d.claim_id
+                         AND settled.settled
+                    )
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM pending_claim active
+                     WHERE active.chain = d.destination_chain
+                       AND active.claim_id = d.claim_id
+                       AND NOT active.settled
+                  )
+             )`,
+          [ids.map(String)],
+        );
+        rowsPruned = deleted.rowCount;
+      } else {
+        rowsPruned = 0;
+      }
+    } else {
+      const compacted = await compactRouteHealthBatch(
+        tx,
+        values.batchSize,
+        cursor,
+        options.retainRecentHours ?? 24,
+      );
+      ids = compacted.lastId === null ? [] : [compacted.lastId];
+      rowsPruned = compacted.deleted;
+      const scanned = compacted.scanned;
+      const complete = scanned < values.batchSize;
+      const nextCursor = complete ? 0n : (compacted.lastId ?? cursor);
+      await persistMaintenanceBatch(
+        tx,
+        options,
+        lease.fenceToken,
+        nextCursor,
+        rowsPruned,
+        complete,
+      );
+      return {
+        leaseLost: false,
+        complete,
+        rowsPruned,
+        cursor: nextCursor === 0n ? null : nextCursor,
+      };
+    }
+    const lastId = ids.at(-1) ?? null;
+    const complete = ids.length < values.batchSize;
+    const nextCursor = complete ? 0n : (lastId ?? cursor);
+    await persistMaintenanceBatch(tx, options, lease.fenceToken, nextCursor, rowsPruned, complete);
+    return {
+      leaseLost: false,
+      complete,
+      rowsPruned,
+      cursor: nextCursor === 0n ? null : nextCursor,
+    };
+  });
+}
+
+async function persistMaintenanceBatch(
+  tx: Queryable,
+  options: RunMaintenanceJobOptions,
+  fenceToken: bigint,
+  cursor: bigint,
+  rowsPruned: number,
+  complete: boolean,
+): Promise<void> {
+  const { rowCount } = await tx.query(
+    `UPDATE maintenance_job_lease
+        SET resume_cursor = $4,
+            batches_completed = batches_completed + 1,
+            rows_pruned = rows_pruned + $5,
+            last_batch_at = clock_timestamp(),
+            last_completed_at = CASE WHEN $6 THEN clock_timestamp() ELSE last_completed_at END,
+            updated_at = clock_timestamp()
+      WHERE job_name = $1 AND owner_id = $2 AND fence_token = $3`,
+    [
+      options.jobName,
+      options.ownerId,
+      fenceToken.toString(),
+      cursor.toString(),
+      rowsPruned,
+      complete,
+    ],
+  );
+  if (rowCount !== 1) throw new Error("Maintenance lease ownership changed during a batch.");
+}
+
+async function compactRouteHealthBatch(
+  tx: Queryable,
+  batchSize: number,
+  afterId: bigint,
+  retainRecentHours: number,
+): Promise<{ readonly deleted: number; readonly scanned: number; readonly lastId: bigint | null }> {
+  const { rows } = await tx.query(
+    `WITH ordered AS (
+       SELECT id, sampled_at, available, blocker, flow_available, median_seconds,
+         LAG(available) OVER w AS prev_available,
+         LAG(blocker) OVER w AS prev_blocker,
+         LAG(flow_available) OVER w AS prev_flow_available,
+         LAG(median_seconds) OVER w AS prev_median_seconds,
+         LEAD(available) OVER w AS next_available,
+         LEAD(blocker) OVER w AS next_blocker,
+         LEAD(flow_available) OVER w AS next_flow_available,
+         LEAD(median_seconds) OVER w AS next_median_seconds,
+         ROW_NUMBER() OVER w AS rn
+       FROM route_health
+       WINDOW w AS (
+         PARTITION BY origin_chain, destination_chain, route, token
+         ORDER BY sampled_at ASC, id ASC
+       )
+     ),
+     candidates AS (
+       SELECT r.id
+         FROM ordered
+         JOIN route_health r USING (id)
+        WHERE ordered.id > $1
+          AND ordered.sampled_at < now() - ($3 * INTERVAL '1 hour')
+          AND ordered.rn > 1
+          AND ordered.prev_available IS NOT DISTINCT FROM ordered.available
+          AND ordered.prev_blocker IS NOT DISTINCT FROM ordered.blocker
+          AND ordered.prev_flow_available IS NOT DISTINCT FROM ordered.flow_available
+          AND ordered.prev_median_seconds IS NOT DISTINCT FROM ordered.median_seconds
+          AND ordered.next_available IS NOT DISTINCT FROM ordered.available
+          AND ordered.next_blocker IS NOT DISTINCT FROM ordered.blocker
+          AND ordered.next_flow_available IS NOT DISTINCT FROM ordered.flow_available
+          AND ordered.next_median_seconds IS NOT DISTINCT FROM ordered.median_seconds
+        ORDER BY ordered.id
+        LIMIT $2
+        FOR UPDATE OF r SKIP LOCKED
+     ),
+     deleted AS (
+       DELETE FROM route_health
+        WHERE id IN (SELECT id FROM candidates)
+        RETURNING id
+     )
+     SELECT (SELECT count(*)::int FROM candidates) AS scanned,
+            count(*)::int AS deleted,
+            max(id)::bigint AS last_id
+       FROM deleted`,
+    [afterId.toString(), batchSize, retainRecentHours],
+  );
+  const row = one(rows, "compactRouteHealthBatch");
+  return {
+    deleted: integer(row, "deleted"),
+    scanned: integer(row, "scanned"),
+    lastId: row.last_id === null ? null : bigintOf(row, "last_id"),
+  };
+}
+
+export async function runMaintenanceJob(
+  db: Transactional,
+  options: RunMaintenanceJobOptions,
+): Promise<MaintenanceJobResult> {
+  const values = validateMaintenanceOptions(options);
+  const lease = await acquireMaintenanceLease(db, {
+    jobName: options.jobName,
+    ownerId: options.ownerId,
+    leaseDurationMs: values.leaseDurationMs,
+  });
+  if (lease === null) {
+    return {
+      acquired: false,
+      completed: false,
+      interrupted: false,
+      leaseLost: false,
+      fenceToken: null,
+      batchesRun: 0,
+      rowsPruned: 0,
+      resumeCursor: null,
+    };
+  }
+
+  let completed = false;
+  let leaseLost = false;
+  let batchesRun = 0;
+  let rowsPruned = 0;
+  let resumeCursor: bigint | null = lease.resumeCursor === 0n ? null : lease.resumeCursor;
+  try {
+    while (batchesRun < values.maxBatches && !options.signal?.aborted) {
+      const batch = await runMaintenanceBatch(db, options, lease, values);
+      if (batch.leaseLost) {
+        leaseLost = true;
+        break;
+      }
+      batchesRun++;
+      rowsPruned += batch.rowsPruned;
+      resumeCursor = batch.cursor;
+      if (batch.complete) {
+        completed = true;
+        break;
+      }
+    }
+  } finally {
+    await releaseMaintenanceLease(db, {
+      jobName: options.jobName,
+      ownerId: options.ownerId,
+      fenceToken: lease.fenceToken,
+    });
+  }
+
+  return {
+    acquired: true,
+    completed,
+    interrupted: !completed && !leaseLost,
+    leaseLost,
+    fenceToken: lease.fenceToken,
+    batchesRun,
+    rowsPruned,
+    resumeCursor,
+  };
 }
 
 export type DigestRecordKind = "outbound_transfer" | "inbound_delivery" | "pending_claim" | "all";
