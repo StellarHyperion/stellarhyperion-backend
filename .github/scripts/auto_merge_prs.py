@@ -6,6 +6,7 @@ can mechanically establish that a particular issue's behavior is implemented.
 """
 
 import base64
+from datetime import datetime, timedelta, timezone
 import html
 import json
 import os
@@ -15,13 +16,18 @@ import sys
 import urllib.error
 import urllib.parse
 
-from check_pr_description import DEPENDENCY_BOTS, validate_description
+from check_pr_description import DEPENDENCY_BOTS, validate_description, visible_markdown
 from enforce_pr_assignments import Enforcement, GitHub, text_references
 
 CI_PATH = ".github/workflows/ci.yml"
 BOT_LOGIN = "github-actions[bot]"
 MARKER = "<!-- hyperion-auto-merge:v1 -->"
 SHA = re.compile(r"[0-9a-f]{40}")
+ISSUE_TARGET = (r"(?:https://github\.com/[\w.-]+/[\w.-]+/issues/[1-9]\d*"
+                r"|[\w.-]+/[\w.-]+#[1-9]\d*|#[1-9]\d*)\b")
+CLOSING_REFERENCE = re.compile(
+    r"\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)\s*:?[ \t]+"
+    + ISSUE_TARGET + r"(?:[ \t]*,[ \t]*(?:and[ \t]+)?" + ISSUE_TARGET + r")*", re.IGNORECASE)
 THREADS_QUERY = """
 query($owner: String!, $repo: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
@@ -62,6 +68,17 @@ def safe_text(value):
     value = " ".join(str(value).split())[:700]
     value = re.sub(r"([\\`*_{}\[\]()#!|])", r"\\\1", value)
     return html.escape(value, quote=False).replace("@", "&#64;")
+
+
+def completion_references(body, repository):
+    """Only positive closing declarations, never incidental issue mentions."""
+    refs = set()
+    for line in visible_markdown(body).splitlines():
+        if re.search(r"\b(?:not|never|don't)\s+(?:close|fix|resolve)\b", line, re.IGNORECASE):
+            continue
+        for match in CLOSING_REFERENCE.finditer(line):
+            refs |= text_references(match[0], repository)
+    return refs
 
 
 class AutoMerge:
@@ -344,7 +361,10 @@ class AutoMerge:
                             "commit_title": f"Merge PR #{number}",
                             "commit_message": "Automatically merged after CI, issue-link and assignment verification."})
                         if result.get("merged") is True:
-                            return "MERGED: all test-based policy checks passed"
+                            # GITHUB_TOKEN merges do not trigger another Actions workflow.
+                            # Complete issues here too; periodic reconciliation retries errors.
+                            completed = IssueCompletion(self.github, self.default_branch).process(number)
+                            return "MERGED: all test-based policy checks passed; " + completed
                         reasons = ["GitHub declined the merge. A maintainer must inspect branch rules and merge permissions."]
                     except urllib.error.HTTPError as error:
                         if error.code not in {403, 405, 409, 422}:
@@ -354,14 +374,112 @@ class AutoMerge:
         return "WAIT: " + "; ".join(reasons)
 
 
+class IssueCompletion:
+    """Complete declared closing/development links only after a real merge.
+
+    Mentions in comments/fenced examples, other organizations and PR references
+    are excluded by the same reference parser and real-issue checks as admission.
+    Every target must still be assigned to the original PR author, even when
+    that author has a maintainer role. Successful current-head PR CI and all
+    head checks are required for reconciliation as well as immediate completion.
+    Assignees, PR authors and commit history are never modified.
+    """
+
+    def __init__(self, github, default_branch):
+        self.github, self.default_branch = github, default_branch
+        self.prefix = f"repos/{github.repository}/"
+
+    def process(self, number, dry_run=False):
+        if type(number) is not int or number <= 0:
+            raise ValueError("Invalid PR number")
+        pr = self.github.request(self.prefix + f"pulls/{number}")
+        base = pr.get("base") or {}
+        if (pr.get("state") != "closed" or pr.get("merged") is not True
+                or not pr.get("merged_at") or base.get("ref") != self.default_branch
+                or base.get("repo", {}).get("full_name", "").lower() != self.github.repository.lower()):
+            return "SKIP: PR was not merged into the default branch"
+        merge_sha = pr.get("merge_commit_sha")
+        if not isinstance(merge_sha, str) or not SHA.fullmatch(merge_sha):
+            raise ValueError("Missing verified merge revision")
+        branch = urllib.parse.quote(self.default_branch, safe="")
+        comparison = self.github.request(self.prefix + f"compare/{merge_sha}...{branch}")
+        if (comparison.get("merge_base_commit", {}).get("sha") != merge_sha
+                or comparison.get("status") not in {"ahead", "identical"}):
+            raise ValueError("Merged revision is not on the current default branch")
+        author = pr["user"]["login"].lower()
+        refs = completion_references(pr.get("body"), self.github.repository)
+        refs |= self.github.linked_issues(number)
+        organization = self.github.repository.split("/")[0].lower()
+        refs = {(repo, issue) for repo, issue in refs if repo.split("/")[0] == organization}
+        candidates = []
+        for repo, issue_number in sorted(refs):
+            issue = self.github.request(f"repos/{repo}/issues/{issue_number}")
+            if ("pull_request" not in issue
+                    and author in {user["login"].lower() for user in issue["assignees"]}
+                    and not (issue.get("state") == "closed" and issue.get("state_reason") == "completed")):
+                candidates.append((repo, issue_number))
+        if not candidates:
+            return "COMPLETED: 0 issue(s)"
+        verifier = AutoMerge(self.github, None, self.default_branch)
+        _, reasons = verifier.current_ci(pr)
+        # Post-merge push checks are separate from the PR's checks. The original
+        # PR head must pass every gate; a newer failed/pending rerun blocks closure.
+        reasons.extend(verifier.checks({**pr, "merge_commit_sha": None}))
+        if reasons:
+            return "WAIT: PR checks have not all succeeded; issues preserved"
+        completed, errors = 0, []
+        for repo, issue_number in candidates:
+            try:
+                endpoint = f"repos/{repo}/issues/{issue_number}"
+                issue = self.github.request(endpoint)
+                if "pull_request" in issue:
+                    continue
+                if author not in {user["login"].lower() for user in issue["assignees"]}:
+                    continue
+                # Native GitHub closing keywords may already have completed it.
+                if issue.get("state") == "closed" and issue.get("state_reason") == "completed":
+                    continue
+                if dry_run:
+                    completed += 1
+                    continue
+                updated = self.github.request(endpoint, "PATCH", {
+                    "state": "closed", "state_reason": "completed"})
+                if updated.get("state") != "closed" or updated.get("state_reason") != "completed":
+                    raise ValueError("Issue completion was not confirmed")
+                completed += 1
+            except Exception as error:
+                # Preserve partial success and try every issue before failing the run.
+                errors.append(f"{repo}#{issue_number}: {type(error).__name__}")
+        if errors:
+            raise RuntimeError("Issue completion failed; periodic sweep will retry: " + "; ".join(errors))
+        return f"{'WOULD COMPLETE' if dry_run else 'COMPLETED'}: {completed} issue(s)"
+
+    def recent(self):
+        # Updated order allows an early stop. A recently edited old PR is also
+        # reconciled; the initial historical backfill is a maintainer operation.
+        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        for pr in self.github.pages(self.prefix + "pulls?state=closed&sort=updated&direction=desc"):
+            if datetime.fromisoformat(pr["updated_at"].replace("Z", "+00:00")) < cutoff:
+                return
+            if pr.get("merged_at"):
+                yield pr
+
+
 def main():
     github = GitHub(os.environ["GITHUB_TOKEN"], os.environ["GITHUB_REPOSITORY"], os.environ["POLICY_SHA"])
     policy = Enforcement(github, os.environ.get("PR_ASSIGNMENT_HELPER_BOTS", ""))
     bot = AutoMerge(github, policy, os.environ["DEFAULT_BRANCH"])
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
     dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
-    prs = list(github.pages(bot.prefix + "pulls?state=open"))
-    if os.environ["GITHUB_EVENT_NAME"] == "workflow_run":
+    event_name = os.environ["GITHUB_EVENT_NAME"]
+    completion = IssueCompletion(github, bot.default_branch)
+    if event_name == "pull_request_target":
+        prs = []
+        merged = [event["pull_request"]]
+    else:
+        prs = list(github.pages(bot.prefix + "pulls?state=open"))
+        merged = list(completion.recent()) if event_name in {"schedule", "workflow_dispatch"} else []
+    if event_name == "workflow_run":
         trigger = event["workflow_run"]
         if trigger.get("event") != "pull_request" or trigger.get("path") != CI_PATH:
             return 0
@@ -373,12 +491,19 @@ def main():
             result = bot.process(number, dry_run)
         except Exception as error:
             errors += 1
-            result = f"ERROR: {type(error).__name__}; verification failed and PR was preserved"
+            result = f"ERROR: {type(error).__name__}; merge or issue completion requires a retry"
             try:
-                bot.comment(number, ["GitHub API or policy verification failed. No merge was attempted after the failed check. The bot will retry; a maintainer should inspect the Automatic PR merge workflow if this persists."], dry_run)
+                bot.comment(number, ["GitHub API or policy verification failed. The bot will retry; a maintainer should inspect the Automatic PR merge workflow if this persists."], dry_run)
             except Exception:
                 result += "; comment API also unavailable"
         print(f"PR {number}: {safe_text(result)}", flush=True)
+    for pr in merged:
+        try:
+            result = completion.process(pr["number"], dry_run)
+        except Exception as error:
+            errors += 1
+            result = f"ERROR: {type(error).__name__}; issue completion will retry"
+        print(f"PR {pr['number']} issues: {safe_text(result)}", flush=True)
     return int(bool(errors))
 
 
