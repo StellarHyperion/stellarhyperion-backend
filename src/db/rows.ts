@@ -20,6 +20,34 @@ export class RowError extends Error {
 
 export type Row = Record<string, unknown>;
 
+export interface MaintenanceLeaseRow {
+  readonly jobName: string;
+  readonly ownerId: string | null;
+  readonly fenceToken: bigint;
+  readonly leaseExpiresAt: Date | null;
+  readonly resumeCursor: bigint;
+  readonly batchesCompleted: bigint;
+  readonly rowsPruned: bigint;
+  readonly lastBatchAt: Date | null;
+  readonly lastCompletedAt: Date | null;
+  readonly updatedAt: Date;
+}
+
+export function readMaintenanceLeaseRow(row: Row): MaintenanceLeaseRow {
+  return {
+    jobName: text(row, "job_name"),
+    ownerId: textOrNull(row, "owner_id"),
+    fenceToken: bigintOf(row, "fence_token"),
+    leaseExpiresAt: timestampOrNull(row, "lease_expires_at"),
+    resumeCursor: bigintOf(row, "resume_cursor"),
+    batchesCompleted: bigintOf(row, "batches_completed"),
+    rowsPruned: bigintOf(row, "rows_pruned"),
+    lastBatchAt: timestampOrNull(row, "last_batch_at"),
+    lastCompletedAt: timestampOrNull(row, "last_completed_at"),
+    updatedAt: timestamp(row, "updated_at"),
+  };
+}
+
 export function text(row: Row, column: string): string {
   const value = row[column];
   if (typeof value !== "string")

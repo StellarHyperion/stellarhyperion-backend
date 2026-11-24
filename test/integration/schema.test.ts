@@ -75,11 +75,13 @@ suite("the schema", () => {
       "admin_action",
       "axelar_delivery_evidence",
       "axelar_status_quarantine",
+      "cctp_delivery_evidence",
       "inbound_delivery",
       "indexed_history_digest",
       "indexer_cursor",
       "indexer_worker_heartbeat",
       "ingestion_rejection",
+      "maintenance_job_lease",
       "outbound_transfer",
       "pending_claim",
       "rail_attestation",
@@ -515,6 +517,9 @@ suite("maintenance and pruning", () => {
 
   afterAll(async () => {
     await db.query(
+      "DELETE FROM public.inbound_delivery WHERE source_chain = 'prune-test-1' AND source_nonce = 999991",
+    );
+    await db.query(
       "DELETE FROM public.rail_attestation WHERE transfer_id IN (999991, 999992, 999993)",
     );
     await db.query("DELETE FROM public.outbound_transfer WHERE id IN (999991, 999992, 999993)");
@@ -554,6 +559,15 @@ suite("maintenance and pruning", () => {
       `INSERT INTO public.rail_attestation (transfer_id, route, status, updated_at)
        VALUES (999993, 0, 'pending', now() - INTERVAL '40 days')
        ON CONFLICT (transfer_id) DO UPDATE SET status = 'pending', updated_at = now() - INTERVAL '40 days'`,
+    );
+
+    await db.query(
+      `INSERT INTO public.inbound_delivery
+         (destination_chain, route, source_chain, source_nonce, recipient, token, amount,
+          delivered, claim_id, destination_block, destination_tx)
+       VALUES ('stellar-testnet', 0, 'prune-test-1', 999991, 'GA5ZYIIV', 'USDC', 100,
+               true, NULL, 1, '0xprune-destination')
+       ON CONFLICT (destination_chain, route, source_chain, source_nonce, source_transfer_id) DO NOTHING`,
     );
 
     const deletedCount = await db.pruneCompletedAttestations(30);

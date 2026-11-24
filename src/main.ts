@@ -20,7 +20,7 @@ import { ConfigError, NetworkAdmissionError } from "./config/env.js";
 import { checkDatabasePolicy } from "./db/policy.js";
 import { checkSchemaCompatibility } from "./db/schema.js";
 import { runBudgetedCatchUp } from "./runtime/budget.js";
-import { Database } from "./db/pool.js";
+import { Database, startMaintenanceTask } from "./db/pool.js";
 import { buildServer } from "./http/server.js";
 import { createApiRedis } from "./http/rate-limit-redis.js";
 import { createLogger } from "./logging/logger.js";
@@ -147,6 +147,13 @@ export async function startContinuousApplication(): Promise<ContinuousApplicatio
   } catch (error) {
     await application.stop("startup-failure");
     throw error;
+  }
+  if (config.databaseRole !== "read-only") {
+    const stopMaintenance = startMaintenanceTask(db, { logger });
+    shutdown.add("database-maintenance", () => {
+      stopMaintenance();
+      return Promise.resolve();
+    });
   }
   // After listen, so the probes are answering before the first page is read. A watcher that
   // starts first makes its initial RPC calls while nothing can report on them.

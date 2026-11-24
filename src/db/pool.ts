@@ -13,6 +13,7 @@
  * costume. Narrowing happens once per table, in `rows.ts`, where it is visible.
  */
 import { performance } from "node:perf_hooks";
+import { randomUUID } from "node:crypto";
 
 import { Client, Pool } from "pg";
 import type { PoolClient, PoolConfig } from "pg";
@@ -33,10 +34,14 @@ import {
   type HistoryDigestResult,
   type StoredHistoryDigest,
   auditTransferAndClaimInvariants,
-  compactRouteHealthSamples,
   type CompactRouteHealthOptions,
   type RouteHealthCompactionResult,
   type TransferClaimAuditReport,
+  runMaintenanceJob as runDatabaseMaintenanceJob,
+  MAINTENANCE_JOBS,
+  type MaintenanceJobName,
+  type MaintenanceJobResult,
+  type RunMaintenanceJobOptions,
 } from "../chains/writers.js";
 
 import {
@@ -420,13 +425,18 @@ export class Database implements Transactional {
    * Returns the count of deleted rows.
    */
   async pruneCompletedAttestations(olderThanDays = 30): Promise<number> {
-    const { rowCount } = await this.query(
-      `DELETE FROM rail_attestation
-        WHERE status = 'delivered'
-          AND updated_at < now() - ($1 * INTERVAL '1 day')`,
-      [olderThanDays],
-    );
-    return rowCount;
+    const result = await this.runMaintenanceJob({
+      jobName: MAINTENANCE_JOBS.railAttestationRetention,
+      ownerId: randomUUID(),
+      olderThanDays,
+      batchSize: 1_000,
+      maxBatches: 20,
+    });
+    return result.rowsPruned;
+  }
+
+  async runMaintenanceJob(options: RunMaintenanceJobOptions): Promise<MaintenanceJobResult> {
+    return runDatabaseMaintenanceJob(this, options);
   }
 
   /**
@@ -436,7 +446,14 @@ export class Database implements Transactional {
   async compactRouteHealthSamples(
     options: CompactRouteHealthOptions = {},
   ): Promise<RouteHealthCompactionResult> {
-    return compactRouteHealthSamples(this, options);
+    const result = await this.runMaintenanceJob({
+      jobName: MAINTENANCE_JOBS.routeHealthCompaction,
+      ownerId: randomUUID(),
+      batchSize: options.batchSize ?? 1_000,
+      maxBatches: 1,
+      retainRecentHours: options.retainRecentHours ?? 24,
+    });
+    return { deleted: result.rowsPruned };
   }
 
   /**
@@ -648,6 +665,8 @@ export interface MaintenanceTaskOptions {
   readonly olderThanDays?: number;
   readonly routeHealthRetainRecentHours?: number;
   readonly routeHealthBatchSize?: number;
+  readonly maxBatches?: number;
+  readonly ownerId?: string;
   readonly logger?: {
     info?: (obj: unknown, msg: string) => void;
     error?: (obj: unknown, msg: string) => void;
@@ -667,25 +686,66 @@ export function startMaintenanceTask(
   const olderThanDays = options.olderThanDays ?? 30;
   const routeHealthRetainRecentHours = options.routeHealthRetainRecentHours;
   const routeHealthBatchSize = options.routeHealthBatchSize;
+  const maxBatches = options.maxBatches ?? 20;
+  const ownerId = options.ownerId ?? randomUUID();
+  const controller = new AbortController();
+  let running = false;
+  let stopped = false;
 
-  const timer = setInterval(() => {
-    void db.pruneCompletedAttestations(olderThanDays).catch((error: unknown) => {
-      options.logger?.warn?.({ err: error }, "maintenance attestation pruning failed");
-    });
-    void db
-      .compactRouteHealthSamples({
-        ...(routeHealthRetainRecentHours !== undefined
-          ? { retainRecentHours: routeHealthRetainRecentHours }
-          : {}),
-        ...(routeHealthBatchSize !== undefined ? { batchSize: routeHealthBatchSize } : {}),
-      })
-      .catch((error: unknown) => {
-        options.logger?.warn?.({ err: error }, "maintenance route_health compaction failed");
-      });
-  }, intervalMs);
+  const run = async () => {
+    if (stopped || running) return;
+    running = true;
+    try {
+      const jobs: readonly MaintenanceJobName[] = [
+        MAINTENANCE_JOBS.railAttestationRetention,
+        MAINTENANCE_JOBS.routeHealthCompaction,
+      ];
+      for (const jobName of jobs) {
+        if (controller.signal.aborted) break;
+        const result = await db.runMaintenanceJob({
+          jobName,
+          ownerId,
+          ...(jobName === MAINTENANCE_JOBS.railAttestationRetention ? { olderThanDays } : {}),
+          ...(jobName === MAINTENANCE_JOBS.routeHealthCompaction
+            ? {
+                ...(routeHealthRetainRecentHours !== undefined
+                  ? { retainRecentHours: routeHealthRetainRecentHours }
+                  : {}),
+                ...(routeHealthBatchSize !== undefined ? { batchSize: routeHealthBatchSize } : {}),
+              }
+            : {}),
+          maxBatches,
+          signal: controller.signal,
+        });
+        if (result.acquired) {
+          options.logger?.info?.(
+            {
+              jobName,
+              completed: result.completed,
+              interrupted: result.interrupted,
+              rowsPruned: result.rowsPruned,
+              batchesRun: result.batchesRun,
+            },
+            "database maintenance job finished",
+          );
+        }
+      }
+    } catch (error) {
+      options.logger?.warn?.(
+        { err: error instanceof Error ? error.name : "UnknownError" },
+        "database maintenance job failed",
+      );
+    } finally {
+      running = false;
+    }
+  };
+
+  const timer = setInterval(() => void run(), intervalMs);
 
   timer.unref();
   return () => {
+    stopped = true;
+    controller.abort();
     clearInterval(timer);
   };
 }
