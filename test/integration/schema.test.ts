@@ -75,6 +75,7 @@ suite("the schema", () => {
       "admin_action",
       "axelar_delivery_evidence",
       "axelar_status_quarantine",
+      "cctp_delivery_evidence",
       "inbound_delivery",
       "indexed_history_digest",
       "indexer_cursor",

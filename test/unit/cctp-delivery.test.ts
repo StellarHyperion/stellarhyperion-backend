@@ -7,6 +7,7 @@ import { loadConfig } from "../../src/config/config.js";
 import {
   inspectCctpDelivery,
   describeCctpProofChecks,
+  revalidateCctpDeliveryProofs,
   type CctpProofCheckSummary,
 } from "../../src/rails/cctp/delivery.js";
 import type { PendingTransfer, RailReport } from "../../src/rails/types.js";
@@ -29,7 +30,7 @@ import {
 import type { DeliveryLog } from "../../src/rails/axelar/events.js";
 import { IrisClient, reportFor } from "../../src/rails/cctp/iris.js";
 import { writeAttestation, writeInbound } from "../../src/chains/writers.js";
-import type { Queryable } from "../../src/db/pool.js";
+import type { Queryable, Transactional } from "../../src/db/pool.js";
 
 const expected: ExpectedCctpTransfer = {
   sourceToken: "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
@@ -764,6 +765,133 @@ describe("CCTP full message identity", () => {
       );
       expect(result.proofEvidence).toBeNull();
       expect(result.failure).toBe("message_already_delivered");
+    });
+
+    it("reopens a confirmed delivery when its saved destination block is orphaned", async () => {
+      const evidence = {
+        id: "71",
+        transfer_id: "41",
+        destination_chain: "sepolia",
+        tx_hash: hash,
+        block_number: "100",
+        block_hash: hash,
+        mint_log_index: "3",
+        message_nonce: identity.nonce,
+        message_digest: identity.digest,
+        message_bytes: raw,
+        token: expected.token.toLowerCase(),
+        recipient: expected.recipient.toLowerCase(),
+        amount: verified.amount.toString(),
+        source_binding: {
+          originChain: transfer.originChain,
+          nonce: transfer.nonce.toString(),
+          originTx: transfer.originTx,
+          destinationChain: transfer.destinationChain,
+          token: expected.sourceToken,
+          amount: expected.sourceAmount.toString(),
+          destination: stored.destination,
+        },
+      };
+      let evidenceStatus = "canonical";
+      let inboundExists = true;
+      let reopened = false;
+      const base = database(stored, [{ source_transfer_id: "41" }]);
+      const db: Transactional = {
+        async query(sql, params = []) {
+          if (sql.includes("FROM cctp_delivery_evidence WHERE status = 'canonical'"))
+            return { rows: evidenceStatus === "canonical" ? [evidence] : [], rowCount: 1 };
+          if (sql.includes("FROM outbound_transfer WHERE id = $1 AND route = $2"))
+            return { rows: [{ id: "41", route: RouteKind.Cctp, ...stored }], rowCount: 1 };
+          if (sql.includes("DELETE FROM inbound_delivery")) {
+            inboundExists = false;
+            return { rows: [], rowCount: 1 };
+          }
+          if (sql.includes("UPDATE rail_attestation SET status = 'attested'")) {
+            reopened = true;
+            return { rows: [], rowCount: 1 };
+          }
+          if (sql.includes("FROM inbound_delivery")) {
+            return inboundExists
+              ? base.query(sql, params)
+              : Promise.resolve({ rows: [], rowCount: 0 });
+          }
+          if (sql.includes("UPDATE cctp_delivery_evidence SET status = 'orphaned'")) {
+            evidenceStatus = "orphaned";
+            return { rows: [{ id: "71" }], rowCount: 1 };
+          }
+          if (sql.includes("SELECT id FROM outbound_transfer WHERE id = $1 FOR UPDATE"))
+            return { rows: [{ id: "41" }], rowCount: 1 };
+          return base.query(sql, params);
+        },
+        transaction(work) {
+          return work(this);
+        },
+      };
+      evm.getBlock.mockResolvedValueOnce({
+        hash: `0x${"aa".repeat(32)}`,
+        timestamp: 1700000000n,
+      });
+
+      const count = await revalidateCctpDeliveryProofs(config, db, 10);
+
+      expect(count).toBe(1);
+      expect(evidenceStatus).toBe("orphaned");
+      expect(inboundExists).toBe(false);
+      expect(reopened).toBe(true);
+      expect(evm.getTransactionReceipt).toHaveBeenCalledWith({ hash });
+    });
+
+    it("retains a canonical proof's exact integer amount and token during revalidation", async () => {
+      const evidence = {
+        id: "72",
+        transfer_id: "41",
+        destination_chain: "sepolia",
+        tx_hash: hash,
+        block_number: "100",
+        block_hash: hash,
+        mint_log_index: "3",
+        message_nonce: identity.nonce,
+        message_digest: identity.digest,
+        message_bytes: raw,
+        token: expected.token.toLowerCase(),
+        recipient: expected.recipient.toLowerCase(),
+        amount: verified.amount.toString(),
+        source_binding: {
+          originChain: transfer.originChain,
+          nonce: transfer.nonce.toString(),
+          originTx: transfer.originTx,
+          destinationChain: transfer.destinationChain,
+          token: expected.sourceToken,
+          amount: expected.sourceAmount.toString(),
+          destination: stored.destination,
+        },
+      };
+      let markedCanonical = false;
+      const base = database(stored, [{ source_transfer_id: "41" }]);
+      const db: Transactional = {
+        async query(sql, params = []) {
+          if (sql.includes("FROM cctp_delivery_evidence WHERE status = 'canonical'"))
+            return { rows: [evidence], rowCount: 1 };
+          if (sql.includes("FROM outbound_transfer WHERE id = $1 AND route = $2"))
+            return { rows: [{ id: "41", route: RouteKind.Cctp, ...stored }], rowCount: 1 };
+          if (sql.includes("UPDATE cctp_delivery_evidence SET last_revalidated_at = now()")) {
+            markedCanonical = true;
+            expect(evidence.amount).toBe("99600000");
+            expect(evidence.token).toBe(expected.token.toLowerCase());
+            return { rows: [], rowCount: 1 };
+          }
+          return base.query(sql, params);
+        },
+        transaction(work) {
+          return work(this);
+        },
+      };
+
+      const count = await revalidateCctpDeliveryProofs(config, db, 10);
+
+      expect(count).toBe(0);
+      expect(markedCanonical).toBe(true);
+      expect(evm.getTransactionReceipt).toHaveBeenCalledWith({ hash });
     });
   });
 });

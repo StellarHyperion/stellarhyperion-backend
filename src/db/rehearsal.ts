@@ -27,6 +27,7 @@ export const REHEARSAL_TABLES = [
   "indexer_cursor",
   "outbound_transfer",
   "axelar_delivery_evidence",
+  "cctp_delivery_evidence",
   "inbound_delivery",
   "pending_claim",
   "admin_action",

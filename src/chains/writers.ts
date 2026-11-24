@@ -1,4 +1,5 @@
 import type { CctpFeeReconciliation, CctpVerificationFailure } from "../rails/types.js";
+import { RouteKind } from "@hyperion/protocol";
 import { bounded, safeString } from "../rails/axelar/gmp.js";
 /**
  * Every statement that writes an indexed row, in one file, for both chain families.
@@ -491,6 +492,125 @@ export interface AxelarDeliveryEvidenceRow {
   readonly paymentLogIndex: number;
   readonly paymentRecipient: string;
   readonly paymentAmount: bigint;
+}
+
+export interface CctpDeliveryEvidenceRow {
+  readonly transferId: bigint;
+  readonly destinationChain: string;
+  readonly txHash: string;
+  readonly blockNumber: bigint;
+  readonly blockHash: string;
+  readonly mintLogIndex: number;
+  readonly messageNonce: string;
+  readonly messageDigest: string;
+  readonly messageBytes: string;
+  readonly token: string;
+  readonly recipient: string;
+  readonly amount: bigint;
+  readonly sourceBinding: {
+    readonly originChain: string;
+    readonly nonce: string;
+    readonly originTx: string;
+    readonly destinationChain: string;
+    readonly token: string;
+    readonly amount: string;
+    readonly destination: string;
+  };
+}
+
+export async function writeCctpDeliveryEvidence(
+  db: Queryable,
+  row: CctpDeliveryEvidenceRow,
+): Promise<bigint> {
+  const source = (
+    await db.query(
+      `SELECT origin_chain, nonce::text, origin_tx, destination_chain, token, net_amount::text,
+              destination
+         FROM outbound_transfer WHERE id = $1 AND route = $2 FOR UPDATE`,
+      [row.transferId.toString(), RouteKind.Cctp],
+    )
+  ).rows[0];
+  const expected = row.sourceBinding;
+  if (
+    source?.origin_chain !== expected.originChain ||
+    source.nonce !== expected.nonce ||
+    source.origin_tx !== expected.originTx ||
+    source.destination_chain !== expected.destinationChain ||
+    source.token !== expected.token ||
+    source.net_amount !== expected.amount ||
+    source.destination !== expected.destination
+  )
+    throw new Error("CCTP verified source binding changed before proof admission.");
+
+  await db.query(
+    `UPDATE cctp_delivery_evidence SET status = 'superseded'
+      WHERE transfer_id = $1 AND status = 'canonical'
+        AND (tx_hash, mint_log_index) IS DISTINCT FROM ($2, $3)`,
+    [row.transferId.toString(), row.txHash, row.mintLogIndex],
+  );
+  const { rows } = await db.query(
+    `INSERT INTO cctp_delivery_evidence
+       (transfer_id, destination_chain, status, tx_hash, block_number, block_hash,
+        mint_log_index, message_nonce, message_digest, message_bytes, token, recipient, amount,
+        source_binding, last_revalidated_at)
+     VALUES ($1, $2, 'canonical', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, now())
+     ON CONFLICT (transfer_id, tx_hash, mint_log_index) DO UPDATE
+       SET status = 'canonical',
+           destination_chain = EXCLUDED.destination_chain,
+           block_number = EXCLUDED.block_number,
+           block_hash = EXCLUDED.block_hash,
+           message_nonce = EXCLUDED.message_nonce,
+           message_digest = EXCLUDED.message_digest,
+           message_bytes = EXCLUDED.message_bytes,
+           token = EXCLUDED.token,
+           recipient = EXCLUDED.recipient,
+           amount = EXCLUDED.amount,
+           source_binding = EXCLUDED.source_binding,
+           last_revalidated_at = now()
+     RETURNING id`,
+    [
+      row.transferId.toString(),
+      row.destinationChain,
+      row.txHash,
+      row.blockNumber.toString(),
+      row.blockHash,
+      row.mintLogIndex,
+      row.messageNonce,
+      row.messageDigest,
+      row.messageBytes,
+      row.token,
+      row.recipient,
+      row.amount.toString(),
+      JSON.stringify(row.sourceBinding),
+    ],
+  );
+  const id = rows[0]?.id;
+  if (typeof id !== "string" && typeof id !== "number" && typeof id !== "bigint")
+    throw new Error("CCTP delivery evidence insert did not return its id.");
+  return BigInt(id);
+}
+
+export async function linkCctpDeliveryEvidence(
+  db: Queryable,
+  row: CctpDeliveryEvidenceRow,
+  evidenceId: bigint,
+): Promise<void> {
+  const { rowCount } = await db.query(
+    `UPDATE inbound_delivery SET cctp_evidence_id = $6
+      WHERE destination_chain = $1 AND route = $2 AND destination_block = $3
+        AND destination_tx = $4 AND destination_log_index = $5
+        AND delivered = true AND source_transfer_id = $7`,
+    [
+      row.destinationChain,
+      RouteKind.Cctp,
+      row.blockNumber.toString(),
+      row.txHash,
+      row.mintLogIndex,
+      evidenceId.toString(),
+      row.transferId.toString(),
+    ],
+  );
+  if (rowCount !== 1) throw new Error("CCTP evidence did not match its inbound delivery.");
 }
 
 export async function writeAxelarQuarantine(

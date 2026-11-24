@@ -1,7 +1,7 @@
 import type { WorkerPolicyStore } from "../runtime/worker-policy.js";
 import type { VerifiedDelivery } from "./axelar/delivery.js";
 import { RouteKind } from "@hyperion/protocol";
-import type { AxelarDeliveryEvidenceRow } from "../chains/writers.js";
+import type { AxelarDeliveryEvidenceRow, CctpDeliveryEvidenceRow } from "../chains/writers.js";
 /**
  * One pass over the transfers waiting on one rail.
  *
@@ -28,7 +28,7 @@ import { abortable, combinedSignal } from "./cancellation.js";
 import { revalidateItsDeliveryProofs, verifyItsDelivery } from "./axelar/delivery.js";
 import { ingestAxelarGasEvidence } from "./axelar/gas.js";
 import type { VerificationDiagnostic } from "./axelar/events.js";
-import { inspectCctpDelivery } from "./cctp/delivery.js";
+import { inspectCctpDelivery, revalidateCctpDeliveryProofs } from "./cctp/delivery.js";
 import { BoundedCandidateReceiptCache } from "./candidate-receipt-cache.js";
 import type { Logger } from "pino";
 
@@ -40,6 +40,8 @@ import {
   writeAttestation,
   writeAxelarDeliveryEvidence,
   linkAxelarDeliveryEvidence,
+  writeCctpDeliveryEvidence,
+  linkCctpDeliveryEvidence,
   writeAxelarQuarantine,
 } from "../chains/writers.js";
 import {
@@ -378,6 +380,14 @@ export class RailPass {
           effective,
         );
     }
+    if (this.options.config && client.rail === "cctp" && this.options.route === RouteKind.Cctp)
+      await abortable(
+        revalidateCctpDeliveryProofs(this.options.config, db, batchSize, {
+          signal: effective,
+          logger,
+        }),
+        effective,
+      );
 
     let checked = 0;
     let settled = 0;
@@ -734,6 +744,7 @@ export class RailPass {
     let itsVerificationState: "receipt_unavailable" | "payout_unverified" | "verified" | null =
       null;
     let verificationFailure: CctpVerificationFailure | null = null;
+    let cctpStoredEvidence: CctpDeliveryEvidenceRow | null = null;
     if (this.options.config) {
       const verificationOptions = {
         signal,
@@ -769,12 +780,18 @@ export class RailPass {
                 signal,
               );
               verified = cctp.delivery;
+              if (cctp.delivery !== null && "storedEvidence" in cctp)
+                cctpStoredEvidence = cctp.storedEvidence;
               verificationFailure = cctp.failure;
             }
             this.circuits.recordSuccess(verificationKey);
             if (verified) {
               signal.throwIfAborted();
-              if (transfer.route === RouteKind.AxelarIts && "evidence" in verified) {
+              if (cctpStoredEvidence !== null) {
+                const evidenceId = await writeCctpDeliveryEvidence(db, cctpStoredEvidence);
+                await writeInbound(db, verified.at, verified.row);
+                await linkCctpDeliveryEvidence(db, cctpStoredEvidence, evidenceId);
+              } else if (transfer.route === RouteKind.AxelarIts && "evidence" in verified) {
                 const evidence = verified.evidence as AxelarDeliveryEvidenceRow;
                 const evidenceId = await writeAxelarDeliveryEvidence(db, evidence);
                 await writeInbound(db, verified.at, verified.row);

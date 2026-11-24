@@ -11,10 +11,11 @@ import {
 import type { Hex } from "viem";
 import type { Logger } from "pino";
 import { isDestinationVerificationChain, type AppConfig } from "../../config/config.js";
-import type { Queryable } from "../../db/pool.js";
+import type { Queryable, Transactional } from "../../db/pool.js";
 import { bigintOf, text, textOrNull } from "../../db/rows.js";
 import type { PendingTransfer, RailCandidate, RailReport } from "../types.js";
 import type { VerifiedDelivery } from "../axelar/delivery.js";
+import type { CctpDeliveryEvidenceRow } from "../../chains/writers.js";
 import {
   destinationVerificationViemClient,
   withDestinationVerification,
@@ -48,6 +49,7 @@ export interface CctpDeliverySuccess {
    * provider credential or internal adapter address appears in this structure.
    */
   readonly proofEvidence: CctpProofEvidence;
+  readonly storedEvidence: CctpDeliveryEvidenceRow;
 }
 
 /** Returned by inspectCctpDelivery when delivery cannot be confirmed. */
@@ -64,6 +66,12 @@ export interface DeliveryVerificationOptions {
   readonly logger?: Logger;
   readonly clientForUrl?: DestinationVerificationClientFactory;
   readonly candidateReceiptCache?: BoundedCandidateReceiptCache;
+}
+
+export interface CctpRevalidationOptions {
+  readonly signal?: AbortSignal;
+  readonly logger?: Logger;
+  readonly clientForUrl?: DestinationVerificationClientFactory;
 }
 
 /**
@@ -439,10 +447,35 @@ export async function inspectCctpDelivery(
         mintAmount: message.amount.toString(),
         destinationChain: transfer.destinationChain,
       };
+      const sourceBinding = {
+        originChain: transfer.originChain,
+        nonce: bigintOf(stored, "nonce").toString(),
+        originTx: text(stored, "origin_tx"),
+        destinationChain: transfer.destinationChain,
+        token: text(stored, "token"),
+        amount: bigintOf(stored, "net_amount").toString(),
+        destination: text(stored, "destination"),
+      };
+      const storedEvidence: CctpDeliveryEvidenceRow = {
+        transferId: transfer.transferId,
+        destinationChain: transfer.destinationChain,
+        txHash: receipt.transactionHash,
+        blockNumber: receipt.blockNumber,
+        blockHash: receipt.blockHash,
+        mintLogIndex: payment.logIndex,
+        messageNonce: identity.nonce,
+        messageDigest: identity.digest,
+        messageBytes: raw,
+        token: token.address.toLowerCase(),
+        recipient: expected.recipient.toLowerCase(),
+        amount: message.amount,
+        sourceBinding,
+      };
 
       return {
         failure: null,
         proofEvidence,
+        storedEvidence,
         delivery: {
           at: {
             chainKey: transfer.destinationChain,
@@ -480,4 +513,201 @@ export async function verifyCctpDelivery(
   options: DeliveryVerificationOptions = {},
 ): Promise<VerifiedDelivery | null> {
   return (await inspectCctpDelivery(config, db, transfer, report, options)).delivery;
+}
+
+/**
+ * Revalidate previously confirmed CCTP destination proofs without consulting Iris or submitting
+ * any transactions. A proof is reopened only when its saved receipt/payment no longer verifies.
+ */
+export async function revalidateCctpDeliveryProofs(
+  config: AppConfig,
+  db: Transactional,
+  limit: number,
+  options: CctpRevalidationOptions = {},
+): Promise<number> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000)
+    throw new Error("CCTP revalidation batch must be between 1 and 1000.");
+
+  const { rows } = await db.query(
+    `SELECT id, transfer_id, destination_chain, tx_hash, block_number, block_hash,
+            mint_log_index, message_nonce, message_digest, message_bytes, token, recipient,
+            amount::text, source_binding
+       FROM cctp_delivery_evidence WHERE status = 'canonical'
+      ORDER BY last_revalidated_at NULLS FIRST, block_number, id LIMIT $1`,
+    [limit],
+  );
+  let orphaned = 0;
+  for (const row of rows) {
+    options.signal?.throwIfAborted();
+    const transferId = bigintOf(row, "transfer_id");
+    const id = bigintOf(row, "id");
+    const source = (
+      await db.query(
+        `SELECT id, route, origin_chain, nonce, origin_tx, destination_chain, token,
+                net_amount, destination
+           FROM outbound_transfer WHERE id = $1 AND route = $2`,
+        [transferId.toString(), RouteKind.Cctp],
+      )
+    ).rows[0];
+    if (source === undefined) {
+      if (await markCctpProofOrphaned(db, id, transferId)) orphaned += 1;
+      continue;
+    }
+
+    const sourceBinding = parseCctpSourceBinding(row.source_binding);
+    const sourceMatches =
+      sourceBinding !== null &&
+      sourceBinding.originChain === text(source, "origin_chain") &&
+      sourceBinding.nonce === bigintOf(source, "nonce").toString() &&
+      sourceBinding.originTx === text(source, "origin_tx") &&
+      sourceBinding.destinationChain === text(source, "destination_chain") &&
+      sourceBinding.token === text(source, "token") &&
+      sourceBinding.amount === bigintOf(source, "net_amount").toString() &&
+      sourceBinding.destination === text(source, "destination");
+    if (!sourceMatches) {
+      if (await markCctpProofOrphaned(db, id, transferId)) orphaned += 1;
+      continue;
+    }
+
+    const transfer: PendingTransfer = {
+      transferId,
+      route: RouteKind.Cctp,
+      originChain: text(source, "origin_chain"),
+      destinationChain: text(source, "destination_chain"),
+      nonce: bigintOf(source, "nonce"),
+      originTx: text(source, "origin_tx"),
+      status: "attested",
+      checkFailures: 0,
+      retryAttempts: 0,
+      delivered: false,
+    };
+    const report: RailReport = {
+      status: "attested",
+      railStatus: "proof_revalidation",
+      reference: text(row, "message_nonce"),
+      attestedAt: null,
+      forwardTxHash: text(row, "tx_hash") as `0x${string}`,
+      messageBytes: text(row, "message_bytes"),
+      messageNonce: text(row, "message_nonce"),
+      messageDigest: text(row, "message_digest"),
+    };
+    const result = await inspectCctpDelivery(config, db, transfer, report, options);
+    const proofStillMatches =
+      result.delivery !== null &&
+      "storedEvidence" in result &&
+      result.storedEvidence.txHash.toLowerCase() === text(row, "tx_hash").toLowerCase() &&
+      result.storedEvidence.blockNumber === bigintOf(row, "block_number") &&
+      result.storedEvidence.blockHash.toLowerCase() === text(row, "block_hash").toLowerCase() &&
+      result.storedEvidence.mintLogIndex === Number(row.mint_log_index) &&
+      result.storedEvidence.messageNonce.toLowerCase() ===
+        text(row, "message_nonce").toLowerCase() &&
+      result.storedEvidence.messageDigest.toLowerCase() ===
+        text(row, "message_digest").toLowerCase() &&
+      result.storedEvidence.token.toLowerCase() === text(row, "token").toLowerCase() &&
+      result.storedEvidence.recipient.toLowerCase() === text(row, "recipient").toLowerCase() &&
+      result.storedEvidence.amount === bigintOf(row, "amount");
+    if (proofStillMatches) {
+      await db.query(
+        `UPDATE cctp_delivery_evidence SET last_revalidated_at = now()
+          WHERE id = $1 AND status = 'canonical'`,
+        [id.toString()],
+      );
+      continue;
+    }
+    const orphanFailures: readonly CctpVerificationFailure[] = [
+      "non_canonical_receipt",
+      "receipt_reverted",
+      "receipt_missing",
+      "receipt_mismatch",
+      "mint_missing",
+      "amount_mismatch",
+      "token_mismatch",
+      "recipient_mismatch",
+      "invalid_message",
+    ];
+    if (result.failure !== null && !orphanFailures.includes(result.failure)) {
+      await db.query(
+        `UPDATE cctp_delivery_evidence SET last_revalidated_at = now()
+          WHERE id = $1 AND status = 'canonical'`,
+        [id.toString()],
+      );
+      continue;
+    }
+    if (await markCctpProofOrphaned(db, id, transferId)) {
+      orphaned += 1;
+      options.logger?.warn(
+        { transferId: transferId.toString(), destinationChain: transfer.destinationChain },
+        "CCTP destination proof is no longer canonical; delivery was reopened",
+      );
+    }
+  }
+  return orphaned;
+}
+
+function parseCctpSourceBinding(value: unknown): CctpDeliveryEvidenceRow["sourceBinding"] | null {
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value) as unknown;
+    } catch {
+      return null;
+    }
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const binding = value as Record<string, unknown>;
+  const fields = [
+    "originChain",
+    "nonce",
+    "originTx",
+    "destinationChain",
+    "token",
+    "amount",
+    "destination",
+  ] as const;
+  if (fields.some((field) => typeof binding[field] !== "string")) return null;
+  return {
+    originChain: binding.originChain as string,
+    nonce: binding.nonce as string,
+    originTx: binding.originTx as string,
+    destinationChain: binding.destinationChain as string,
+    token: binding.token as string,
+    amount: binding.amount as string,
+    destination: binding.destination as string,
+  };
+}
+
+async function markCctpProofOrphaned(
+  db: Transactional,
+  evidenceId: bigint,
+  transferId: bigint,
+): Promise<boolean> {
+  return db.transaction(async (tx) => {
+    const locked = await tx.query(
+      "SELECT id FROM outbound_transfer WHERE id = $1 FOR UPDATE SKIP LOCKED",
+      [transferId.toString()],
+    );
+    if (locked.rowCount !== 1) return false;
+    const updated = await tx.query(
+      `UPDATE cctp_delivery_evidence SET status = 'orphaned', last_revalidated_at = now()
+        WHERE id = $1 AND transfer_id = $2 AND status = 'canonical'
+        RETURNING id`,
+      [evidenceId.toString(), transferId.toString()],
+    );
+    if (updated.rowCount !== 1) return false;
+    await tx.query("DELETE FROM inbound_delivery WHERE cctp_evidence_id = $1", [
+      evidenceId.toString(),
+    ]);
+    await tx.query(
+      "SELECT set_config('hyperion.rail_reconcile_transfer',$1,true), set_config('hyperion.rail_reconcile_reason','destination_proof_reorg',true)",
+      [transferId.toString()],
+    );
+    await tx.query(
+      `UPDATE rail_attestation SET status = 'attested', updated_at = now(),
+          next_attempt_at = now(), retry_class = NULL
+        WHERE transfer_id = $1 AND status = 'delivered'
+          AND NOT EXISTS (SELECT 1 FROM inbound_delivery d
+            WHERE d.source_transfer_id = $1 AND d.delivered = true)`,
+      [transferId.toString()],
+    );
+    return true;
+  });
 }
