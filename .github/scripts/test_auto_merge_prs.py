@@ -34,7 +34,7 @@ class FakeGitHub:
     def __init__(self):
         self.repository, self.policy_ref = REPO, BASE
         self.pr, self.run = pr(), run()
-        self.jobs = [{"name": "gate", "head_sha": HEAD, "status": "completed", "conclusion": "success"}]
+        self.jobs = [{"name": merger.CI_GATE, "head_sha": HEAD, "status": "completed", "conclusion": "success"}]
         self.files = [{"filename": "src/fix.py"}]
         self.issue = {"title": "Fix bug", "body": "Acceptance criteria", "state": "open",
                       "state_reason": None,
@@ -294,9 +294,13 @@ class AutoMergeTests(unittest.TestCase):
                 self.assert_wait("gate")
         self.assertTrue(any("attempts/2/jobs" in path for path in self.api.reads))
 
+    def test_main_gate_cannot_replace_the_required_dev_gate(self):
+        self.api.jobs[0]["name"] = "gate"
+        self.assert_wait("successful dev gate")
+
     def test_missing_gate_cannot_be_replaced_with_green_workflow(self):
         self.api.jobs = []
-        self.assert_wait("successful gate")
+        self.assert_wait("successful dev gate")
 
     def test_ci_provenance_rejects_other_revision_repo_event_or_workflow(self):
         changes = [{"head_sha": BASE}, {"event": "push"}, {"path": ".github/workflows/fake.yml"},

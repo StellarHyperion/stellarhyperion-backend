@@ -21,6 +21,7 @@ from enforce_pr_assignments import Enforcement, GitHub, text_references
 
 CI_PATH = ".github/workflows/dev-ci.yml"
 MAIN_CI_PATH = ".github/workflows/ci.yml"
+CI_GATE = "dev gate"
 BOT_LOGIN = "github-actions[bot]"
 MARKER = "<!-- hyperion-auto-merge:v1 -->"
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -130,9 +131,9 @@ class AutoMerge:
                 reasons.append(f"CI job {job.get('name', 'unknown')} is {job.get('conclusion') or job.get('status', 'pending')}. Fix it or wait for completion. {url}")
         if run.get("status") != "completed" or run.get("conclusion") != "success":
             reasons.append(f"The newest CI attempt is {run.get('conclusion') or run.get('status', 'pending')}. All required development checks must succeed. {url}")
-        gates = [job for job in jobs if job.get("name") == "gate"]
+        gates = [job for job in jobs if job.get("name") == CI_GATE]
         if len(gates) != 1 or gates[0].get("conclusion") != "success":
-            reasons.append(f"The current CI attempt must contain a successful gate job. {url}")
+            reasons.append(f"The current CI attempt must contain a successful dev gate job. {url}")
         if any(job.get("head_sha") != pr["head"]["sha"] for job in jobs):
             raise ValueError("CI jobs do not match the current revision")
         return (run["id"], attempt), reasons

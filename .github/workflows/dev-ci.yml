@@ -72,7 +72,7 @@ jobs:
         run: npm run fmt:check && npm run lint && npm run typecheck
 
   gate:
-    name: gate
+    name: dev gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
