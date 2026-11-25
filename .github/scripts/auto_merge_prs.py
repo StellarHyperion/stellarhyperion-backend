@@ -19,7 +19,9 @@ import urllib.parse
 from check_pr_description import DEPENDENCY_BOTS, validate_description, visible_markdown
 from enforce_pr_assignments import Enforcement, GitHub, text_references
 
-CI_PATH = ".github/workflows/ci.yml"
+CI_PATH = ".github/workflows/dev-ci.yml"
+MAIN_CI_PATH = ".github/workflows/ci.yml"
+CI_GATE = "dev gate"
 BOT_LOGIN = "github-actions[bot]"
 MARKER = "<!-- hyperion-auto-merge:v1 -->"
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -108,7 +110,7 @@ class AutoMerge:
 
     def current_ci(self, pr):
         runs = [run for run in self.items(
-            f"actions/workflows/ci.yml/runs?event=pull_request&head_sha={pr['head']['sha']}",
+            f"actions/workflows/dev-ci.yml/runs?event=pull_request&head_sha={pr['head']['sha']}",
             "workflow_runs") if run_matches(pr, run, self.github.repository)]
         if not runs:
             return None, ["CI has not registered for this revision. Wait for CI; authorized fork CI is started by Automatic PR CI."]
@@ -128,10 +130,10 @@ class AutoMerge:
             if job.get("status") != "completed" or job.get("conclusion") != "success":
                 reasons.append(f"CI job {job.get('name', 'unknown')} is {job.get('conclusion') or job.get('status', 'pending')}. Fix it or wait for completion. {url}")
         if run.get("status") != "completed" or run.get("conclusion") != "success":
-            reasons.append(f"The newest CI attempt is {run.get('conclusion') or run.get('status', 'pending')}. All tests and security checks must succeed. {url}")
-        gates = [job for job in jobs if job.get("name") == "gate"]
+            reasons.append(f"The newest CI attempt is {run.get('conclusion') or run.get('status', 'pending')}. All required development checks must succeed. {url}")
+        gates = [job for job in jobs if job.get("name") == CI_GATE]
         if len(gates) != 1 or gates[0].get("conclusion") != "success":
-            reasons.append(f"The current CI attempt must contain a successful gate job. {url}")
+            reasons.append(f"The current CI attempt must contain a successful dev gate job. {url}")
         if any(job.get("head_sha") != pr["head"]["sha"] for job in jobs):
             raise ValueError("CI jobs do not match the current revision")
         return (run["id"], attempt), reasons
@@ -209,6 +211,11 @@ class AutoMerge:
                     or run.get("head_sha") != sha or type(workflow_id) is not int or workflow_id <= 0
                     or type(attempt) is not int or attempt <= 0):
                 unidentified.append(check)
+                continue
+            # Full main promotion results are advisory for dev integration. Only
+            # this provenance-verified workflow path is excluded; failed dev CI
+            # and all other workflows or external checks remain blocking.
+            if self.default_branch == "dev" and run.get("path") == MAIN_CI_PATH:
                 continue
             # A different workflow using the same job name must not hide a failure.
             action_groups.setdefault((app_id, workflow_id), {}).setdefault(run_id, []).append(check)
@@ -290,7 +297,7 @@ class AutoMerge:
             reasons.append("Update your branch with the latest default branch, then let CI run again.")
         if reasons:
             return None, reasons
-        # Require that the tested head includes current main, even if an administrator
+        # Require that the tested head includes current dev, even if an administrator
         # has temporarily disabled GitHub's strict status check setting.
         compare = self.github.request(self.prefix + f"compare/{pr['base']['sha']}...{pr['head']['sha']}")
         if compare.get("merge_base_commit", {}).get("sha") != pr["base"]["sha"] or compare.get("status") not in {"ahead", "identical"}:

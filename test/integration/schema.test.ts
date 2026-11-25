@@ -567,7 +567,7 @@ suite("maintenance and pruning", () => {
           delivered, claim_id, destination_block, destination_tx)
        VALUES ('stellar-testnet', 0, 'prune-test-1', 999991, 'GA5ZYIIV', 'USDC', 100,
                true, NULL, 1, '0xprune-destination')
-       ON CONFLICT (destination_chain, route, source_chain, source_nonce) DO NOTHING`,
+       ON CONFLICT (destination_chain, route, source_chain, source_nonce, source_transfer_id) DO NOTHING`,
     );
 
     const deletedCount = await db.pruneCompletedAttestations(30);
