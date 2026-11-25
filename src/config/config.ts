@@ -205,6 +205,8 @@ export interface AppConfig {
   readonly freshnessSlo: FreshnessSloConfig;
   readonly shutdownTimeoutMs: number;
   readonly schemaVersion: string;
+  /** Days to retain unreferenced, non-canonical CCTP proof records before bounded pruning. */
+  readonly cctpProofRetentionDays: number;
   readonly catchUpBudgetMs: number;
   readonly catchUpEnabled: boolean;
   readonly indexerLeaseTtlMs: number;
@@ -456,6 +458,18 @@ const RAIL_MAX_CHECK_FAILURES: VarSpec = {
   printable: true,
   purpose:
     "Consecutive failures before the queue stops offering a transfer. Per transfer, not per rail: one unanswerable transfer must not back off the whole rail.",
+};
+
+const CCTP_PROOF_RETENTION_DAYS: VarSpec = {
+  name: "CCTP_PROOF_RETENTION_DAYS",
+  kind: "integer",
+  required: false,
+  fallback: "365",
+  min: 1,
+  max: 36500,
+  printable: true,
+  purpose:
+    "Days to retain unreferenced orphaned or superseded CCTP proof records; canonical delivery evidence is never pruned.",
 };
 
 const KEEPER_ENABLED: VarSpec = {
@@ -938,6 +952,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
   const catchUpBudgetMs = reader.integer(CATCH_UP_BUDGET_MS);
   const catchUpEnabled = reader.boolean(CATCH_UP_ENABLED);
   const indexerLeaseTtlMs = reader.integer(INDEXER_LEASE_TTL_MS);
+  const cctpProofRetentionDays = reader.integer(CCTP_PROOF_RETENTION_DAYS);
   const indexerLeaseOwnerId =
     reader.string(INDEXER_LEASE_OWNER_ID) || `${hostname()}:${process.pid}`;
 
@@ -1134,6 +1149,7 @@ export function loadConfig(options: LoadOptions = {}): AppConfig {
     },
     shutdownTimeoutMs,
     schemaVersion,
+    cctpProofRetentionDays,
     catchUpBudgetMs,
     catchUpEnabled,
     indexerLeaseTtlMs,
@@ -1348,6 +1364,7 @@ function buildProvenanceEntries(
     add("RAIL_RECHECK_AFTER_MS", config.rails.recheckAfterMs);
     add("RAIL_MAX_CHECK_FAILURES", config.rails.maxCheckFailures);
   }
+  add("CCTP_PROOF_RETENTION_DAYS", config.cctpProofRetentionDays);
   if (config.keeper.enabled) {
     add("KEEPER_POLL_INTERVAL_MS", config.keeper.pollIntervalMs);
     add("KEEPER_CONCURRENCY", config.keeper.concurrency);

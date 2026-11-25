@@ -149,7 +149,10 @@ export async function startContinuousApplication(): Promise<ContinuousApplicatio
     throw error;
   }
   if (config.databaseRole !== "read-only") {
-    const stopMaintenance = startMaintenanceTask(db, { logger });
+    const stopMaintenance = startMaintenanceTask(db, {
+      logger,
+      cctpProofRetentionDays: config.cctpProofRetentionDays,
+    });
     shutdown.add("database-maintenance", () => {
       stopMaintenance();
       return Promise.resolve();
