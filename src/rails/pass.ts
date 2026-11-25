@@ -64,6 +64,7 @@ import {
   type RailRetryClass,
   type RailWorkLease,
   type CctpVerificationFailure,
+  type CctpMessageVersionReference,
   type RailCancellationOptions,
 } from "./types.js";
 
@@ -732,6 +733,12 @@ export class RailPass {
     }
 
     const { report } = lookup;
+    const cctpMessageVersions =
+      this.options.client.rail === "cctp"
+        ? (report.candidates ?? [report]).flatMap((candidate) =>
+            candidate.cctpMessageVersion === undefined ? [] : [candidate.cctpMessageVersion],
+          )
+        : undefined;
     if (report.quarantine && this.options.client.rail === "axelar")
       await writeAxelarQuarantine(db, {
         transferId: transfer.transferId,
@@ -810,6 +817,7 @@ export class RailPass {
                 nextAttemptAt: null,
                 retryClass: null,
                 diagnostics,
+                cctpMessageVersions,
                 itsVerificationState,
                 verificationFailure: null,
               });
@@ -854,6 +862,7 @@ export class RailPass {
       nextAttemptAt: isTerminal(status) ? null : this.nextCheckAt(at),
       retryClass: null,
       diagnostics,
+      cctpMessageVersions,
       itsVerificationState,
       verificationFailure,
     });
@@ -933,6 +942,7 @@ export class RailPass {
       readonly nextAttemptAt: Date | null;
       readonly retryClass: RailRetryClass | null;
       readonly diagnostics?: readonly VerificationDiagnostic[];
+      readonly cctpMessageVersions?: readonly CctpMessageVersionReference[];
       readonly itsVerificationState?:
         "receipt_unavailable" | "payout_unverified" | "verified" | null;
       readonly verificationFailure: CctpVerificationFailure | null;
@@ -953,6 +963,7 @@ export class RailPass {
       nextAttemptAt: fields.nextAttemptAt,
       retryClass: fields.retryClass,
       diagnostics: fields.diagnostics ?? [],
+      cctpMessageVersions: fields.cctpMessageVersions,
       itsVerificationState: fields.itsVerificationState ?? null,
       verificationFailure: fields.verificationFailure,
     });

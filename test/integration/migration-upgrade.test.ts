@@ -11,6 +11,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resolve } from "node:path";
 import { mkdtemp, readdir, cp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { writeAttestation } from "../../src/chains/writers.js";
+import type { Queryable } from "../../src/db/pool.js";
 
 const CONNECTION = process.env.TEST_DATABASE_URL;
 const suite = CONNECTION === undefined ? describe.skip : describe;
@@ -148,6 +150,91 @@ suite("migration upgrade fixtures", () => {
       `SELECT count(*)::int AS count FROM ${SCHEMA}.outbound_transfer WHERE origin_tx = 'source-tx'`,
     );
     expect(rows[0]?.count).toBe(1);
+  });
+
+  it("retains original and replacement CCTP version references across replay", async () => {
+    await client.query(`SET search_path TO ${SCHEMA}`);
+    try {
+      const source = await client.query(
+        `SELECT id FROM outbound_transfer WHERE origin_tx = 'source-tx'`,
+      );
+      const transferId = BigInt(String(source.rows[0]?.id));
+      const db: Queryable = {
+        async query(sql, params = []) {
+          const result = await client.query(sql, [...params]);
+          return { rows: result.rows, rowCount: result.rowCount ?? result.rows.length };
+        },
+      };
+      const base = {
+        transferId,
+        route: 1,
+        status: "attested",
+        railStatus: "complete",
+        railReference: `0x${"ab".repeat(32)}`,
+        attestedAt: null,
+        checkedAt: new Date("2026-11-25T00:00:00Z"),
+        checkFailures: 0,
+        lastError: null,
+        retryAttempts: 0,
+        nextAttemptAt: null,
+        retryClass: null,
+        verificationFailure: null,
+      } as const;
+      await writeAttestation(db, {
+        ...base,
+        cctpMessageVersions: [
+          {
+            messageNonce: `0x${"11".repeat(32)}`,
+            messageDigest: `0x${"22".repeat(32)}`,
+            forwardTxHash: `0x${"33".repeat(32)}`,
+            providerStatus: "expired",
+            attestationDigest: `0x${"44".repeat(32)}`,
+            attestationType: "standard",
+            attestationTimestamp: null,
+            expirationBlock: "18446744073709551616",
+            observedAt: new Date("2026-11-24T00:00:00Z"),
+          },
+        ],
+      });
+      const replacementVersion = {
+        messageNonce: `0x${"11".repeat(32)}`,
+        messageDigest: `0x${"55".repeat(32)}`,
+        forwardTxHash: `0x${"66".repeat(32)}` as const,
+        providerStatus: "attested" as const,
+        attestationDigest: `0x${"77".repeat(32)}`,
+        attestationType: "standard" as const,
+        attestationTimestamp: null,
+        expirationBlock: null,
+        observedAt: new Date("2026-11-25T00:00:00Z"),
+      };
+      await writeAttestation(db, {
+        ...base,
+        cctpMessageVersions: [replacementVersion],
+      });
+      await writeAttestation(db, {
+        ...base,
+        cctpMessageVersions: [replacementVersion],
+      });
+      const versions = await client.query(
+        `SELECT cctp_message_versions FROM rail_attestation WHERE transfer_id = $1`,
+        [transferId.toString()],
+      );
+      expect(versions.rows[0]?.cctp_message_versions).toHaveLength(2);
+      expect(versions.rows[0]?.cctp_message_versions).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            messageDigest: `0x${"22".repeat(32)}`,
+            providerStatus: "expired",
+          }),
+          expect.objectContaining({
+            messageDigest: `0x${"55".repeat(32)}`,
+            providerStatus: "attested",
+          }),
+        ]),
+      );
+    } finally {
+      await client.query("RESET search_path");
+    }
   });
 
   it("rolls back a failed monetary upgrade and resumes from the unchanged recorded boundary", async () => {

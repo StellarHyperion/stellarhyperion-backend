@@ -227,6 +227,63 @@ export function cctpMessageIdentity(raw: string): CctpMessageIdentity | null {
   }
 }
 
+export function inspectCctpReplacementEquivalence(
+  originalRaw: Hex,
+  replacementRaw: Hex,
+):
+  | { readonly equivalent: true; readonly failure: null }
+  | { readonly equivalent: false; readonly failure: CctpVerificationFailure } {
+  try {
+    const original = parseCctpMessage(originalRaw);
+    const replacement = parseCctpMessage(replacementRaw);
+    const originalBody = cctpBody(originalRaw);
+    const replacementBody = cctpBody(replacementRaw);
+    const originalBurn = parseCctpBurnMessage(originalBody);
+    const replacementBurn = parseCctpBurnMessage(replacementBody);
+    assertSupportedMessage(original);
+    assertSupportedMessage(replacement);
+    assertSupportedBurn(originalBurn);
+    assertSupportedBurn(replacementBurn);
+
+    if (original.nonce.toLowerCase() !== replacement.nonce.toLowerCase())
+      return { equivalent: false, failure: "invalid_message" };
+    if (
+      original.sourceDomain !== replacement.sourceDomain ||
+      original.destinationDomain !== replacement.destinationDomain
+    )
+      return { equivalent: false, failure: "invalid_message" };
+    if (
+      original.sender.toLowerCase() !== replacement.sender.toLowerCase() ||
+      original.recipient.toLowerCase() !== replacement.recipient.toLowerCase() ||
+      original.version !== replacement.version ||
+      original.minFinalityThreshold !== replacement.minFinalityThreshold
+    )
+      return { equivalent: false, failure: "invalid_message" };
+    if (
+      original.finalityThresholdExecuted < 2000 ||
+      replacement.finalityThresholdExecuted < 2000
+    )
+      return { equivalent: false, failure: "finality_mismatch" };
+
+    if (originalBurn.mintRecipient.toLowerCase() !== replacementBurn.mintRecipient.toLowerCase())
+      return { equivalent: false, failure: "recipient_mismatch" };
+    if (originalBurn.burnToken.toLowerCase() !== replacementBurn.burnToken.toLowerCase())
+      return { equivalent: false, failure: "token_mismatch" };
+    if (originalBurn.messageSender.toLowerCase() !== replacementBurn.messageSender.toLowerCase())
+      return { equivalent: false, failure: "source_adapter_mismatch" };
+    if (originalBurn.amount !== replacementBurn.amount)
+      return { equivalent: false, failure: "amount_mismatch" };
+
+    // CCTP replacement may change destinationCaller and the executed finality threshold only.
+    // The full burn body (including fee parameters, expiry, and hook payload) remains immutable.
+    if (toHex(originalBody).toLowerCase() !== toHex(replacementBody).toLowerCase())
+      return { equivalent: false, failure: "invalid_message" };
+    return { equivalent: true, failure: null };
+  } catch {
+    return { equivalent: false, failure: "invalid_message" };
+  }
+}
+
 export type CctpMessageVerification =
   | {
       readonly message: ReturnType<typeof parseCctpMessage>;

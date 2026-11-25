@@ -58,6 +58,7 @@ beforeAll(async () => {
     "1794200000000_cctp-delivery-evidence.sql",
     "1794300000000_database-maintenance-leases.sql",
     "1794400000000_cctp-proof-retention.sql",
+    "1794500000000_cctp-message-versions.sql",
   ]) {
     const migration = readFileSync(new URL(`../../migrations/${file}`, import.meta.url), "utf8");
     await pg.exec(migration.split("-- Down Migration")[0]!);

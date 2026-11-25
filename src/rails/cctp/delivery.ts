@@ -30,6 +30,7 @@ import {
   evaluateCctpContractIdentity,
   inspectCctpMessage,
   inspectCctpPayment,
+  inspectCctpReplacementEquivalence,
   type CctpProofEvidence,
   type CctpVerificationContext,
   type CctpContractRole,
@@ -250,12 +251,10 @@ export async function inspectCctpDelivery(
     identity: NonNullable<ReturnType<typeof cctpMessageIdentity>>;
     message: Extract<ReturnType<typeof inspectCctpMessage>, { failure: null }>;
   }[] = [];
+  const sameNonceFailures = new Map<string, CctpVerificationFailure>();
+  const sameNonceMessages = new Map<string, Hex[]>();
   let firstFailure: CctpVerificationFailure | null = null;
   for (const candidate of candidates) {
-    if (!candidate.forwardTxHash) {
-      firstFailure ??= "forward_tx_missing";
-      continue;
-    }
     if (!candidate.messageBytes) {
       firstFailure ??= "message_missing";
       continue;
@@ -269,17 +268,29 @@ export async function inspectCctpDelivery(
     }
     const raw = candidate.messageBytes as Hex;
     const identity = cctpMessageIdentity(raw);
+    if (!identity) {
+      firstFailure ??= "invalid_message";
+      continue;
+    }
     if (
-      !identity ||
       (candidate.messageNonce != null && candidate.messageNonce.toLowerCase() !== identity.nonce) ||
       (candidate.messageDigest != null && candidate.messageDigest.toLowerCase() !== identity.digest)
     ) {
+      sameNonceFailures.set(identity.nonce, "invalid_message");
       firstFailure ??= "invalid_message";
       continue;
     }
     const message = inspectCctpMessage(raw, expected);
     if (message.failure !== null) {
+      sameNonceFailures.set(identity.nonce, message.failure);
       firstFailure ??= message.failure;
+      continue;
+    }
+    const sameNonce = sameNonceMessages.get(identity.nonce) ?? [];
+    sameNonce.push(raw);
+    sameNonceMessages.set(identity.nonce, sameNonce);
+    if (!candidate.forwardTxHash) {
+      firstFailure ??= "forward_tx_missing";
       continue;
     }
     matches.push({ candidate, raw, identity, message });
@@ -288,8 +299,24 @@ export async function inspectCctpDelivery(
   // to choose between two complete matches. Keeping that ambiguity unverified prevents a burn
   // from being associated with the wrong transfer on replay.
   if (matches.length === 0) return failed(firstFailure ?? "invalid_message");
-  if (matches.length > 1) return failed("invalid_message");
-  const match = matches[0];
+  const messageNonce = matches[0]?.identity.nonce;
+  if (!messageNonce) return failed(firstFailure ?? "invalid_message");
+  if (matches.some((candidate) => candidate.identity.nonce !== messageNonce))
+    return failed("invalid_message");
+  const sameNonceFailure = sameNonceFailures.get(messageNonce);
+  if (sameNonceFailure !== undefined) return failed(sameNonceFailure);
+  const original = matches[0];
+  if (!original) return failed(firstFailure ?? "invalid_message");
+  for (const raw of sameNonceMessages.get(messageNonce) ?? []) {
+    if (raw.toLowerCase() === original.raw.toLowerCase()) continue;
+    const equivalence = inspectCctpReplacementEquivalence(original.raw, raw);
+    if (!equivalence.equivalent) return failed(equivalence.failure);
+  }
+  // Prefer the provider's non-expired candidate as the receipt lookup hint. The receipt and
+  // exact MessageReceived/mint checks below remain the only delivery authority.
+  const match =
+    matches.filter(({ candidate }) => candidate.status !== "expired").at(-1) ??
+    matches.at(-1);
   if (match === undefined) return failed(firstFailure ?? "invalid_message");
   const { candidate, raw, identity, message } = match;
   const forwardTxHash = candidate.forwardTxHash;

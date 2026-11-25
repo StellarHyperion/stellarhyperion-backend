@@ -63,6 +63,19 @@ export interface CctpFeeReconciliation {
   readonly actualPayoutDestinationUnits: bigint;
 }
 
+/** Sanitized reference to one observed CCTP message/attestation version. */
+export interface CctpMessageVersionReference {
+  readonly messageNonce: string;
+  readonly messageDigest: string;
+  readonly forwardTxHash: `0x${string}` | null;
+  readonly providerStatus: AttestationStatus;
+  readonly attestationDigest: string | null;
+  readonly attestationType: "fast" | "standard" | null;
+  readonly attestationTimestamp: Date | null;
+  readonly expirationBlock: string | null;
+  readonly observedAt: Date;
+}
+
 /** Terminal states. Nothing polls a transfer again once it reaches one. */
 export const TERMINAL: readonly AttestationStatus[] = ["delivered", "failed", "expired"];
 
@@ -109,6 +122,8 @@ export interface RailCandidate {
    */
   readonly messageNonce?: string | null;
   readonly messageDigest?: string | null;
+  /** Private, credential-free audit reference for this CCTP message/attestation version. */
+  readonly cctpMessageVersion?: CctpMessageVersionReference;
   readonly attestation?: string | null;
   readonly attestationSignature?: string | null;
   readonly attestationTimestamp?: Date | null;
