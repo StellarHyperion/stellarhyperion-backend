@@ -37,6 +37,10 @@ behavior, then merge manually with a merge commit. The auto-merge bot handles on
 branches include the release history. Automatic issue completion on `dev` records
 integration of an assigned issue; it does not assert that the wave has been released.
 
+The default-branch scheduler dispatches `indexer.yml` on `main`. The indexer still
+requires successful full main CI and uses the existing main-only environment; dev
+code never receives its runtime credentials.
+
 ## Issue assignment requirement
 
 Request assignment from a maintainer before opening a pull request. Reference the issue in
