@@ -4,7 +4,7 @@ on:
   pull_request_target:
     types: [closed]
   workflow_run:
-    workflows: [ci]
+    workflows: [dev ci]
     types: [completed]
   issues:
     types: [assigned, unassigned, edited]

@@ -1,0 +1,57 @@
+name: Schedule main indexer
+
+# Scheduled workflows run from the default branch. Dispatch the existing runtime
+# workflow on main so its full-CI authorization and main-only environment stay intact.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: schedule-main-indexer
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Restrict scheduler network access
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c
+        with:
+          egress-policy: block
+          disable-sudo-and-containers: true
+          disable-telemetry: true
+          allowed-endpoints: api.github.com:443
+
+      - name: Dispatch only the main indexer workflow
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 -B - <<'PYCODE'
+          import json
+          import os
+          import urllib.request
+
+          request = urllib.request.Request(
+              "https://api.github.com/repos/" + os.environ["REPOSITORY"]
+              + "/actions/workflows/indexer.yml/dispatches",
+              data=json.dumps({"ref": "main"}).encode(),
+              method="POST",
+              headers={
+                  "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+                  "Accept": "application/vnd.github+json",
+                  "Content-Type": "application/json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              if response.status != 204:
+                  raise RuntimeError("Main indexer dispatch was not accepted")
+          print("Main indexer dispatched; its existing main CI gate remains required.")
+          PYCODE

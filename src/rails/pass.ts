@@ -817,7 +817,7 @@ export class RailPass {
                 nextAttemptAt: null,
                 retryClass: null,
                 diagnostics,
-                cctpMessageVersions,
+                ...(cctpMessageVersions === undefined ? {} : { cctpMessageVersions }),
                 itsVerificationState,
                 verificationFailure: null,
               });
@@ -862,7 +862,7 @@ export class RailPass {
       nextAttemptAt: isTerminal(status) ? null : this.nextCheckAt(at),
       retryClass: null,
       diagnostics,
-      cctpMessageVersions,
+      ...(cctpMessageVersions === undefined ? {} : { cctpMessageVersions }),
       itsVerificationState,
       verificationFailure,
     });
@@ -963,7 +963,9 @@ export class RailPass {
       nextAttemptAt: fields.nextAttemptAt,
       retryClass: fields.retryClass,
       diagnostics: fields.diagnostics ?? [],
-      cctpMessageVersions: fields.cctpMessageVersions,
+      ...(fields.cctpMessageVersions === undefined
+        ? {}
+        : { cctpMessageVersions: fields.cctpMessageVersions }),
       itsVerificationState: fields.itsVerificationState ?? null,
       verificationFailure: fields.verificationFailure,
     });

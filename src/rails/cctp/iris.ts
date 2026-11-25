@@ -343,10 +343,7 @@ export class IrisClient implements RailClient {
         : selectedReport;
     return {
       kind: "found",
-      report:
-        reports.length === 1
-          ? report
-          : { ...report, candidates: reports },
+      report: reports.length === 1 ? report : { ...report, candidates: reports },
     };
   }
 
@@ -490,8 +487,7 @@ export function reportFor(message: IrisMessage): RailReport {
     Boolean(message.fastAttestation);
 
   const forwardTxHash =
-    typeof message.forwardTxHash === "string" &&
-    /^0x[0-9a-fA-F]{64}$/.test(message.forwardTxHash)
+    typeof message.forwardTxHash === "string" && /^0x[0-9a-fA-F]{64}$/.test(message.forwardTxHash)
       ? (message.forwardTxHash as `0x${string}`)
       : null;
   const observedAt = new Date();
@@ -505,8 +501,7 @@ export function reportFor(message: IrisMessage): RailReport {
           forwardTxHash,
           providerStatus: mapped,
           attestationDigest:
-            attestationSignature !== null &&
-            /^0x(?:[0-9a-fA-F]{2})+$/.test(attestationSignature)
+            attestationSignature !== null && /^0x(?:[0-9a-fA-F]{2})+$/.test(attestationSignature)
               ? keccak256(attestationSignature as Hex)
               : null,
           attestationType: attestationSignature === null ? null : isFast ? "fast" : "standard",
@@ -589,8 +584,8 @@ function safeReference(value: string): string | null {
 function appendExpiry(railStatus: string, message: IrisMessage): string {
   const expirationBlock = expirationBlockOf(message);
   return expirationBlock !== null && !railStatus.includes("expires@")
-      ? `${railStatus} expires@${expirationBlock}`
-      : railStatus;
+    ? `${railStatus} expires@${expirationBlock}`
+    : railStatus;
 }
 
 function expirationBlockOf(message: IrisMessage): string | null {

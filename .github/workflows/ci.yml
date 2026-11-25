@@ -2,10 +2,12 @@ name: ci
 
 on:
   pull_request:
+    branches: [main]
     types: [opened, synchronize, reopened, edited, ready_for_review]
   push:
     branches: [main]
   merge_group:
+    branches: [main]
   workflow_dispatch:
 
 permissions:

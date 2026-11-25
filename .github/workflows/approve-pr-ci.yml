@@ -2,7 +2,7 @@ name: Automatic PR CI
 
 on:
   pull_request_target:
-    branches: [main]
+    branches: [dev]
     types: [opened, synchronize, reopened, edited, ready_for_review]
   issues:
     types: [assigned]

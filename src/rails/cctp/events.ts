@@ -259,10 +259,7 @@ export function inspectCctpReplacementEquivalence(
       original.minFinalityThreshold !== replacement.minFinalityThreshold
     )
       return { equivalent: false, failure: "invalid_message" };
-    if (
-      original.finalityThresholdExecuted < 2000 ||
-      replacement.finalityThresholdExecuted < 2000
-    )
+    if (original.finalityThresholdExecuted < 2000 || replacement.finalityThresholdExecuted < 2000)
       return { equivalent: false, failure: "finality_mismatch" };
 
     if (originalBurn.mintRecipient.toLowerCase() !== replacementBurn.mintRecipient.toLowerCase())

@@ -303,6 +303,8 @@ export async function inspectCctpDelivery(
   if (!messageNonce) return failed(firstFailure ?? "invalid_message");
   if (matches.some((candidate) => candidate.identity.nonce !== messageNonce))
     return failed("invalid_message");
+  if (new Set(matches.map(({ identity }) => identity.digest)).size !== matches.length)
+    return failed("invalid_message");
   const sameNonceFailure = sameNonceFailures.get(messageNonce);
   if (sameNonceFailure !== undefined) return failed(sameNonceFailure);
   const original = matches[0];
@@ -315,8 +317,7 @@ export async function inspectCctpDelivery(
   // Prefer the provider's non-expired candidate as the receipt lookup hint. The receipt and
   // exact MessageReceived/mint checks below remain the only delivery authority.
   const match =
-    matches.filter(({ candidate }) => candidate.status !== "expired").at(-1) ??
-    matches.at(-1);
+    matches.filter(({ candidate }) => candidate.status !== "expired").at(-1) ?? matches.at(-1);
   if (match === undefined) return failed(firstFailure ?? "invalid_message");
   const { candidate, raw, identity, message } = match;
   const forwardTxHash = candidate.forwardTxHash;

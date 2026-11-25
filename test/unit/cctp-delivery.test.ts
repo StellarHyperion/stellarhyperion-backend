@@ -503,7 +503,9 @@ describe("CCTP full message identity", () => {
     const fetch = vi.fn(() =>
       Promise.resolve(
         new Response(
-          JSON.stringify({ messages: [{ status: "expired", eventNonce: displayed, message: raw }] }),
+          JSON.stringify({
+            messages: [{ status: "expired", eventNonce: displayed, message: raw }],
+          }),
           { status: 200, headers: { "content-type": "application/json" } },
         ),
       ),
@@ -701,9 +703,13 @@ describe("CCTP full message identity", () => {
       expect(result.storedEvidence.messageDigest).toBe(replacementIdentity.digest);
     });
 
-    it("does not deliver when a same-nonce replacement changes the recipient", async () => {
+    it.each([
+      [196, "recipient_mismatch"],
+      [184, "invalid_message"],
+    ])("does not deliver when a replacement changes recipient byte %s", async (offset, failure) => {
       const changedRecipient = hexToBytes(raw);
-      changedRecipient[184] = 0x22;
+      // The bytes32 recipient starts at 184; its EVM address starts after 12 padding bytes.
+      changedRecipient[offset] = 0x22;
       const replacement = toHex(changedRecipient);
       const replacementIdentity = cctpMessageIdentity(replacement);
       if (!replacementIdentity) throw new Error("Expected valid replacement identity");
@@ -725,7 +731,7 @@ describe("CCTP full message identity", () => {
 
       expect(result).toMatchObject({
         delivery: null,
-        failure: "recipient_mismatch",
+        failure,
         proofEvidence: null,
       });
     });

@@ -1,0 +1,90 @@
+name: dev ci
+
+# Contributor integration checks. ci.yml keeps the full main promotion checks.
+on:
+  pull_request:
+    branches: [dev]
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  push:
+    branches: [dev]
+  merge_group:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NPM_CONFIG_IGNORE_SCRIPTS: "true"
+  HYPERION_LIVE_ROUTES: "0"
+  HYPERION_LIVE_TESTNET: "0"
+
+jobs:
+  supply-chain:
+    uses: ./.github/workflows/supply-chain.yml
+
+  pr-description:
+    uses: ./.github/workflows/pr-description.yml
+
+  fast-checks:
+    name: format, lint, typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Require the development branch, including manual runs
+        env:
+          TARGET_REF: ${{ github.event.pull_request.base.ref || github.event.merge_group.base_ref || github.ref }}
+        run: test "$TARGET_REF" = dev || test "$TARGET_REF" = refs/heads/dev
+
+      - name: Restrict check network access
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c
+        with:
+          egress-policy: block
+          disable-sudo-and-containers: true
+          disable-telemetry: true
+          allowed-endpoints: >-
+            github.com:443
+            api.github.com:443
+            raw.githubusercontent.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            registry.npmjs.org:443
+            nodejs.org:443
+
+      - name: Check out the tested source without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 22.22.1
+
+      - name: Install locked dependencies without package scripts
+        run: npm ci --ignore-scripts
+
+      - name: Check formatting, lint and types
+        run: npm run fmt:check && npm run lint && npm run typecheck
+
+  gate:
+    name: dev gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    needs: [fast-checks, supply-chain, pr-description]
+    steps:
+      - name: Require every development check to pass
+        env:
+          FAST_CHECKS: ${{ needs.fast-checks.result }}
+          SUPPLY_CHAIN: ${{ needs.supply-chain.result }}
+          PR_DESCRIPTION: ${{ needs.pr-description.result }}
+        run: |
+          set -eu
+          test "$FAST_CHECKS" = success
+          test "$SUPPLY_CHAIN" = success
+          test "$PR_DESCRIPTION" = success

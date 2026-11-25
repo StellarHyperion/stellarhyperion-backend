@@ -36,7 +36,7 @@ jobs:
           persist-credentials: false
 
       - name: Initialize static analysis without executing a project build
-        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066
+        uses: github/codeql-action/init@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea
         with:
           languages: ${{ matrix.language }}
           build-mode: none
@@ -44,7 +44,7 @@ jobs:
           tools: linked
 
       - name: Analyze source and write local findings
-        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066
+        uses: github/codeql-action/analyze@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea
         with:
           upload: never
           upload-database: false
