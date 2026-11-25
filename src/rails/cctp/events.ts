@@ -183,6 +183,36 @@ export interface CctpProofEvidence {
   readonly destinationChain: string;
 }
 
+/** Private-to-storage assumptions required to reconstruct the original proof decision. */
+export interface CctpVerificationContext {
+  readonly schema: "cctp-proof-verification/v1";
+  readonly chainId: number;
+  readonly sourceDomain: number;
+  readonly destinationDomain: number;
+  readonly sourceToken: string;
+  readonly sourceAdapter: string;
+  readonly sourceMessenger: string;
+  readonly destinationMessenger: string;
+  readonly messageTransmitter: string;
+  readonly token: string;
+  readonly recipient: string;
+  readonly sourceAmount: string;
+  readonly requiredConfirmations: number;
+  readonly observedConfirmations: string;
+  readonly contractObservations: readonly CctpContractObservation[];
+  readonly contractBaselines: readonly {
+    readonly role: CctpContractRole;
+    readonly address: string;
+    readonly codeHash: string;
+  }[];
+  readonly receiptChecks: readonly [
+    "successful_transaction",
+    "canonical_block_hash",
+    "exact_message_received_event",
+    "native_usdc_mint_from_zero_address",
+  ];
+}
+
 export function cctpMessageIdentity(raw: string): CctpMessageIdentity | null {
   if (raw.length > 8192 || !/^0x(?:[0-9a-fA-F]{2})+$/.test(raw)) return null;
   try {
@@ -294,13 +324,15 @@ export function inspectCctpPayment<T extends DeliveryLog>(
   raw: Hex,
   expected: ExpectedCctpTransfer,
 ):
-  | { readonly payment: T; readonly failure: null }
+  | { readonly payment: T; readonly receiptLogIndex: number; readonly failure: null }
   | { readonly payment: null; readonly failure: CctpVerificationFailure } {
   const verified = inspectCctpMessage(raw, expected);
   if (verified.failure !== null) return { payment: null, failure: verified.failure };
   const encodedBody = toHex(verified.body);
   let sawReceipt = false;
   let received = false;
+  let duplicateReceipt = false;
+  let receiptLogIndex: number | null = null;
   let payment: T | null = null;
   let receiptFailure: CctpVerificationFailure | null = null;
   let mintMismatch: CctpVerificationFailure | null = null;
@@ -319,7 +351,18 @@ export function inspectCctpPayment<T extends DeliveryLog>(
           event.args.finalityThresholdExecuted === verified.message.finalityThresholdExecuted &&
           event.args.messageBody.toLowerCase() === encodedBody.toLowerCase()
         ) {
-          received = true;
+          if (
+            received ||
+            log.logIndex === null ||
+            !Number.isSafeInteger(log.logIndex) ||
+            log.logIndex < 0
+          ) {
+            duplicateReceipt ||= received;
+            receiptFailure = "receipt_mismatch";
+          } else {
+            received = true;
+            receiptLogIndex = log.logIndex;
+          }
         } else if (event.args.sourceDomain !== 27) {
           receiptFailure = "source_domain_mismatch";
         } else if (
@@ -351,6 +394,7 @@ export function inspectCctpPayment<T extends DeliveryLog>(
       // Unrelated receipt events do not establish this transfer's delivery.
     }
   }
+  if (duplicateReceipt) return { payment: null, failure: "receipt_mismatch" };
   if (!received) {
     return {
       payment: null,
@@ -358,7 +402,8 @@ export function inspectCctpPayment<T extends DeliveryLog>(
     };
   }
   if (!payment) return { payment: null, failure: mintMismatch ?? "mint_missing" };
-  return { payment, failure: null };
+  if (receiptLogIndex === null) return { payment: null, failure: "receipt_missing" };
+  return { payment, receiptLogIndex, failure: null };
 }
 
 /*

@@ -31,6 +31,7 @@ import {
   inspectCctpMessage,
   inspectCctpPayment,
   type CctpProofEvidence,
+  type CctpVerificationContext,
   type CctpContractRole,
   type CctpContractObservation,
   type ExpectedCctpTransfer,
@@ -466,9 +467,45 @@ export async function inspectCctpDelivery(
         messageNonce: identity.nonce,
         messageDigest: identity.digest,
         messageBytes: raw,
+        receiptLogIndex: paymentResult.receiptLogIndex,
         token: token.address.toLowerCase(),
         recipient: expected.recipient.toLowerCase(),
         amount: message.amount,
+        verificationContext: {
+          schema: "cctp-proof-verification/v1",
+          chainId: destination.chainId,
+          sourceDomain: 27,
+          destinationDomain: expected.destinationDomain,
+          sourceToken: expected.sourceToken,
+          sourceAdapter: expected.sourceAdapter,
+          sourceMessenger: expected.sourceMessenger,
+          destinationMessenger: expected.destinationMessenger,
+          messageTransmitter: expected.transmitter,
+          token: expected.token,
+          recipient: expected.recipient,
+          sourceAmount: expected.sourceAmount.toString(),
+          requiredConfirmations: destination.confirmations,
+          observedConfirmations: (head - receipt.blockNumber + 1n).toString(),
+          contractObservations: observations,
+          contractBaselines: observations.flatMap((observation) => {
+            const baseline = baselines.get(observation.role);
+            return baseline === undefined
+              ? []
+              : [
+                  {
+                    role: observation.role,
+                    address: baseline.address,
+                    codeHash: baseline.codeHash,
+                  },
+                ];
+          }),
+          receiptChecks: [
+            "successful_transaction",
+            "canonical_block_hash",
+            "exact_message_received_event",
+            "native_usdc_mint_from_zero_address",
+          ],
+        } satisfies CctpVerificationContext,
         sourceBinding,
       };
 
@@ -531,7 +568,7 @@ export async function revalidateCctpDeliveryProofs(
   const { rows } = await db.query(
     `SELECT id, transfer_id, destination_chain, tx_hash, block_number, block_hash,
             mint_log_index, message_nonce, message_digest, message_bytes, token, recipient,
-            amount::text, source_binding
+            amount::text, source_binding, receipt_log_index, verification_context
        FROM cctp_delivery_evidence WHERE status = 'canonical'
       ORDER BY last_revalidated_at NULLS FIRST, block_number, id LIMIT $1`,
     [limit],
@@ -599,6 +636,8 @@ export async function revalidateCctpDeliveryProofs(
       result.storedEvidence.blockNumber === bigintOf(row, "block_number") &&
       result.storedEvidence.blockHash.toLowerCase() === text(row, "block_hash").toLowerCase() &&
       result.storedEvidence.mintLogIndex === Number(row.mint_log_index) &&
+      (row.receipt_log_index === null ||
+        result.storedEvidence.receiptLogIndex === Number(row.receipt_log_index)) &&
       result.storedEvidence.messageNonce.toLowerCase() ===
         text(row, "message_nonce").toLowerCase() &&
       result.storedEvidence.messageDigest.toLowerCase() ===

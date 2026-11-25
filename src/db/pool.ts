@@ -663,6 +663,7 @@ function normalizeDatabaseError(error: unknown): unknown {
 export interface MaintenanceTaskOptions {
   readonly intervalMs?: number;
   readonly olderThanDays?: number;
+  readonly cctpProofRetentionDays?: number;
   readonly routeHealthRetainRecentHours?: number;
   readonly routeHealthBatchSize?: number;
   readonly maxBatches?: number;
@@ -684,6 +685,7 @@ export function startMaintenanceTask(
 ): () => void {
   const intervalMs = options.intervalMs ?? 24 * 60 * 60 * 1000;
   const olderThanDays = options.olderThanDays ?? 30;
+  const cctpProofRetentionDays = options.cctpProofRetentionDays ?? 365;
   const routeHealthRetainRecentHours = options.routeHealthRetainRecentHours;
   const routeHealthBatchSize = options.routeHealthBatchSize;
   const maxBatches = options.maxBatches ?? 20;
@@ -699,6 +701,7 @@ export function startMaintenanceTask(
       const jobs: readonly MaintenanceJobName[] = [
         MAINTENANCE_JOBS.railAttestationRetention,
         MAINTENANCE_JOBS.routeHealthCompaction,
+        MAINTENANCE_JOBS.cctpProofRetention,
       ];
       for (const jobName of jobs) {
         if (controller.signal.aborted) break;
@@ -706,6 +709,9 @@ export function startMaintenanceTask(
           jobName,
           ownerId,
           ...(jobName === MAINTENANCE_JOBS.railAttestationRetention ? { olderThanDays } : {}),
+          ...(jobName === MAINTENANCE_JOBS.cctpProofRetention
+            ? { olderThanDays: cctpProofRetentionDays }
+            : {}),
           ...(jobName === MAINTENANCE_JOBS.routeHealthCompaction
             ? {
                 ...(routeHealthRetainRecentHours !== undefined

@@ -191,6 +191,9 @@ describe("CCTP forwarded destination proof", () => {
     expect(matchingCctpPayment([paid, received], raw, expected)).toBe(paid);
     expect(matchingCctpPayment([received], raw, expected)).toBeNull();
     expect(matchingCctpPayment([paid], raw, expected)).toBeNull();
+    expect(inspectCctpPayment([received, received, paid], raw, expected).failure).toBe(
+      "receipt_mismatch",
+    );
     expect(inspectCctpPayment([received], raw, expected).failure).toBe("mint_missing");
     expect(inspectCctpPayment([paid], raw, expected).failure).toBe("receipt_missing");
     expect(
@@ -751,6 +754,26 @@ describe("CCTP full message identity", () => {
       expect(result.proofEvidence.mintAmount).toBe("99600000");
       expect(typeof result.proofEvidence.mintAmount).toBe("string");
       expect(result.proofEvidence.destinationChain).toBe("sepolia");
+      expect(result.storedEvidence.receiptLogIndex).toBe(4);
+      expect(result.storedEvidence.verificationContext).toMatchObject({
+        schema: "cctp-proof-verification/v1",
+        chainId: 11155111,
+        sourceDomain: 27,
+        destinationDomain: expected.destinationDomain,
+        destinationMessenger: expected.destinationMessenger,
+        messageTransmitter: expected.transmitter,
+        token: expected.token,
+        recipient: expected.recipient,
+        sourceAmount: expected.sourceAmount.toString(),
+        requiredConfirmations: 3,
+        observedConfirmations: "901",
+        receiptChecks: [
+          "successful_transaction",
+          "canonical_block_hash",
+          "exact_message_received_event",
+          "native_usdc_mint_from_zero_address",
+        ],
+      });
       // No credential or adapter address leaks
       const serialized = JSON.stringify(result.proofEvidence);
       expect(serialized).not.toMatch(/apiKey|secret|password|sourceAdapter|CARH6I/i);
@@ -776,6 +799,7 @@ describe("CCTP full message identity", () => {
         block_number: "100",
         block_hash: hash,
         mint_log_index: "3",
+        receipt_log_index: 4,
         message_nonce: identity.nonce,
         message_digest: identity.digest,
         message_bytes: raw,
@@ -850,6 +874,7 @@ describe("CCTP full message identity", () => {
         block_number: "100",
         block_hash: hash,
         mint_log_index: "3",
+        receipt_log_index: 4,
         message_nonce: identity.nonce,
         message_digest: identity.digest,
         message_bytes: raw,

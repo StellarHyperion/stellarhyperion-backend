@@ -46,6 +46,7 @@ import {
 } from "../db/rows.js";
 import type { MaintenanceLeaseRow } from "../db/rows.js";
 import type { RailRetryClass } from "../rails/types.js";
+import type { CctpVerificationContext } from "../rails/cctp/events.js";
 
 /** Where on a chain a row was observed. One shape for a ledger and for a block. */
 export interface Position {
@@ -504,6 +505,8 @@ export interface CctpDeliveryEvidenceRow {
   readonly messageNonce: string;
   readonly messageDigest: string;
   readonly messageBytes: string;
+  readonly receiptLogIndex: number;
+  readonly verificationContext: CctpVerificationContext;
   readonly token: string;
   readonly recipient: string;
   readonly amount: bigint;
@@ -543,7 +546,7 @@ export async function writeCctpDeliveryEvidence(
     throw new Error("CCTP verified source binding changed before proof admission.");
 
   await db.query(
-    `UPDATE cctp_delivery_evidence SET status = 'superseded'
+    `UPDATE cctp_delivery_evidence SET status = 'superseded', last_revalidated_at = now()
       WHERE transfer_id = $1 AND status = 'canonical'
         AND (tx_hash, mint_log_index) IS DISTINCT FROM ($2, $3)`,
     [row.transferId.toString(), row.txHash, row.mintLogIndex],
@@ -552,8 +555,9 @@ export async function writeCctpDeliveryEvidence(
     `INSERT INTO cctp_delivery_evidence
        (transfer_id, destination_chain, status, tx_hash, block_number, block_hash,
         mint_log_index, message_nonce, message_digest, message_bytes, token, recipient, amount,
-        source_binding, last_revalidated_at)
-     VALUES ($1, $2, 'canonical', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, now())
+        source_binding, receipt_log_index, verification_context, last_revalidated_at)
+     VALUES ($1, $2, 'canonical', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb,
+             $14, $15::jsonb, now())
      ON CONFLICT (transfer_id, tx_hash, mint_log_index) DO UPDATE
        SET status = 'canonical',
            destination_chain = EXCLUDED.destination_chain,
@@ -566,6 +570,10 @@ export async function writeCctpDeliveryEvidence(
            recipient = EXCLUDED.recipient,
            amount = EXCLUDED.amount,
            source_binding = EXCLUDED.source_binding,
+           receipt_log_index = EXCLUDED.receipt_log_index,
+           verification_context = COALESCE(
+             cctp_delivery_evidence.verification_context, EXCLUDED.verification_context
+           ),
            last_revalidated_at = now()
      RETURNING id`,
     [
@@ -582,6 +590,8 @@ export async function writeCctpDeliveryEvidence(
       row.recipient,
       row.amount.toString(),
       JSON.stringify(row.sourceBinding),
+      row.receiptLogIndex,
+      JSON.stringify(row.verificationContext),
     ],
   );
   const id = rows[0]?.id;
@@ -879,6 +889,7 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
 export const MAINTENANCE_JOBS = {
   railAttestationRetention: "rail_attestation_retention",
   routeHealthCompaction: "route_health_compaction",
+  cctpProofRetention: "cctp_proof_retention",
 } as const;
 
 export type MaintenanceJobName = (typeof MAINTENANCE_JOBS)[keyof typeof MAINTENANCE_JOBS];
@@ -932,6 +943,11 @@ function validateMaintenanceOptions(options: RunMaintenanceJobOptions): {
     throw new RangeError("Maintenance olderThanDays must be a non-negative finite number.");
   if (olderThanDays > 100_000)
     throw new RangeError("Maintenance olderThanDays exceeds the supported retention range.");
+  if (
+    options.jobName === MAINTENANCE_JOBS.cctpProofRetention &&
+    (olderThanDays < 1 || olderThanDays > 36_500)
+  )
+    throw new RangeError("CCTP proof retention must be between 1 and 36500 days.");
   if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > MAX_MAINTENANCE_BATCH_SIZE)
     throw new RangeError(
       `Maintenance batchSize must be between 1 and ${MAX_MAINTENANCE_BATCH_SIZE}.`,
@@ -1086,6 +1102,41 @@ async function runMaintenanceBatch(
                   )
              )`,
           [ids.map(String)],
+        );
+        rowsPruned = deleted.rowCount;
+      } else {
+        rowsPruned = 0;
+      }
+    } else if (options.jobName === MAINTENANCE_JOBS.cctpProofRetention) {
+      const selected = await tx.query(
+        `SELECT id
+           FROM cctp_delivery_evidence
+          WHERE status IN ('orphaned', 'superseded')
+            AND COALESCE(last_revalidated_at, verified_at) < $1
+            AND id > $2
+            AND NOT EXISTS (
+              SELECT 1 FROM inbound_delivery d
+               WHERE d.cctp_evidence_id = cctp_delivery_evidence.id
+                 AND d.delivered = true
+            )
+          ORDER BY id
+          LIMIT $3
+          FOR UPDATE SKIP LOCKED`,
+        [cutoff, cursor.toString(), values.batchSize],
+      );
+      ids = selected.rows.map((row) => bigintOf(row, "id"));
+      if (ids.length > 0) {
+        const deleted = await tx.query(
+          `DELETE FROM cctp_delivery_evidence e
+            USING unnest($1::bigint[]) AS candidate(id)
+           WHERE e.id = candidate.id
+             AND e.status IN ('orphaned', 'superseded')
+             AND COALESCE(e.last_revalidated_at, e.verified_at) < $2
+             AND NOT EXISTS (
+               SELECT 1 FROM inbound_delivery d
+                WHERE d.cctp_evidence_id = e.id AND d.delivered = true
+             )`,
+          [ids.map(String), cutoff],
         );
         rowsPruned = deleted.rowCount;
       } else {
