@@ -1,4 +1,8 @@
-import type { CctpFeeReconciliation, CctpVerificationFailure } from "../rails/types.js";
+import type {
+  CctpFeeReconciliation,
+  CctpMessageVersionReference,
+  CctpVerificationFailure,
+} from "../rails/types.js";
 import { RouteKind } from "@hyperion/protocol";
 import { bounded, safeString } from "../rails/axelar/gmp.js";
 /**
@@ -453,6 +457,7 @@ export interface AttestationRow {
   readonly nextAttemptAt: Date | null;
   readonly retryClass: RailRetryClass | null;
   readonly diagnostics?: readonly VerificationDiagnostic[];
+  readonly cctpMessageVersions?: readonly CctpMessageVersionReference[];
   readonly itsVerificationState?: "receipt_unavailable" | "payout_unverified" | "verified" | null;
   readonly verificationFailure?: CctpVerificationFailure | null;
 }
@@ -846,8 +851,9 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
   await db.query(
     `INSERT INTO rail_attestation
        (transfer_id, route, status, rail_status, rail_reference, attested_at, last_checked_at,
-        check_failures, last_error, next_attempt_at, retry_class, retry_attempts, diagnostics, verification_failure, its_verification_state)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+          check_failures, last_error, next_attempt_at, retry_class, retry_attempts, diagnostics,
+          verification_failure, its_verification_state, cctp_message_versions)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb)
      ON CONFLICT (transfer_id) DO UPDATE
        SET status = EXCLUDED.status,
            rail_status = COALESCE(EXCLUDED.rail_status, rail_attestation.rail_status),
@@ -864,6 +870,21 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
            retry_class = EXCLUDED.retry_class,
            diagnostics = CASE WHEN EXCLUDED.its_verification_state IS NULL THEN rail_attestation.diagnostics ELSE EXCLUDED.diagnostics END,
            its_verification_state = COALESCE(EXCLUDED.its_verification_state, rail_attestation.its_verification_state),
+           cctp_message_versions = (
+             SELECT COALESCE(jsonb_agg(selected.value ORDER BY
+               selected.value->>'messageNonce', selected.value->>'messageDigest',
+               selected.value->>'attestationDigest'), '[]'::jsonb)
+             FROM (
+               SELECT DISTINCT ON (
+                 item.value->>'messageDigest', item.value->>'attestationDigest'
+               ) item.value
+               FROM jsonb_array_elements(
+                 rail_attestation.cctp_message_versions || EXCLUDED.cctp_message_versions
+               ) AS item(value)
+               ORDER BY item.value->>'messageDigest', item.value->>'attestationDigest',
+                        item.value->>'observedAt' DESC
+             ) AS selected
+           ),
            verification_failure = EXCLUDED.verification_failure,
            updated_at = now()`,
     [
@@ -882,6 +903,7 @@ export async function writeAttestation(db: Queryable, row: AttestationRow): Prom
       JSON.stringify(normalizeVerificationDiagnostics(row.diagnostics ?? [])),
       row.verificationFailure ?? null,
       row.itsVerificationState ?? null,
+      JSON.stringify(row.cctpMessageVersions ?? []),
     ],
   );
 }

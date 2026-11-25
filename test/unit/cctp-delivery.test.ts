@@ -23,6 +23,7 @@ import {
   cctpMessageIdentity,
   inspectCctpMessage,
   inspectCctpPayment,
+  inspectCctpReplacementEquivalence,
   matchingCctpPayment,
   verifiedCctpMessage,
   type ExpectedCctpTransfer,
@@ -318,9 +319,32 @@ describe("CCTP forwarded destination proof", () => {
     expect(report.railStatus).toBe("complete");
     expect(report.messageBytes).toBeNull();
   });
+  it("tracks attestation versions by digest without retaining signature bytes", () => {
+    const signature = `0x${"c1".repeat(65)}`;
+    const report = reportFor({
+      status: "fast_complete",
+      message: raw,
+      attestation: signature,
+      attestationType: "fast",
+    });
+    expect(report.cctpMessageVersion?.attestationDigest).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(report.cctpMessageVersion?.attestationType).toBe("fast");
+    expect(JSON.stringify(report.cctpMessageVersion)).not.toContain(signature);
+  });
   it("persists only the bounded verification failure code with the attestation", async () => {
     let statement = "";
     let parameters: readonly unknown[] = [];
+    const observedVersion = {
+      messageNonce: nonce,
+      messageDigest: cctpMessageIdentity(raw)!.digest,
+      forwardTxHash: `0x${"12".repeat(32)}` as const,
+      providerStatus: "expired" as const,
+      attestationDigest: `0x${"34".repeat(32)}`,
+      attestationType: "standard" as const,
+      attestationTimestamp: null,
+      expirationBlock: "18446744073709551616",
+      observedAt: new Date("2026-11-19T09:00:00Z"),
+    };
     const db: Queryable = {
       query(sql, values = []) {
         statement = sql;
@@ -342,9 +366,13 @@ describe("CCTP forwarded destination proof", () => {
       nextAttemptAt: new Date("2026-11-19T09:01:00Z"),
       retryClass: null,
       verificationFailure: "recipient_mismatch",
+      cctpMessageVersions: [observedVersion],
     });
     expect(statement).toContain("verification_failure = EXCLUDED.verification_failure");
+    expect(statement).toContain("cctp_message_versions");
     expect(parameters[13]).toBe("recipient_mismatch");
+    expect(parameters[15]).toBe(JSON.stringify([observedVersion]));
+    expect(String(parameters[15])).not.toContain("signature");
   });
 });
 
@@ -407,6 +435,30 @@ describe("CCTP full message identity", () => {
     expect(shortMismatch.reference).toBeNull();
   });
 
+  it("recognizes CCTP replacement semantics without permitting burn-body changes", () => {
+    const changedCaller = hexToBytes(raw);
+    changedCaller[108] = 1;
+    const callerReplacement = toHex(changedCaller);
+    expect(inspectCctpReplacementEquivalence(raw, callerReplacement)).toEqual({
+      equivalent: true,
+      failure: null,
+    });
+
+    const changedRecipient = hexToBytes(raw);
+    changedRecipient[184] = 0x22;
+    expect(inspectCctpReplacementEquivalence(raw, toHex(changedRecipient))).toEqual({
+      equivalent: false,
+      failure: "recipient_mismatch",
+    });
+
+    const changedFee = hexToBytes(raw);
+    changedFee[311] = (changedFee[311] ?? 0) + 1;
+    expect(inspectCctpReplacementEquivalence(raw, toHex(changedFee))).toEqual({
+      equivalent: false,
+      failure: "invalid_message",
+    });
+  });
+
   it("retains every message candidate returned for one source transaction", async () => {
     const fetch = vi.fn(() =>
       Promise.resolve(
@@ -439,6 +491,41 @@ describe("CCTP full message identity", () => {
       raw,
       sibling,
     ]);
+    expect(result.report.candidates?.[0]?.cctpMessageVersion).toMatchObject({
+      messageNonce: nonce,
+      providerStatus: "attested",
+      attestationDigest: null,
+      expirationBlock: null,
+    });
+  });
+
+  it("keeps an expired original auditable without making the transfer terminal", async () => {
+    const fetch = vi.fn(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            messages: [{ status: "expired", eventNonce: displayed, message: raw }],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+    const result = await new IrisClient("testnet", { fetch }).look({
+      transferId: 1n,
+      route: RouteKind.Cctp,
+      originChain: "stellar-testnet",
+      destinationChain: "sepolia",
+      nonce: 1n,
+      originTx: "source-burn-tx",
+      status: null,
+      checkFailures: 0,
+      retryAttempts: 0,
+      delivered: false,
+    });
+    expect(result.kind).toBe("found");
+    if (result.kind !== "found") return;
+    expect(result.report.status).toBe("pending");
+    expect(result.report.cctpMessageVersion?.providerStatus).toBe("expired");
   });
 
   describe("delivery association", () => {
@@ -586,6 +673,96 @@ describe("CCTP full message identity", () => {
       );
       expect(repeat.failure).toBeNull();
       expect(repeat.delivery).toEqual(first.delivery);
+    });
+
+    it("verifies the active replacement receipt while retaining the expired original reference", async () => {
+      const replacementBytes = hexToBytes(raw);
+      replacementBytes[108] = 1;
+      const replacement = toHex(replacementBytes);
+      const replacementIdentity = cctpMessageIdentity(replacement);
+      if (!replacementIdentity) throw new Error("Expected valid replacement identity");
+      const withReplacement: RailReport = {
+        ...report,
+        candidates: [
+          { ...report, status: "expired" },
+          {
+            ...report,
+            status: "attested",
+            messageBytes: replacement,
+            messageNonce: replacementIdentity.nonce,
+            messageDigest: replacementIdentity.digest,
+          },
+        ],
+      };
+
+      const result = await inspectCctpDelivery(config, database(stored), transfer, withReplacement);
+
+      expect(result.delivery).not.toBeNull();
+      if (!("storedEvidence" in result)) throw new Error("Expected stored CCTP proof evidence");
+      expect(result.storedEvidence.messageBytes).toBe(replacement);
+      expect(result.storedEvidence.messageDigest).toBe(replacementIdentity.digest);
+    });
+
+    it.each([
+      [196, "recipient_mismatch"],
+      [184, "invalid_message"],
+    ])("does not deliver when a replacement changes recipient byte %s", async (offset, failure) => {
+      const changedRecipient = hexToBytes(raw);
+      // The bytes32 recipient starts at 184; its EVM address starts after 12 padding bytes.
+      changedRecipient[offset] = 0x22;
+      const replacement = toHex(changedRecipient);
+      const replacementIdentity = cctpMessageIdentity(replacement);
+      if (!replacementIdentity) throw new Error("Expected valid replacement identity");
+      const withReplacement: RailReport = {
+        ...report,
+        candidates: [
+          { ...report, status: "expired" },
+          {
+            ...report,
+            status: "attested",
+            messageBytes: replacement,
+            messageNonce: replacementIdentity.nonce,
+            messageDigest: replacementIdentity.digest,
+          },
+        ],
+      };
+
+      const result = await inspectCctpDelivery(config, database(stored), transfer, withReplacement);
+
+      expect(result).toMatchObject({
+        delivery: null,
+        failure,
+        proofEvidence: null,
+      });
+    });
+
+    it("leaves unrecognized same-nonce replacement changes unresolved", async () => {
+      const changedFee = hexToBytes(raw);
+      changedFee[311] = (changedFee[311] ?? 0) + 1;
+      const replacement = toHex(changedFee);
+      const replacementIdentity = cctpMessageIdentity(replacement);
+      if (!replacementIdentity) throw new Error("Expected valid replacement identity");
+      const withReplacement: RailReport = {
+        ...report,
+        candidates: [
+          { ...report, status: "expired" },
+          {
+            ...report,
+            status: "attested",
+            messageBytes: replacement,
+            messageNonce: replacementIdentity.nonce,
+            messageDigest: replacementIdentity.digest,
+          },
+        ],
+      };
+
+      const result = await inspectCctpDelivery(config, database(stored), transfer, withReplacement);
+
+      expect(result).toMatchObject({
+        delivery: null,
+        failure: "invalid_message",
+        proofEvidence: null,
+      });
     });
 
     it("rejects a racing first-use code observation after rereading the immutable winner", async () => {

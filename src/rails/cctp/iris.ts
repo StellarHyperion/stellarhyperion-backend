@@ -24,6 +24,7 @@
  * with that wait attached, and the pass holds off rather than doubling from a second.
  */
 import { CHAINS, IRIS_API, isChainKey, type NetworkMode } from "@hyperion/protocol";
+import { keccak256, type Hex } from "viem";
 
 import type {
   PendingTransfer,
@@ -31,6 +32,7 @@ import type {
   RailLookup,
   RailReport,
   AttestationStatus,
+  CctpMessageVersionReference,
 } from "../types.js";
 import { RailError } from "../types.js";
 import { sanitizeRailDiagnostic } from "../diagnostics.js";
@@ -332,11 +334,16 @@ export class IrisClient implements RailClient {
     }
 
     const reports = messages.map(reportFor);
-    const firstReport = reports[0];
-    if (!firstReport) return { kind: "missing" };
+    const activeReports = reports.filter((candidate) => candidate.status !== "expired");
+    const selectedReport = activeReports.at(-1) ?? reports[0];
+    if (!selectedReport) return { kind: "missing" };
+    const report =
+      activeReports.length === 0
+        ? { ...selectedReport, status: "pending" as const }
+        : selectedReport;
     return {
       kind: "found",
-      report: reports.length === 1 ? firstReport : { ...firstReport, candidates: reports },
+      report: reports.length === 1 ? report : { ...report, candidates: reports },
     };
   }
 
@@ -479,15 +486,36 @@ export function reportFor(message: IrisMessage): RailReport {
     statusLower.includes("fast") ||
     Boolean(message.fastAttestation);
 
+  const forwardTxHash =
+    typeof message.forwardTxHash === "string" && /^0x[0-9a-fA-F]{64}$/.test(message.forwardTxHash)
+      ? (message.forwardTxHash as `0x${string}`)
+      : null;
+  const observedAt = new Date();
+  const expirationBlock = expirationBlockOf(message);
+  const cctpMessageVersion: CctpMessageVersionReference | undefined =
+    identity === null
+      ? undefined
+      : {
+          messageNonce: identity.nonce,
+          messageDigest: identity.digest,
+          forwardTxHash,
+          providerStatus: mapped,
+          attestationDigest:
+            attestationSignature !== null && /^0x(?:[0-9a-fA-F]{2})+$/.test(attestationSignature)
+              ? keccak256(attestationSignature as Hex)
+              : null,
+          attestationType: attestationSignature === null ? null : isFast ? "fast" : "standard",
+          attestationTimestamp,
+          expirationBlock,
+          observedAt,
+        };
+
   const safeStatus = safeRailPart(rawStatus) ?? "unknown";
   let railStatus = delay === null ? safeStatus : `${safeStatus}/${delay}`;
   railStatus = appendExpiry(railStatus, message);
 
   return {
-    ...(typeof message.forwardTxHash === "string" &&
-    /^0x[0-9a-fA-F]{64}$/.test(message.forwardTxHash)
-      ? { forwardTxHash: message.forwardTxHash as `0x${string}` }
-      : {}),
+    ...(forwardTxHash === null ? {} : { forwardTxHash }),
     status: mapped,
     railStatus,
     reference,
@@ -500,6 +528,7 @@ export function reportFor(message: IrisMessage): RailReport {
     attestationSignature,
     attestationTimestamp,
     fastTransfer: isFast,
+    ...(cctpMessageVersion === undefined ? {} : { cctpMessageVersion }),
   };
 }
 
@@ -553,21 +582,26 @@ function safeReference(value: string): string | null {
  * chain, so the natural home is the pass once it is given that.
  */
 function appendExpiry(railStatus: string, message: IrisMessage): string {
+  const expirationBlock = expirationBlockOf(message);
+  return expirationBlock !== null && !railStatus.includes("expires@")
+    ? `${railStatus} expires@${expirationBlock}`
+    : railStatus;
+}
+
+function expirationBlockOf(message: IrisMessage): string | null {
   const raw =
     message.decodedMessage?.decodedMessageBody?.expirationBlock ??
     (typeof message.fastAttestation === "object" && message.fastAttestation !== null
       ? message.fastAttestation.expirationBlock
       : undefined);
-  if (typeof raw !== "string" && typeof raw !== "number") return railStatus;
+  if (typeof raw !== "string" && typeof raw !== "number") return null;
   try {
-    if (typeof raw === "number" && !Number.isSafeInteger(raw)) return railStatus;
-    if (typeof raw === "string" && (raw.length > 78 || !/^\d+$/.test(raw))) return railStatus;
+    if (typeof raw === "number" && !Number.isSafeInteger(raw)) return null;
+    if (typeof raw === "string" && (raw.length > 78 || !/^\d+$/.test(raw))) return null;
     const block = BigInt(raw);
-    return block > 0n && !railStatus.includes("expires@")
-      ? `${railStatus} expires@${block.toString()}`
-      : railStatus;
+    return block > 0n ? block.toString() : null;
   } catch {
-    return railStatus;
+    return null;
   }
 }
 
