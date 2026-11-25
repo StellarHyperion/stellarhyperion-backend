@@ -21,7 +21,7 @@ def pr():
             "user": {"login": "alice", "type": "User"}, "mergeable": True,
             "mergeable_state": "clean", "changed_files": 1,
             "head": {"sha": HEAD, "ref": "fix", "repo": {"id": 2, "full_name": "alice/example"}},
-            "base": {"sha": BASE, "ref": "main", "repo": {"id": 1, "full_name": REPO}}}
+            "base": {"sha": BASE, "ref": "dev", "repo": {"id": 1, "full_name": REPO}}}
 
 
 def run():
@@ -73,7 +73,7 @@ class FakeGitHub:
             return copy.deepcopy(self.pr)
         if path == PREFIX + "actions/runs/12":
             return copy.deepcopy(self.run)
-        if "/actions/workflows/ci.yml/runs?" in path:
+        if "/actions/workflows/dev-ci.yml/runs?" in path:
             return {"workflow_runs": [copy.deepcopy(self.run)]}
         if "/attempts/2/jobs?" in path:
             return {"jobs": copy.deepcopy(self.jobs)}
@@ -109,7 +109,7 @@ class IssueCompletionTests(unittest.TestCase):
     def setUp(self):
         self.api = FakeGitHub()
         self.api.pr.update(state="closed", merged=True, merged_at="2026-11-24T01:00:00Z", merge_commit_sha=BASE)
-        self.bot = merger.IssueCompletion(self.api, "main")
+        self.bot = merger.IssueCompletion(self.api, "dev")
 
     def test_only_issues_assigned_to_original_author_are_completed(self):
         self.api.pr["body"] = "Closes #42. Related #43, #44, #45. outside/other#46"
@@ -146,7 +146,7 @@ class IssueCompletionTests(unittest.TestCase):
                 self.api.issue["assignees"] = []
             return result
         with patch.object(self.api, "request", side_effect=revoke):
-            self.assertTrue(merger.AutoMerge(self.api, policy, "main").process(1).startswith("MERGED"))
+            self.assertTrue(merger.AutoMerge(self.api, policy, "dev").process(1).startswith("MERGED"))
         self.assertEqual(len(self.api.writes), 1)
         self.assertTrue(self.api.writes[0][0].endswith("/merge"))
 
@@ -246,7 +246,7 @@ class AutoMergeTests(unittest.TestCase):
         self.api = FakeGitHub()
         self.policy = Mock()
         self.policy.decision.return_value = (True, "assigned")
-        self.bot = merger.AutoMerge(self.api, self.policy, "main")
+        self.bot = merger.AutoMerge(self.api, self.policy, "dev")
 
     def assert_wait(self, text):
         result = self.bot.process(1)
@@ -326,7 +326,7 @@ class AutoMergeTests(unittest.TestCase):
         self.assert_wait("Update your branch")
 
     def test_changed_security_policy_and_renames_require_maintainer(self):
-        for item in [{"filename": ".github/workflows/ci.yml"},
+        for item in [{"filename": ".github/workflows/dev-ci.yml"},
                      {"filename": "src/safe.py", "previous_filename": ".github/scripts/check.py"},
                      {"filename": "nested/AGENTS.md"}, {"filename": "CODEOWNERS"}]:
             with self.subTest(item=item):
@@ -376,6 +376,27 @@ class AutoMergeTests(unittest.TestCase):
              "check_run_url": f"https://api.github.com/repos/{REPO}/check-runs/{check['id']}"}
             for check in records]
         return records
+
+    def test_main_ci_results_are_advisory_for_dev_integration(self):
+        self.add_action_run(101, [(200, "failure")])
+        self.api.extra_runs[101].update(path=merger.MAIN_CI_PATH, conclusion="failure")
+        self.assertEqual(self.bot.checks(self.api.pr), [])
+
+    def test_failed_dev_ci_still_blocks_dev_integration(self):
+        self.add_action_run(101, [(200, "failure")])
+        self.api.extra_runs[101]["path"] = merger.CI_PATH
+        self.assertTrue(self.bot.checks(self.api.pr))
+
+    def test_other_failed_workflow_still_blocks_dev_integration(self):
+        self.add_action_run(101, [(200, "failure")])
+        self.api.extra_runs[101]["path"] = ".github/workflows/other.yml"
+        self.assertTrue(self.bot.checks(self.api.pr))
+
+    def test_main_ci_failure_is_not_ignored_for_a_main_policy(self):
+        self.add_action_run(101, [(200, "failure")])
+        self.api.extra_runs[101]["path"] = merger.MAIN_CI_PATH
+        self.bot.default_branch = "main"
+        self.assertTrue(self.bot.checks(self.api.pr))
 
     def test_new_workflow_run_supersedes_failed_suite_even_with_larger_old_check_id(self):
         self.add_action_run(100, [(900, "failure")])
@@ -541,6 +562,46 @@ class AutoMergeTests(unittest.TestCase):
             self.assertNotIn(forbidden, source)
         self.assertIn("github.workflow_sha", source)
 
+
+
+class DevelopmentIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.api = FakeGitHub()
+        self.policy = Mock()
+        self.policy.decision.return_value = (True, "assigned")
+        self.bot = merger.AutoMerge(self.api, self.policy, "dev")
+
+    def test_main_promotion_cannot_be_automatically_merged(self):
+        self.api.pr["base"]["ref"] = "main"
+        proof, reasons = self.bot.inspect(self.api.pr)
+        self.assertIsNone(proof)
+        self.assertTrue(any("dev" in reason for reason in reasons))
+        self.assertEqual(self.api.writes, [])
+        self.policy.decision.assert_not_called()
+
+    def test_dev_merge_requires_the_dev_ci_workflow(self):
+        self.api.run["path"] = ".github/workflows/ci.yml"
+        _, reasons = self.bot.current_ci(self.api.pr)
+        self.assertTrue(any("CI has not registered" in reason for reason in reasons))
+        self.assertEqual(self.api.writes, [])
+
+    def test_merged_dev_pr_completes_only_its_assigned_issue(self):
+        self.api.pr.update(state="closed", merged=True,
+                           merged_at="2026-11-25T12:00:00Z", merge_commit_sha=BASE)
+        self.api.pr["body"] = "Closes #42"
+        result = merger.IssueCompletion(self.api, "dev").process(1)
+        self.assertIn("COMPLETED", result)
+        self.assertEqual(self.api.issue["state_reason"], "completed")
+        self.assertEqual(self.api.issue["assignees"], [{"login": "alice"}])
+
+    def test_main_promotion_cannot_complete_a_dev_issue(self):
+        self.api.pr.update(state="closed", merged=True,
+                           merged_at="2026-11-25T12:00:00Z", merge_commit_sha=BASE)
+        self.api.pr["base"]["ref"] = "main"
+        self.api.pr["body"] = "Closes #42"
+        merger.IssueCompletion(self.api, "dev").process(1)
+        self.assertEqual(self.api.issue["state"], "open")
+        self.assertEqual(self.api.writes, [])
 
 if __name__ == "__main__":
     unittest.main()

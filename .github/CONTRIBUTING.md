@@ -3,6 +3,40 @@
 Hyperion backend indexes cross-chain transfers between Stellar and EVM chains, polls rail
 attestation APIs, runs on-chain keeper upkeep jobs, and exposes transfer queries via REST.
 
+## Development waves and pull request target
+
+`dev` is the default branch. Create feature branches from the latest `origin/dev`
+and open contributor pull requests against `dev`:
+
+```bash
+git fetch origin
+git switch -c feature/my-change origin/dev
+# Make and commit the change, then push the feature branch.
+git push -u origin feature/my-change
+gh pr create --base dev
+```
+
+Keep your branch updated with `origin/dev` before automatic merging. Issue assignment,
+PR descriptions and contribution security remain required. `dev ci` checks formatting,
+lint and types; the contracts repository also checks Rust and Solidity formatting.
+It omits production builds, integration suites, CodeQL and deployment rehearsals.
+Passing these fast checks permits integration into the contributor wave, not release.
+The bot verifies `dev-ci.yml`; historical or optional `ci.yml` results belong to main
+promotion. Failed dev checks and other workflows or external checks still block it.
+
+When a wave is complete, maintainers open a promotion PR from `dev` to `main`:
+
+```bash
+gh pr create --base main --head dev
+```
+
+`ci.yml` runs the existing full correctness, build, test and security pipeline for
+that promotion. Maintainers review correctness, security, migrations and deployment
+behavior, then merge manually with a merge commit. The auto-merge bot handles only
+`dev`. After promotion, merge the updated `main` back into `dev` so future feature
+branches include the release history. Automatic issue completion on `dev` records
+integration of an assigned issue; it does not assert that the wave has been released.
+
 ## Issue assignment requirement
 
 Request assignment from a maintainer before opening a pull request. Reference the issue in
@@ -83,7 +117,7 @@ DATABASE_URL=postgres://hyperion:hyperion-local-only@127.0.0.1:5433/hyperion_tes
 
 ## Running checks and test suites
 
-All checks must pass before opening a pull request:
+Run the fast checks before opening a pull request; run the full suite before main promotion:
 
 ```bash
 # Code style and formatting
@@ -163,10 +197,10 @@ bot, organization-role, or code-owner exemption. Issue-assignment events and the
 five-minute scheduled sweep remain recovery paths. GitHub event delivery and runner
 availability can still delay execution; conflicted PRs may have no runnable CI.
 
-The approval job uses a `pull_request_target` event restricted to `main`. It never
+The approval job uses a `pull_request_target` event restricted to `dev`. It never
 checks out a branch, downloads contributed artifacts, or executes PR code. It loads
 only default-branch authorization modules through the GitHub API. Only the current
-fork head's ordinary `ci.yml` run can be approved. The job waits briefly for a newly
+fork head's ordinary `dev-ci.yml` run can be approved. The job waits briefly for a newly
 submitted or edited PR's CI run to register, rechecks all issue assignments, and
 checks the PR head and description again immediately before approval. It cannot
 approve a code review or merge a PR. PR build jobs retain read-only permissions and
@@ -190,16 +224,16 @@ Description edits rerun CI. This validates the description's structure and
 attestations; reviewers still assess whether its claims match the change.
 
 Authenticated `dependabot[bot]` and `renovate[bot]` accounts are exempt only from
-description formatting. Their full build and security checks remain required.
+description formatting. Their branch-specific checks remain required; full builds and source security run on main promotion.
 
 ## Source and dependency security
 
-The required gate includes CodeQL's `security-extended` analysis for
+The main promotion gate includes CodeQL's `security-extended` analysis for
 JavaScript/TypeScript and Python, without executing a project build. High and
 critical source findings block; all findings are retained as SARIF artifacts for
 14 days. The analysis uses read-only permissions and does not require a paid plan
 for these public repositories. Existing dependency, secret, workflow and
-contract-specific checks remain required. These tools do not prove that arbitrary
+contract-specific main checks remain required. These tools do not prove that arbitrary
 code is free of malware.
 
 For dependency behavior and suspected malware detection, the
@@ -221,11 +255,11 @@ python3 -B .github/scripts/test_approve_pr_ci.py
 
 ## Test-based automatic merging
 
-`Automatic PR merge` runs after `ci` completes, on issue assignment/description changes,
+`Automatic PR merge` runs after `dev ci` completes, on issue assignment/description changes,
 and every 15 minutes as recovery. It has no model, review credits, or daily merge quota.
-It squash-merges open, non-draft PRs targeting `main` only after the current head's newest
+It merge-commits open, non-draft PRs targeting `dev` only after the current head's newest
 CI attempt and every CI job (including `gate`) succeed, every external check/status succeeds,
-the head includes current `main`, and GitHub reports no conflicts. Existing assignment
+the head includes current `dev`, and GitHub reports no conflicts. Existing assignment
 exemptions and automatic closure of unauthorized contributors are preserved. A PR must still
 reference at least one real StellarHyperion issue, and its current description must satisfy
 the established template. Dependency bots retain their description-formatting exemption.

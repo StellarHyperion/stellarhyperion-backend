@@ -12,11 +12,11 @@ HEAD = "a" * 40
 def pr():
     return {"number": 42, "state": "open", "draft": False,
             "head": {"sha": HEAD, "ref": "fix", "repo": {"id": 2, "full_name": "contributor/example"}},
-            "base": {"ref": "main", "repo": {"full_name": REPO}}}
+            "base": {"ref": "dev", "repo": {"full_name": REPO}}}
 
 
 def run():
-    return {"id": 7, "event": "pull_request", "path": ".github/workflows/ci.yml",
+    return {"id": 7, "event": "pull_request", "path": ".github/workflows/dev-ci.yml",
             "repository": {"full_name": REPO}, "head_sha": HEAD, "head_branch": "fix",
             "head_repository": {"id": 2, "full_name": "contributor/example"},
             "status": "completed", "conclusion": "action_required"}
@@ -37,7 +37,7 @@ class Policy:
 
 class GitHub:
     repository = REPO
-    policy_ref = "main"
+    policy_ref = "dev"
 
     def __init__(self):
         self.pr = pr()
@@ -144,18 +144,18 @@ class ApprovalTests(unittest.TestCase):
             with self.subTest(change=change):
                 candidate = run()
                 candidate.update(change)
-                self.assertFalse(matches(pr(), candidate, REPO, "main"))
+                self.assertFalse(matches(pr(), candidate, REPO, "dev"))
 
     def test_non_default_base_and_same_repo_runs_are_excluded(self):
         for changes in [{"ref": "other"}, {"repo": {"full_name": "other/repo"}}]:
             current = pr()
             current["base"].update(changes)
-            self.assertFalse(matches(current, run(), REPO, "main"))
+            self.assertFalse(matches(current, run(), REPO, "dev"))
         current = pr()
         current["head"]["repo"] = {"id": 1, "full_name": REPO}
         candidate = run()
         candidate["head_repository"] = current["head"]["repo"]
-        self.assertFalse(matches(current, candidate, REPO, "main"))
+        self.assertFalse(matches(current, candidate, REPO, "dev"))
 
     def test_invalid_identifiers_cannot_be_api_paths(self):
         for number in [True, -1, 0, "42/merge"]:
@@ -173,15 +173,15 @@ class ApprovalTests(unittest.TestCase):
             candidate = run()
             current["head"]["repo"] = identity
             candidate["head_repository"] = identity
-            self.assertFalse(matches(current, candidate, REPO, "main"))
+            self.assertFalse(matches(current, candidate, REPO, "dev"))
         current = pr()
         candidate = run()
         current["head"]["ref"] = ""
         candidate["head_branch"] = ""
-        self.assertFalse(matches(current, candidate, REPO, "main"))
+        self.assertFalse(matches(current, candidate, REPO, "dev"))
         candidate = run()
         candidate["head_repository"]["id"] = True
-        self.assertFalse(matches(pr(), candidate, REPO, "main"))
+        self.assertFalse(matches(pr(), candidate, REPO, "dev"))
 
     def test_verification_error_never_approves_ci(self):
         self.github.failure = True
@@ -247,6 +247,25 @@ class ApprovalTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 timestamp(value)
 
+
+
+class DevelopmentAuthorizationTests(unittest.TestCase):
+    def test_dev_run_is_authorized_for_an_assigned_contributor(self):
+        github, policy = GitHub(), Policy()
+        self.assertIn("APPROVE", Approval(github, policy).approve(42)[0])
+        self.assertEqual(len(github.approvals), 1)
+
+    def test_main_promotion_is_not_automatically_authorized(self):
+        github, policy = GitHub(), Policy()
+        github.pr["base"]["ref"] = "main"
+        Approval(github, policy).approve(42)
+        self.assertEqual(github.approvals, [])
+
+    def test_full_main_ci_cannot_authorize_a_dev_pull_request(self):
+        github, policy = GitHub(), Policy()
+        github.run["path"] = ".github/workflows/ci.yml"
+        Approval(github, policy).approve(42)
+        self.assertEqual(github.approvals, [])
 
 if __name__ == "__main__":
     unittest.main()

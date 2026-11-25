@@ -15,7 +15,7 @@ from pathlib import Path
 
 from enforce_pr_assignments import Enforcement, GitHub
 
-CI_PATH = ".github/workflows/ci.yml"
+CI_PATH = ".github/workflows/dev-ci.yml"
 SHA = re.compile(r"[0-9a-f]{40}")
 
 
