@@ -23,6 +23,7 @@ permissions:
   issues: write
   actions: read
   checks: read
+  statuses: read
 
 concurrency:
   group: automatic-pr-merge-${{ github.repository }}
@@ -65,7 +66,7 @@ jobs:
           revision = os.environ["POLICY_SHA"]
           if not re.fullmatch(r"[0-9a-f]{40}", revision):
               raise ValueError("Invalid trusted workflow revision")
-          for module in ["enforce_pr_assignments", "check_pr_description", "auto_merge_prs"]:
+          for module in ["enforce_pr_assignments", "check_pr_description", "pr_safety", "auto_merge_prs"]:
               path = ".github/scripts/" + module + ".py"
               query = urllib.parse.urlencode({"ref": revision})
               request = urllib.request.Request(

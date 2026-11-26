@@ -35,13 +35,16 @@ class FakeGitHub:
         self.repository, self.policy_ref = REPO, BASE
         self.pr, self.run = pr(), run()
         self.jobs = [{"name": merger.CI_GATE, "head_sha": HEAD, "status": "completed", "conclusion": "success"}]
-        self.files = [{"filename": "src/fix.py"}]
+        self.files = [{"filename": "src/fix.py", "status": "added", "additions": 1, "deletions": 0,
+                       "patch": "@@ -0,0 +1 @@\n+fixed = True"}]
         self.issue = {"title": "Fix bug", "body": "Acceptance criteria", "state": "open",
                       "state_reason": None,
                       "assignees": [{"login": "alice"}]}
         self.refs = set()
         self.issues = {}
         self.comments, self.reviews, self.statuses, self.checks = [], [], [], []
+        self.safety_status = [{"context": "PR safety", "state": "success", "description": f"Passed (base {BASE})",
+                               "creator": {"login": "github-actions[bot]"}}]
         self.resolved, self.branch = True, BASE
         self.writes, self.reads = [], []
         self.extra_runs, self.extra_jobs = {}, {}
@@ -82,7 +85,8 @@ class FakeGitHub:
         if "/issues/" in path:
             return copy.deepcopy(self.issues.get(path.rsplit("/", 1)[1], self.issue))
         if "/compare/" in path:
-            return {"merge_base_commit": {"sha": self.branch}, "status": "ahead"}
+            return {"base_commit": {"sha": BASE}, "merge_base_commit": {"sha": self.branch},
+                    "status": "ahead", "files": copy.deepcopy(self.files)}
         if "/check-runs?" in path:
             return {"check_runs": copy.deepcopy(self.checks)}
         if "/git/ref/heads/" in path:
@@ -94,14 +98,12 @@ class FakeGitHub:
         raise AssertionError(path)
 
     def pages(self, path):
-        if path.endswith("/files"):
-            return iter(copy.deepcopy(self.files))
         if path.endswith("/reviews"):
             return iter(copy.deepcopy(self.reviews))
         if path.endswith("/comments"):
             return iter(copy.deepcopy(self.comments))
         if path.endswith("/statuses"):
-            return iter(copy.deepcopy(self.statuses))
+            return iter(copy.deepcopy(self.statuses + self.safety_status))
         raise AssertionError(path)
 
 
@@ -334,8 +336,23 @@ class AutoMergeTests(unittest.TestCase):
                      {"filename": "src/safe.py", "previous_filename": ".github/scripts/check.py"},
                      {"filename": "nested/AGENTS.md"}, {"filename": "CODEOWNERS"}]:
             with self.subTest(item=item):
-                self.api.files = [item]
-                self.assert_wait("Maintainer merge required")
+                self.api.files = [{"status": "renamed" if "previous_filename" in item else "modified", **item}]
+                self.assert_wait("requires maintainer review")
+
+    def test_safety_requires_current_trusted_status_even_with_green_ci(self):
+        status = self.api.safety_status[0]
+        for statuses, reason in [([], "trusted PR safety status"),
+                                 ([{**status, "state": "failure"}], "PR safety is failure"),
+                                 ([{**status, "description": "Passed for an old base"}], "current dev base"),
+                                 ([{**status, "creator": {"login": "contributor"}}], "must come from GitHub Actions")]:
+            with self.subTest(statuses=statuses):
+                self.api.safety_status = statuses
+                self.assert_wait(reason)
+
+    def test_green_status_cannot_override_unsafe_diff(self):
+        self.api.files = [{"filename": ".gitignore", "status": "added", "additions": 1, "deletions": 0,
+                           "patch": "@@ -0,0 +1 @@\n+example" + " " * 100 + "hidden text"}]
+        self.assert_wait("wide gap")
 
     def test_incomplete_file_listing_is_an_error_not_an_approval(self):
         self.api.pr["changed_files"] = 2

@@ -24,14 +24,76 @@ env:
   HYPERION_LIVE_TESTNET: "0"
 
 jobs:
+  pr-safety-preflight:
+    name: require trusted PR safety
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: read
+    steps:
+      - name: Restrict safety verification network access
+        if: github.event_name == 'pull_request'
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c
+        with:
+          egress-policy: block
+          disable-sudo-and-containers: true
+          disable-telemetry: true
+          allowed-endpoints: api.github.com:443
+
+      - name: Wait for the trusted status on the tested PR snapshot
+        if: github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 -B - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import time
+          import urllib.error
+          import urllib.request
+
+          pr = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())["pull_request"]
+          base, head = pr["base"]["sha"], pr["head"]["sha"]
+          if not all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (base, head)):
+              raise SystemExit("Invalid PR snapshot")
+          endpoint = f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/commits/{head}/statuses?per_page=100"
+          request = urllib.request.Request(endpoint, headers={
+              "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+          })
+          for attempt in range(16):
+              try:
+                  with urllib.request.urlopen(request, timeout=8) as response:
+                      statuses = json.load(response)
+              except (OSError, ValueError):
+                  statuses = []
+              status = next((item for item in statuses if item.get("context") == "PR safety"), {})
+              if ((status.get("creator") or {}).get("login") == "github-actions[bot]"
+                      and (status.get("description") or "").endswith(f" (base {base})")):
+                  if status["state"] == "success":
+                      break
+                  if status["state"] == "failure":
+                      raise SystemExit("PR safety blocked this revision. Open the PR safety details on GitHub.")
+              if attempt < 15:
+                  time.sleep(8)
+          else:
+              raise SystemExit("No successful trusted PR safety status for this snapshot; no PR code ran in dev CI.")
+          PY
+
   supply-chain:
+    needs: pr-safety-preflight
     uses: ./.github/workflows/supply-chain.yml
 
   pr-description:
+    needs: pr-safety-preflight
     uses: ./.github/workflows/pr-description.yml
 
   fast-checks:
     name: format, lint, typecheck
+    needs: pr-safety-preflight
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -76,15 +138,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [fast-checks, supply-chain, pr-description]
+    needs: [pr-safety-preflight, fast-checks, supply-chain, pr-description]
     steps:
       - name: Require every development check to pass
         env:
+          PR_SAFETY_PREFLIGHT: ${{ needs.pr-safety-preflight.result }}
           FAST_CHECKS: ${{ needs.fast-checks.result }}
           SUPPLY_CHAIN: ${{ needs.supply-chain.result }}
           PR_DESCRIPTION: ${{ needs.pr-description.result }}
         run: |
           set -eu
+          test "$PR_SAFETY_PREFLIGHT" = success
           test "$FAST_CHECKS" = success
           test "$SUPPLY_CHAIN" = success
           test "$PR_DESCRIPTION" = success

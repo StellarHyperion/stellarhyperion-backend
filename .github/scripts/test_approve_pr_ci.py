@@ -2,6 +2,7 @@
 
 import copy
 import unittest
+from unittest.mock import Mock
 
 from approve_pr_ci import Approval, event_number, matches, timestamp
 
@@ -12,7 +13,7 @@ HEAD = "a" * 40
 def pr():
     return {"number": 42, "state": "open", "draft": False,
             "head": {"sha": HEAD, "ref": "fix", "repo": {"id": 2, "full_name": "contributor/example"}},
-            "base": {"ref": "dev", "repo": {"full_name": REPO}}}
+            "base": {"ref": "dev", "sha": "b" * 40, "repo": {"full_name": REPO}}}
 
 
 def run():
@@ -72,12 +73,34 @@ class ApprovalTests(unittest.TestCase):
     def setUp(self):
         self.github = GitHub()
         self.policy = Policy()
-        self.approval = Approval(self.github, self.policy)
+        self.safety = Mock()
+        self.safety.report.return_value = "success", []
+        self.approval = Approval(self.github, self.policy, self.safety)
 
     def test_assigned_author_starts_only_waiting_current_ci(self):
         self.assertIn("APPROVE", self.approval.approve(42)[0])
         self.assertEqual(self.github.approvals, [f"repos/{REPO}/actions/runs/7/approve"])
         self.assertEqual(self.policy.calls, 2)
+
+    def test_safety_denial_or_error_never_starts_fork_ci(self):
+        for verdict, tag in [("failure", "BLOCK"), ("error", "ERROR"), ("changed", "WAIT")]:
+            with self.subTest(verdict=verdict):
+                self.safety.report.return_value = verdict, ["Changed file requires review"]
+                self.assertIn(tag, self.approval.approve(42)[0])
+                self.assertEqual(self.github.approvals, [])
+                self.assertEqual(self.policy.calls, 0)
+
+    def test_base_change_after_scan_prevents_approval(self):
+        self.github.before_recheck = lambda github: github.pr["base"].update(sha="c" * 40)
+        self.assertIn("SKIP", self.approval.approve(42)[0])
+        self.assertEqual(self.github.approvals, [])
+
+    def test_same_repo_pr_is_scanned_even_without_fork_approval(self):
+        self.github.pr["head"]["repo"] = self.github.pr["base"]["repo"]
+        self.safety.report.return_value = "failure", ["Changed file requires review"]
+        self.assertIn("BLOCK", self.approval.approve(42)[0])
+        self.safety.report.assert_called_once()
+        self.assertEqual(self.github.approvals, [])
 
     def test_only_newest_waiting_description_run_is_approved(self):
         older = run()
@@ -250,21 +273,26 @@ class ApprovalTests(unittest.TestCase):
 
 
 class DevelopmentAuthorizationTests(unittest.TestCase):
+    def setUp(self):
+        self.safety = Mock()
+        self.safety.report.return_value = "success", []
+
     def test_dev_run_is_authorized_for_an_assigned_contributor(self):
         github, policy = GitHub(), Policy()
-        self.assertIn("APPROVE", Approval(github, policy).approve(42)[0])
+        self.assertIn("APPROVE", Approval(github, policy, self.safety).approve(42)[0])
         self.assertEqual(len(github.approvals), 1)
 
     def test_main_promotion_is_not_automatically_authorized(self):
         github, policy = GitHub(), Policy()
         github.pr["base"]["ref"] = "main"
-        Approval(github, policy).approve(42)
+        Approval(github, policy, self.safety).approve(42)
+        self.safety.report.assert_not_called()
         self.assertEqual(github.approvals, [])
 
     def test_full_main_ci_cannot_authorize_a_dev_pull_request(self):
         github, policy = GitHub(), Policy()
         github.run["path"] = ".github/workflows/ci.yml"
-        Approval(github, policy).approve(42)
+        Approval(github, policy, self.safety).approve(42)
         self.assertEqual(github.approvals, [])
 
 if __name__ == "__main__":

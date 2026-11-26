@@ -4,6 +4,8 @@ on:
   pull_request_target:
     branches: [dev]
     types: [opened, synchronize, reopened, edited, ready_for_review]
+  push:
+    branches: [dev]
   issues:
     types: [assigned]
   schedule:
@@ -15,6 +17,7 @@ permissions:
   issues: read
   pull-requests: read
   actions: write
+  statuses: write
 
 concurrency:
   group: automatic-pr-ci-${{ github.repository }}-${{ github.event.pull_request.number || 'sweep' }}
@@ -22,7 +25,8 @@ concurrency:
 
 jobs:
   authorize:
-    name: authorize assigned contributor CI
+    name: scan PR safety and authorize assigned contributor CI
+    if: github.event_name == 'pull_request_target' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -34,26 +38,31 @@ jobs:
           disable-telemetry: true
           allowed-endpoints: api.github.com:443
 
-      - name: Authorize CI with the trusted default-branch assignment policy
+      - name: Scan and authorize CI with immutable dev policy
         env:
           GITHUB_TOKEN: ${{ github.token }}
           POLICY_REF: ${{ github.event.repository.default_branch }}
+          POLICY_SHA: ${{ github.workflow_sha }}
           PR_ASSIGNMENT_HELPER_BOTS: ${{ vars.PR_ASSIGNMENT_HELPER_BOTS }}
         run: |
-          python3 - <<'PY'
+          python3 -B - <<'PY'
           import base64
           import json
           import os
+          import re
           import sys
           import types
           import urllib.parse
           import urllib.request
 
           # No checkout, PR import, artifact download, or contributed code runs here.
-          # Both authorization modules are loaded only from the default branch.
-          for module in ["enforce_pr_assignments", "approve_pr_ci"]:
+          # The policy modules come from the trusted workflow revision, not a PR ref.
+          revision = os.environ["POLICY_SHA"]
+          if not re.fullmatch(r"[0-9a-f]{40}", revision):
+              raise ValueError("Invalid trusted workflow revision")
+          for module in ["enforce_pr_assignments", "pr_safety", "approve_pr_ci"]:
               path = ".github/scripts/" + module + ".py"
-              query = urllib.parse.urlencode({"ref": os.environ["POLICY_REF"]})
+              query = urllib.parse.urlencode({"ref": revision})
               request = urllib.request.Request(
                   "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"]
                   + "/contents/" + path + "?" + query,
@@ -66,7 +75,9 @@ jobs:
               )
               with urllib.request.urlopen(request, timeout=30) as response:
                   content = json.load(response)
-              source = base64.b64decode(content["content"], validate=False)
+              if content.get("type") != "file" or content.get("encoding") != "base64":
+                  raise ValueError("Trusted policy module unavailable")
+              source = base64.b64decode(content["content"])
               loaded = types.ModuleType(module)
               sys.modules[module] = loaded
               exec(compile(source, path, "exec"), loaded.__dict__)

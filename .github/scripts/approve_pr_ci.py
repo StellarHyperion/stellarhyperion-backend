@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from enforce_pr_assignments import Enforcement, GitHub
+from pr_safety import Safety, snapshot
 
 CI_PATH = ".github/workflows/dev-ci.yml"
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -78,9 +79,10 @@ def matches(pr, run, repository, default_branch):
 
 
 class Approval:
-    def __init__(self, github, policy):
+    def __init__(self, github, policy, safety):
         self.github = github
         self.policy = policy
+        self.safety = safety
 
     def runs(self, sha):
         if not isinstance(sha, str) or SHA.fullmatch(sha) is None:
@@ -106,6 +108,16 @@ class Approval:
         pr = self.github.request(endpoint)
         if pr["state"] != "open":
             return ["SKIP: pull request is closed"]
+        if pr["base"]["ref"] != self.github.policy_ref:
+            return ["SKIP: pull request does not target dev"]
+        scanned = snapshot(pr)
+        verdict, findings = self.safety.report(pr, endpoint)
+        if verdict == "changed":
+            return ["WAIT: PR changed during safety verification; the recovery sweep will retry"]
+        if verdict == "error":
+            return ["ERROR: " + finding for finding in findings]
+        if verdict != "success":
+            return ["BLOCK: " + finding for finding in findings]
         # The trusted PR event can arrive before GitHub registers the ordinary CI run.
         # Retry only registration, always fetching fresh PR state and assignments.
         for attempt in range(registration_attempts):
@@ -126,6 +138,8 @@ class Approval:
             pr = self.github.request(endpoint)
             if pr["state"] != "open":
                 return ["SKIP: pull request is closed"]
+            if snapshot(pr) != scanned:
+                return ["SKIP: PR revision changed; the recovery sweep will scan it"]
         if not candidates:
             return ["SKIP: current CI already started" if runs else
                     "WAIT: current CI has not registered; the recovery sweep will retry"]
@@ -139,7 +153,8 @@ class Approval:
                 raise ValueError("Invalid workflow run id")
             run = self.github.request(f"repos/{self.github.repository}/actions/runs/{run_id}")
             current = self.github.request(endpoint)
-            if not waiting(run) or not matches(current, run, self.github.repository, self.github.policy_ref):
+            if (snapshot(current) != scanned or not waiting(run)
+                    or not matches(current, run, self.github.repository, self.github.policy_ref)):
                 rows.append(f"SKIP run {run_id}: run or PR head changed")
                 continue
             # Recheck every issue assignment immediately before approval, then the PR head
@@ -150,6 +165,7 @@ class Approval:
                 continue
             latest = self.github.request(endpoint)
             if (authorization_state(latest) != authorization_state(current)
+                    or snapshot(latest) != scanned
                     or not matches(latest, run, self.github.repository, self.github.policy_ref)):
                 rows.append(f"SKIP run {run_id}: PR changed during assignment verification")
                 continue
@@ -176,7 +192,7 @@ def event_number(event_name, event):
 def main():
     github = GitHub(os.environ["GITHUB_TOKEN"], os.environ["GITHUB_REPOSITORY"], os.environ["POLICY_REF"])
     policy = Enforcement(github, os.environ.get("PR_ASSIGNMENT_HELPER_BOTS", ""))
-    approval = Approval(github, policy)
+    approval = Approval(github, policy, Safety(github))
     event_name = os.environ.get("GITHUB_EVENT_NAME", "")
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text()) if event_name == "pull_request_target" else {}
     number = event_number(event_name, event)
@@ -190,7 +206,7 @@ def main():
                                        not_before=not_before)
         except Exception as error:
             results = ["ERROR: " + type(error).__name__ + "; CI was not approved"]
-            errors += 1
+        errors += any(result.startswith("ERROR:") for result in results)
         for result in results:
             line = f"PR {number}: {result}"
             print(line, flush=True)

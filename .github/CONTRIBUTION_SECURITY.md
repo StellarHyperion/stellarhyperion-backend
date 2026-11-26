@@ -5,6 +5,23 @@ and no application secrets. Every checkout disables credential persistence. Acti
 security tools are pinned to reviewed commits/digests; npm installs disable dependency lifecycle hooks.
 The normal build, test, and migration commands still execute project code and require review.
 
+## Dev PR safety
+
+`PR safety` is a required GitHub Actions status on the exact contributor commit. A trusted
+`dev` workflow reads GitHub's immutable base/head diff as data. It never checks out the PR, runs
+its commands, or installs its dependencies. It checks for obscured text and puts editor/startup
+configuration, changes to npm scripts, CI/security policy changes, and incomplete or opaque diffs
+on hold. Automatic fork approval and the merge bot enforce the policy independently. The normal
+`dev` CI jobs also wait for the successful status on PR runs before checking out the branch.
+Large diffs can require manual review; split them where practical.
+
+When the check fails, open its **Details** in GitHub and review the indicated paths in the browser
+without opening the PR in an editor or installing packages. Ask for a clean revision when possible.
+Legitimate changes to protected entrypoints require maintainer review rather than automatic merge.
+Do not bypass a finding just to make CI run. This is a conservative preflight, not a guarantee that
+ordinary source or dependencies are safe; keep reviewing them and treat third-party bot flags as
+independent evidence.
+
 The `gate` check includes workflow security analysis, new-commit secret scanning, and dependency
 advisory checks. Secret scanning redacts findings and does not accept repository-provided suppressions.
 Build jobs block outbound traffic outside their documented endpoint lists and disable sudo/container

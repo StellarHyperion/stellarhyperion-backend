@@ -18,6 +18,7 @@ import urllib.parse
 
 from check_pr_description import DEPENDENCY_BOTS, validate_description, visible_markdown
 from enforce_pr_assignments import Enforcement, GitHub, text_references
+from pr_safety import CONTEXT as SAFETY_CONTEXT, STATUS_AUTHOR, compare as safety_compare, findings as safety_findings
 
 CI_PATH = ".github/workflows/dev-ci.yml"
 MAIN_CI_PATH = ".github/workflows/ci.yml"
@@ -260,8 +261,15 @@ class AutoMerge:
                 if context in seen:
                     continue
                 seen.add(context)
+                if context == SAFETY_CONTEXT:
+                    if (status.get("creator") or {}).get("login") != STATUS_AUTHOR:
+                        reasons.append("The PR safety status must come from GitHub Actions.")
+                    if not (status.get("description") or "").endswith(f" (base {pr['base']['sha']})"):
+                        reasons.append("Wait for the trusted PR safety status for the current dev base.")
                 if status.get("state") != "success":
                     reasons.append(f"Status {context} is {status.get('state', 'pending')}. Fix it or wait for success.")
+            if sha == pr["head"]["sha"] and SAFETY_CONTEXT not in seen:
+                reasons.append("Wait for the trusted PR safety status on the current head.")
         return reasons
 
     def inspect(self, pr):
@@ -299,19 +307,10 @@ class AutoMerge:
             return None, reasons
         # Require that the tested head includes current dev, even if an administrator
         # has temporarily disabled GitHub's strict status check setting.
-        compare = self.github.request(self.prefix + f"compare/{pr['base']['sha']}...{pr['head']['sha']}")
+        compare = safety_compare(self.github, pr)
         if compare.get("merge_base_commit", {}).get("sha") != pr["base"]["sha"] or compare.get("status") not in {"ahead", "identical"}:
             reasons.append("Update your branch with the latest default branch, then let CI run again.")
-        files = list(self.github.pages(self.prefix + f"pulls/{pr['number']}/files"))
-        if len(files) != pr.get("changed_files"):
-            raise ValueError("GitHub did not return the complete changed-file list")
-        # A contributor must not replace the very workflows/scripts producing green
-        # checks. Control-plane changes are a maintainer task, not automatic merges.
-        protected = [name for item in files for name in [item["filename"], item.get("previous_filename", "")]
-                     if name.startswith(".github/") or name in {"CODEOWNERS", "docs/CODEOWNERS"}
-                     or name.rsplit("/", 1)[-1].lower() in {"agent.md", "agents.md", ".gitleaksignore"}]
-        if protected:
-            reasons.append("Maintainer merge required for changes to CI, automation, agent instructions, or security policy: " + ", ".join(sorted(set(protected))))
+        reasons.extend("PR safety: " + issue for issue in safety_findings(self.github, pr, compare)[:20])
         reasons.extend(self.conversations(pr))
         reasons.extend(self.checks(pr))
         return (state(pr), issues, ci), reasons
